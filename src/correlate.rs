@@ -75,6 +75,18 @@ pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
     AgentKind::PlainShell
 }
 
+fn is_plain_shell_name(name: &str) -> bool {
+    let base = Path::new(name)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "zsh" | "bash" | "fish" | "sh" | "nu" | "dash" | "tmux" | "screen"
+    )
+}
+
 /// Returns `true` if the terminal should be included in the fleet view (`include_all` bypasses the plain-shell exclusion filter).
 pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
     if include_all {
@@ -84,11 +96,20 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
     if kind != AgentKind::PlainShell {
         return true;
     }
-    if term.reported || term.status.is_some() {
-        return true;
-    }
     if term.labels.keys().any(|k| k.starts_with("cockpit.")) {
         return true;
+    }
+    if let Some(st) = &term.status {
+        let state = st.state.trim().to_ascii_lowercase();
+        let active_state = matches!(state.as_str(), "working" | "blocked" | "done" | "error");
+        let non_shell_app = st
+            .app
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|app| !app.is_empty() && !is_plain_shell_name(app));
+        if active_state && non_shell_app {
+            return true;
+        }
     }
     false
 }
@@ -577,5 +598,40 @@ mod tests {
         assert_eq!(rem.host, "github.com");
         assert_eq!(rem.owner, "acme");
         assert_eq!(rem.repo, "platform");
+    }
+
+    #[test]
+    fn test_should_include_terminal_filters_idle_or_reported_plain_shells() {
+        use crate::herdr::HcStatus;
+
+        let reported_zsh = HcTerminal {
+            address: "t1".into(),
+            name: Some("zsh".into()),
+            state: "live".into(),
+            reported: true,
+            argv: vec!["/bin/zsh".into()],
+            status: Some(HcStatus {
+                state: "idle".into(),
+                app: Some("zsh".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(!should_include_terminal(&reported_zsh, false));
+        assert!(should_include_terminal(&reported_zsh, true));
+
+        let working_non_shell_app = HcTerminal {
+            address: "t2".into(),
+            name: Some("zsh".into()),
+            state: "live".into(),
+            argv: vec!["/bin/zsh".into()],
+            status: Some(HcStatus {
+                state: "working".into(),
+                app: Some("my-custom-agent".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(should_include_terminal(&working_non_shell_app, false));
     }
 }

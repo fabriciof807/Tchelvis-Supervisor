@@ -1359,12 +1359,27 @@ export default class CockpitMod extends View {
         }
         return line.trimEnd();
       })
-      .filter(
-        (line) =>
-          line.trim().length > 0 &&
-          !/^[\s│┃╎╏¦|─━╭╮╯╰┌┐┘└├┤┬┴┼═║╔╗╚╝]+$/.test(line)
-      )
+      .filter((line) => {
+        const trimmed = line.trim();
+        if (trimmed.length === 0) return false;
+        if (/^[\s│┃╎╏¦|─━╭╮╯╰┌┐┘└├┤┬┴┼═║╔╗╚╝]+$/.test(line)) return false;
+        if (
+          trimmed.includes("Monitorando sessão ativa do agente.") ||
+          trimmed.includes("Nenhuma auto-resposta registrada") ||
+          trimmed.includes("OUTPUT PREVIEW (LAST 25 LINES)") ||
+          trimmed.includes("AUTO-REPLY AUDIT LOG") ||
+          trimmed.includes("DURABLE SUPERVISOR") ||
+          /^t\w+\s+\(.+\)\s+\[(WORKING|BLOCKED|IDLE|COMPLETED)\]$/i.test(trimmed)
+        ) {
+          return false;
+        }
+        return true;
+      })
       .slice(-20);
+    const previewText = cleanedPreviewLines
+      .slice(-12)
+      .map((line) => (line.length > 96 ? `${line.slice(0, 95)}…` : line))
+      .join("\n");
 
     const sectionTitle = (title) =>
       div()
@@ -1840,29 +1855,20 @@ export default class CockpitMod extends View {
                   )
               )
               // 1c. Output Preview (Last 25 Lines)
-              .when(cleanedPreviewLines.length > 0, (el) =>
+              .when(Boolean(previewText), (el) =>
                 el
                   .child(sectionTitle("OUTPUT PREVIEW (LAST 25 LINES)"))
                   .child(
                     cardBox().child(
-                      v_flex()
+                      div()
                         .p(8)
-                        .gap(2)
-                        .max_h(160)
-                        .overflow_y_scrollbar()
                         .rounded(6)
                         .bg(t.background)
                         .border(1)
                         .border_color(t.border)
-                        .children(
-                          cleanedPreviewLines.map((line) =>
-                            div()
-                              .text_size(11)
-                              .text_color(t.muted)
-                              .truncate()
-                              .child(line)
-                          )
-                        )
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .child(previewText)
                     )
                   )
               )

@@ -1,9 +1,11 @@
 use super::config::HcAdapterConfig;
 use anyhow::{anyhow, Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
 use std::process::Command;
+use std::sync::LazyLock;
 
 /// Normalized representation of an active or recently transitioned `hc` session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -446,6 +448,21 @@ pub fn is_blank_or_box_border_only(line: &str) -> bool {
         .all(|c| c.is_whitespace() || ('\u{2500}'..='\u{257F}').contains(&c) || c == '|')
 }
 
+static SUPERVISOR_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^t\w+\s+\(.+\)\s+\[(WORKING|BLOCKED|IDLE|COMPLETED)\]$")
+        .expect("valid supervisor header regex")
+});
+
+fn is_supervisor_tui_noise(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.contains("Monitorando sessão ativa do agente.")
+        || trimmed.contains("Nenhuma auto-resposta registrada")
+        || trimmed.contains("OUTPUT PREVIEW (LAST 25 LINES)")
+        || trimmed.contains("AUTO-REPLY AUDIT LOG")
+        || trimmed.contains("DURABLE SUPERVISOR")
+        || SUPERVISOR_HEADER_RE.is_match(trimmed)
+}
+
 fn clean_tui_line(line: &str) -> &str {
     let trimmed = line.trim();
     if trimmed.starts_with('│') || trimmed.ends_with('│') {
@@ -459,7 +476,7 @@ fn clean_tui_line(line: &str) -> &str {
 }
 
 /// Extracts the last `max_lines` from either `hc read --json` (`{"text": "..."}`) or raw text,
-/// stripping empty lines and Ratatui/TUI box-drawing border lines.
+/// stripping empty lines, Ratatui/TUI box-drawing border lines, and leftover supervisor TUI lines.
 pub fn extract_tail_lines(raw_output: &str, max_lines: usize) -> Result<String> {
     let text = if let Ok(parsed) = serde_json::from_str::<RawHcReadOutput>(raw_output.trim()) {
         parsed.text
@@ -470,7 +487,7 @@ pub fn extract_tail_lines(raw_output: &str, max_lines: usize) -> Result<String> 
     let meaningful_lines: Vec<&str> = text
         .lines()
         .map(clean_tui_line)
-        .filter(|line| !is_blank_or_box_border_only(line))
+        .filter(|line| !is_blank_or_box_border_only(line) && !is_supervisor_tui_noise(line))
         .collect();
 
     let start = meaningful_lines.len().saturating_sub(max_lines);
@@ -520,13 +537,11 @@ mod tests {
         let raw = "┌───────────────────────────────────────┐\n\
                    │ Monitorando sessão ativa do agente.   │\n\
                    │ t9g (ant-game / 1 (zsh)) [WORKING]    │\n\
-                   │                                       │\n\
+                   │ Running cargo test...                 │\n\
+                   │ test result: ok. 42 passed            │\n\
                    │                                       │\n\
                    └───────────────────────────────────────┘";
         let tail = extract_tail_lines(raw, 25).unwrap();
-        assert_eq!(
-            tail,
-            "Monitorando sessão ativa do agente.\nt9g (ant-game / 1 (zsh)) [WORKING]"
-        );
+        assert_eq!(tail, "Running cargo test...\ntest result: ok. 42 passed");
     }
 }
