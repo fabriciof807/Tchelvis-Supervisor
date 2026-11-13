@@ -1,0 +1,31 @@
+[package]
+name = "cockpit"
+version = "0.1.0"
+edition = "2021"
+authors = ["notchelvis"]
+description = "Local-first, read-only dashboard and CLI for tracking coding agents running through Herdr (hc)"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.28"
+libc = "0.2"
+ratatui = "0.29"
+regex = "1.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "signal", "fs"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+ureq = { version = "2.12", features = ["json"] }
+
+[dev-dependencies]
+tempfile = "3.12"

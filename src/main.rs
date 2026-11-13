@@ -1,0 +1,702 @@
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use cockpit::config::{CockpitConfig, CockpitPaths};
+use cockpit::daemon::{collect_once, query_socket_once, run_daemon};
+use cockpit::doctor::run_doctor;
+use cockpit::herdr::HerdrClient;
+use cockpit::logging::{init_logging, read_filtered_logs};
+use cockpit::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
+use cockpit::providers::ProviderCoordinator;
+use cockpit::setup::{run_setup, run_uninstall, SetupOptions};
+use cockpit::store::CacheStore;
+use cockpit::supervisor::state::SupervisorMode;
+use cockpit::supervisor::{
+    approve_action, current_status, ignore_action, run_supervisor_daemon, run_tick_once, run_tui,
+    set_or_cycle_mode, unload_model,
+};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::process::Command;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "cockpit",
+    version,
+    about = "Local-first, read-only dashboard and CLI for tracking coding agents running through Herdr (hc)"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the single-instance background service or a single collection cycle
+    Daemon {
+        /// Execute one snapshot cycle and exit
+        #[arg(long)]
+        once: bool,
+        /// Custom Unix domain socket path
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Show live and recent coding agent fleet status
+    Status {
+        /// Output full CockpitSnapshot JSON
+        #[arg(long)]
+        json: bool,
+        /// Force immediate external provider refresh
+        #[arg(long)]
+        refresh: bool,
+        /// Include plain non-agent shells
+        #[arg(long)]
+        all: bool,
+        /// Do not auto-spawn background daemon if socket is absent
+        #[arg(long)]
+        no_spawn: bool,
+    },
+    /// Stream live fleet updates from the Cockpit daemon
+    Watch {
+        /// Output newline-delimited CockpitSnapshot JSON lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect correlation provenance, PR/CI/review/deploy details, tickets, Slack, and runbooks for one terminal
+    Inspect {
+        /// Terminal address (e.g., t7) or name
+        terminal: String,
+        /// Output InspectResponse JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Attach, remove (`k=`), or view `cockpit.*` provenance labels on a Herdr terminal
+    Label {
+        /// Terminal address or name
+        terminal: String,
+        /// Key=value pairs (e.g., cockpit.issue=ENG-42 or issue=ENG-42; `k=` removes key)
+        pairs: Vec<String>,
+    },
+    /// Verify hc runtime, hook hashes, Herdr mod schema, SQLite store, and provider health
+    Doctor {
+        /// Output DoctorReport JSON
+        #[arg(long)]
+        json: bool,
+        /// Write a secret-redacted diagnostic bundle to the specified path
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+    },
+    /// Configure shell helpers, coding agent hooks, and Herdr Desktop mod assets
+    Setup {
+        /// Preview planned file changes without modifying disk
+        #[arg(long)]
+        dry_run: bool,
+        /// Comma-separated targets: shell,claude,opencode,pi,herdr-mod,systemd
+        #[arg(long)]
+        only: Option<String>,
+        /// Comma-separated targets to skip
+        #[arg(long)]
+        skip: Option<String>,
+        /// Verify installed asset SHA-256 hashes without modifying files
+        #[arg(long)]
+        verify: bool,
+        /// Roll back all Cockpit-managed changes using setup-manifest.json
+        #[arg(long)]
+        undo: bool,
+        /// Set `cockpit` as the default layout in herdr-app/settings.json
+        #[arg(long)]
+        set_default_layout: bool,
+        /// Write ~/.config/systemd/user/cockpit.service
+        #[arg(long)]
+        systemd: bool,
+        /// When used with --undo, also purge Cockpit directories and remove the cockpit binary
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Remove all Cockpit-managed hooks, fenced shell blocks, mod files, and manifest state
+    Uninstall {
+        /// Preview planned rollback actions without modifying disk
+        #[arg(long)]
+        dry_run: bool,
+        /// Proceed even if warnings occur
+        #[arg(long)]
+        force: bool,
+        /// Also delete ~/.config/cockpit, ~/.local/share/cockpit, ~/.local/state/cockpit, runtime sockets, and the cockpit binary
+        #[arg(long)]
+        purge: bool,
+    },
+    /// View redacted structured JSONL logs
+    Logs {
+        /// Filter by terminal/agent ID
+        #[arg(long)]
+        agent: Option<String>,
+        /// Filter by provider name
+        #[arg(long)]
+        provider: Option<String>,
+        /// Maximum number of log lines to display
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// Launch the interactive Ratatui Cockpit & Durable Supervisor TUI dashboard
+    Tui,
+    /// Manage the Pi-Durable FSM Supervisor (tick, status, approve, ignore, mode, unload, watch)
+    Supervisor {
+        #[command(subcommand)]
+        action: SupervisorCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SupervisorCommands {
+    /// Return the current DesktopModSnapshot JSON
+    Status {
+        /// Output JSON (always emits DesktopModSnapshot JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Execute one deterministic supervisor evaluation tick
+    Tick {
+        /// Output JSON (always emits OnceOutput JSON)
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the supervisor watcher loop and persist supervisor_mod_snapshot.json
+    Watch,
+    /// Approve a pending operator Action Card and send payload to the agent
+    Approve {
+        /// Agent / terminal ID
+        agent_id: String,
+        /// Optional command payload override
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        payload: Vec<String>,
+    },
+    /// Ignore/dismiss a pending operator Action Card
+    Ignore {
+        /// Agent / terminal ID
+        agent_id: String,
+    },
+    /// Set or cycle the supervisor operating mode (semi-auto, alert-only, paused, cycle)
+    Mode {
+        /// Target mode or "cycle"
+        mode: String,
+    },
+    /// Unload the configured Ollama model from memory (keep_alive: 0)
+    Unload,
+}
+
+const VALID_LABEL_KEYS: [&str; 7] = [
+    "cockpit.issue",
+    "cockpit.pr",
+    "cockpit.slack",
+    "cockpit.runbook",
+    "cockpit.agent",
+    "cockpit.supervisor_state",
+    "cockpit.supervisor_decision",
+];
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let paths = CockpitPaths::resolve()?;
+    let _ = paths.ensure_dirs();
+    let _ = init_logging(&paths.log_file());
+    let cfg = CockpitConfig::load_or_default(&paths)?;
+
+    match cli.command {
+        Commands::Daemon { once, socket } => {
+            if once {
+                let store = CacheStore::open(&paths.db_file())?;
+                let herdr = HerdrClient::default();
+                let coord = ProviderCoordinator::new();
+                let snap = collect_once(&cfg, &paths, &store, &herdr, &coord, false, false).await?;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                return Ok(());
+            }
+            run_daemon(cfg, paths, socket).await
+        }
+        Commands::Status {
+            json,
+            refresh,
+            all,
+            no_spawn,
+        } => {
+            let snap = obtain_snapshot(&cfg, &paths, refresh, all, no_spawn).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                print_human_status(&snap);
+            }
+            Ok(())
+        }
+        Commands::Watch { json } => {
+            let sock = paths.socket_file();
+            if !sock.exists() {
+                let _ = try_autospawn_daemon(&sock).await;
+            }
+            if let Ok(stream) = UnixStream::connect(&sock).await {
+                let (read_half, mut write_half) = stream.into_split();
+                let req = IpcRequest {
+                    op: IpcOp::Watch,
+                    terminal: None,
+                    include_all: false,
+                };
+                let mut line = serde_json::to_string(&req)?;
+                line.push('\n');
+                write_half.write_all(line.as_bytes()).await?;
+
+                let mut reader = BufReader::new(read_half);
+                let mut incoming = String::new();
+                loop {
+                    incoming.clear();
+                    let n = reader.read_line(&mut incoming).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    if json {
+                        print!("{incoming}");
+                    } else if let Ok(snap) =
+                        serde_json::from_str::<CockpitSnapshot>(incoming.trim())
+                    {
+                        print!("\x1b[2J\x1b[H");
+                        print_human_status(&snap);
+                    }
+                }
+                Ok(())
+            } else {
+                let snap = obtain_snapshot(&cfg, &paths, false, false, true).await?;
+                if json {
+                    println!("{}", serde_json::to_string(&snap)?);
+                } else {
+                    print_human_status(&snap);
+                }
+                Ok(())
+            }
+        }
+        Commands::Inspect { terminal, json } => {
+            let sock = paths.socket_file();
+            let req = IpcRequest {
+                op: IpcOp::Inspect,
+                terminal: Some(terminal.clone()),
+                include_all: true,
+            };
+            let resp: InspectResponse = match query_socket_once(&sock, &req).await {
+                Ok(r) => r,
+                Err(_) => {
+                    let store = CacheStore::open(&paths.db_file())?;
+                    let herdr = HerdrClient::default();
+                    let coord = ProviderCoordinator::new();
+                    let snap =
+                        collect_once(&cfg, &paths, &store, &herdr, &coord, true, false).await?;
+                    let agent = snap
+                        .agents
+                        .into_iter()
+                        .find(|a| a.address == terminal || a.name == terminal)
+                        .with_context(|| format!("terminal '{}' not found", terminal))?;
+                    InspectResponse {
+                        agent,
+                        providers: snap.providers,
+                    }
+                }
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&resp)?);
+            } else {
+                print_human_inspect(&resp);
+            }
+            Ok(())
+        }
+        Commands::Label { terminal, pairs } => {
+            let herdr = HerdrClient::default();
+            if pairs.is_empty() {
+                let mut rpc = None;
+                let term = herdr.get_terminal(&mut rpc, &terminal).await?;
+                for (k, v) in term
+                    .labels
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("cockpit."))
+                {
+                    println!("{k}={v}");
+                }
+                return Ok(());
+            }
+            let mut normalized_args = vec!["label".to_string(), terminal];
+            for pair in pairs {
+                let Some((raw_k, v)) = pair.split_once('=') else {
+                    bail!(
+                        "Invalid label syntax '{}'; expected key=value or key=",
+                        pair
+                    );
+                };
+                let full_k = if raw_k.starts_with("cockpit.") {
+                    raw_k.to_string()
+                } else {
+                    format!("cockpit.{raw_k}")
+                };
+                if !VALID_LABEL_KEYS.contains(&full_k.as_str()) {
+                    bail!(
+                        "Unsupported Cockpit label key '{}'. Valid keys: {}",
+                        full_k,
+                        VALID_LABEL_KEYS.join(", ")
+                    );
+                }
+                normalized_args.push(format!("{full_k}={v}"));
+            }
+            let status = Command::new(herdr.hc_bin())
+                .args(&normalized_args)
+                .status()
+                .await
+                .context("failed invoking `hc label`")?;
+            if !status.success() {
+                bail!("`hc label` exited with {}", status);
+            }
+            Ok(())
+        }
+        Commands::Doctor { json, bundle } => {
+            let rep = run_doctor(&cfg, &paths, bundle.as_deref()).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                print_human_doctor(&rep);
+            }
+            Ok(())
+        }
+        Commands::Setup {
+            dry_run,
+            only,
+            skip,
+            verify,
+            undo,
+            set_default_layout,
+            systemd,
+            purge,
+        } => {
+            let opts = SetupOptions {
+                dry_run,
+                only,
+                skip,
+                verify_only: verify,
+                undo,
+                set_default_layout,
+                systemd,
+                purge,
+            };
+            let rep = run_setup(&paths, &opts)?;
+            println!("Cockpit {} (dry_run={}):", rep.action, rep.dry_run);
+            for line in &rep.planned_or_applied {
+                println!("  - {line}");
+            }
+            if !rep.verified_ok {
+                bail!("Setup verification reported mismatches");
+            }
+            Ok(())
+        }
+        Commands::Uninstall {
+            dry_run,
+            force: _,
+            purge,
+        } => {
+            let rep = run_uninstall(&paths, dry_run, purge, None)?;
+            println!("Cockpit {} (dry_run={}):", rep.action, rep.dry_run);
+            for line in &rep.planned_or_applied {
+                println!("  - {line}");
+            }
+            Ok(())
+        }
+        Commands::Logs {
+            agent,
+            provider,
+            lines,
+        } => {
+            let entries = read_filtered_logs(
+                &paths.log_file(),
+                agent.as_deref(),
+                provider.as_deref(),
+                lines,
+            )?;
+            for line in entries {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        Commands::Tui => {
+            tokio::task::spawn_blocking(run_tui)
+                .await
+                .context("supervisor TUI task panicked")??;
+            Ok(())
+        }
+        Commands::Supervisor { action } => match action {
+            SupervisorCommands::Status { json: _ } => {
+                let snap = tokio::task::spawn_blocking(current_status)
+                    .await
+                    .context("supervisor status task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+            SupervisorCommands::Tick { json: _ } => {
+                let out = tokio::task::spawn_blocking(run_tick_once)
+                    .await
+                    .context("supervisor tick task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&out)?);
+                Ok(())
+            }
+            SupervisorCommands::Watch => {
+                tokio::task::spawn_blocking(run_supervisor_daemon)
+                    .await
+                    .context("supervisor watch task panicked")??;
+                Ok(())
+            }
+            SupervisorCommands::Approve { agent_id, payload } => {
+                let payload_opt = if payload.is_empty() {
+                    None
+                } else {
+                    Some(payload.join(" "))
+                };
+                let snap = tokio::task::spawn_blocking(move || {
+                    approve_action(&agent_id, payload_opt.as_deref())
+                })
+                .await
+                .context("supervisor approve task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+            SupervisorCommands::Ignore { agent_id } => {
+                let snap = tokio::task::spawn_blocking(move || ignore_action(&agent_id))
+                    .await
+                    .context("supervisor ignore task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+            SupervisorCommands::Mode { mode } => {
+                let parsed = match mode.to_ascii_lowercase().as_str() {
+                    "semi-auto" | "semi_auto" | "semiauto" => Some(SupervisorMode::SemiAuto),
+                    "alert-only" | "alert_only" | "alertonly" => Some(SupervisorMode::AlertOnly),
+                    "paused" => Some(SupervisorMode::Paused),
+                    "cycle" => None,
+                    other => bail!(
+                        "Invalid supervisor mode '{}'; expected semi-auto, alert-only, paused, or cycle",
+                        other
+                    ),
+                };
+                let snap = tokio::task::spawn_blocking(move || set_or_cycle_mode(parsed))
+                    .await
+                    .context("supervisor mode task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+            SupervisorCommands::Unload => {
+                let snap = tokio::task::spawn_blocking(unload_model)
+                    .await
+                    .context("supervisor unload task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+        },
+    }
+}
+
+async fn obtain_snapshot(
+    cfg: &CockpitConfig,
+    paths: &CockpitPaths,
+    refresh: bool,
+    include_all: bool,
+    no_spawn: bool,
+) -> Result<CockpitSnapshot> {
+    let sock = paths.socket_file();
+    let req = IpcRequest {
+        op: if refresh {
+            IpcOp::Refresh
+        } else {
+            IpcOp::Status
+        },
+        terminal: None,
+        include_all,
+    };
+
+    if let Ok(snap) = query_socket_once::<CockpitSnapshot>(&sock, &req).await {
+        return Ok(snap);
+    }
+
+    if !no_spawn {
+        let _ = try_autospawn_daemon(&sock).await;
+        if let Ok(snap) = query_socket_once::<CockpitSnapshot>(&sock, &req).await {
+            return Ok(snap);
+        }
+    }
+
+    let store = CacheStore::open(&paths.db_file())?;
+    let herdr = HerdrClient::default();
+    let coord = ProviderCoordinator::new();
+    collect_once(cfg, paths, &store, &herdr, &coord, include_all, refresh).await
+}
+
+async fn try_autospawn_daemon(sock_path: &std::path::Path) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let _child = Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    for _ in 0..10 {
+        if sock_path.exists() {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+fn print_human_status(snap: &CockpitSnapshot) {
+    println!(
+        "COCKPIT v{} | herdr={} | live={} (blocked={} working={} done={} idle={}) | recent_finished={}",
+        snap.cockpit_version,
+        if snap.herdr_connected { "connected" } else { "offline" },
+        snap.summary.total_live,
+        snap.summary.blocked,
+        snap.summary.working,
+        snap.summary.done,
+        snap.summary.idle,
+        snap.summary.recent_finished
+    );
+    println!(
+        "{:<8} {:<14} {:<10} {:<18} {:<22} {:<12} {:<14}",
+        "ADDR", "NAME", "AGENT", "STATE", "BRANCH", "TICKET", "PR / CI"
+    );
+    println!("{}", "-".repeat(102));
+
+    for row in &snap.agents {
+        let state_str = match &row.attention_state {
+            AttentionState::Blocked { kind, .. } => format!("BLOCKED({})", kind.as_str()),
+            other => {
+                if !row.lifecycle.is_live() {
+                    "finished".to_string()
+                } else {
+                    other.label().to_string()
+                }
+            }
+        };
+        let branch = row
+            .workspace
+            .git_branch
+            .as_deref()
+            .unwrap_or("Local / No PR");
+        let ticket = row
+            .context
+            .issue
+            .as_ref()
+            .map(|i| format!("{} ({})", i.key, i.status))
+            .or_else(|| row.context.candidate_issues.first().cloned())
+            .unwrap_or_else(|| "-".into());
+        let pr_ci = match (&row.context.pull_request, &row.context.ci) {
+            (Some(pr), Some(ci)) => format!("#{} [{}]", pr.number, ci.overall_state),
+            (Some(pr), None) => format!("#{} ({})", pr.number, pr.state),
+            _ => "-".into(),
+        };
+        println!(
+            "{:<8} {:<14} {:<10} {:<18} {:<22} {:<12} {:<14}",
+            row.address,
+            truncate_col(&row.name, 14),
+            row.agent_kind.as_str(),
+            truncate_col(&state_str, 18),
+            truncate_col(branch, 22),
+            truncate_col(&ticket, 12),
+            truncate_col(&pr_ci, 14),
+        );
+    }
+}
+
+fn print_human_inspect(resp: &InspectResponse) {
+    let a = &resp.agent;
+    println!("Terminal: {} ({})", a.name, a.address);
+    println!("Agent Kind: {}", a.agent_kind.as_str());
+    println!("Lifecycle: {:?}", a.lifecycle);
+    println!("Attention State: {:?}", a.attention_state);
+    if !a.blocked_children.is_empty() {
+        println!("Blocked Children: {}", a.blocked_children.join(", "));
+    }
+    println!("Workspace CWD: {}", a.workspace.cwd);
+    println!(
+        "Git Branch: {} (HEAD: {})",
+        a.workspace.git_branch.as_deref().unwrap_or("none"),
+        a.workspace.git_head_sha.as_deref().unwrap_or("none")
+    );
+    println!("Correlation Tier: {}", a.correlation_tier.as_str());
+    if !a.provenance.is_empty() {
+        println!("Provenance:");
+        for edge in &a.provenance {
+            println!(
+                "  - [{}] {} -> {} ({})",
+                edge.confidence.as_str(),
+                edge.source,
+                edge.target,
+                edge.detail
+            );
+        }
+    }
+    if let Some(pr) = &a.context.pull_request {
+        println!(
+            "Pull Request: #{} {} ({}) - {}",
+            pr.number, pr.title, pr.state, pr.url
+        );
+    } else {
+        println!("Pull Request: Local / No PR");
+    }
+    if let Some(ci) = &a.context.ci {
+        println!(
+            "CI Checks: {} (passed={}, failed={}, pending={})",
+            ci.overall_state, ci.passed, ci.failed, ci.pending
+        );
+    }
+    if let Some(iss) = &a.context.issue {
+        println!(
+            "Ticket: {} [{}] {} ({})",
+            iss.key, iss.status, iss.title, iss.url
+        );
+    } else if !a.context.candidate_issues.is_empty() {
+        println!(
+            "Candidate Ticket Keys: {}",
+            a.context.candidate_issues.join(", ")
+        );
+    }
+    if !a.context.runbooks.is_empty() {
+        println!("Matched Local Runbooks:");
+        for rb in &a.context.runbooks {
+            println!("  - {} ({}) [{}]", rb.title, rb.path, rb.matched_reason);
+        }
+    }
+}
+
+fn print_human_doctor(rep: &cockpit::doctor::DoctorReport) {
+    println!(
+        "Cockpit Doctor v{} — overall: {}",
+        rep.cockpit_version, rep.overall_status
+    );
+    println!("\nSystem Checks:");
+    for c in &rep.checks {
+        println!("  [{:<13}] {:<14} {}", c.status, c.name, c.detail);
+    }
+    println!("\nProviders:");
+    for (id, h) in &rep.providers {
+        println!(
+            "  [{:?}] {:<10} {}",
+            h.status,
+            id.as_str(),
+            h.detail.as_deref().unwrap_or("")
+        );
+    }
+}
+
+fn truncate_col(s: &str, max_chars: usize) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
+}
