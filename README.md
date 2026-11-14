@@ -107,17 +107,6 @@ cockpit supervisor unload    # stop the container (0 B RAM/VRAM)
 
 Container settings live in the `[llm_container]` table of `~/.config/cockpit/supervisor.toml`. See [Configuration reference](#configuration-reference).
 
-### Host / container (`incus`) workflow
-
-If you build `cockpit` inside an `incus` container (for example `ai-box`) and run Herdr Desktop on the host, copy the binary to the host and run setup there:
-
-```bash
-incus file pull ai-box/home/ubuntu/.local/bin/cockpit ~/.local/bin/cockpit
-chmod +x ~/.local/bin/cockpit
-cockpit setup --set-default-layout
-cockpit doctor
-```
-
 ---
 
 ## How to Use
