@@ -705,9 +705,16 @@ export default class CockpitMod extends View {
 
   selectedAddress() {
     const f = focused();
+    const fTerm = f?.terminal ?? null;
+    const lastFocus = shared("cockpit.lastFocusedTerminal") ?? null;
+    if (fTerm && fTerm !== lastFocus) {
+      setShared("cockpit.lastFocusedTerminal", fTerm);
+      setShared("cockpit.selected", fTerm);
+      return fTerm;
+    }
     const sharedSel = shared("cockpit.selected");
-    if (f?.terminal) return f.terminal;
     if (typeof sharedSel === "string" && sharedSel) return sharedSel;
+    if (fTerm) return fTerm;
     const first = agents()[0]?.address;
     if (first) return first;
     const supSnap = shared("supervisor.snapshot");
@@ -748,7 +755,7 @@ export default class CockpitMod extends View {
     cx.spawn(async (cx) => {
       try {
         const res = await exec("cockpit", ["supervisor", "tick", "--json"], {
-          timeout: 25000,
+          timeout: 60000,
         });
         if (res.code === 0 && res.stdout) {
           const snap = parseSnapshotOutput(res.stdout);
@@ -950,7 +957,7 @@ export default class CockpitMod extends View {
     this.editingField = null;
     this.note = `Sent to ${address}`;
     cx.notify();
-    hc(["send", address, text]);
+    hc(["send", "--force", address, text]);
   }
 
   fetchHomeSnapshot(cx) {
@@ -1543,12 +1550,11 @@ export default class CockpitMod extends View {
               ? t.blocked
               : t.muted;
       const summaryLine = a.message || a.rolling_summary || "";
-      const cardBorder =
-        isBlocked || hasAlert
+      const cardBorder = isSelected
+        ? t.accent
+        : isBlocked || hasAlert
           ? withAlpha(t.blocked, "88", t.blocked)
-          : isSelected
-            ? t.accent
-            : t.border;
+          : t.border;
 
       return v_flex()
         .id(`ck-row-${a.address}`)
@@ -1561,12 +1567,22 @@ export default class CockpitMod extends View {
         .bg(isSelected ? t.selected : t.surface)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
+          const curFocus = focused()?.terminal ?? null;
+          setShared("cockpit.lastFocusedTerminal", curFocus);
           setShared("cockpit.selected", a.address);
           setShared("cockpit.viewMode", "inspector");
           this.inspectorTab = "inspector";
-          if (a.pane) run("pane.focus", { pane: a.pane });
-          else run("agent.focus", { terminal: a.address });
+          if (findNode(layout(), "cockpit-inspector")?.hidden) {
+            run("layout.toggle", { id: "cockpit-inspector" });
+          }
+          if (a.pane) {
+            run("pane.focus", { pane: a.pane });
+          } else {
+            run("agent.focus", { terminal: a.address });
+          }
+          this.refreshInspector(cx);
           cx.notify();
         })
         // Row 1: Dot/Spinner + Terminal ID + Program Badge + Status Pill
@@ -2861,6 +2877,10 @@ export default class CockpitMod extends View {
     const allTerms = terminals();
     const merged = mergeFleetRows(live, allTerms, snap, supSnap);
     const addr = this.selectedAddress();
+    if (addr && this.lastInspectedAddr !== addr) {
+      this.lastInspectedAddr = addr;
+      this.refreshInspector(cx);
+    }
     const agent =
       merged.find((a) => a.address === addr) ?? merged[0] ?? null;
     const detailed =
@@ -3179,9 +3199,28 @@ export default class CockpitMod extends View {
                               if (agent.pane)
                                 run("pane.focus", { pane: agent.pane });
                               else
-                                run("agent.focus", { terminal: agent.address });
+                                run("terminal.peek", {
+                                  terminal: agent.address,
+                                });
                             },
                             true
+                          )
+                        )
+                        .when(!agent.pane, (el) =>
+                          el.child(
+                            this.actionBtn(
+                              t,
+                              "ck-ctl-attach",
+                              "Attach Tab",
+                              () => {
+                                const sp = spaces().find((s) => s.active);
+                                run("tab.new", {
+                                  space: sp?.id,
+                                  name: agent.address,
+                                  argv: ["hc", "attach", agent.address],
+                                });
+                              }
+                            )
                           )
                         )
                         .child(

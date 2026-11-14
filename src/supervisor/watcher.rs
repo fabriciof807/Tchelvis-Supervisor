@@ -1,5 +1,7 @@
 use super::config::SupervisorConfig;
-use super::guardrails::{has_error_or_loop_signature, validate_evaluation};
+use super::guardrails::{
+    contains_forbidden_payload, has_error_or_loop_signature, validate_evaluation,
+};
 use super::hc::HcBackend;
 use super::ollama::{CognitiveBackend, SupervisorDecision};
 use super::state::{
@@ -175,9 +177,34 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             let state_snapshot = state.clone();
             self.runtime_status = SupervisorRuntimeStatus::Evaluating(session.agent_id.clone());
 
-            let raw_eval = self.cognitive.evaluate(&state_snapshot, &output)?;
+            let Ok(raw_eval) = self.cognitive.evaluate(&state_snapshot, &output) else {
+                continue;
+            };
             self.model_loaded = true;
-            let eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
+            let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
+            if eval.decision == SupervisorDecision::AutoReply {
+                if contains_forbidden_payload(&output).is_some() {
+                    eval.decision = SupervisorDecision::AlertOperator;
+                    eval.urgency = Urgency::Critical;
+                    let note = "[Comando destrutivo detectado no terminal]";
+                    if eval.reason_for_operator.trim().is_empty() {
+                        eval.reason_for_operator = note.to_string();
+                    } else {
+                        if !eval.reason_for_operator.ends_with(' ') {
+                            eval.reason_for_operator.push(' ');
+                        }
+                        eval.reason_for_operator.push_str(note);
+                    }
+                } else {
+                    let lower_output = output.to_lowercase();
+                    if (lower_output.contains("(y/n)") || lower_output.contains("[y/n]"))
+                        && eval.hc_command_payload.len() > 3
+                        && eval.hc_command_payload.contains('_')
+                    {
+                        eval.hc_command_payload = "y".to_string();
+                    }
+                }
+            }
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             let state = self
@@ -192,17 +219,29 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             match eval.decision {
                 SupervisorDecision::NoOp => {}
                 SupervisorDecision::AutoReply => {
-                    self.hc
-                        .send_input(&session.agent_id, &eval.hc_command_payload, false)?;
-                    state.consecutive_auto_replies += 1;
-                    state.last_auto_action = Some(eval.hc_command_payload.clone());
-                    state.pending_operator_action = None;
-                    state.auto_reply_log.push(AutoReplyAuditEntry {
-                        timestamp: now,
-                        payload: eval.hc_command_payload.clone(),
-                        summary: eval.updated_summary.clone(),
-                    });
-                    outcome.auto_replied_agents.push(session.agent_id.clone());
+                    if self
+                        .hc
+                        .send_input(&session.agent_id, &eval.hc_command_payload, true)
+                        .is_ok()
+                    {
+                        let _ = self.hc.set_labels(
+                            &session.agent_id,
+                            &[
+                                ("cockpit.state", "working"),
+                                ("cockpit.kind", ""),
+                                ("cockpit.msg", ""),
+                            ],
+                        );
+                        state.consecutive_auto_replies += 1;
+                        state.last_auto_action = Some(eval.hc_command_payload.clone());
+                        state.pending_operator_action = None;
+                        state.auto_reply_log.push(AutoReplyAuditEntry {
+                            timestamp: now,
+                            payload: eval.hc_command_payload.clone(),
+                            summary: eval.updated_summary.clone(),
+                        });
+                        outcome.auto_replied_agents.push(session.agent_id.clone());
+                    }
                 }
                 SupervisorDecision::AlertOperator => {
                     state.pending_operator_action = Some(PendingOperatorAction {
@@ -248,6 +287,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         if !command_payload.trim().is_empty() {
             self.hc.send_input(agent_id, command_payload, true)?;
         }
+        let _ = self.hc.set_labels(
+            agent_id,
+            &[
+                ("cockpit.state", "working"),
+                ("cockpit.kind", ""),
+                ("cockpit.msg", ""),
+            ],
+        );
         if let Some(agent) = self.store.agents.get_mut(agent_id) {
             agent.reset_operator_counter();
             agent.last_change_timestamp = now;
@@ -258,6 +305,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
     /// Operator clicked `[Ignorar]` on an Action Card.
     pub fn ignore_operator_action(&mut self, agent_id: &str) -> Result<()> {
+        let _ = self.hc.set_labels(
+            agent_id,
+            &[
+                ("cockpit.state", "working"),
+                ("cockpit.kind", ""),
+                ("cockpit.msg", ""),
+            ],
+        );
         if let Some(agent) = self.store.agents.get_mut(agent_id) {
             agent.ignore_alert();
         }
@@ -472,14 +527,14 @@ mod tests {
         assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
         assert_eq!(
             engine.hc.sent_inputs.lock().unwrap().as_slice(),
-            &[("worker-01".to_string(), "cargo test".to_string(), false)]
+            &[("worker-01".to_string(), "cargo test".to_string(), true)]
         );
         let labels = engine.hc.labels.lock().unwrap();
-        assert_eq!(labels.len(), 1);
-        assert!(labels[0]
+        assert_eq!(labels.len(), 2);
+        assert!(labels[1]
             .1
             .contains(&("cockpit.supervisor_state".to_string(), "WAITING_CONFIRMATION".to_string())));
-        assert!(labels[0]
+        assert!(labels[1]
             .1
             .contains(&("supervisor.state".to_string(), "WAITING_CONFIRMATION".to_string())));
 
