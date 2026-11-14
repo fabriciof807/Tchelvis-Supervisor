@@ -125,6 +125,11 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             return Ok(outcome);
         }
 
+        let llm_available = self.cognitive.is_available();
+        if !llm_available {
+            self.model_loaded = false;
+        }
+
         for session in &sessions {
             let output = match self
                 .hc
@@ -155,6 +160,16 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 state.pending_operator_action = None;
             }
 
+            let hash_changed = current_hash != state.last_output_hash;
+            if hash_changed {
+                state.last_output_hash = current_hash.clone();
+                state.last_change_timestamp = now;
+            }
+
+            if !llm_available {
+                continue;
+            }
+
             let status_transition =
                 session.status != state.last_hc_status && session.has_notable_hc_status();
             state.last_hc_status = session.status.clone();
@@ -165,12 +180,6 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 && !status_transition
             {
                 continue;
-            }
-
-            let hash_changed = current_hash != state.last_output_hash;
-            if hash_changed {
-                state.last_output_hash = current_hash.clone();
-                state.last_change_timestamp = now;
             }
 
             let inactivity_trigger = !hash_changed
@@ -422,6 +431,7 @@ mod tests {
     struct MockCognitive {
         eval_calls: Mutex<usize>,
         unload_calls: Mutex<usize>,
+        available: Mutex<bool>,
         next_eval: Mutex<CognitiveEvaluation>,
     }
 
@@ -430,6 +440,7 @@ mod tests {
             Self {
                 eval_calls: Mutex::new(0),
                 unload_calls: Mutex::new(0),
+                available: Mutex::new(true),
                 next_eval: Mutex::new(next_eval),
             }
         }
@@ -448,6 +459,10 @@ mod tests {
         fn unload_model(&self) -> Result<()> {
             *self.unload_calls.lock().unwrap() += 1;
             Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            *self.available.lock().unwrap()
         }
     }
 
@@ -743,5 +758,42 @@ mod tests {
         let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
         engine.tick(1000).unwrap();
         assert!(engine.store.agents["t1"].pending_operator_action.is_none());
+    }
+
+    #[test]
+    fn test_watcher_skips_evaluate_when_llm_unavailable() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Allow read-only inspection? (y/n)"],
+        );
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            decision: SupervisorDecision::AutoReply,
+            ..alert_eval(Urgency::Low, "y")
+        });
+        *cognitive.available.lock().unwrap() = false;
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        // Tick 1 while unavailable: no evaluate, preview refreshed, last_evaluated_hash stays empty
+        let o1 = engine.tick(1000).unwrap();
+        assert_eq!(o1.active_sessions, 1);
+        assert!(o1.evaluated_agents.is_empty());
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert_eq!(
+            engine.store.agents["t1"].last_output_preview,
+            "Allow read-only inspection? (y/n)"
+        );
+        assert_eq!(
+            engine.store.agents["t1"].last_evaluated_hash,
+            compute_sha256("")
+        );
+
+        // User loads LLM -> available becomes true -> next tick evaluates immediately
+        *engine.cognitive.available.lock().unwrap() = true;
+        let o2 = engine.tick(1005).unwrap();
+        assert_eq!(o2.evaluated_agents, vec!["t1"]);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
     }
 }

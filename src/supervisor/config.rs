@@ -1,3 +1,4 @@
+use super::container::{binary_on_path, detect_runtime, ContainerRuntime, LlmContainerConfig};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -137,6 +138,9 @@ pub struct SupervisorConfig {
     pub enable_desktop_notifications: bool,
     /// Configurable `hc` adapter settings.
     pub hc: HcAdapterConfig,
+    /// Managed `llama.cpp` container settings.
+    #[serde(default)]
+    pub llm_container: LlmContainerConfig,
 }
 
 fn parse_env_bool(val: &str) -> bool {
@@ -214,6 +218,23 @@ fn resolve_api_key_from_env() -> Option<String> {
         .filter(|k| !k.trim().is_empty())
 }
 
+fn resolve_container_mode_from_env() -> Option<String> {
+    let raw = env::var("COCKPIT_LLM_CONTAINER").ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" => Some("on".to_string()),
+        "off" | "0" | "false" => Some("off".to_string()),
+        "auto" => Some("auto".to_string()),
+        _ => None,
+    }
+}
+
+fn resolve_container_runtime_from_env() -> Option<String> {
+    env::var("COCKPIT_CONTAINER_RUNTIME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl Default for SupervisorConfig {
     fn default() -> Self {
         let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
@@ -236,6 +257,13 @@ impl Default for SupervisorConfig {
             .or_else(|| Some("http://10.121.213.1:11434".to_string()));
         let ollama_model = resolve_llm_model_from_env().unwrap_or_else(|| "lfm3:1.7b".to_string());
         let allow_gpu = resolve_allow_gpu_from_env().unwrap_or(false);
+        let mut llm_container = LlmContainerConfig::default();
+        if let Some(mode) = resolve_container_mode_from_env() {
+            llm_container.mode = mode;
+        }
+        if let Some(rt) = resolve_container_runtime_from_env() {
+            llm_container.runtime = rt;
+        }
 
         Self {
             llm_backend,
@@ -255,6 +283,7 @@ impl Default for SupervisorConfig {
             state_file_path: default_state_path,
             enable_desktop_notifications: true,
             hc: HcAdapterConfig::default(),
+            llm_container,
         }
     }
 }
@@ -334,12 +363,49 @@ impl SupervisorConfig {
         if let Ok(hc_bin) = env::var("HC_BIN") {
             self.hc.hc_bin = hc_bin;
         }
+        if let Some(mode) = resolve_container_mode_from_env() {
+            self.llm_container.mode = mode;
+        }
+        if let Some(rt) = resolve_container_runtime_from_env() {
+            self.llm_container.runtime = rt;
+        }
+    }
+
+    /// Detects the configured container runtime (`kiri` -> `podman` -> `docker`), respecting overrides.
+    pub fn detected_container_runtime(&self) -> Option<ContainerRuntime> {
+        detect_runtime(&self.llm_container.runtime, binary_on_path)
+    }
+
+    /// Returns `true` when the Supervisor's LLM runs as a managed `llama.cpp` container.
+    pub fn container_mode_active(&self) -> bool {
+        self.container_mode_active_with(binary_on_path)
+    }
+
+    pub(crate) fn container_mode_active_with(&self, is_on_path: impl Fn(&str) -> bool) -> bool {
+        match self.llm_container.mode.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" | "false" => false,
+            "on" | "1" | "true" => true,
+            _ => detect_runtime(&self.llm_container.runtime, is_on_path).is_some(),
+        }
+    }
+
+    /// Returns the effective LLM backend (`LlamaCpp` when container mode is active).
+    pub fn effective_backend(&self) -> LlmBackendKind {
+        if self.container_mode_active() {
+            LlmBackendKind::LlamaCpp
+        } else {
+            self.llm_backend
+        }
     }
 
     /// Returns the effective primary host for the configured `llm_backend`.
-    /// When `ollama_host` is still the Ollama default (`http://localhost:11434`),
+    /// When container mode is active, returns `http://127.0.0.1:<port>`.
+    /// Otherwise, when `ollama_host` is still the Ollama default (`http://localhost:11434`),
     /// switches to each backend's standard default endpoint.
     pub fn effective_primary_host(&self) -> String {
+        if self.container_mode_active() {
+            return format!("http://127.0.0.1:{}", self.llm_container.port);
+        }
         if self.ollama_host == "http://localhost:11434" {
             match self.llm_backend {
                 LlmBackendKind::Ollama => self.ollama_host.clone(),
@@ -446,6 +512,7 @@ mod tests {
     #[test]
     fn test_effective_primary_host() {
         let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.mode = "off".to_string();
         cfg.ollama_host = "http://localhost:11434".to_string();
 
         cfg.llm_backend = LlmBackendKind::Ollama;
@@ -474,5 +541,37 @@ mod tests {
         assert_eq!(read_gpu_override(&path), Some(true));
         write_gpu_override(&path, false).unwrap();
         assert_eq!(read_gpu_override(&path), Some(false));
+    }
+
+    #[test]
+    fn test_old_toml_without_llm_container_parses() {
+        let base = SupervisorConfig::default();
+        let mut raw = toml::to_string(&base).unwrap();
+        // Strip [llm_container] section if present
+        if let Some(idx) = raw.find("[llm_container]") {
+            raw.truncate(idx);
+        }
+        let parsed: SupervisorConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.llm_container.mode, "auto");
+        assert_eq!(parsed.llm_container.port, 11435);
+        assert_eq!(parsed.llm_container.name, "cockpit-supervisor-llm");
+    }
+
+    #[test]
+    fn test_container_mode_active_and_effective_host_backend() {
+        let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.mode = "on".to_string();
+        cfg.llm_container.port = 11435;
+        assert!(cfg.container_mode_active_with(|_| false));
+        assert_eq!(cfg.effective_backend(), LlmBackendKind::LlamaCpp);
+        assert_eq!(cfg.effective_primary_host(), "http://127.0.0.1:11435");
+
+        cfg.llm_container.mode = "off".to_string();
+        assert!(!cfg.container_mode_active_with(|_| true));
+        assert_eq!(cfg.effective_backend(), cfg.llm_backend);
+
+        cfg.llm_container.mode = "auto".to_string();
+        assert!(!cfg.container_mode_active_with(|_| false));
+        assert!(cfg.container_mode_active_with(|b| b == "docker"));
     }
 }

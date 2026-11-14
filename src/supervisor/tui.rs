@@ -65,6 +65,12 @@ pub struct DesktopModSnapshot {
     pub model_installed: bool,
     #[serde(default)]
     pub llm_status_detail: String,
+    #[serde(default)]
+    pub llm_managed: bool,
+    #[serde(default)]
+    pub llm_runtime: String,
+    #[serde(default)]
+    pub llm_container_state: String,
     pub agents: Vec<AgentCardView>,
 }
 
@@ -77,11 +83,12 @@ pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
         engine.model_loaded,
         &engine.store,
     );
-    snap.llm_backend = engine.config.llm_backend.as_str().to_string();
+    snap.llm_backend = engine.config.effective_backend().as_str().to_string();
     snap.llm_host = engine.config.effective_primary_host();
     snap.llm_model = engine.config.ollama_model.clone();
     snap.num_gpu = engine.config.effective_num_gpu();
     snap.allow_gpu = snap.num_gpu != 0;
+    snap.llm_managed = engine.config.container_mode_active();
     snap
 }
 
@@ -100,7 +107,14 @@ pub fn enrich_snapshot_with_llm_health(
     snap.llm_vram_bytes = health.vram_bytes;
     snap.llm_connected = health.connected;
     snap.model_installed = health.model_installed;
-    snap.model_loaded = snap.model_loaded || health.model_loaded;
+    snap.llm_managed = health.llm_managed;
+    snap.llm_runtime = health.llm_runtime;
+    snap.llm_container_state = health.llm_container_state;
+    if health.llm_managed {
+        snap.model_loaded = health.model_loaded;
+    } else {
+        snap.model_loaded = snap.model_loaded || health.model_loaded;
+    }
     snap.llm_status_detail = health.detail;
 }
 
@@ -153,6 +167,9 @@ pub fn build_desktop_mod_snapshot_from_parts(
         llm_connected: true,
         model_installed: true,
         llm_status_detail: String::new(),
+        llm_managed: false,
+        llm_runtime: String::new(),
+        llm_container_state: String::new(),
         agents,
     }
 }

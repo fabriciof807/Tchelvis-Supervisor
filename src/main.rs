@@ -12,8 +12,8 @@ use cockpit::setup::{run_setup, run_uninstall, SetupOptions};
 use cockpit::store::CacheStore;
 use cockpit::supervisor::state::SupervisorMode;
 use cockpit::supervisor::{
-    approve_action, current_status, ignore_action, run_supervisor_daemon, run_tick_once, run_tui,
-    set_gpu, set_or_cycle_mode, unload_model,
+    approve_action, current_status, ignore_action, load_model, run_supervisor_daemon,
+    run_tick_once, run_tui, set_gpu, set_or_cycle_mode, unload_model,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -250,7 +250,9 @@ enum SupervisorCommands {
         /// Target mode or "cycle"
         mode: String,
     },
-    /// Unload the configured Ollama model from memory (keep_alive: 0)
+    /// Start/load the managed LLM container (or warm the Ollama model) and wait until healthy
+    Load,
+    /// Stop/unload the managed LLM container (or unload the Ollama model with keep_alive: 0)
     Unload,
     /// Toggle GPU offload for the local LLM (`off` = CPU-only num_gpu 0, default; `on` = offload all layers)
     Gpu {
@@ -573,6 +575,13 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
                 Ok(())
             }
+            SupervisorCommands::Load => {
+                let snap = tokio::task::spawn_blocking(load_model)
+                    .await
+                    .context("supervisor load task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
             SupervisorCommands::Unload => {
                 let snap = tokio::task::spawn_blocking(unload_model)
                     .await
@@ -709,11 +718,10 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Usage { json, detect } => {
-            let snap = tokio::task::spawn_blocking(move || {
-                cockpit::usage::collect_usage_snapshot(detect)
-            })
-            .await
-            .context("usage snapshot task panicked")?;
+            let snap =
+                tokio::task::spawn_blocking(move || cockpit::usage::collect_usage_snapshot(detect))
+                    .await
+                    .context("usage snapshot task panicked")?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
             } else {

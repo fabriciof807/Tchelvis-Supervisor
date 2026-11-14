@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 use super::config::{LlmBackendKind, SupervisorConfig};
+use super::container::{ContainerState, LlmContainer, SystemContainerCli};
 use super::state::{AgentDurableState, LifecycleState, Urgency};
 
 /// Decision emitted by the cognitive evaluation layer.
@@ -45,6 +46,12 @@ pub trait CognitiveBackend: Send + Sync {
     ) -> Result<CognitiveEvaluation>;
 
     fn unload_model(&self) -> Result<()>;
+
+    /// Returns `true` when the backend is ready to accept evaluation requests.
+    /// In managed container mode, returns `true` only while the container is `Running`.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// Live connectivity and model availability status for the configured local/remote LLM backend.
@@ -64,6 +71,12 @@ pub struct LlmHealthStatus {
     pub model_installed: bool,
     pub model_loaded: bool,
     pub detail: String,
+    #[serde(default)]
+    pub llm_managed: bool,
+    #[serde(default)]
+    pub llm_runtime: String,
+    #[serde(default)]
+    pub llm_container_state: String,
 }
 
 /// Human-readable inference placement for a given `num_gpu` value.
@@ -125,8 +138,10 @@ pub fn extract_ollama_model_memory(val: &Value, target: &str) -> Option<(u64, u6
 pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
     let primary_host = config.effective_primary_host();
     let num_gpu = config.effective_num_gpu();
+    let effective_backend = config.effective_backend();
+    let managed = config.container_mode_active();
     let mut status = LlmHealthStatus {
-        backend: config.llm_backend.as_str().to_string(),
+        backend: effective_backend.as_str().to_string(),
         host: primary_host.clone(),
         model: config.ollama_model.clone(),
         num_gpu,
@@ -136,13 +151,58 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
         model_installed: false,
         model_loaded: false,
         detail: String::new(),
+        llm_managed: managed,
+        llm_runtime: String::new(),
+        llm_container_state: String::new(),
     };
 
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_millis(1200))
         .build();
 
-    match config.llm_backend {
+    if managed {
+        let Some(rt) = config.detected_container_runtime() else {
+            status.llm_container_state = "missing".to_string();
+            status.detail =
+                "Nenhum runtime de container encontrado (kiri/podman/docker)".to_string();
+            return status;
+        };
+        status.llm_runtime = rt.as_str().to_string();
+        let mgr = LlmContainer::new(rt, config.llm_container.clone(), SystemContainerCli);
+        let cstate = mgr.state().unwrap_or(ContainerState::Missing);
+        status.llm_container_state = cstate.as_str().to_string();
+        match cstate {
+            ContainerState::Missing | ContainerState::Stopped => {
+                status.detail = format!(
+                    "Desativado (container {} parado · {})",
+                    config.llm_container.name,
+                    rt.as_str()
+                );
+            }
+            ContainerState::Running => {
+                let base = primary_host.trim_end_matches('/');
+                let health_url = format!("{base}/health");
+                let healthy = matches!(agent.get(&health_url).call(), Ok(r) if r.status() == 200);
+                if healthy {
+                    status.connected = true;
+                    status.model_installed = true;
+                    status.model_loaded = true;
+                    status.ram_bytes = mgr.ram_bytes();
+                    status.vram_bytes = None;
+                    status.detail = format!(
+                        "Conectado ({primary_host}) · {} ({})",
+                        config.ollama_model,
+                        gpu_mode_label(num_gpu)
+                    );
+                } else {
+                    status.detail = format!("Iniciando… ({})", rt.as_str());
+                }
+            }
+        }
+        return status;
+    }
+
+    match effective_backend {
         LlmBackendKind::Ollama => {
             let mut hosts = vec![primary_host.clone()];
             if let Some(ref fb) = config.ollama_fallback_host {
@@ -507,7 +567,7 @@ impl CognitiveBackend for OllamaClient {
         state: &AgentDurableState,
         recent_output: &str,
     ) -> Result<CognitiveEvaluation> {
-        match self.config.llm_backend {
+        match self.config.effective_backend() {
             LlmBackendKind::Ollama => {
                 let body = self.build_chat_request_body(state, recent_output);
                 let response = self.post_json_with_fallback("/api/chat", &body)?;
@@ -535,6 +595,14 @@ impl CognitiveBackend for OllamaClient {
     }
 
     fn unload_model(&self) -> Result<()> {
+        if self.config.container_mode_active() {
+            if let Some(rt) = self.config.detected_container_runtime() {
+                let mgr =
+                    LlmContainer::new(rt, self.config.llm_container.clone(), SystemContainerCli);
+                mgr.stop()?;
+            }
+            return Ok(());
+        }
         match self.config.llm_backend {
             LlmBackendKind::Ollama => {
                 let body = self.build_unload_request_body();
@@ -545,6 +613,17 @@ impl CognitiveBackend for OllamaClient {
             | LlmBackendKind::LmStudio
             | LlmBackendKind::OpenAiCompatible => Ok(()),
         }
+    }
+
+    fn is_available(&self) -> bool {
+        if !self.config.container_mode_active() {
+            return true;
+        }
+        let Some(rt) = self.config.detected_container_runtime() else {
+            return false;
+        };
+        let mgr = LlmContainer::new(rt, self.config.llm_container.clone(), SystemContainerCli);
+        matches!(mgr.state(), Ok(ContainerState::Running))
     }
 }
 

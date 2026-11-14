@@ -99,7 +99,10 @@ pub async fn run_doctor(
     let embedded_layout_valid = serde_json::from_str::<serde_json::Value>(HERDR_LAYOUT_JSON)
         .map(|v| {
             v.get("id").and_then(|n| n.as_str()) == Some("root")
-                && matches!(v.get("type").and_then(|t| t.as_str()), Some("row" | "column"))
+                && matches!(
+                    v.get("type").and_then(|t| t.as_str()),
+                    Some("row" | "column")
+                )
         })
         .unwrap_or(false);
 
@@ -174,6 +177,19 @@ pub async fn run_doctor(
     .map(|s| s.mode.label().to_string())
     .unwrap_or_else(|_| "unknown".to_string());
     let health = crate::supervisor::ollama::probe_llm_health(&sup_cfg);
+    let sup_detail = if health.llm_managed {
+        let rt = if health.llm_runtime.is_empty() {
+            "none"
+        } else {
+            &health.llm_runtime
+        };
+        format!(
+            "{} · runtime={} · container={} · mode={}",
+            health.detail, rt, health.llm_container_state, sup_mode
+        )
+    } else {
+        format!("{} · mode={}", health.detail, sup_mode)
+    };
     checks.push(DoctorCheck {
         name: "supervisor".into(),
         status: if health.connected && health.model_installed {
@@ -181,7 +197,7 @@ pub async fn run_doctor(
         } else {
             "warn".into()
         },
-        detail: format!("{} · mode={}", health.detail, sup_mode),
+        detail: sup_detail,
     });
 
     let report = DoctorReport {

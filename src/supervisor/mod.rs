@@ -1,4 +1,5 @@
 pub mod config;
+pub mod container;
 pub mod guardrails;
 pub mod hc;
 pub mod ollama;
@@ -56,7 +57,7 @@ pub fn run_tick_once() -> Result<OnceOutput> {
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
     if tick_outcome.active_sessions == 0 {
-        if snapshot.model_loaded {
+        if !engine.config.container_mode_active() && snapshot.model_loaded {
             let _ = engine.cognitive.unload_model();
             engine.model_loaded = false;
             engine.store.model_loaded = false;
@@ -147,31 +148,99 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
     Ok(snapshot)
 }
 
-/// Explicitly unloads the configured Ollama model (`keep_alive: 0`) and returns the updated `DesktopModSnapshot`.
-pub fn unload_model() -> Result<DesktopModSnapshot> {
-    let mut engine = build_default_engine()?;
-    engine.cognitive.unload_model()?;
-    engine.model_loaded = false;
+/// Explicitly starts/loads the managed `llama.cpp` container (or warms Ollama) and waits until healthy.
+pub fn load_model() -> Result<DesktopModSnapshot> {
+    let config = SupervisorConfig::load();
+    if config.container_mode_active() {
+        let rt = config.detected_container_runtime().ok_or_else(|| {
+            anyhow::anyhow!("Nenhum runtime de container encontrado (kiri/podman/docker)")
+        })?;
+        let model = container::resolve_model_source(
+            &config.llm_container,
+            &config.ollama_model,
+            &container::default_ollama_roots(),
+        )?;
+        let mgr = container::LlmContainer::new(
+            rt,
+            config.llm_container.clone(),
+            container::SystemContainerCli,
+        );
+        mgr.start(config.effective_num_gpu(), &model)?;
+        let host = config.effective_primary_host();
+        container::wait_healthy(&host, Duration::from_secs(90))?;
+    } else {
+        let client = OllamaClient::new(config.clone());
+        client.warm_model()?;
+    }
+
+    let mut engine = build_engine_from_config(config)?;
+    engine.model_loaded = true;
+    engine.zero_active_since = None;
+    engine.store.model_loaded = true;
+    engine.store.zero_active_since = None;
+    let _ = engine.store.save();
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
     Ok(snapshot)
 }
 
-/// Persists the GPU-offload toggle, unloads the model (`keep_alive: 0`) so the next evaluation
-/// reloads with the new `num_gpu`, optionally warm-loads it, and returns the updated snapshot.
+/// Explicitly stops the managed container (or unloads Ollama with `keep_alive: 0`) and returns the updated snapshot.
+pub fn unload_model() -> Result<DesktopModSnapshot> {
+    let mut engine = build_default_engine()?;
+    engine.cognitive.unload_model()?;
+    engine.model_loaded = false;
+    engine.store.model_loaded = false;
+    let _ = engine.store.save();
+    sync_runtime_status(&mut engine);
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
+}
+
+/// Persists the GPU-offload toggle and applies it to the active LLM backend:
+/// - In container mode: if Running, recreates with the new `-ngl` and waits healthy (or stops if `--no-warm`); if stopped, only persists.
+/// - Outside container mode: unloads the Ollama model (`keep_alive: 0`) and optionally warm-loads it.
 pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
     config::write_gpu_override(&config::gpu_override_path(), allow_gpu)?;
     let mut config = SupervisorConfig::load();
     config.allow_gpu = allow_gpu;
-    let client = OllamaClient::new(config.clone());
-    let _ = client.unload_model();
-    if warm {
-        let _ = client.warm_model();
+    let mut loaded_after = false;
+
+    if config.container_mode_active() {
+        if let Some(rt) = config.detected_container_runtime() {
+            let mgr = container::LlmContainer::new(
+                rt,
+                config.llm_container.clone(),
+                container::SystemContainerCli,
+            );
+            if matches!(mgr.state(), Ok(container::ContainerState::Running)) {
+                if warm {
+                    let model = container::resolve_model_source(
+                        &config.llm_container,
+                        &config.ollama_model,
+                        &container::default_ollama_roots(),
+                    )?;
+                    mgr.start(config.effective_num_gpu(), &model)?;
+                    let host = config.effective_primary_host();
+                    container::wait_healthy(&host, Duration::from_secs(90))?;
+                    loaded_after = true;
+                } else {
+                    let _ = mgr.stop();
+                }
+            }
+        }
+    } else {
+        let client = OllamaClient::new(config.clone());
+        let _ = client.unload_model();
+        if warm {
+            let _ = client.warm_model();
+        }
     }
+
     let mut engine = build_engine_from_config(config)?;
-    engine.model_loaded = false;
-    engine.store.model_loaded = false;
+    engine.model_loaded = loaded_after;
+    engine.store.model_loaded = loaded_after;
     let _ = engine.store.save();
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);

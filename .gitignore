@@ -9,3 +9,6 @@
 
 # Landing page standalone project
 /landing-page/
+
+# Coordinator/worker briefs and returns
+/.work/

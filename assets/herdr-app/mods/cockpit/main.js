@@ -1257,14 +1257,14 @@ export default class CockpitMod extends View {
     });
   }
 
-  runSupervisorAction(cx, args, successNote) {
+  runSupervisorAction(cx, args, successNote, timeoutMs = 15000) {
     if (this.busy) return;
     this.busy = true;
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", args, { timeout: 15000 });
+        const res = await exec("cockpit", args, { timeout: timeoutMs });
         if (res.code === 0 && res.stdout) {
           const snap = parseSnapshotOutput(res.stdout);
           if (snap) {
@@ -1278,6 +1278,38 @@ export default class CockpitMod extends View {
       } catch (e) {
         this.note = `Error: ${String(e)}`;
       } finally {
+        this.busy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  loadSupervisorLlm(cx, onLoaded = null) {
+    if (this.loadingLlm || this.busy) return;
+    this.loadingLlm = true;
+    this.busy = true;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("cockpit", ["supervisor", "load"], {
+          timeout: 300000,
+        });
+        if (res.code === 0 && res.stdout) {
+          const snap = parseSnapshotOutput(res.stdout);
+          if (snap) {
+            setShared("supervisor.snapshot", snap);
+            setShared("supervisor.lastError", "");
+          }
+          this.note = "LLM carregada";
+          if (onLoaded) onLoaded(cx);
+        } else {
+          this.note = res.stderr?.trim() || `Command failed (${res.code})`;
+        }
+      } catch (e) {
+        this.note = `Error: ${String(e)}`;
+      } finally {
+        this.loadingLlm = false;
         this.busy = false;
         cx.notify();
       }
@@ -1960,9 +1992,24 @@ export default class CockpitMod extends View {
     const modelInstalled = supSnap ? Boolean(supSnap.model_installed) : false;
     const modelLoaded = Boolean(supSnap?.model_loaded);
 
+    const llmManaged = Boolean(supSnap?.llm_managed);
+    const llmContainerState = supSnap?.llm_container_state || "missing";
+    const llmContainerRunning = llmContainerState === "running";
+
     let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
     let llmPillColor = t.muted;
-    if (llmConnected && modelInstalled) {
+    if (llmManaged) {
+      if (!llmContainerRunning) {
+        llmPillText = `○ LLM: ${llmModel} (DESATIVADO)`;
+        llmPillColor = t.muted;
+      } else if (!llmConnected) {
+        llmPillText = `◌ LLM: ${llmModel} (INICIANDO…)`;
+        llmPillColor = t.working;
+      } else {
+        llmPillText = `● LLM: ${llmModel} (llama.cpp · ${llmMemoryLabel(supSnap) || "ATIVO"})`;
+        llmPillColor = t.done;
+      }
+    } else if (llmConnected && modelInstalled) {
       llmPillText = `● LLM: ${llmModel} (${llmBackend} · ${modelLoaded ? llmMemoryLabel(supSnap) || "EM RAM" : "PRONTO"})`;
       llmPillColor = t.done;
     } else if (llmConnected && !modelInstalled) {
@@ -2128,18 +2175,38 @@ export default class CockpitMod extends View {
           )
           .child(
             this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
+              if (llmManaged && !llmContainerRunning) {
+                this.loadSupervisorLlm(cx, (loadedCx) => {
+                  this.refreshCockpit(loadedCx, true);
+                  this.tickSupervisor(loadedCx, true);
+                });
+                return;
+              }
               this.refreshCockpit(cx, true);
               this.tickSupervisor(cx, true);
             })
           )
           .child(
-            this.actionBtn(t, "ck-pill-unload", "⏻ Unload LLM", (_e, cx) =>
-              this.runSupervisorAction(
-                cx,
-                ["supervisor", "unload"],
-                "Modelo Ollama descarregado"
-              )
-            )
+            (() => {
+              const showLoadBtn = llmManaged && !llmContainerRunning;
+              const unloadLabel = this.loadingLlm
+                ? "◌ Carregando…"
+                : showLoadBtn
+                  ? "▶ Load LLM"
+                  : "⏻ Unload LLM";
+              return this.actionBtn(t, "ck-pill-unload", unloadLabel, (_e, cx) => {
+                if (this.loadingLlm) return;
+                if (showLoadBtn) {
+                  this.loadSupervisorLlm(cx);
+                } else {
+                  this.runSupervisorAction(
+                    cx,
+                    ["supervisor", "unload"],
+                    llmManaged ? "Container LLM descarregado" : "Modelo Ollama descarregado"
+                  );
+                }
+              });
+            })()
           )
       )
       // Right Cluster: Unified Segmented View Switcher + Switch Layout
@@ -2785,10 +2852,18 @@ export default class CockpitMod extends View {
                   supSnap
                     ? supSnap.llm_connected
                       ? `${supSnap.llm_model || "lfm3:1.7b"} · ON`
-                      : `${supSnap.llm_model || "lfm3:1.7b"} · OFF`
+                      : supSnap.llm_managed && supSnap.llm_container_state !== "running"
+                        ? `${supSnap.llm_model || "lfm3:1.7b"} · DESATIVADO`
+                        : `${supSnap.llm_model || "lfm3:1.7b"} · OFF`
                     : `${supSnap?.llm_model || "lfm3:1.7b"} · …`,
                   `${supSnap?.llm_backend || "ollama"} · ${gpuModeText(supSnap)}`,
-                  supSnap?.llm_connected ? t.done : supSnap ? t.blocked : t.muted
+                  supSnap?.llm_connected
+                    ? t.done
+                    : supSnap?.llm_managed && supSnap?.llm_container_state !== "running"
+                      ? t.muted
+                      : supSnap
+                        ? t.blocked
+                        : t.muted
                 )
               )
           )
@@ -4767,18 +4842,26 @@ export default class CockpitMod extends View {
                                 : supSnap?.model_installed
                                   ? "CONECTADO · PRONTO"
                                   : "MODELO AUSENTE"
-                              : supSnap
-                                ? "OFFLINE"
-                                : "VERIFICANDO…",
+                              : supSnap?.llm_managed && supSnap?.llm_container_state !== "running"
+                                ? "DESATIVADO"
+                                : supSnap?.llm_managed
+                                  ? "INICIANDO…"
+                                  : supSnap
+                                    ? "OFFLINE"
+                                    : "VERIFICANDO…",
                             supSnap?.llm_connected
                               ? supSnap?.model_loaded
                                 ? t.accent
                                 : supSnap?.model_installed
                                   ? t.done
                                   : t.working
-                              : supSnap
-                                ? t.blocked
-                                : t.muted
+                              : supSnap?.llm_managed && supSnap?.llm_container_state !== "running"
+                                ? t.muted
+                                : supSnap?.llm_managed
+                                  ? t.working
+                                  : supSnap
+                                    ? t.blocked
+                                    : t.muted
                           )
                         )
                     )
@@ -5551,6 +5634,8 @@ export default class CockpitMod extends View {
     });
     const llmModel = supSnap?.llm_model || "lfm3:1.7b";
     const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
+    const llmManagedStopped =
+      Boolean(supSnap?.llm_managed) && supSnap?.llm_container_state !== "running";
     const numGpu = supSnap?.num_gpu ?? 0;
     const blockedCount = liveMerged.filter((a) => a.status === "blocked").length;
     const workingCount = liveMerged.filter((a) => a.status === "working").length;
@@ -5630,9 +5715,17 @@ export default class CockpitMod extends View {
       )
       .child(
         div()
-          .text_color(llmConnected ? t.done : supSnap ? t.blocked : t.muted)
+          .text_color(
+            llmConnected
+              ? t.done
+              : llmManagedStopped
+                ? t.muted
+                : supSnap
+                  ? t.blocked
+                  : t.muted
+          )
           .child(
-            `LLM: ${llmModel} (${llmConnected ? "ONLINE" : supSnap ? "OFFLINE" : "…"} · ${gpuOn(supSnap) ? "GPU" : "CPU num_gpu=0"})`
+            `LLM: ${llmModel} (${llmConnected ? "ONLINE" : llmManagedStopped ? "DESATIVADO" : supSnap ? "OFFLINE" : "…"} · ${gpuOn(supSnap) ? "GPU" : "CPU num_gpu=0"})`
           )
       )
       .child(
