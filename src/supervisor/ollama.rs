@@ -54,10 +54,25 @@ pub struct LlmHealthStatus {
     pub host: String,
     pub model: String,
     pub num_gpu: u32,
+    /// Resident bytes of the configured model in system RAM (`size - size_vram`); Ollama only.
+    #[serde(default)]
+    pub ram_bytes: Option<u64>,
+    /// Resident bytes of the configured model in GPU VRAM (`size_vram`); Ollama only.
+    #[serde(default)]
+    pub vram_bytes: Option<u64>,
     pub connected: bool,
     pub model_installed: bool,
     pub model_loaded: bool,
     pub detail: String,
+}
+
+/// Human-readable inference placement for a given `num_gpu` value.
+pub fn gpu_mode_label(num_gpu: u32) -> String {
+    if num_gpu == 0 {
+        "CPU-only · num_gpu=0".to_string()
+    } else {
+        format!("GPU offload · num_gpu={num_gpu}")
+    }
 }
 
 fn ollama_model_matches(candidate: &str, target: &str) -> bool {
@@ -87,6 +102,24 @@ fn extract_ollama_model_names(val: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Extracts `(ram_bytes, vram_bytes)` for `target` from an Ollama `/api/ps` payload.
+/// RAM is `size - size_vram`; returns `None` when the model is not resident.
+pub fn extract_ollama_model_memory(val: &Value, target: &str) -> Option<(u64, u64)> {
+    let models = val.get("models")?.as_array()?;
+    models.iter().find_map(|item| {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .or_else(|| item.get("model").and_then(|v| v.as_str()))?;
+        if !ollama_model_matches(name, target) {
+            return None;
+        }
+        let size = item.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let vram = item.get("size_vram").and_then(|v| v.as_u64()).unwrap_or(0);
+        Some((size.saturating_sub(vram), vram.min(size.max(vram))))
+    })
+}
+
 /// Probes the configured LLM backend (`Ollama`, `LlamaCpp`, `LmStudio`, or `OpenAiCompatible`)
 /// with a short timeout to determine reachability, installed model presence, and RAM residency.
 pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
@@ -97,6 +130,8 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
         host: primary_host.clone(),
         model: config.ollama_model.clone(),
         num_gpu,
+        ram_bytes: None,
+        vram_bytes: None,
         connected: false,
         model_installed: false,
         model_loaded: false,
@@ -144,18 +179,26 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
                         status.model_loaded = loaded_names
                             .iter()
                             .any(|name| ollama_model_matches(name, &config.ollama_model));
+                        if let Some((ram, vram)) =
+                            extract_ollama_model_memory(&val, &config.ollama_model)
+                        {
+                            status.ram_bytes = Some(ram);
+                            status.vram_bytes = Some(vram);
+                        }
                     }
                 }
 
                 status.detail = if status.model_installed && status.model_loaded {
                     format!(
-                        "Conectado ({active}) · {} carregado em RAM (num_gpu={})",
-                        config.ollama_model, num_gpu
+                        "Conectado ({active}) · {} carregado ({})",
+                        config.ollama_model,
+                        gpu_mode_label(num_gpu)
                     )
                 } else if status.model_installed {
                     format!(
-                        "Conectado ({active}) · {} pronto (standby 0B · num_gpu={})",
-                        config.ollama_model, num_gpu
+                        "Conectado ({active}) · {} pronto (standby 0B · {})",
+                        config.ollama_model,
+                        gpu_mode_label(num_gpu)
                     )
                 } else {
                     format!(
@@ -203,6 +246,7 @@ pub const SYSTEM_PROMPT: &str = r#"You are the Cockpit Durable Supervisor, an au
 Your job is to analyze an agent's durable state and its last 25 lines of terminal output, then output a strict JSON decision.
 
 RULES FOR DECISION ("NO_OP", "AUTO_REPLY", "ALERT_OPERATOR"):
+0. Only an agent that is BLOCKED on a pending prompt (a question or permission request awaiting input) may receive "AUTO_REPLY" or "ALERT_OPERATOR". If the agent is WORKING, thinking, or waiting on its own background subagent/tool, choose "NO_OP" and just update "updated_summary". Non-fatal log noise (e.g. a hook error, "aborted", a warning) is NOT a reason to alert the operator.
 1. Choose "NO_OP" if the agent is still compiling, downloading, running long tests normally, or requires no action.
 2. Choose "AUTO_REPLY" ONLY for safe, reversible, whitelisted situations:
    - Confirming non-destructive continuation prompts (e.g., "continue", "y" for read-only inspection, pagination).
@@ -210,7 +254,7 @@ RULES FOR DECISION ("NO_OP", "AUTO_REPLY", "ALERT_OPERATOR"):
    - Instructing a stalled agent to run tests or linters after editing code.
    - NEVER use "AUTO_REPLY" if consecutive_auto_replies >= max_auto_replies.
 3. Choose "ALERT_OPERATOR" if:
-   - The agent asks to delete files, run destructive git commands (git push --force, git reset --hard, rm -rf, sudo, etc.), install system packages, or change architecture. ALWAYS choose "ALERT_OPERATOR" with "urgency": "critical" and set "hc_command_payload": "n".
+   - The agent asks to delete files, run destructive git commands (git push --force, git reset --hard, rm -rf, sudo, etc.), install system packages, or change architecture. ALWAYS choose "ALERT_OPERATOR" with "urgency": "critical" and set "hc_command_payload": "n". Only do this when such a command is literally shown in the pending prompt. For any other alert leave "hc_command_payload" empty.
    - The agent is stuck in a loop repeating the same error.
    - The agent has completed its main task and awaits final human review.
 
@@ -333,11 +377,7 @@ impl OllamaClient {
     }
 
     /// Builds the `/api/chat` request payload with `num_gpu` policy and strict JSON schema.
-    pub fn build_chat_request_body(
-        &self,
-        state: &AgentDurableState,
-        recent_output: &str,
-    ) -> Value {
+    pub fn build_chat_request_body(&self, state: &AgentDurableState, recent_output: &str) -> Value {
         let user_payload = build_user_prompt_payload(state, recent_output);
         json!({
             "model": self.config.ollama_model,
@@ -399,6 +439,23 @@ impl OllamaClient {
             "model": self.config.ollama_model,
             "keep_alive": 0,
         })
+    }
+
+    /// Pre-loads the Ollama model with the current `num_gpu` policy (best effort).
+    /// Used after a GPU toggle so the next evaluation does not pay the reload cost.
+    pub fn warm_model(&self) -> Result<()> {
+        if self.config.llm_backend != LlmBackendKind::Ollama {
+            return Ok(());
+        }
+        let body = json!({
+            "model": self.config.ollama_model,
+            "prompt": "",
+            "stream": false,
+            "keep_alive": "5m",
+            "options": { "num_gpu": self.config.effective_num_gpu() },
+        });
+        let _ = self.post_json_with_fallback("/api/generate", &body)?;
+        Ok(())
     }
 
     fn post_json_to_host(&self, host: &str, path: &str, body: &Value) -> Result<Value> {
@@ -705,6 +762,20 @@ mod tests {
         assert_eq!(
             openai_chat_completions_path("https://openrouter.ai/api/v1/"),
             "/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_extract_ollama_model_memory_splits_ram_and_vram() {
+        let ps = json!({"models":[{"name":"lfm3:1.7b","size":1_300_000_000u64,"size_vram":200_000_000u64}]});
+        assert_eq!(
+            extract_ollama_model_memory(&ps, "lfm3:1.7b"),
+            Some((1_100_000_000, 200_000_000))
+        );
+        assert_eq!(extract_ollama_model_memory(&ps, "other:1b"), None);
+        assert_eq!(
+            extract_ollama_model_memory(&json!({"models":[]}), "lfm3:1.7b"),
+            None
         );
     }
 }

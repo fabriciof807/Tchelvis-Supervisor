@@ -217,6 +217,36 @@ function formatTimestamp(ts) {
   return `${hh}:${mm}:${ss}`;
 }
 
+function fmtBytes(n) {
+  const b = Number(n) || 0;
+  if (b >= 1e9) return `${(b / 1e9).toFixed(1)} GB`;
+  return `${Math.round(b / 1e6)} MB`;
+}
+
+// Compact LLM residency label from /api/ps: "1.3 GB RAM" or "1.1 GB VRAM · 0.2 GB RAM".
+// Returns "" when the snapshot carries no usage numbers (non-Ollama backend / older binary).
+function llmMemoryLabel(snap) {
+  const ram = snap?.llm_ram_bytes;
+  const vram = snap?.llm_vram_bytes;
+  if (ram == null && vram == null) return "";
+  const parts = [];
+  if (Number(vram) > 0) parts.push(`${fmtBytes(vram)} VRAM`);
+  if (Number(ram) > 0 || parts.length === 0) parts.push(`${fmtBytes(ram)} RAM`);
+  return parts.join(" · ");
+}
+
+function gpuOn(snap) {
+  return Boolean(snap?.allow_gpu) || Number(snap?.num_gpu ?? 0) !== 0;
+}
+
+function gpuPillLabel(snap) {
+  return gpuOn(snap) ? "num_gpu: all (GPU)" : "num_gpu: 0 (CPU)";
+}
+
+function gpuModeText(snap) {
+  return gpuOn(snap) ? "num_gpu=all (GPU offload)" : "num_gpu=0 (CPU-only, 0 MB VRAM)";
+}
+
 function parseSnapshotOutput(stdout) {
   if (!stdout) return null;
   const parsed = JSON.parse(stdout);
@@ -1384,12 +1414,11 @@ export default class CockpitMod extends View {
     const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
     const modelInstalled = supSnap ? Boolean(supSnap.model_installed) : false;
     const modelLoaded = Boolean(supSnap?.model_loaded);
-    const numGpu = supSnap?.num_gpu ?? 0;
 
     let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
     let llmPillColor = t.muted;
     if (llmConnected && modelInstalled) {
-      llmPillText = `● LLM: ${llmModel} (${llmBackend} · ${modelLoaded ? "EM RAM" : "PRONTO"})`;
+      llmPillText = `● LLM: ${llmModel} (${llmBackend} · ${modelLoaded ? llmMemoryLabel(supSnap) || "EM RAM" : "PRONTO"})`;
       llmPillColor = t.done;
     } else if (llmConnected && !modelInstalled) {
       llmPillText = `⚠ LLM: ${llmModel} (NÃO INSTALADO)`;
@@ -1491,7 +1520,26 @@ export default class CockpitMod extends View {
               )
           )
           .child(this.pillBadge(t, llmPillText, llmPillColor))
-          .child(this.pillBadge(t, `num_gpu: ${numGpu}`, t.done))
+          .child(
+            this.pillBadge(
+              t,
+              gpuPillLabel(supSnap),
+              gpuOn(supSnap) ? t.accent : t.done
+            )
+              .id("ck-gpu-toggle")
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) =>
+                this.runSupervisorAction(
+                  cx,
+                  ["supervisor", "gpu", gpuOn(supSnap) ? "off" : "on"],
+                  gpuOn(supSnap)
+                    ? "GPU desligada: LLM em CPU (num_gpu 0)"
+                    : "GPU ligada: LLM com offload total"
+                )
+              )
+          )
           .when(alertCount > 0, (el) =>
             el.child(
               this.pillBadge(
@@ -2186,7 +2234,7 @@ export default class CockpitMod extends View {
                       ? `${supSnap.llm_model || "lfm3:1.7b"} · ON`
                       : `${supSnap.llm_model || "lfm3:1.7b"} · OFF`
                     : `${supSnap?.llm_model || "lfm3:1.7b"} · …`,
-                  `${supSnap?.llm_backend || "ollama"} · num_gpu=${supSnap?.num_gpu ?? 0} (0 MB VRAM)`,
+                  `${supSnap?.llm_backend || "ollama"} · ${gpuModeText(supSnap)}`,
                   supSnap?.llm_connected ? t.done : supSnap ? t.blocked : t.muted
                 )
               )
@@ -2811,7 +2859,7 @@ export default class CockpitMod extends View {
       {
         name: "supervisor",
         status: supSnap ? "pass" : "unknown",
-        detail: "lfm3:1.7b · num_gpu=0 (CPU-only)",
+        detail: `${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`,
       },
     ];
     const checks = report?.checks?.length ? report.checks : defaultChecks;
@@ -2879,7 +2927,7 @@ export default class CockpitMod extends View {
               .text_size(11.5)
               .text_color(t.muted)
               .child(
-                `cockpit v${report?.cockpit_version ?? version} · supervisor lfm3:1.7b · num_gpu=0`
+                `cockpit v${report?.cockpit_version ?? version} · supervisor ${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`
               )
           )
           .child(
@@ -3495,7 +3543,7 @@ export default class CockpitMod extends View {
                             .font_semibold()
                             .text_color(t.foreground)
                             .child(
-                              `🧠 ${supSnap?.llm_model || "lfm3:1.7b"} (${supSnap?.llm_backend || "ollama"} · num_gpu=${supSnap?.num_gpu ?? 0})`
+                              `🧠 ${supSnap?.llm_model || "lfm3:1.7b"} (${supSnap?.llm_backend || "ollama"} · ${gpuOn(supSnap) ? "GPU" : "CPU"}${llmMemoryLabel(supSnap) ? ` · ${llmMemoryLabel(supSnap)}` : ""})`
                             )
                         )
                         .child(
@@ -4354,7 +4402,7 @@ export default class CockpitMod extends View {
         div()
           .text_color(llmConnected ? t.done : supSnap ? t.blocked : t.muted)
           .child(
-            `LLM: ${llmModel} (${llmConnected ? "ONLINE" : supSnap ? "OFFLINE" : "…"} · num_gpu=${numGpu})`
+            `LLM: ${llmModel} (${llmConnected ? "ONLINE" : supSnap ? "OFFLINE" : "…"} · ${gpuOn(supSnap) ? "GPU" : "CPU num_gpu=0"})`
           )
       )
       .child(

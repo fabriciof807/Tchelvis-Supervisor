@@ -185,6 +185,8 @@ cockpit supervisor watch
 
 By default, the Durable Supervisor uses **Ollama** with **`lfm3:1.7b`** in CPU-only mode (`num_gpu: 0`). You can switch the cognitive evaluation backend at any time via `~/.config/cockpit/supervisor.toml` or environment variables—no rebuild required.
 
+**GPU toggle:** run `cockpit supervisor gpu on|off` (or click the `num_gpu` pill in the top bar) to switch between CPU-only (`num_gpu: 0`, default, zero VRAM) and full GPU offload (`num_gpu: 99`). The choice is persisted in `~/.local/state/cockpit/supervisor_gpu`, the model is unloaded (`keep_alive: 0`) and warm-reloaded with the new setting (`--no-warm` skips the reload). `COCKPIT_ALLOW_GPU` still takes precedence. `supervisor status --json` exposes `allow_gpu`, `num_gpu`, `llm_ram_bytes` and `llm_vram_bytes` (from Ollama `/api/ps`); the top-bar LLM pill shows e.g. `1.3 GB RAM` or `1.1 GB VRAM · 0.2 GB RAM`.
+
 #### Option A: Ollama (Default — Local Zero-VRAM + 180s Auto-Unload)
 
 1. Pull the model:
@@ -261,7 +263,7 @@ If you prefer not to run any model locally, point Cockpit at any OpenAI-compatib
 | `OLLAMA_FALLBACK_HOST` | Optional fallback host when primary is unreachable | `http://10.121.213.1:11434` |
 | `COCKPIT_LLM_MODEL` / `OLLAMA_MODEL` | Model identifier sent in chat completion requests | `lfm3:1.7b` |
 | `COCKPIT_LLM_API_KEY` | Bearer token for `openai-compatible` (or `OPENAI_API_KEY` / `OPENROUTER_API_KEY`) | None |
-| `COCKPIT_ALLOW_GPU` | Allow GPU layers on Ollama (`false` forces `num_gpu: 0`) | `false` |
+| `COCKPIT_ALLOW_GPU` | Allow GPU layers on Ollama (`false` forces `num_gpu: 0`); overrides `cockpit supervisor gpu` | `false` |
 | `HC_BIN` | Override path to `hc` binary | `hc` |
 
 ### 5. Optional Provider Integrations (`~/.config/cockpit/config.toml`)

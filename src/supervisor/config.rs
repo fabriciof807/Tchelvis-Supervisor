@@ -64,7 +64,12 @@ pub enum LlmBackendKind {
     LlamaCpp,
     #[serde(alias = "lmstudio", alias = "lm_studio")]
     LmStudio,
-    #[serde(alias = "openai", alias = "api", alias = "cloud", alias = "openai_compatible")]
+    #[serde(
+        alias = "openai",
+        alias = "api",
+        alias = "cloud",
+        alias = "openai_compatible"
+    )]
     OpenAiCompatible,
 }
 
@@ -148,6 +153,40 @@ fn resolve_allow_gpu_from_env() -> Option<bool> {
     None
 }
 
+/// Path of the persisted GPU-offload toggle written by `cockpit supervisor gpu <on|off>`.
+pub fn gpu_override_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("cockpit")
+        .join("supervisor_gpu")
+}
+
+/// Reads the persisted GPU toggle (`on` / `off`); `None` when absent or unreadable.
+pub fn read_gpu_override(path: &std::path::Path) -> Option<bool> {
+    match fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "on" => Some(true),
+        "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Persists the GPU toggle atomically.
+pub fn write_gpu_override(path: &std::path::Path, allow_gpu: bool) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, if allow_gpu { "on\n" } else { "off\n" })?;
+    fs::rename(&tmp, path)
+}
+
 fn resolve_llm_backend_from_env() -> Option<LlmBackendKind> {
     env::var("COCKPIT_LLM_BACKEND")
         .ok()
@@ -195,8 +234,7 @@ impl Default for SupervisorConfig {
         let ollama_fallback_host = env::var("OLLAMA_FALLBACK_HOST")
             .ok()
             .or_else(|| Some("http://10.121.213.1:11434".to_string()));
-        let ollama_model =
-            resolve_llm_model_from_env().unwrap_or_else(|| "lfm3:1.7b".to_string());
+        let ollama_model = resolve_llm_model_from_env().unwrap_or_else(|| "lfm3:1.7b".to_string());
         let allow_gpu = resolve_allow_gpu_from_env().unwrap_or(false);
 
         Self {
@@ -260,6 +298,12 @@ impl SupervisorConfig {
                     cfg = parsed;
                     cfg.apply_env_overrides();
                 }
+            }
+        }
+        // Persisted `cockpit supervisor gpu on|off` wins over the TOML file, but env vars win over it.
+        if resolve_allow_gpu_from_env().is_none() {
+            if let Some(allow) = read_gpu_override(&gpu_override_path()) {
+                cfg.allow_gpu = allow;
             }
         }
         cfg
@@ -418,9 +462,17 @@ mod tests {
 
         // Explicit custom host is preserved for any backend
         cfg.ollama_host = "https://openrouter.ai/api/v1".to_string();
-        assert_eq!(
-            cfg.effective_primary_host(),
-            "https://openrouter.ai/api/v1"
-        );
+        assert_eq!(cfg.effective_primary_host(), "https://openrouter.ai/api/v1");
+    }
+
+    #[test]
+    fn test_gpu_override_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("supervisor_gpu");
+        assert_eq!(read_gpu_override(&path), None);
+        write_gpu_override(&path, true).unwrap();
+        assert_eq!(read_gpu_override(&path), Some(true));
+        write_gpu_override(&path, false).unwrap();
+        assert_eq!(read_gpu_override(&path), Some(false));
     }
 }

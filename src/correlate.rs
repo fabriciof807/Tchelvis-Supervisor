@@ -101,9 +101,14 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
         return true;
     }
     if term.state != "finished" && term.is_plain_shell_foreground() {
-        return ["cockpit.issue", "cockpit.pr", "cockpit.slack", "cockpit.runbook"]
-            .iter()
-            .any(|k| term.labels.get(*k).is_some_and(|v| !v.trim().is_empty()));
+        return [
+            "cockpit.issue",
+            "cockpit.pr",
+            "cockpit.slack",
+            "cockpit.runbook",
+        ]
+        .iter()
+        .any(|k| term.labels.get(*k).is_some_and(|v| !v.trim().is_empty()));
     }
     let kind = classify_agent_kind(term);
     if kind != AgentKind::PlainShell {

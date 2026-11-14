@@ -18,10 +18,97 @@ pub const FORBIDDEN_TOKENS: &[&str] = &[
 /// Checks case-insensitively whether `payload` contains any token in `FORBIDDEN_TOKENS`.
 pub fn contains_forbidden_payload(payload: &str) -> Option<&'static str> {
     let lower = payload.to_lowercase();
-    FORBIDDEN_TOKENS
-        .iter()
-        .copied()
-        .find(|token| lower.contains(token))
+    FORBIDDEN_TOKENS.iter().copied().find(|token| {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(token) {
+            let abs = from + pos;
+            // Word-boundary on the left so "confirm " does not match "rm ".
+            let boundary_ok = lower[..abs]
+                .chars()
+                .next_back()
+                .map_or(true, |c| !c.is_alphanumeric());
+            if boundary_ok {
+                return true;
+            }
+            from = abs + token.len();
+        }
+        false
+    })
+}
+
+/// Number of trailing non-empty lines considered the "pending prompt / question area".
+const PROMPT_AREA_LINES: usize = 8;
+
+/// Returns the last few non-empty lines of `output`, where a pending question lives.
+pub fn pending_prompt_area(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(PROMPT_AREA_LINES);
+    lines[start..].join("\n")
+}
+
+/// True when the prompt area looks like it is asking the operator/agent for input.
+pub fn has_pending_prompt(output: &str) -> bool {
+    let area = pending_prompt_area(output);
+    if prompt_signature_regex().is_match(&area) {
+        return true;
+    }
+    let lower = area.to_lowercase();
+    if lower.contains("do you want") || lower.contains("allow ") || lower.contains("(y/n)") {
+        return true;
+    }
+    area.lines()
+        .last()
+        .map(|l| {
+            let t = l.trim_end();
+            t.ends_with('?') || t.ends_with(':')
+        })
+        .unwrap_or(false)
+}
+
+/// Deterministic destructive-command detection restricted to the pending prompt area and the payload
+/// (never arbitrary scrollback such as "error" / "aborted" lines).
+pub fn detect_destructive(output: &str, payload: &str) -> Option<&'static str> {
+    contains_forbidden_payload(&pending_prompt_area(output))
+        .or_else(|| contains_forbidden_payload(payload))
+}
+
+/// Enforces the "only blocked agents get action cards" policy deterministically.
+///
+/// * Not blocked  -> always `NoOp` (the rolling summary is still kept by the caller).
+/// * Blocked      -> destructive command in the prompt area/payload forces a `Critical` alert with
+///   payload `n`; otherwise LLM urgency is capped at `Normal`; an alert without a pending prompt
+///   carries no payload.
+pub fn enforce_blocked_policy(
+    is_blocked: bool,
+    output: &str,
+    mut eval: CognitiveEvaluation,
+) -> CognitiveEvaluation {
+    if !is_blocked {
+        eval.decision = SupervisorDecision::NoOp;
+        eval.urgency = Urgency::Low;
+        eval.hc_command_payload.clear();
+        eval.reason_for_operator.clear();
+        return eval;
+    }
+
+    if let Some(token) = detect_destructive(output, &eval.hc_command_payload) {
+        eval.decision = SupervisorDecision::AlertOperator;
+        eval.urgency = Urgency::Critical;
+        eval.hc_command_payload = "n".to_string();
+        append_reason(
+            &mut eval.reason_for_operator,
+            &format!("[Comando destrutivo detectado no terminal: {token}]"),
+        );
+        return eval;
+    }
+
+    if eval.urgency == Urgency::Critical {
+        eval.urgency = Urgency::Normal;
+    }
+    if eval.decision == SupervisorDecision::AlertOperator && !has_pending_prompt(output) {
+        eval.hc_command_payload.clear();
+    }
+    eval
 }
 
 fn error_signature_regex() -> &'static Regex {
@@ -214,9 +301,7 @@ mod tests {
         let borders = "================\n================\n================";
         assert!(!has_error_or_loop_signature(borders));
 
-        assert!(has_error_or_loop_signature(
-            "Do you want to proceed? [y/N]"
-        ));
+        assert!(has_error_or_loop_signature("Do you want to proceed? [y/N]"));
         assert!(has_error_or_loop_signature("Press Enter to continue"));
         assert!(has_error_or_loop_signature(
             "Traceback (most recent call last):\n  File \"app.py\", line 1"
@@ -232,5 +317,65 @@ mod tests {
                         Error: connection refused on port 5432\n\
                         Error: connection refused on port 5432";
         assert!(has_error_or_loop_signature(repeated));
+    }
+
+    const HOOKS_ERROR_OUTPUT: &str =
+        "HooksError: git process aborted after 2000ms in tickets-pane\n\
+        HooksError: git process aborted after 2000ms in tickets-pane\n\
+        Waiting for background agent to finish...";
+
+    #[test]
+    fn test_working_agent_with_hooks_error_is_noop() {
+        let mut eval = sample_eval(SupervisorDecision::AlertOperator, "n");
+        eval.urgency = Urgency::Critical;
+        let out = enforce_blocked_policy(false, HOOKS_ERROR_OUTPUT, eval);
+        assert_eq!(out.decision, SupervisorDecision::NoOp);
+        assert_eq!(out.urgency, Urgency::Low);
+        assert!(out.hc_command_payload.is_empty());
+        assert_eq!(out.updated_summary, "Agente aguardando confirmação.");
+    }
+
+    #[test]
+    fn test_hooks_error_text_never_triggers_destructive_detection() {
+        assert!(detect_destructive(HOOKS_ERROR_OUTPUT, "").is_none());
+        assert!(detect_destructive("Please confirm the change", "").is_none());
+    }
+
+    #[test]
+    fn test_blocked_force_push_prompt_is_critical_alert() {
+        let output = "Bash command\n  git push --force origin main\nDo you want to proceed? (y/n)";
+        let out = enforce_blocked_policy(
+            true,
+            output,
+            sample_eval(SupervisorDecision::AutoReply, "y"),
+        );
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert_eq!(out.urgency, Urgency::Critical);
+        assert_eq!(out.hc_command_payload, "n");
+    }
+
+    #[test]
+    fn test_blocked_safe_prompt_keeps_auto_reply_and_caps_llm_critical() {
+        let output = "Run cargo test?\nProceed? (y/n)";
+        let out = enforce_blocked_policy(
+            true,
+            output,
+            sample_eval(SupervisorDecision::AutoReply, "y"),
+        );
+        assert_eq!(out.decision, SupervisorDecision::AutoReply);
+
+        let mut alert = sample_eval(SupervisorDecision::AlertOperator, "n");
+        alert.urgency = Urgency::Critical;
+        let out = enforce_blocked_policy(true, output, alert);
+        assert_eq!(out.urgency, Urgency::Normal);
+    }
+
+    #[test]
+    fn test_alert_without_pending_prompt_has_no_payload() {
+        let mut alert = sample_eval(SupervisorDecision::AlertOperator, "n");
+        alert.urgency = Urgency::Normal;
+        let out = enforce_blocked_policy(true, "Task finished.\nAll done", alert);
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert!(out.hc_command_payload.is_empty());
     }
 }

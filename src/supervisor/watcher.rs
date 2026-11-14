@@ -1,7 +1,5 @@
 use super::config::SupervisorConfig;
-use super::guardrails::{
-    contains_forbidden_payload, has_error_or_loop_signature, validate_evaluation,
-};
+use super::guardrails::{enforce_blocked_policy, has_error_or_loop_signature, validate_evaluation};
 use super::hc::HcBackend;
 use super::ollama::{CognitiveBackend, SupervisorDecision};
 use super::state::{
@@ -82,7 +80,8 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
         if sessions.is_empty() {
             let zero_since = *self.zero_active_since.get_or_insert(now);
-            if !self.model_loaded || now.saturating_sub(zero_since) >= self.config.idle_unload_secs {
+            if !self.model_loaded || now.saturating_sub(zero_since) >= self.config.idle_unload_secs
+            {
                 if self.model_loaded {
                     let _ = self.cognitive.unload_model();
                     self.model_loaded = false;
@@ -116,6 +115,9 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                         )
                     });
                 entry.session_name = session.session_name.clone();
+                if !session.is_blocked() {
+                    entry.pending_operator_action = None;
+                }
             }
             self.store.zero_active_since = self.zero_active_since;
             self.store.model_loaded = self.model_loaded;
@@ -147,6 +149,11 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 });
             state.session_name = session.session_name.clone();
             state.last_output_preview = output.clone();
+
+            // Stale Action Cards: an agent that is no longer blocked needs no operator attention.
+            if !session.is_blocked() && state.pending_operator_action.is_some() {
+                state.pending_operator_action = None;
+            }
 
             let status_transition =
                 session.status != state.last_hc_status && session.has_notable_hc_status();
@@ -188,27 +195,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             };
             self.model_loaded = true;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
+            eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
             if eval.decision == SupervisorDecision::AutoReply {
-                if contains_forbidden_payload(&output).is_some() {
-                    eval.decision = SupervisorDecision::AlertOperator;
-                    eval.urgency = Urgency::Critical;
-                    let note = "[Comando destrutivo detectado no terminal]";
-                    if eval.reason_for_operator.trim().is_empty() {
-                        eval.reason_for_operator = note.to_string();
-                    } else {
-                        if !eval.reason_for_operator.ends_with(' ') {
-                            eval.reason_for_operator.push(' ');
-                        }
-                        eval.reason_for_operator.push_str(note);
-                    }
-                } else {
-                    let lower_output = output.to_lowercase();
-                    if (lower_output.contains("(y/n)") || lower_output.contains("[y/n]"))
-                        && eval.hc_command_payload.len() > 3
-                        && eval.hc_command_payload.contains('_')
-                    {
-                        eval.hc_command_payload = "y".to_string();
-                    }
+                let lower_output = output.to_lowercase();
+                if (lower_output.contains("(y/n)") || lower_output.contains("[y/n]"))
+                    && eval.hc_command_payload.len() > 3
+                    && eval.hc_command_payload.contains('_')
+                {
+                    eval.hc_command_payload = "y".to_string();
                 }
             }
             outcome.evaluated_agents.push(session.agent_id.clone());
@@ -404,10 +398,11 @@ mod tests {
         }
 
         fn send_input(&self, agent_id: &str, payload: &str, force: bool) -> Result<()> {
-            self.sent_inputs
-                .lock()
-                .unwrap()
-                .push((agent_id.to_string(), payload.to_string(), force));
+            self.sent_inputs.lock().unwrap().push((
+                agent_id.to_string(),
+                payload.to_string(),
+                force,
+            ));
             Ok(())
         }
 
@@ -463,9 +458,15 @@ mod tests {
             agent_program: Some("pi".to_string()),
             cwd: Some("/tmp".to_string()),
             state: "live".to_string(),
-            status: Some("working".to_string()),
+            status: Some("blocked".to_string()),
             turn: Some(1),
         }
+    }
+
+    fn working_session(id: &str) -> HcSession {
+        let mut s = test_session(id);
+        s.status = Some("working".to_string());
+        s
     }
 
     fn test_config(dir: &tempfile::TempDir) -> SupervisorConfig {
@@ -481,7 +482,7 @@ mod tests {
         let cfg = test_config(&dir);
         let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
         let hc = MockHc::new(
-            vec![test_session("worker-01")],
+            vec![working_session("worker-01")],
             vec![
                 "Compiling step 1...",
                 "Compiling step 2...",
@@ -513,7 +514,10 @@ mod tests {
     fn test_stalled_prompt_triggers_auto_reply_and_increments_counter() {
         let dir = tempdir().unwrap();
         let cfg = test_config(&dir);
-        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut agent = AgentDurableState::new("worker-01", "refactor-auth", 2, 1000);
+        agent.last_hc_status = Some("blocked".to_string());
+        store.agents.insert("worker-01".to_string(), agent);
         let hc = MockHc::new(
             vec![test_session("worker-01")],
             vec!["Waiting for input...", "Waiting for input..."],
@@ -542,12 +546,14 @@ mod tests {
         );
         let labels = engine.hc.labels.lock().unwrap();
         assert_eq!(labels.len(), 2);
-        assert!(labels[1]
-            .1
-            .contains(&("cockpit.supervisor_state".to_string(), "WAITING_CONFIRMATION".to_string())));
-        assert!(labels[1]
-            .1
-            .contains(&("supervisor.state".to_string(), "WAITING_CONFIRMATION".to_string())));
+        assert!(labels[1].1.contains(&(
+            "cockpit.supervisor_state".to_string(),
+            "WAITING_CONFIRMATION".to_string()
+        )));
+        assert!(labels[1].1.contains(&(
+            "supervisor.state".to_string(),
+            "WAITING_CONFIRMATION".to_string()
+        )));
 
         let agent = engine.store.agents.get("worker-01").unwrap();
         assert_eq!(agent.consecutive_auto_replies, 1);
@@ -631,5 +637,111 @@ mod tests {
         assert!(!engine.model_loaded);
         assert_eq!(*engine.cognitive.unload_calls.lock().unwrap(), 1);
         assert_eq!(engine.runtime_status, SupervisorRuntimeStatus::Idle);
+    }
+
+    fn alert_eval(urgency: Urgency, payload: &str) -> CognitiveEvaluation {
+        CognitiveEvaluation {
+            updated_summary: "Agente t10b aguardando background agent.".to_string(),
+            detected_state: LifecycleState::Error,
+            decision: SupervisorDecision::AlertOperator,
+            urgency,
+            hc_command_payload: payload.to_string(),
+            reason_for_operator: "HooksError repetido.".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_working_agent_with_hooks_error_creates_no_card() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![working_session("t10b")],
+            vec!["HooksError: git process aborted after 2000ms\nerror[E0308]: noise\nWaiting for background agent"],
+        );
+        let cognitive = MockCognitive::new(alert_eval(Urgency::Critical, "n"));
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.evaluated_agents, vec!["t10b"]);
+        assert!(o.alerted_agents.is_empty());
+        let agent = engine.store.agents.get("t10b").unwrap();
+        assert!(agent.pending_operator_action.is_none());
+        assert_eq!(
+            agent.rolling_summary,
+            "Agente t10b aguardando background agent."
+        );
+    }
+
+    #[test]
+    fn test_blocked_force_push_prompt_raises_critical_card() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Bash: git push --force origin main\nProceed? (y/n)"],
+        );
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: "y".to_string(),
+            ..alert_eval(Urgency::Low, "y")
+        });
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        let o = engine.tick(1000).unwrap();
+        assert!(o.auto_replied_agents.is_empty());
+        let card = engine.store.agents["t1"]
+            .pending_operator_action
+            .clone()
+            .unwrap();
+        assert_eq!(card.urgency, Urgency::Critical);
+        assert_eq!(card.hc_command_payload, "n");
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_blocked_safe_prompt_auto_replies_y() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Run cargo test?\nProceed? (y/n)"],
+        );
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: "y".to_string(),
+            ..alert_eval(Urgency::Low, "y")
+        });
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t1"]);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t1".to_string(), "y".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn test_stale_action_card_cleared_when_agent_no_longer_blocked() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let mut store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut agent = AgentDurableState::new("t1", "refactor-auth", 2, 900);
+        agent.pending_operator_action = Some(PendingOperatorAction {
+            urgency: Urgency::Critical,
+            detected_state: LifecycleState::Error,
+            reason_for_operator: "x".into(),
+            updated_summary: "x".into(),
+            hc_command_payload: "n".into(),
+            triggered_at: 900,
+        });
+        store.agents.insert("t1".to_string(), agent);
+        let hc = MockHc::new(vec![working_session("t1")], vec!["Compiling..."]);
+        let cognitive = MockCognitive::new(alert_eval(Urgency::Low, ""));
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        engine.tick(1000).unwrap();
+        assert!(engine.store.agents["t1"].pending_operator_action.is_none());
     }
 }

@@ -30,7 +30,8 @@ pub fn build_engine_from_config(
     config: SupervisorConfig,
 ) -> Result<WatcherEngine<HcCliAdapter, OllamaClient>> {
     let legacy_path = SupervisorConfig::legacy_state_file_path();
-    let store = DurableStateStore::load_or_init_with_fallback(&config.state_file_path, &legacy_path)?;
+    let store =
+        DurableStateStore::load_or_init_with_fallback(&config.state_file_path, &legacy_path)?;
     let hc = HcCliAdapter::new(config.hc.clone());
     hc.register_self_terminal();
     let cognitive = OllamaClient::new(config.clone());
@@ -104,10 +105,7 @@ pub fn current_status() -> Result<DesktopModSnapshot> {
 
 /// Approves a pending operator action for `agent_id` and returns the updated `DesktopModSnapshot`.
 /// If `command_payload` is `None`, uses the pending Action Card's `hc_command_payload` if present.
-pub fn approve_action(
-    agent_id: &str,
-    command_payload: Option<&str>,
-) -> Result<DesktopModSnapshot> {
+pub fn approve_action(agent_id: &str, command_payload: Option<&str>) -> Result<DesktopModSnapshot> {
     let mut engine = build_default_engine()?;
     let payload = match command_payload {
         Some(p) => p.to_string(),
@@ -154,6 +152,27 @@ pub fn unload_model() -> Result<DesktopModSnapshot> {
     let mut engine = build_default_engine()?;
     engine.cognitive.unload_model()?;
     engine.model_loaded = false;
+    sync_runtime_status(&mut engine);
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
+}
+
+/// Persists the GPU-offload toggle, unloads the model (`keep_alive: 0`) so the next evaluation
+/// reloads with the new `num_gpu`, optionally warm-loads it, and returns the updated snapshot.
+pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
+    config::write_gpu_override(&config::gpu_override_path(), allow_gpu)?;
+    let mut config = SupervisorConfig::load();
+    config.allow_gpu = allow_gpu;
+    let client = OllamaClient::new(config.clone());
+    let _ = client.unload_model();
+    if warm {
+        let _ = client.warm_model();
+    }
+    let mut engine = build_engine_from_config(config)?;
+    engine.model_loaded = false;
+    engine.store.model_loaded = false;
+    let _ = engine.store.save();
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);

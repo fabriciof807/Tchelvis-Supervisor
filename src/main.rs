@@ -4,7 +4,7 @@ use cockpit::config::{CockpitConfig, CockpitPaths};
 use cockpit::daemon::{collect_once, query_socket_once, run_daemon};
 use cockpit::doctor::run_doctor;
 use cockpit::herdr::HerdrClient;
-use cockpit::home::{self, DailyTaskStore, HomeSnapshot, TaskPriority, unix_now_secs};
+use cockpit::home::{self, unix_now_secs, DailyTaskStore, HomeSnapshot, TaskPriority};
 use cockpit::logging::{init_logging, read_filtered_logs};
 use cockpit::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
 use cockpit::providers::ProviderCoordinator;
@@ -13,7 +13,7 @@ use cockpit::store::CacheStore;
 use cockpit::supervisor::state::SupervisorMode;
 use cockpit::supervisor::{
     approve_action, current_status, ignore_action, run_supervisor_daemon, run_tick_once, run_tui,
-    set_or_cycle_mode, unload_model,
+    set_gpu, set_or_cycle_mode, unload_model,
 };
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -243,6 +243,14 @@ enum SupervisorCommands {
     },
     /// Unload the configured Ollama model from memory (keep_alive: 0)
     Unload,
+    /// Toggle GPU offload for the local LLM (`off` = CPU-only num_gpu 0, default; `on` = offload all layers)
+    Gpu {
+        /// `on` or `off`
+        state: String,
+        /// Skip warm-loading the model after the toggle
+        #[arg(long)]
+        no_warm: bool,
+    },
 }
 
 const VALID_LABEL_KEYS: [&str; 7] = [
@@ -544,6 +552,18 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
                 Ok(())
             }
+            SupervisorCommands::Gpu { state, no_warm } => {
+                let allow = match state.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "1" | "gpu" => true,
+                    "off" | "false" | "0" | "cpu" => false,
+                    other => bail!("Invalid gpu state '{}'; expected on or off", other),
+                };
+                let snap = tokio::task::spawn_blocking(move || set_gpu(allow, !no_warm))
+                    .await
+                    .context("supervisor gpu task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
             SupervisorCommands::Unload => {
                 let snap = tokio::task::spawn_blocking(unload_model)
                     .await
@@ -569,10 +589,11 @@ async fn main() -> Result<()> {
             let task_path = DailyTaskStore::default_path(&paths);
             match action {
                 TaskCommand::List { json } => {
-                    let snap =
-                        tokio::task::spawn_blocking(move || home::build_home_snapshot(&paths_clone))
-                            .await
-                            .context("task list task panicked")??;
+                    let snap = tokio::task::spawn_blocking(move || {
+                        home::build_home_snapshot(&paths_clone)
+                    })
+                    .await
+                    .context("task list task panicked")??;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&snap)?);
                     } else {

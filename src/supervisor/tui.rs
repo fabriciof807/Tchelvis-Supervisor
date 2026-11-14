@@ -50,6 +50,15 @@ pub struct DesktopModSnapshot {
     pub llm_model: String,
     #[serde(default)]
     pub num_gpu: u32,
+    /// `true` when GPU offload is enabled (`num_gpu != 0`).
+    #[serde(default)]
+    pub allow_gpu: bool,
+    /// Model bytes resident in system RAM (Ollama `/api/ps`); `null` when unloaded / non-Ollama.
+    #[serde(default)]
+    pub llm_ram_bytes: Option<u64>,
+    /// Model bytes resident in GPU VRAM (Ollama `/api/ps`); `null` when unloaded / non-Ollama.
+    #[serde(default)]
+    pub llm_vram_bytes: Option<u64>,
     #[serde(default)]
     pub llm_connected: bool,
     #[serde(default)]
@@ -72,6 +81,7 @@ pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
     snap.llm_host = engine.config.effective_primary_host();
     snap.llm_model = engine.config.ollama_model.clone();
     snap.num_gpu = engine.config.effective_num_gpu();
+    snap.allow_gpu = snap.num_gpu != 0;
     snap
 }
 
@@ -85,6 +95,9 @@ pub fn enrich_snapshot_with_llm_health(
     snap.llm_host = health.host;
     snap.llm_model = health.model;
     snap.num_gpu = health.num_gpu;
+    snap.allow_gpu = health.num_gpu != 0;
+    snap.llm_ram_bytes = health.ram_bytes;
+    snap.llm_vram_bytes = health.vram_bytes;
     snap.llm_connected = health.connected;
     snap.model_installed = health.model_installed;
     snap.model_loaded = snap.model_loaded || health.model_loaded;
@@ -134,6 +147,9 @@ pub fn build_desktop_mod_snapshot_from_parts(
         llm_host: String::new(),
         llm_model: String::new(),
         num_gpu: 0,
+        allow_gpu: false,
+        llm_ram_bytes: None,
+        llm_vram_bytes: None,
         llm_connected: true,
         model_installed: true,
         llm_status_detail: String::new(),
@@ -216,7 +232,10 @@ impl SupervisorTuiApp {
         }
     }
 
-    pub fn selected_agent<'a>(&self, snapshot: &'a DesktopModSnapshot) -> Option<&'a AgentCardView> {
+    pub fn selected_agent<'a>(
+        &self,
+        snapshot: &'a DesktopModSnapshot,
+    ) -> Option<&'a AgentCardView> {
         snapshot.agents.get(self.selected_index)
     }
 
@@ -470,9 +489,7 @@ impl SupervisorTuiApp {
                 })
                 .collect();
 
-            let log_widget = Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: true });
+            let log_widget = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
             frame.render_widget(log_widget, area);
         } else {
             let title = match &agent.audit_badge {
@@ -533,16 +550,12 @@ fn render_header(frame: &mut Frame, area: Rect, snapshot: &DesktopModSnapshot, a
     let line = Line::from(vec![
         Span::styled(
             format!(" ● {} ", snapshot.pill_text),
-            Style::default()
-                .fg(pill_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | Mode: "),
         Span::styled(
             snapshot.mode_label.clone(),
-            Style::default()
-                .fg(mode_color)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
         Span::raw(" [M] | VRAM: "),
         Span::styled(vram_label, Style::default().fg(Color::Gray)),
@@ -577,9 +590,7 @@ impl Drop for TerminalGuard {
 }
 
 /// Runs the interactive Ratatui + Crossterm TUI event loop for the Cockpit Durable Supervisor.
-pub fn run_tui<H: HcBackend, C: CognitiveBackend>(
-    engine: &mut WatcherEngine<H, C>,
-) -> Result<()> {
+pub fn run_tui<H: HcBackend, C: CognitiveBackend>(engine: &mut WatcherEngine<H, C>) -> Result<()> {
     enable_raw_mode().context("Failed to enable terminal raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
@@ -797,10 +808,7 @@ mod tests {
         assert_eq!(card1.agent_id, "worker-01");
         assert_eq!(card1.audit_badge, Some("Auto-assisted (1/2)".to_string()));
         assert!(card1.action_card.is_some());
-        assert_eq!(
-            card1.action_card.as_ref().unwrap().hc_command_payload,
-            "n"
-        );
+        assert_eq!(card1.action_card.as_ref().unwrap().hc_command_payload, "n");
 
         let card2 = &watching_snap.agents[1];
         assert_eq!(card2.audit_badge, None);

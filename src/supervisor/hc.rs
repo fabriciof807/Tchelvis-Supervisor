@@ -33,6 +33,11 @@ impl HcSession {
         self.state == "live"
     }
 
+    /// Returns true if the agent is genuinely blocked on a prompt awaiting input.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self.status.as_deref(), Some("blocked") | Some("waiting"))
+    }
+
     /// Returns true if `hc` reported a status transition to waiting/blocked, failed/error, or finished/done.
     pub fn has_notable_hc_status(&self) -> bool {
         matches!(
@@ -195,7 +200,9 @@ impl HcBackend for HcCliAdapter {
         let output = Command::new(&self.config.hc_bin)
             .args(["read", agent_id, "--lines", &lines.to_string(), "--json"])
             .output()
-            .with_context(|| format!("Failed to execute `{} read {agent_id}`", self.config.hc_bin))?;
+            .with_context(|| {
+                format!("Failed to execute `{} read {agent_id}`", self.config.hc_bin)
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -218,9 +225,9 @@ impl HcBackend for HcCliAdapter {
         }
         cmd.arg(agent_id).arg(payload).arg("--json");
 
-        let output = cmd
-            .output()
-            .with_context(|| format!("Failed to execute `{} send {agent_id}`", self.config.hc_bin))?;
+        let output = cmd.output().with_context(|| {
+            format!("Failed to execute `{} send {agent_id}`", self.config.hc_bin)
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -248,12 +255,7 @@ impl HcBackend for HcCliAdapter {
 }
 
 fn normalize_program_token(raw: &str) -> String {
-    let base = raw
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(raw)
-        .trim();
+    let base = raw.trim().rsplit(['/', '\\']).next().unwrap_or(raw).trim();
     base.to_ascii_lowercase()
 }
 
@@ -313,10 +315,7 @@ fn extract_status_fields(status: Option<&serde_json::Value>) -> (Option<String>,
     };
     if let Some(s) = val.as_str() {
         let trimmed = s.trim();
-        return (
-            (!trimmed.is_empty()).then(|| trimmed.to_string()),
-            None,
-        );
+        return ((!trimmed.is_empty()).then(|| trimmed.to_string()), None);
     }
     if let Some(obj) = val.as_object() {
         let state = obj
@@ -417,11 +416,7 @@ pub fn is_coding_agent_terminal(
 pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Result<Vec<HcSession>> {
     let val: serde_json::Value =
         serde_json::from_str(raw_json.trim()).context("Failed to parse `hc ls --json` output")?;
-    let parsed: RawHcListOutput = if val
-        .get("result")
-        .and_then(|r| r.get("terminals"))
-        .is_some()
-    {
+    let parsed: RawHcListOutput = if val.get("result").and_then(|r| r.get("terminals")).is_some() {
         serde_json::from_value(val["result"].clone())
             .context("Failed to parse `hc connect` terminal.list result")?
     } else {
@@ -561,10 +556,7 @@ fn is_supervisor_tui_noise(line: &str) -> bool {
 fn clean_tui_line(line: &str) -> &str {
     let trimmed = line.trim();
     if trimmed.starts_with('│') || trimmed.ends_with('│') {
-        trimmed
-            .trim_start_matches('│')
-            .trim_end_matches('│')
-            .trim()
+        trimmed.trim_start_matches('│').trim_end_matches('│').trim()
     } else {
         line.trim_end()
     }
@@ -622,7 +614,8 @@ mod tests {
 
     #[test]
     fn test_extract_tail_lines_from_hc_read_json() {
-        let raw = r#"{"complete":true,"how":"screen","text":"line 1\nline 2\nline 3\nline 4\n\n\n"}"#;
+        let raw =
+            r#"{"complete":true,"how":"screen","text":"line 1\nline 2\nline 3\nline 4\n\n\n"}"#;
         let tail = extract_tail_lines(raw, 2).unwrap();
         assert_eq!(tail, "line 3\nline 4");
     }
