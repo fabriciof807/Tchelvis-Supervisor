@@ -763,13 +763,20 @@ export default class CockpitMod extends View {
     this.homeSnap = shared("cockpit.home") ?? null;
     this.usageSnap = shared("cockpit.usage") ?? null;
     this.fetchingUsage = false;
-    this.usageFetchedAtMs = 0;
-    this.usageFilter = "accounts"; // "accounts" | "alerts" | "catalog"
+    this.usageFetchedAtMs = Number(shared("cockpit.usageFetchedAtMs") ?? 0);
+    this.usageOpen = Boolean(shared("cockpit.usageOpen"));
+    this.usageOnlyDrawer = Boolean(shared("cockpit.usageOnlyDrawer"));
+    this.usageMenuOpen = false;
+    this.selectedUsageEntryId = shared("cockpit.usageEntryId") ?? null;
     this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
     this.taskFilter = "pending"; // "pending" | "all" | "done"
-    this.inspectorTab = shared("cockpit.viewMode") || "inspector"; // "usage" | "home" | "inspector" | "doctor"
+    const initialViewMode = shared("cockpit.viewMode");
+    this.inspectorTab =
+      initialViewMode && initialViewMode !== "usage"
+        ? initialViewMode
+        : "inspector"; // "home" | "inspector" | "doctor"
     this.handle = cx.focus_handle();
 
     const role = props()?.role ?? "fleet";
@@ -795,8 +802,12 @@ export default class CockpitMod extends View {
       }
       cx.timer.every(6000, (cx) => this.refreshInspector(cx));
       cx.timer.every(60000, (cx) => {
-        const view = shared("cockpit.viewMode") || this.inspectorTab;
-        if (view === "usage") this.fetchUsageSnapshot(cx, false, false);
+        const inspectorHidden = Boolean(
+          findNode(layout(), "cockpit-inspector")?.hidden
+        );
+        if (Boolean(shared("cockpit.usageOpen")) && !inspectorHidden) {
+          this.fetchUsageSnapshot(cx, false, false);
+        }
       });
     } else if (role === "pill" || role === "status") {
       if (!shared("supervisor.snapshot")) {
@@ -1112,8 +1123,9 @@ export default class CockpitMod extends View {
   }
 
   fetchUsageSnapshot(cx, force = false, detect = false) {
-    if (this.fetchingUsage) return;
+    if (this.fetchingUsage || shared("cockpit.usageFetching")) return;
     this.fetchingUsage = true;
+    setShared("cockpit.usageFetching", true);
     if (force || detect) {
       this.note = detect
         ? "Detectando contas locais no ai-usagebar…"
@@ -1206,7 +1218,9 @@ export default class CockpitMod extends View {
 
       if (snap) {
         this.usageSnap = snap;
-        this.usageFetchedAtMs = Date.now();
+        const nowMs = Date.now();
+        this.usageFetchedAtMs = nowMs;
+        setShared("cockpit.usageFetchedAtMs", nowMs);
         setShared("cockpit.usage", snap);
         if (force || detect) {
           if (!snap.installed) {
@@ -1219,6 +1233,7 @@ export default class CockpitMod extends View {
         }
       }
       this.fetchingUsage = false;
+      setShared("cockpit.usageFetching", false);
       cx.notify();
     });
   }
@@ -1435,30 +1450,93 @@ export default class CockpitMod extends View {
       .child(label);
   }
 
-  openDrawerView(cx, tab, toggleIfActive = false) {
+  toggleUsagePopup(cx) {
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
-    const currentView =
-      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
-    if (toggleIfActive && !inspectorHidden && currentView === tab) {
-      run("layout.toggle", { id: "cockpit-inspector" });
+    const usageOpen = Boolean(shared("cockpit.usageOpen") ?? this.usageOpen);
+    if (usageOpen && !inspectorHidden) {
+      this.closeUsagePopup(cx);
       return;
     }
-    setShared("cockpit.viewMode", tab);
-    this.inspectorTab = tab;
-    if (tab === "home") this.fetchHomeSnapshot(cx);
-    else if (
-      tab === "usage" &&
-      (!this.usageSnap || Date.now() - (this.usageFetchedAtMs ?? 0) > 60000)
-    ) {
+    this.usageOpen = true;
+    this.usageMenuOpen = false;
+    setShared("cockpit.usageOpen", true);
+    if (inspectorHidden) {
+      this.usageOnlyDrawer = true;
+      setShared("cockpit.usageOnlyDrawer", true);
+      run("layout.toggle", { id: "cockpit-inspector" });
+    } else {
+      this.usageOnlyDrawer = false;
+      setShared("cockpit.usageOnlyDrawer", false);
+    }
+    const curSnap = shared("cockpit.usage") ?? this.usageSnap;
+    const fetchedAt = Number(
+      shared("cockpit.usageFetchedAtMs") ?? this.usageFetchedAtMs ?? 0
+    );
+    if (!curSnap || Date.now() - fetchedAt > 60000) {
       this.fetchUsageSnapshot(cx, false, false);
-    } else if (tab === "doctor" && !this.doctorReport) this.runDoctorCheck(cx);
-    else if (tab === "inspector") this.refreshInspector(cx);
+    }
+    cx?.notify();
+  }
+
+  closeUsagePopup(cx) {
+    const onlyDrawer = Boolean(
+      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
+    );
+    this.usageOpen = false;
+    this.usageMenuOpen = false;
+    this.usageOnlyDrawer = false;
+    setShared("cockpit.usageOpen", false);
+    setShared("cockpit.usageOnlyDrawer", false);
+    if (onlyDrawer && !findNode(layout(), "cockpit-inspector")?.hidden) {
+      run("layout.hide", { id: "cockpit-inspector" });
+    }
+    cx?.notify();
+  }
+
+  openDrawerView(cx, tab, toggleIfActive = false) {
+    const normalizedTab = tab === "usage" ? "inspector" : tab;
+    const inspectorHidden = Boolean(
+      findNode(layout(), "cockpit-inspector")?.hidden
+    );
+    const onlyUsage = Boolean(
+      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
+    );
+    const rawView =
+      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
+    const currentView = rawView === "usage" ? "inspector" : rawView;
+    if (
+      toggleIfActive &&
+      !inspectorHidden &&
+      !onlyUsage &&
+      currentView === normalizedTab
+    ) {
+      this.usageOpen = false;
+      this.usageOnlyDrawer = false;
+      this.usageMenuOpen = false;
+      setShared("cockpit.usageOpen", false);
+      setShared("cockpit.usageOnlyDrawer", false);
+      run("layout.toggle", { id: "cockpit-inspector" });
+      cx?.notify();
+      return;
+    }
+    if (onlyUsage) {
+      this.usageOnlyDrawer = false;
+      setShared("cockpit.usageOnlyDrawer", false);
+    }
+    setShared("cockpit.viewMode", normalizedTab);
+    this.inspectorTab = normalizedTab;
+    if (normalizedTab === "home") this.fetchHomeSnapshot(cx);
+    else if (normalizedTab === "doctor" && !this.doctorReport) {
+      this.runDoctorCheck(cx);
+    } else if (normalizedTab === "inspector") {
+      this.refreshInspector(cx);
+    }
     if (inspectorHidden) {
       run("layout.toggle", { id: "cockpit-inspector" });
     }
-    cx.notify();
+    cx?.notify();
   }
 
   actionBtn(t, id, label, onClick, accent = false, danger = false) {
@@ -1556,8 +1634,12 @@ export default class CockpitMod extends View {
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
-    const rightView =
+    const onlyUsage = Boolean(
+      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
+    );
+    const rawView =
       shared("cockpit.viewMode") || this.inspectorTab || "inspector";
+    const rightView = rawView === "usage" ? "inspector" : rawView;
     const w = win();
     const macNoFs = w?.platform === "macos" && !w?.fullscreen;
 
@@ -1732,18 +1814,9 @@ export default class CockpitMod extends View {
               .child(
                 this.segmentBtn(
                   t,
-                  "ck-pill-view-usage",
-                  "📊 Uso",
-                  rightView === "usage" && !inspectorHidden,
-                  (_e, cx) => this.openDrawerView(cx, "usage", true)
-                )
-              )
-              .child(
-                this.segmentBtn(
-                  t,
                   "ck-pill-view-home",
                   "🏠 Home",
-                  rightView === "home" && !inspectorHidden,
+                  rightView === "home" && !inspectorHidden && !onlyUsage,
                   (_e, cx) => this.openDrawerView(cx, "home", true)
                 )
               )
@@ -1752,7 +1825,7 @@ export default class CockpitMod extends View {
                   t,
                   "ck-pill-view-inspector",
                   "🔍 Inspector",
-                  rightView === "inspector" && !inspectorHidden,
+                  rightView === "inspector" && !inspectorHidden && !onlyUsage,
                   (_e, cx) => this.openDrawerView(cx, "inspector", true)
                 )
               )
@@ -1761,7 +1834,7 @@ export default class CockpitMod extends View {
                   t,
                   "ck-pill-view-doctor",
                   "🩺 Doctor",
-                  rightView === "doctor" && !inspectorHidden,
+                  rightView === "doctor" && !inspectorHidden && !onlyUsage,
                   (_e, cx) => this.openDrawerView(cx, "doctor", true)
                 )
               )
@@ -1873,6 +1946,7 @@ export default class CockpitMod extends View {
           setShared("cockpit.lastFocusedTerminal", curFocus);
           setShared("cockpit.selected", a.address);
           setShared("cockpit.viewMode", "inspector");
+          setShared("cockpit.usageOnlyDrawer", false);
           this.inspectorTab = "inspector";
           if (findNode(layout(), "cockpit-inspector")?.hidden) {
             run("layout.toggle", { id: "cockpit-inspector" });
@@ -2835,6 +2909,7 @@ export default class CockpitMod extends View {
                     (_e, cx) => {
                       setShared("cockpit.selected", a.address);
                       setShared("cockpit.viewMode", "inspector");
+                      setShared("cockpit.usageOnlyDrawer", false);
                       this.inspectorTab = "inspector";
                       this.refreshInspector(cx);
                       if (findNode(layout(), "cockpit-inspector")?.hidden) {
@@ -3207,135 +3282,153 @@ export default class CockpitMod extends View {
       );
   }
 
-  renderUsageBody(cx, themeArg = null) {
+  renderUsagePopover(cx, themeArg = null, standalone = true) {
     const t = themeArg ?? theme();
-    const usageSnap = this.usageSnap ?? shared("cockpit.usage") ?? null;
+    const usageSnap = shared("cockpit.usage") ?? this.usageSnap ?? null;
     const entries = Array.isArray(usageSnap?.entries) ? usageSnap.entries : [];
     const vendors = Array.isArray(usageSnap?.vendors) ? usageSnap.vendors : [];
-
-    const severityColor = (severity, pct) => {
-      const s = String(severity ?? "").toLowerCase();
-      const n = Number(pct ?? 0);
-      if (s === "critical" || n >= 95) return t.blocked;
-      if (s === "high" || n >= 80) return t.working;
-      if (s === "mid" || n >= 50) return t.accent;
-      if (s === "low") return t.done;
-      return n >= 50 ? t.accent : t.done;
-    };
-
-    const capsuleMeter = (pct, col) => {
-      const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
-      const filled =
-        clamped > 0 ? Math.max(1, Math.round((clamped / 100) * 20)) : 0;
-      const segs = [];
-      for (let i = 0; i < 20; i++) {
-        segs.push(
-          div()
-            .flex_1()
-            .h(6)
-            .rounded(2)
-            .bg(i < filled ? col : withAlpha(t.border, "66", t.background))
-        );
-      }
-      return h_flex().gap(2).items_center().children(segs);
-    };
-
-    const kpiCard = (label, value, sub, valueColor = t.foreground) =>
-      v_flex()
-        .flex_1()
-        .min_w(0)
-        .p(10)
-        .gap(4)
-        .rounded(10)
-        .border(1)
-        .border_color(t.border)
-        .bg(t.surface)
-        .child(
-          div()
-            .text_size(10.5)
-            .font_semibold()
-            .text_color(t.muted)
-            .child(label)
-        )
-        .child(
-          div()
-            .text_size(15)
-            .font_semibold()
-            .text_color(valueColor)
-            .child(ellipsize(value, 22))
-        )
-        .when(Boolean(sub), (el) =>
-          el.child(
-            div()
-              .text_size(11)
-              .text_color(t.muted)
-              .child(ellipsize(sub, 30))
-          )
-        );
+    const isFetching = Boolean(
+      this.fetchingUsage || shared("cockpit.usageFetching")
+    );
 
     const vendorById = new Map();
     for (const v of vendors) {
       if (v?.id) vendorById.set(String(v.id), v);
     }
 
-    const entryHasAlert = (entry) => {
-      if (entry?.status === "error" || entry?.error || entry?.stale) return true;
-      const metrics = Array.isArray(entry?.metrics) ? entry.metrics : [];
-      for (const m of metrics) {
-        const sev = String(m?.severity ?? "").toLowerCase();
-        if (sev === "high" || sev === "critical" || Number(m?.percent ?? 0) >= 80) {
-          return true;
-        }
+    const selectedId =
+      this.selectedUsageEntryId ?? shared("cockpit.usageEntryId") ?? null;
+    const selectedEntry =
+      entries.find((e) => e?.id === selectedId) ??
+      (usageSnap?.primary
+        ? entries.find((e) => e?.id === usageSnap.primary)
+        : null) ??
+      entries[0] ??
+      null;
+
+    const usageVendorIcon = (entry) => {
+      const key = String(
+        entry?.brand || entry?.id || entry?.name || ""
+      ).toLowerCase();
+      if (key.includes("antigravity")) return "✨";
+      if (key.includes("opencode")) return "</>";
+      if (key.includes("deepseek")) return "🐟";
+      if (key.includes("anthropic") || key.includes("claude")) return "✦";
+      if (key.includes("openai") || key.includes("codex")) return "◎";
+      if (key.includes("gemini") || key.includes("google")) return "✧";
+      if (key.includes("copilot") || key.includes("github")) return "◈";
+      if (key.includes("cursor")) return "⌘";
+      if (key.includes("zai") || key.includes("z.ai")) return "⚡";
+      const rawIcon = String(entry?.icon ?? "").trim();
+      if (
+        rawIcon &&
+        !/[\uE000-\uF8FF]/u.test(rawIcon) &&
+        !/[\u{F0000}-\u{10FFFF}]/u.test(rawIcon)
+      ) {
+        return rawIcon;
       }
-      const secs = Array.isArray(entry?.sections) ? entry.sections : [];
-      for (const s of secs) {
-        const sev = String(s?.severity ?? "").toLowerCase();
-        if (sev === "high" || sev === "critical" || Number(s?.percent ?? 0) >= 80) {
-          return true;
-        }
-      }
-      return false;
+      return "◆";
     };
 
-    const alertEntries = entries.filter(entryHasAlert);
-    const readyCount = entries.filter((e) => e?.status !== "error" && !e?.error).length;
-    const errorCount = entries.length - readyCount;
-    const enabledVendorsCount = vendors.filter((v) => v?.enabled).length;
+    const metricColor = (severity, pct) => {
+      const s = String(severity ?? "").toLowerCase();
+      const n = Number(pct ?? 0);
+      if (s === "critical" || n >= 95) return t.blocked;
+      if (s === "high" || n >= 80) return t.working;
+      return t.accent;
+    };
 
-    let maxPct = 0;
-    let maxSeverity = "low";
-    let maxLabel = "Sem métricas";
-    for (const e of entries) {
-      const metrics = Array.isArray(e?.metrics) ? e.metrics : [];
-      for (const m of metrics) {
-        const pct = Number(m?.percent ?? 0);
-        if (pct >= maxPct) {
-          maxPct = pct;
-          maxSeverity = m?.severity ?? "low";
-          maxLabel = `${e?.short_name || e?.name || "AI"} · ${m?.label || "uso"}`;
+    const progressBar24 = (pct, col, hPx = 5, radius = 3, trackAlpha = "66") => {
+      const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+      const filled =
+        clamped > 0 ? Math.max(1, Math.round((clamped / 100) * 24)) : 0;
+      const trackCol = withAlpha(t.border, trackAlpha, t.background);
+      const segs = [];
+      for (let i = 0; i < 24; i++) {
+        segs.push(
+          div()
+            .flex_1()
+            .h(hPx)
+            .bg(i < filled ? col : trackCol)
+        );
+      }
+      return h_flex().gap(0).rounded(radius).overflow_hidden().children(segs);
+    };
+
+    const formatRemainingSecs = (secs) => {
+      const total = Math.max(0, Math.floor(secs));
+      const d = Math.floor(total / 86400);
+      const h = Math.floor((total % 86400) / 3600);
+      const m = Math.floor((total % 3600) / 60);
+      if (d > 0) return `${d}d ${h}h`;
+      if (h > 0) return `${h}h ${m}m`;
+      return `${Math.max(1, m)}m`;
+    };
+
+    const parseMetricFooter = (sec) => {
+      const raw = String(sec?.detail ?? "").trim();
+      const parts = raw
+        .split("·")
+        .map((p) => p.trim())
+        .filter(Boolean);
+
+      let elapsedPct = null;
+      let resetText = null;
+      let pacingText = null;
+      let isOver = false;
+      const extraParts = [];
+
+      for (const p of parts) {
+        const elMatch = p.match(/(\d+(?:\.\d+)?)\s*%\s*elapsed/i);
+        if (elMatch) {
+          elapsedPct = Math.max(0, Math.min(100, Number(elMatch[1])));
+          continue;
+        }
+        const resetMatch = p.match(/resets?\s+in\s+(.+)/i);
+        if (resetMatch) {
+          resetText = resetMatch[1].trim();
+          continue;
+        }
+        if (/^\d+[dhms](?:\s+\d+[dhms])*$/i.test(p) && !resetText) {
+          resetText = p;
+          continue;
+        }
+        if (/\b(under|over)\b/i.test(p)) {
+          pacingText = p;
+          isOver = /\bover\b/i.test(p);
+          continue;
+        }
+        extraParts.push(p);
+      }
+
+      if (sec?.reset_at) {
+        const resetMs = Date.parse(sec.reset_at);
+        if (Number.isFinite(resetMs)) {
+          const remainingSecs = Math.max(0, (resetMs - Date.now()) / 1000);
+          if (!resetText && remainingSecs > 0) {
+            resetText = formatRemainingSecs(remainingSecs);
+          }
+          const winSecs = Number(sec?.window_secs ?? 0);
+          if (elapsedPct === null && winSecs > 0) {
+            elapsedPct = Math.max(
+              0,
+              Math.min(100, ((winSecs - remainingSecs) / winSecs) * 100)
+            );
+          }
         }
       }
-    }
 
-    const activeFilter = this.usageFilter || "accounts";
-    const shownEntries = activeFilter === "alerts" ? alertEntries : entries;
-
-    const statusBadgeText =
-      this.fetchingUsage && !usageSnap
-        ? "CARREGANDO…"
-        : usageSnap && !usageSnap.installed
-          ? "NÃO INSTALADO"
-          : entries.length === 0
-            ? "SEM CONTAS"
-            : `${readyCount}/${entries.length} PRONTAS`;
-    const statusBadgeColor =
-      this.fetchingUsage && !usageSnap
-        ? t.accent
-        : usageSnap && !usageSnap.installed
-          ? t.blocked
-          : entries.length === 0 || errorCount > 0
-            ? t.working
-            : t.done;
+      return {
+        elapsedPct,
+        resetText,
+        pacingText,
+        isOver,
+        fallbackDetail:
+          !resetText && !pacingText && extraParts.length > 0
+            ? ellipsize(extraParts.join(" · "), 52)
+            : null,
+      };
+    };
 
     const launchTabCmd = (tabName, cmdArgs) => {
       const sp = spaces().find((s) => s.active);
@@ -3346,469 +3439,226 @@ export default class CockpitMod extends View {
       });
     };
 
-    const renderEntryCard = (entry, idx) => {
-      const isErr = entry?.status === "error" || Boolean(entry?.error);
-      const entryId = String(entry?.id ?? `entry-${idx}`);
-      const brandKey = String(entry?.brand || entryId.split("@")[0] || "");
-      const vendorMeta = vendorById.get(brandKey);
-      const shortTag = String(
-        entry?.short_name || brandKey || "AI"
-      ).toUpperCase();
-      const titleText = entry?.display_name || entry?.name || entryId;
-      const isPrimary =
-        Boolean(usageSnap?.primary) && usageSnap.primary === entry?.id;
-      const borderCol = isErr
-        ? withAlpha(t.blocked, "88", t.blocked)
-        : entryHasAlert(entry)
-          ? withAlpha(t.working, "77", t.working)
-          : isPrimary
-            ? t.accent
-            : t.border;
-
-      const rawSections =
-        Array.isArray(entry?.sections) && entry.sections.length > 0
-          ? entry.sections
-          : (Array.isArray(entry?.metrics) ? entry.metrics : []).map((m) => ({
-              type: "metric",
-              ...m,
-            }));
-
-      const sectionEls = [];
-      let lastGroup = null;
-      for (let sIdx = 0; sIdx < rawSections.length; sIdx++) {
-        const sec = rawSections[sIdx];
-        if (!sec) continue;
-        if (sec.type === "spacer") {
-          lastGroup = null;
-          sectionEls.push(div().h(3));
-          continue;
-        }
-        if (sec.type === "metric") {
-          const grp = sec.group ? String(sec.group) : null;
-          if (grp && grp !== lastGroup) {
-            lastGroup = grp;
-            sectionEls.push(
-              div()
-                .pt(3)
-                .text_size(10)
-                .font_semibold()
-                .text_color(t.dim)
-                .child(grp.toUpperCase())
-            );
-          } else if (!grp) {
-            lastGroup = null;
-          }
-          const pct = Number(sec.percent ?? 0);
-          const col = severityColor(sec.severity, pct);
-          const rightVal =
-            sec.headline === "value"
-              ? `${sec.value ?? ""} (${pct}%)`
-              : `${pct}%${
-                  sec.value && sec.value !== `${pct}%` ? ` · ${sec.value}` : ""
-                }`;
-
-          sectionEls.push(
-            v_flex()
-              .id(`ck-usage-sec-${idx}-${sIdx}`)
-              .gap(4)
-              .child(
-                h_flex()
-                  .gap(6)
-                  .items_center()
-                  .justify_between()
-                  .child(
-                    h_flex()
-                      .flex_1()
-                      .min_w(0)
-                      .gap(5)
-                      .items_center()
-                      .child(
-                        div()
-                          .text_size(11.5)
-                          .font_semibold()
-                          .text_color(t.foreground)
-                          .child(ellipsize(sec.label || "Quota", 28))
-                      )
-                      .when(Boolean(sec.model_pool), (el) =>
-                        el.child(this.badge(t, "pool", t.muted))
-                      )
-                  )
-                  .child(
-                    div()
-                      .flex_none()
-                      .text_size(11.5)
-                      .font_semibold()
-                      .text_color(col)
-                      .child(ellipsize(rightVal, 24))
-                  )
-              )
-              .child(capsuleMeter(pct, col))
-              .when(Boolean(sec.detail), (el) =>
-                el.child(
-                  div()
-                    .text_size(10.5)
-                    .text_color(t.muted)
-                    .child(ellipsize(sec.detail, 76))
-                )
-              )
-          );
-        } else if (sec.type === "text") {
-          lastGroup = null;
-          const hasMeter = sec.percent !== undefined && sec.percent !== null;
-          const col = hasMeter
-            ? severityColor(sec.severity, sec.percent)
-            : t.foreground;
-          sectionEls.push(
-            v_flex()
-              .gap(3)
-              .child(
-                h_flex()
-                  .gap(6)
-                  .items_center()
-                  .justify_between()
-                  .when(Boolean(sec.label), (el) =>
-                    el.child(
-                      div()
-                        .text_size(11)
-                        .text_color(t.muted)
-                        .child(ellipsize(sec.label, 24))
-                    )
-                  )
-                  .child(
-                    div()
-                      .text_size(11)
-                      .font_semibold()
-                      .text_color(col)
-                      .child(ellipsize(sec.value ?? "", 46))
-                  )
-              )
-              .when(hasMeter, (el) =>
-                el.child(capsuleMeter(sec.percent, col))
-              )
-          );
-        } else if (sec.type === "block") {
-          lastGroup = null;
-          const bodyLines = Array.isArray(sec.body) ? sec.body : [];
-          sectionEls.push(
-            v_flex()
-              .p(7)
-              .gap(2)
-              .rounded(6)
-              .border(1)
-              .border_color(t.border)
-              .bg(t.background)
-              .when(Boolean(sec.label), (el) =>
-                el.child(
-                  div()
-                    .text_size(10.5)
-                    .font_semibold()
-                    .text_color(t.muted)
-                    .child(ellipsize(sec.label, 34))
-                )
-              )
-              .children(
-                bodyLines.map((line) =>
-                  div()
-                    .text_size(10.5)
-                    .text_color(t.muted)
-                    .child(ellipsize(line, 74))
-                )
-              )
-          );
-        }
-      }
-
-      return v_flex()
-        .id(`ck-usage-entry-${idx}`)
-        .p(10)
-        .gap(7)
-        .rounded(10)
+    const headerIconBtn = (id, label, onClick, active = false) =>
+      h_flex()
+        .id(id)
+        .flex_none()
+        .h(24)
+        .w(24)
+        .items_center()
+        .justify_center()
+        .rounded(6)
         .border(1)
-        .border_color(borderCol)
-        .bg(t.surface)
-        .child(
-          h_flex()
-            .gap(6)
-            .items_center()
-            .justify_between()
-            .child(
-              h_flex()
-                .flex_1()
-                .min_w(0)
-                .gap(6)
-                .items_center()
-                .child(
-                  this.pillBadge(
-                    t,
-                    shortTag,
-                    isErr ? t.blocked : isPrimary ? t.accent : t.done
-                  )
-                )
-                .child(
-                  div()
-                    .text_size(12.5)
-                    .font_semibold()
-                    .text_color(t.foreground)
-                    .child(ellipsize(titleText, 24))
-                )
-                .when(Boolean(entry?.plan), (el) =>
-                  el.child(this.badge(t, ellipsize(entry.plan, 16), t.accent))
-                )
-            )
-            .child(
-              h_flex()
-                .flex_none()
-                .gap(4)
-                .items_center()
-                .when(Boolean(entry?.stale), (el) =>
-                  el.child(this.badge(t, "STALE", t.working))
-                )
-                .when(isErr, (el) =>
-                  el.child(this.badge(t, "ERROR", t.blocked))
-                )
-            )
+        .border_color(
+          active ? withAlpha(t.accent, "88", t.accent) : t.border
         )
-        .when(Boolean(entry?.activity), (el) =>
-          el.child(
-            div()
-              .text_size(10.5)
-              .text_color(t.accent)
-              .child(
-                `⚡ ${entry.activity.working ?? 0} working · ${entry.activity.waiting ?? 0} waiting`
-              )
-          )
-        )
-        .when(Boolean(entry?.error), (el) =>
-          el.child(
-            v_flex()
-              .p(8)
-              .gap(6)
-              .rounded(6)
-              .border(1)
-              .border_color(withAlpha(t.blocked, "66", t.blocked))
-              .bg(withAlpha(t.blocked, "18", t.background))
-              .child(
-                div()
-                  .text_size(11)
-                  .text_color(t.blocked)
-                  .child(ellipsize(entry.error, 180))
-              )
-              .when(Boolean(vendorMeta?.login), (el2) =>
-                el2.child(
-                  h_flex().child(
-                    this.actionBtn(
-                      t,
-                      `ck-usage-login-${idx}`,
-                      `🔑 ${vendorMeta.login}`,
-                      () =>
-                        launchTabCmd(
-                          brandKey || "login",
-                          String(vendorMeta.login).trim().split(/\s+/)
-                        )
-                    )
-                  )
-                )
-              )
-          )
-        )
-        .when(!entry?.error && sectionEls.length > 0, (el) =>
-          el.child(v_flex().gap(7).children(sectionEls))
-        );
-    };
+        .bg(active ? t.selected : t.surface)
+        .text_size(12)
+        .text_color(active ? t.accent : t.muted)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, clickCx) => clickCx.stop_propagation())
+        .on_click(onClick)
+        .child(label);
 
-    return v_flex()
-      .flex_1()
-      .min_h(0)
-      .overflow_y_scrollbar()
-      .p(12)
-      .gap(10)
-      // 1. Header Card + Actions
+    const selEntryId = String(selectedEntry?.id ?? "");
+    const selBrandKey = String(
+      selectedEntry?.brand || selEntryId.split("@")[0] || ""
+    );
+    const selVendorMeta = vendorById.get(selBrandKey);
+
+    const rawSections =
+      Array.isArray(selectedEntry?.sections) && selectedEntry.sections.length > 0
+        ? selectedEntry.sections
+        : (Array.isArray(selectedEntry?.metrics)
+            ? selectedEntry.metrics
+            : []
+          ).map((m) => ({
+            type: "metric",
+            ...m,
+          }));
+    const metricSections = rawSections.filter((s) => s && s.type === "metric");
+    const textSections = rawSections.filter((s) => s && s.type === "text");
+
+    let root = v_flex().id("ck-usage-popover").p(10).gap(8).bg(t.chrome);
+    if (standalone) {
+      root = root.rounded(10).border(1).border_color(t.border);
+    }
+
+    return root
+      // 1. Compact Header (`AI Usage` + [↻] [⋯] [×])
       .child(
-        v_flex()
-          .p(11)
-          .gap(8)
-          .rounded(10)
-          .border(1)
-          .border_color(t.border)
-          .bg(t.surface)
+        h_flex()
+          .gap(6)
+          .items_center()
+          .justify_between()
           .child(
             h_flex()
               .gap(6)
               .items_center()
-              .justify_between()
+              .child(div().text_size(13).text_color(t.accent).child("🧠"))
               .child(
                 div()
                   .text_size(12.5)
                   .font_semibold()
                   .text_color(t.foreground)
-                  .child("📊 AI USAGEBAR · LIMITES & COTAS")
+                  .child("AI Usage")
               )
-              .child(this.pillBadge(t, statusBadgeText, statusBadgeColor))
-          )
-          .when(
-            Boolean(usageSnap?.primary || usageSnap?.fetched_at_secs),
-            (el) =>
-              el.child(
-                div()
-                  .text_size(11)
-                  .text_color(t.muted)
-                  .child(
-                    [
-                      usageSnap?.primary ? `primário: ${usageSnap.primary}` : null,
-                      usageSnap?.fetched_at_secs
-                        ? `atualizado ${formatTimestamp(usageSnap.fetched_at_secs)}`
-                        : null,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")
-                  )
+              .when(Boolean(selectedEntry?.stale), (el) =>
+                el.child(this.badge(t, "STALE", t.working))
               )
           )
           .child(
             h_flex()
-              .gap(6)
-              .flex_wrap()
+              .flex_none()
+              .gap(4)
+              .items_center()
               .child(
-                this.actionBtn(
-                  t,
+                headerIconBtn(
                   "ck-usage-refresh",
-                  this.fetchingUsage ? "↻ Atualizando…" : "↻ Atualizar",
-                  (_e, cx) => this.fetchUsageSnapshot(cx, true, false),
-                  true
+                  isFetching ? "…" : "↻",
+                  (_e, clickCx) =>
+                    this.fetchUsageSnapshot(clickCx ?? cx, true, false)
                 )
               )
               .child(
-                this.actionBtn(
-                  t,
-                  "ck-usage-detect",
-                  "🔍 Detectar Contas",
-                  (_e, cx) => this.fetchUsageSnapshot(cx, true, true)
+                headerIconBtn(
+                  "ck-usage-more",
+                  "⋯",
+                  (_e, clickCx) => {
+                    this.usageMenuOpen = !this.usageMenuOpen;
+                    (clickCx ?? cx)?.notify();
+                  },
+                  Boolean(this.usageMenuOpen)
                 )
               )
-              .when(usageSnap?.installed !== false, (el) =>
-                el.child(
-                  this.actionBtn(t, "ck-usage-tui", "🖥 Abrir TUI", () =>
-                    launchTabCmd("ai-usagebar", [
-                      usageSnap?.tui_binary_path || "ai-usagebar-tui",
-                    ])
-                  )
+              .child(
+                headerIconBtn("ck-usage-close", "×", (_e, clickCx) =>
+                  this.closeUsagePopup(clickCx ?? cx)
                 )
               )
           )
       )
-      // 2. 2x2 KPI Cards
-      .when(usageSnap?.installed !== false, (el) =>
+      // 2. Quick Actions Menu (`⋯`)
+      .when(Boolean(this.usageMenuOpen), (el) =>
         el.child(
-          v_flex()
-            .gap(8)
+          h_flex()
+            .gap(6)
+            .flex_wrap()
+            .items_center()
             .child(
-              h_flex()
-                .gap(8)
-                .child(
-                  kpiCard(
-                    "CONTAS ATIVAS",
-                    `${readyCount} / ${entries.length}`,
-                    errorCount > 0 ? `${errorCount} com erro` : "ai-usagebar",
-                    t.foreground
-                  )
-                )
-                .child(
-                  kpiCard(
-                    "MAIOR USO",
-                    entries.length > 0 ? `${maxPct}%` : "—",
-                    maxLabel,
-                    entries.length > 0
-                      ? severityColor(maxSeverity, maxPct)
-                      : t.muted
-                  )
-                )
+              this.actionBtn(
+                t,
+                "ck-usage-detect",
+                "🔍 Detectar Contas",
+                (_e, clickCx) => {
+                  this.usageMenuOpen = false;
+                  this.fetchUsageSnapshot(clickCx ?? cx, true, true);
+                },
+                true
+              )
             )
-            .child(
-              h_flex()
-                .gap(8)
-                .child(
-                  kpiCard(
-                    "ALERTAS / ERROS",
-                    `${alertEntries.length}`,
-                    alertEntries.length > 0
-                      ? ">= 80% ou falha"
-                      : "cotas saudáveis",
-                    alertEntries.length > 0 ? t.blocked : t.done
-                  )
-                )
-                .child(
-                  kpiCard(
-                    "PROVEDORES",
-                    `${enabledVendorsCount} / ${vendors.length}`,
-                    "habilitados no catálogo",
-                    t.accent
-                  )
-                )
+            .when(usageSnap?.installed !== false, (el2) =>
+              el2.child(
+                this.actionBtn(t, "ck-usage-tui", "🖥 Abrir TUI", () => {
+                  this.usageMenuOpen = false;
+                  launchTabCmd("ai-usagebar", [
+                    usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                  ]);
+                })
+              )
+            )
+            .when(Boolean(selVendorMeta?.login), (el2) =>
+              el2.child(
+                this.actionBtn(t, "ck-usage-menu-login", "🔑 Login", () => {
+                  this.usageMenuOpen = false;
+                  launchTabCmd(
+                    selBrandKey || "login",
+                    String(selVendorMeta.login).trim().split(/\s+/)
+                  );
+                })
+              )
             )
         )
       )
-      // 3. Filter Switcher
-      .when(usageSnap?.installed !== false, (el) =>
+      // 3. Provider Sub-tabs (one selected account at a time)
+      .when(usageSnap?.installed !== false && entries.length > 0, (el) =>
         el.child(
-          this.segmentedTrack(t)
-            .child(
-              this.segmentBtn(
-                t,
-                "ck-usage-flt-accounts",
-                `Contas (${entries.length})`,
-                activeFilter === "accounts",
-                (_e, cx) => {
-                  this.usageFilter = "accounts";
-                  cx.notify();
-                }
-              )
-            )
-            .child(
-              this.segmentBtn(
-                t,
-                "ck-usage-flt-alerts",
-                `Alertas (${alertEntries.length})`,
-                activeFilter === "alerts",
-                (_e, cx) => {
-                  this.usageFilter = "alerts";
-                  cx.notify();
-                },
-                alertEntries.length > 0 ? t.blocked : null
-              )
-            )
-            .child(
-              this.segmentBtn(
-                t,
-                "ck-usage-flt-catalog",
-                `Catálogo (${vendors.length})`,
-                activeFilter === "catalog",
-                (_e, cx) => {
-                  this.usageFilter = "catalog";
-                  cx.notify();
-                }
-              )
+          h_flex()
+            .gap(6)
+            .flex_wrap()
+            .items_center()
+            .children(
+              entries.map((entry, idx) => {
+                const isSel = entry?.id === selectedEntry?.id;
+                const tabName = ellipsize(
+                  entry?.display_name || entry?.name || entry?.id || "AI",
+                  16
+                );
+                const icon = usageVendorIcon(entry);
+                return h_flex()
+                  .id(`ck-usage-tab-${idx}`)
+                  .flex_none()
+                  .h(24)
+                  .px(8)
+                  .gap(4)
+                  .items_center()
+                  .justify_center()
+                  .rounded(6)
+                  .border(1)
+                  .border_color(
+                    isSel ? withAlpha(t.accent, "99", t.accent) : t.border
+                  )
+                  .bg(isSel ? t.selected : t.surface)
+                  .text_size(11)
+                  .font_semibold()
+                  .text_color(isSel ? t.accent : t.muted)
+                  .cursor_pointer()
+                  .hover((s) =>
+                    s
+                      .bg(isSel ? t.selected : t.hover)
+                      .text_color(t.foreground)
+                  )
+                  .on_mouse_down("left", (_e, clickCx) =>
+                    clickCx.stop_propagation()
+                  )
+                  .on_click((_e, clickCx) => {
+                    this.selectedUsageEntryId = entry?.id ?? null;
+                    setShared("cockpit.usageEntryId", this.selectedUsageEntryId);
+                    (clickCx ?? cx)?.notify();
+                  })
+                  .child(`${icon} ${tabName}`);
+              })
             )
         )
       )
       // 4. Missing Binary State
       .when(Boolean(usageSnap && !usageSnap.installed), (el) =>
         el.child(
-          this.cardBox(t)
+          v_flex()
+            .p(10)
+            .gap(6)
             .rounded(10)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.surface)
             .child(
               div()
-                .text_size(12)
+                .text_size(11.5)
                 .font_semibold()
                 .text_color(t.blocked)
                 .child("ai-usagebar não encontrado")
             )
             .child(
               div()
-                .text_size(11.5)
+                .text_size(10.5)
                 .text_color(t.muted)
                 .child(
-                  usageSnap?.error ||
-                    "Instale o binário ai-usagebar para ler cotas das suas contas."
+                  ellipsize(
+                    usageSnap?.error ||
+                      "Instale ai-usagebar para visualizar os limites.",
+                    110
+                  )
                 )
             )
             .child(
@@ -3819,7 +3669,7 @@ export default class CockpitMod extends View {
                   this.actionBtn(
                     t,
                     "ck-usage-inst-binstall",
-                    "Instalar (cargo binstall)",
+                    "cargo binstall",
                     () =>
                       launchTabCmd("install-usagebar", [
                         "cargo",
@@ -3830,202 +3680,239 @@ export default class CockpitMod extends View {
                   )
                 )
                 .child(
-                  this.actionBtn(
-                    t,
-                    "ck-usage-inst-yay",
-                    "Instalar (yay AUR)",
-                    () =>
-                      launchTabCmd("install-usagebar", [
-                        "yay",
-                        "-S",
-                        "ai-usagebar-bin",
-                      ])
+                  this.actionBtn(t, "ck-usage-inst-yay", "yay AUR", () =>
+                    launchTabCmd("install-usagebar", [
+                      "yay",
+                      "-S",
+                      "ai-usagebar-bin",
+                    ])
                   )
                 )
             )
         )
       )
-      // 5. Loading / No enabled vendors state
-      .when(!usageSnap && this.fetchingUsage, (el) =>
+      // 5. Loading State
+      .when(!usageSnap && isFetching, (el) =>
         el.child(
-          this.cardBox(t)
+          v_flex()
+            .p(10)
             .rounded(10)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.surface)
             .child(
               div()
-                .text_size(12)
+                .text_size(11.5)
                 .text_color(t.muted)
-                .child("Consultando limites e contas do ai-usagebar…")
+                .child("Consultando limites no ai-usagebar…")
             )
         )
       )
-      .when(
-        Boolean(
-          usageSnap?.installed &&
-            activeFilter !== "catalog" &&
-            shownEntries.length === 0
-        ),
-        (el) =>
-          el.child(
-            this.cardBox(t)
-              .rounded(10)
-              .child(
-                div()
-                  .text_size(12)
-                  .font_semibold()
-                  .text_color(t.foreground)
-                  .child(
-                    activeFilter === "alerts"
-                      ? "Nenhuma conta em alerta ou erro."
-                      : "Nenhuma conta habilitada no ai-usagebar."
+      // 6. Empty State (installed, 0 entries)
+      .when(Boolean(usageSnap?.installed && entries.length === 0), (el) =>
+        el.child(
+          v_flex()
+            .p(10)
+            .gap(6)
+            .rounded(10)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.surface)
+            .child(
+              div()
+                .text_size(11.5)
+                .font_semibold()
+                .text_color(t.foreground)
+                .child("Nenhuma conta habilitada no ai-usagebar.")
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .flex_wrap()
+                .child(
+                  this.actionBtn(
+                    t,
+                    "ck-usage-empty-detect",
+                    "🔍 Detectar Contas",
+                    (_e, clickCx) =>
+                      this.fetchUsageSnapshot(clickCx ?? cx, true, true),
+                    true
                   )
-              )
-              .when(
-                Boolean(usageSnap?.error && activeFilter === "accounts"),
-                (el2) =>
-                  el2.child(
+                )
+                .child(
+                  this.actionBtn(t, "ck-usage-empty-tui", "⚙ Abrir TUI", () =>
+                    launchTabCmd("ai-usagebar", [
+                      usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                    ])
+                  )
+                )
+            )
+        )
+      )
+      // 7. Single Selected Account Card
+      .when(Boolean(usageSnap?.installed && selectedEntry), (el) =>
+        el.child(
+          v_flex()
+            .p(10)
+            .gap(9)
+            .rounded(10)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.surface)
+            .when(Boolean(selectedEntry?.error), (el2) =>
+              el2.child(
+                v_flex()
+                  .gap(6)
+                  .child(
                     div()
                       .text_size(11)
-                      .text_color(t.muted)
-                      .child(ellipsize(usageSnap.error, 160))
+                      .text_color(t.blocked)
+                      .child(ellipsize(selectedEntry.error, 140))
+                  )
+                  .when(Boolean(selVendorMeta?.login), (el3) =>
+                    el3.child(
+                      h_flex().child(
+                        this.actionBtn(
+                          t,
+                          "ck-usage-entry-login",
+                          `🔑 ${selVendorMeta.login}`,
+                          () =>
+                            launchTabCmd(
+                              selBrandKey || "login",
+                              String(selVendorMeta.login).trim().split(/\s+/)
+                            )
+                        )
+                      )
+                    )
                   )
               )
-              .when(activeFilter === "accounts", (el2) =>
-                el2.child(
-                  h_flex()
-                    .gap(6)
-                    .flex_wrap()
-                    .child(
-                      this.actionBtn(
-                        t,
-                        "ck-usage-empty-detect",
-                        "🔍 Detectar Contas Localmente",
-                        (_e, cx) => this.fetchUsageSnapshot(cx, true, true),
-                        true
-                      )
+            )
+            .when(!selectedEntry?.error && metricSections.length > 0, (el2) =>
+              el2.children(
+                metricSections.map((sec, mIdx) => {
+                  const rawPct = Number(sec?.percent ?? 0);
+                  const pct = Math.max(
+                    0,
+                    Math.min(
+                      100,
+                      Number.isFinite(rawPct) ? Math.round(rawPct) : 0
                     )
-                    .child(
-                      this.actionBtn(
-                        t,
-                        "ck-usage-empty-tui",
-                        "⚙ Configurar no TUI",
-                        () =>
-                          launchTabCmd("ai-usagebar", [
-                            usageSnap?.tui_binary_path || "ai-usagebar-tui",
-                          ])
-                      )
-                    )
-                )
-              )
-          )
-      )
-      // 6. Entries Cards
-      .when(
-        Boolean(usageSnap?.installed && activeFilter !== "catalog"),
-        (el) => el.children(shownEntries.map(renderEntryCard))
-      )
-      // 7. Catalog Tab (`vendors --json`)
-      .when(
-        Boolean(usageSnap?.installed && activeFilter === "catalog"),
-        (el) =>
-          el.children(
-            vendors.map((v, vIdx) => {
-              const enabled = Boolean(v?.enabled);
-              const configured = Boolean(v?.configured);
-              const needsCred = v?.needs_credential !== false;
-              return v_flex()
-                .id(`ck-usage-cat-${vIdx}`)
-                .p(9)
-                .gap(5)
-                .rounded(8)
-                .border(1)
-                .border_color(enabled ? t.accent : t.border)
-                .bg(t.background)
-                .child(
-                  h_flex()
-                    .gap(6)
-                    .items_center()
-                    .justify_between()
+                  );
+                  const col = metricColor(sec?.severity, pct);
+                  const rightVal =
+                    sec?.headline === "value" && sec?.value
+                      ? `${sec.value} (${pct}%)`
+                      : `${pct}%`;
+                  const {
+                    elapsedPct,
+                    resetText,
+                    pacingText,
+                    isOver,
+                    fallbackDetail,
+                  } = parseMetricFooter(sec);
+                  const leftFooter = resetText
+                    ? `⏱ ${resetText}`
+                    : fallbackDetail || "";
+                  const rightFooter = pacingText
+                    ? `${isOver ? "⚠" : "✓"} ${pacingText}`
+                    : "";
+
+                  return v_flex()
+                    .id(`ck-usage-metric-${mIdx}`)
+                    .gap(4)
                     .child(
                       h_flex()
-                        .flex_1()
-                        .min_w(0)
                         .gap(6)
                         .items_center()
+                        .justify_between()
                         .child(
-                          this.pillBadge(
-                            t,
-                            String(v?.short_name || v?.id || "?").toUpperCase(),
-                            enabled ? t.done : t.muted
-                          )
+                          div()
+                            .text_size(11.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(ellipsize(sec?.label || "Quota", 28))
                         )
                         .child(
                           div()
-                            .text_size(12)
+                            .flex_none()
+                            .text_size(11.5)
                             .font_semibold()
-                            .text_color(t.foreground)
-                            .child(ellipsize(v?.name || v?.id || "vendor", 24))
+                            .text_color(pct >= 80 ? col : t.foreground)
+                            .child(ellipsize(rightVal, 20))
                         )
                     )
                     .child(
-                      h_flex()
-                        .flex_none()
-                        .gap(4)
-                        .items_center()
-                        .child(
-                          this.badge(
-                            t,
-                            enabled ? "ENABLED" : "OFF",
-                            enabled ? t.done : t.muted
-                          )
-                        )
-                        .when(needsCred, (el2) =>
-                          el2.child(
-                            this.badge(
-                              t,
-                              configured ? "CONFIGURED" : "NO CREDS",
-                              configured ? t.accent : t.working
-                            )
-                          )
+                      v_flex()
+                        .gap(2)
+                        .child(progressBar24(pct, col, 5, 3, "66"))
+                        .when(elapsedPct !== null, (el3) =>
+                          el3.child(progressBar24(elapsedPct, t.muted, 2, 1, "30"))
                         )
                     )
-                )
-                .when(Boolean(v?.env || v?.login || v?.kind), (el2) =>
-                  el2.child(
+                    .when(Boolean(leftFooter || rightFooter), (el3) =>
+                      el3.child(
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .justify_between()
+                          .child(
+                            div()
+                              .text_size(10.5)
+                              .text_color(t.muted)
+                              .child(ellipsize(leftFooter, 36))
+                          )
+                          .child(
+                            div()
+                              .flex_none()
+                              .text_size(10.5)
+                              .text_color(isOver ? t.working : t.muted)
+                              .child(ellipsize(rightFooter, 24))
+                          )
+                      )
+                    );
+                })
+              )
+            )
+            .when(
+              !selectedEntry?.error &&
+                metricSections.length === 0 &&
+                textSections.length > 0,
+              (el2) =>
+                el2.children(
+                  textSections.slice(0, 4).map((sec) =>
                     h_flex()
                       .gap(6)
                       .items_center()
                       .justify_between()
                       .child(
                         div()
-                          .text_size(10.5)
+                          .text_size(11)
                           .text_color(t.muted)
-                          .child(
-                            [
-                              v?.kind ? `auth: ${v.kind}` : null,
-                              v?.env ? `env: ${v.env}` : null,
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")
-                          )
+                          .child(ellipsize(sec?.label || "Info", 22))
                       )
-                      .when(Boolean(v?.login), (el3) =>
-                        el3.child(
-                          this.actionBtn(
-                            t,
-                            `ck-usage-cat-login-${vIdx}`,
-                            `🔑 ${ellipsize(v.login, 18)}`,
-                            () =>
-                              launchTabCmd(
-                                String(v.id || "login"),
-                                String(v.login).trim().split(/\s+/)
-                              )
-                          )
-                        )
+                      .child(
+                        div()
+                          .text_size(11)
+                          .font_semibold()
+                          .text_color(t.foreground)
+                          .child(ellipsize(sec?.value ?? "", 34))
                       )
                   )
-                );
-            })
-          )
+                )
+            )
+            .when(
+              !selectedEntry?.error &&
+                metricSections.length === 0 &&
+                textSections.length === 0,
+              (el2) =>
+                el2.child(
+                  div()
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .child("Sem métricas reportadas para esta conta.")
+                )
+            )
+        )
       );
   }
 
@@ -4047,8 +3934,13 @@ export default class CockpitMod extends View {
       (addr && this.inspectCache[addr]?.agent) ||
       (snap?.agents ?? []).find((a) => a.address === agent?.address) ||
       agent;
-    const activeView =
+    const rawView =
       shared("cockpit.viewMode") || this.inspectorTab || "inspector";
+    const activeView = rawView === "usage" ? "inspector" : rawView;
+    const usageOpen = Boolean(shared("cockpit.usageOpen") ?? this.usageOpen);
+    const usageOnlyDrawer = Boolean(
+      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
+    );
 
     const supAgent =
       (supSnap?.agents ?? []).find((a) => a.agent_id === agent?.address) ??
@@ -4156,6 +4048,18 @@ export default class CockpitMod extends View {
             ? t.blocked
             : t.muted;
 
+    if (usageOpen && usageOnlyDrawer) {
+      return v_flex()
+        .id("ck-inspector-root")
+        .size_full()
+        .track_focus(this.handle)
+        .text_color(t.foreground)
+        .justify_end()
+        .on_key_down((e, cx) => this.handleKeyDown(e, cx, agent))
+        .child(div().flex_1())
+        .child(this.renderUsagePopover(cx, t, true));
+    }
+
     return v_flex()
       .id("ck-inspector-root")
       .size_full()
@@ -4182,30 +4086,12 @@ export default class CockpitMod extends View {
               .child(
                 this.segmentBtn(
                   t,
-                  "ck-ins-tab-usage",
-                  "📊 Uso",
-                  activeView === "usage",
-                  (_e, cx) => {
-                    setShared("cockpit.viewMode", "usage");
-                    this.inspectorTab = "usage";
-                    if (
-                      !this.usageSnap ||
-                      Date.now() - (this.usageFetchedAtMs ?? 0) > 60000
-                    ) {
-                      this.fetchUsageSnapshot(cx, false, false);
-                    }
-                    cx.notify();
-                  }
-                )
-              )
-              .child(
-                this.segmentBtn(
-                  t,
                   "ck-ins-tab-home",
                   "🏠 Home",
                   activeView === "home",
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "home");
+                    setShared("cockpit.usageOnlyDrawer", false);
                     this.inspectorTab = "home";
                     this.fetchHomeSnapshot(cx);
                     cx.notify();
@@ -4220,6 +4106,7 @@ export default class CockpitMod extends View {
                   activeView === "inspector",
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "inspector");
+                    setShared("cockpit.usageOnlyDrawer", false);
                     this.inspectorTab = "inspector";
                     this.refreshInspector(cx);
                     cx.notify();
@@ -4234,6 +4121,7 @@ export default class CockpitMod extends View {
                   activeView === "doctor",
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "doctor");
+                    setShared("cockpit.usageOnlyDrawer", false);
                     this.inspectorTab = "doctor";
                     if (!this.doctorReport) this.runDoctorCheck(cx);
                     cx.notify();
@@ -4247,14 +4135,19 @@ export default class CockpitMod extends View {
               this.refreshCockpit(cx, true);
               this.refreshInspector(cx);
               this.fetchHomeSnapshot(cx);
-              if (activeView === "usage") this.fetchUsageSnapshot(cx, true, false);
+              if (usageOpen) this.fetchUsageSnapshot(cx, true, false);
               if (activeView === "doctor") this.runDoctorCheck(cx);
             })
           )
           .child(
-            this.actionBtn(t, "ck-ins-close", "×", () =>
-              run("layout.hide", { id: "cockpit-inspector" })
-            )
+            this.actionBtn(t, "ck-ins-close", "×", () => {
+              this.usageOpen = false;
+              this.usageOnlyDrawer = false;
+              this.usageMenuOpen = false;
+              setShared("cockpit.usageOpen", false);
+              setShared("cockpit.usageOnlyDrawer", false);
+              run("layout.hide", { id: "cockpit-inspector" });
+            })
           )
       )
       .when(Boolean(this.note), (el) =>
@@ -4281,9 +4174,6 @@ export default class CockpitMod extends View {
                 .child("dismiss")
             )
         )
-      )
-      .when(activeView === "usage", (el) =>
-        el.child(this.renderUsageBody(cx, t))
       )
       .when(activeView === "home", (el) =>
         el.child(this.renderHomeBody(cx, t))
@@ -5289,6 +5179,15 @@ export default class CockpitMod extends View {
                 )
             )
         )
+      )
+      .when(usageOpen, (el) =>
+        el.child(
+          v_flex()
+            .flex_none()
+            .border_t(1)
+            .border_color(t.border)
+            .child(this.renderUsagePopover(cx, t, false))
+        )
       );
   }
 
@@ -5317,8 +5216,13 @@ export default class CockpitMod extends View {
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
-    const rightView =
+    const onlyUsage = Boolean(
+      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
+    );
+    const usageOpen = Boolean(shared("cockpit.usageOpen") ?? this.usageOpen);
+    const rawView =
       shared("cockpit.viewMode") || this.inspectorTab || "inspector";
+    const rightView = rawView === "usage" ? "inspector" : rawView;
     const mac = win()?.platform === "macos";
     const b = keys().find(
       (k) => k.section === "global" && k.action === "app.palette"
@@ -5329,7 +5233,11 @@ export default class CockpitMod extends View {
       div()
         .id(id)
         .cursor_pointer()
-        .text_color(!inspectorHidden && rightView === tab ? t.accent : t.muted)
+        .text_color(
+          !inspectorHidden && !onlyUsage && rightView === tab
+            ? t.accent
+            : t.muted
+        )
         .hover((s) => s.text_color(t.foreground))
         .on_click((_e, clickCx) => this.openDrawerView(clickCx ?? cx, tab, true))
         .child(label);
@@ -5407,7 +5315,15 @@ export default class CockpitMod extends View {
       )
       .child(div().flex_1())
       // Right side: Quick view links
-      .child(viewLink("ck-status-usage", "Uso", "usage"))
+      .child(
+        div()
+          .id("ck-status-usage")
+          .cursor_pointer()
+          .text_color(!inspectorHidden && usageOpen ? t.accent : t.muted)
+          .hover((s) => s.text_color(t.foreground))
+          .on_click((_e, clickCx) => this.toggleUsagePopup(clickCx ?? cx))
+          .child("Uso")
+      )
       .child(div().text_color(t.dim).child("·"))
       .child(viewLink("ck-status-home", "Home", "home"))
       .child(div().text_color(t.dim).child("·"))
