@@ -171,6 +171,10 @@ impl AgentDurableState {
 pub struct DurableStateStore {
     pub mode: SupervisorMode,
     pub agents: BTreeMap<String, AgentDurableState>,
+    #[serde(default)]
+    pub zero_active_since: Option<u64>,
+    #[serde(default)]
+    pub model_loaded: bool,
     #[serde(skip)]
     file_path: PathBuf,
 }
@@ -200,6 +204,7 @@ impl DurableStateStore {
             mode: SupervisorMode::SemiAuto,
             agents: BTreeMap::new(),
             file_path: primary,
+            ..Default::default()
         })
     }
 
@@ -220,6 +225,7 @@ impl DurableStateStore {
                         mode: SupervisorMode::SemiAuto,
                         agents,
                         file_path: save_path,
+                        ..Default::default()
                     });
                 }
             }
@@ -228,6 +234,7 @@ impl DurableStateStore {
             mode: SupervisorMode::SemiAuto,
             agents: BTreeMap::new(),
             file_path: save_path,
+            ..Default::default()
         })
     }
 

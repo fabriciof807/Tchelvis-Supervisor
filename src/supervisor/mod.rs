@@ -51,9 +51,22 @@ pub fn run_tui() -> Result<()> {
 /// Executes a single deterministic watcher tick and returns the updated snapshot and tick outcome.
 pub fn run_tick_once() -> Result<OnceOutput> {
     let mut engine = build_default_engine()?;
-    let tick_outcome = engine.tick(unix_now_secs())?;
+    let mut tick_outcome = engine.tick(unix_now_secs())?;
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    if tick_outcome.active_sessions == 0 {
+        if snapshot.model_loaded {
+            let _ = engine.cognitive.unload_model();
+            engine.model_loaded = false;
+            engine.store.model_loaded = false;
+            let _ = engine.store.save();
+            snapshot.model_loaded = false;
+            tick_outcome.model_unloaded = true;
+            enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+        }
+        snapshot.runtime_status = SupervisorRuntimeStatus::Idle;
+        snapshot.pill_text = SupervisorRuntimeStatus::Idle.pill_text();
+    }
     Ok(OnceOutput {
         snapshot,
         tick_outcome,

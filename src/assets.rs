@@ -71,7 +71,7 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         (
             PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
             if command -v hc >/dev/null 2>&1; then
-                hc label "$HC_TERMINAL_ID" "cockpit.state=idle" >/dev/null 2>&1
+                hc label "$HC_TERMINAL_ID" "cockpit.agent=" "cockpit.state=" "cockpit.kind=" "cockpit.msg=" >/dev/null 2>&1
             fi
         ) &!
         if [ -w /dev/tty ]; then

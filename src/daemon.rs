@@ -224,7 +224,7 @@ pub async fn run_daemon(
     let mut git_head_cache: BTreeMap<String, String> = BTreeMap::new();
 
     let mut worktree_tick = tokio::time::interval(Duration::from_secs(2));
-    let mut reconcile_tick = tokio::time::interval(Duration::from_secs(90));
+    let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
 
     loop {
         let has_event_stream = event_child_and_reader.is_some();
@@ -417,6 +417,11 @@ async fn handle_ipc_client(
             let snap = if req.include_all {
                 collect_once(&cfg, &paths, &store, &herdr, &coord, true, false).await?
             } else {
+                let stale = chrono::Utc::now().timestamp() - shared_snap.read().await.generated_at >= 2;
+                if stale {
+                    let _ = refresh_tx.send(false).await;
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                }
                 shared_snap.read().await.clone()
             };
             let mut out = serde_json::to_string(&snap)?;

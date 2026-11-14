@@ -422,15 +422,14 @@ export function buildProjectsList(
   return list;
 }
 
-function isPlainShellRow(name, programName, labels) {
-  const agentLabel = String(labels?.["cockpit.agent"] ?? "")
-    .trim()
-    .toLowerCase();
-  if (agentLabel && agentLabel !== "shell") {
-    return false;
-  }
-  const rawProg = String(programName ?? "").trim().toLowerCase();
-  const baseProg = rawProg.split(/[\\/]/).pop().replace(/^-/, "");
+function isPlainShellRow(name, programName, labels, term = null) {
+  const norm = (val) =>
+    String(val ?? "")
+      .trim()
+      .toLowerCase()
+      .split(/[\\/]/)
+      .pop()
+      .replace(/^-/, "");
   const plainShells = new Set([
     "zsh",
     "bash",
@@ -444,6 +443,45 @@ function isPlainShellRow(name, programName, labels) {
     "herdr-supervisor",
     "cockpit-supervisor",
   ]);
+  const fgShells = new Set(["zsh", "bash", "fish", "sh", "nu", "nushell", "dash"]);
+  const knownAgents = new Set([
+    "claude",
+    "claude-code",
+    "claudecode",
+    "opencode",
+    "pi",
+    "codex",
+    "aider",
+    "goose",
+    "cursor",
+    "cursor-agent",
+    "amp",
+  ]);
+
+  const fgName = norm(term?.foreground?.name);
+  if (fgName && fgShells.has(fgName)) {
+    const fgArgv = Array.isArray(term?.foreground?.argv)
+      ? term.foreground.argv
+      : [];
+    const hasKnownAgentArg = fgArgv.some((arg) => knownAgents.has(norm(arg)));
+    const stState = String(term?.status?.state ?? "").trim().toLowerCase();
+    const stApp = norm(term?.status?.app);
+    const hasActiveNonShellStatus =
+      ["working", "blocked", "done", "error"].includes(stState) &&
+      Boolean(stApp) &&
+      !plainShells.has(stApp);
+    if (!hasKnownAgentArg && !hasActiveNonShellStatus) {
+      return true;
+    }
+  }
+
+  const agentLabel = String(labels?.["cockpit.agent"] ?? "")
+    .trim()
+    .toLowerCase();
+  if (agentLabel && agentLabel !== "shell") {
+    return false;
+  }
+  const baseProg = norm(programName);
   if (baseProg && plainShells.has(baseProg)) {
     return true;
   }
@@ -457,6 +495,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
   const supMap = new Map(
     (supSnap?.agents ?? []).map((a) => [a.agent_id, a])
   );
+  const hasLiveTermList = Array.isArray(allTerminals) && allTerminals.length > 0;
   const termMap = new Map(allTerminals.map((t) => [t.address, t]));
   const seen = new Set();
   const rows = [];
@@ -474,10 +513,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       a.address;
     const rowProgram = a.program ?? term.program;
     const rowLabels = term?.labels ?? {};
-    if (
-      !snapMap.has(a.address) &&
-      isPlainShellRow(rawName, rowProgram, rowLabels)
-    ) {
+    if (isPlainShellRow(rawName, rowProgram, rowLabels, term)) {
       continue;
     }
     seen.add(a.address);
@@ -492,6 +528,8 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       enriched?.agent_kind
     );
     const displayName = resolveDisplayName(rawName, projectName, a.address);
+    const isFinished =
+      term?.state === "finished" || enriched?.lifecycle?.state === "finished";
     const baseStatus =
       a.status && a.status !== "idle"
         ? a.status
@@ -499,7 +537,11 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
             enriched.attention_state.state !== "idle"
           ? enriched.attention_state.state
           : rowLabels?.["cockpit.state"] || a.status || "idle";
-    const status = sup?.action_card ? "blocked" : baseStatus;
+    const status = isFinished
+      ? "done"
+      : sup?.action_card
+        ? "blocked"
+        : baseStatus;
     rows.push({
       address: a.address,
       pane: a.pane ?? pane?.pane ?? null,
@@ -509,11 +551,12 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       project_name: projectName,
       program_label: programLabel,
       status,
-      kind:
-        enriched?.attention_state?.kind ??
-        term?.report?.kind ??
-        term?.status?.kind ??
-        (sup?.action_card ? "permission" : null),
+      kind: isFinished
+        ? null
+        : enriched?.attention_state?.kind ??
+          term?.report?.kind ??
+          term?.status?.kind ??
+          (sup?.action_card ? "permission" : null),
       message:
         enriched?.attention_state?.message ??
         term?.report?.msg ??
@@ -530,12 +573,12 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: enriched?.correlation_tier ?? null,
       context: enriched?.context ?? null,
       blocked_children: enriched?.blocked_children ?? [],
-      lifecycle: { state: "live" },
+      lifecycle: isFinished ? { state: "finished" } : { state: "live" },
       focused: Boolean(a.focused),
       pinned: Boolean(a.pinned),
       seq: a.seq ?? 0,
       sup_lifecycle: sup?.lifecycle_state ?? null,
-      action_card: sup?.action_card ?? null,
+      action_card: isFinished ? null : (sup?.action_card ?? null),
       audit_badge: sup?.audit_badge ?? null,
       auto_reply_log: sup?.auto_reply_log ?? [],
       rolling_summary: sup?.rolling_summary ?? null,
@@ -545,13 +588,19 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
 
   for (const sa of snap?.agents ?? []) {
     if (seen.has(sa.address)) continue;
-    seen.add(sa.address);
+    if (hasLiveTermList && !termMap.has(sa.address)) continue;
     const term = termMap.get(sa.address) ?? {};
     const sup = supMap.get(sa.address) ?? null;
     const rawName = sa.name || sup?.session_name || sa.address;
+    const rowLabels = term?.labels ?? {};
+    const isFinished =
+      sa?.lifecycle?.state === "finished" || term?.state === "finished";
+    if (!isFinished && isPlainShellRow(rawName, term.program, rowLabels, term)) {
+      continue;
+    }
+    seen.add(sa.address);
     const resolvedCwd = sa?.workspace?.cwd ?? term?.cwd ?? null;
     const projectName = extractRepoName(resolvedCwd, "") || rawName;
-    const rowLabels = term?.labels ?? {};
     const programLabel = resolveProgramName(
       term.program,
       rowLabels,
@@ -559,7 +608,11 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     );
     const displayName = resolveDisplayName(rawName, projectName, sa.address);
     const baseStatus = sa?.attention_state?.state ?? "idle";
-    const status = sup?.action_card ? "blocked" : baseStatus;
+    const status = isFinished
+      ? "done"
+      : sup?.action_card
+        ? "blocked"
+        : baseStatus;
     rows.push({
       address: sa.address,
       pane: null,
@@ -569,9 +622,10 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       project_name: projectName,
       program_label: programLabel,
       status,
-      kind:
-        sa?.attention_state?.kind ??
-        (sup?.action_card ? "permission" : null),
+      kind: isFinished
+        ? null
+        : sa?.attention_state?.kind ??
+          (sup?.action_card ? "permission" : null),
       message:
         sa?.attention_state?.message ??
         sup?.action_card?.reason_for_operator ??
@@ -583,12 +637,14 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: sa?.correlation_tier ?? null,
       context: sa?.context ?? null,
       blocked_children: sa?.blocked_children ?? [],
-      lifecycle: sa?.lifecycle ?? { state: term.state ?? "live" },
+      lifecycle: isFinished
+        ? { state: "finished" }
+        : (sa?.lifecycle ?? { state: term.state ?? "live" }),
       focused: false,
       pinned: false,
       seq: 0,
       sup_lifecycle: sup?.lifecycle_state ?? null,
-      action_card: sup?.action_card ?? null,
+      action_card: isFinished ? null : (sup?.action_card ?? null),
       audit_badge: sup?.audit_badge ?? null,
       auto_reply_log: sup?.auto_reply_log ?? [],
       rolling_summary: sup?.rolling_summary ?? null,
@@ -598,13 +654,20 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
 
   for (const sup of supSnap?.agents ?? []) {
     if (seen.has(sup.agent_id)) continue;
+    if (hasLiveTermList && !termMap.has(sup.agent_id)) continue;
     const term = termMap.get(sup.agent_id) ?? {};
+    if (term?.state === "finished" || sup.lifecycle_state === "COMPLETED") {
+      continue;
+    }
     const rawName = sup.session_name || term.name || sup.agent_id;
     const rowProgram = term.program ?? null;
     const rowLabels = term?.labels ?? {};
+    if (isPlainShellRow(rawName, rowProgram, rowLabels, term)) {
+      continue;
+    }
     if (
-      !snapMap.has(sup.agent_id) &&
-      isPlainShellRow(rawName, rowProgram, rowLabels)
+      !liveAgents.some((a) => a.address === sup.agent_id) &&
+      !snapMap.has(sup.agent_id)
     ) {
       continue;
     }
@@ -746,11 +809,37 @@ export default class CockpitMod extends View {
     });
   }
 
-  tickSupervisor(cx) {
+  tickSupervisor(cx, force = false) {
     if (this.pollingSupervisor) return;
+    const merged = mergeFleetRows(
+      agents(),
+      terminals(),
+      shared("cockpit.snapshot"),
+      shared("supervisor.snapshot")
+    );
+    const liveMerged = merged.filter(
+      (a) => a.lifecycle?.state !== "finished" && a.state !== "finished"
+    );
+    const supSnap = shared("supervisor.snapshot");
+
+    if (!force && liveMerged.length === 0) {
+      const needsIdleCleanup =
+        Boolean(supSnap?.model_loaded) ||
+        (supSnap?.agents?.length ?? 0) > 0 ||
+        (Boolean(supSnap?.runtime_status) && supSnap?.runtime_status !== "Idle");
+      if (!needsIdleCleanup) {
+        return;
+      }
+    }
+
     this.pollingSupervisor = true;
-    setShared("supervisor.evaluating", true);
-    cx.notify();
+    if (force) {
+      setShared("supervisor.forceEvaluating", true);
+    }
+    if (force || liveMerged.length > 0) {
+      setShared("supervisor.evaluating", true);
+      cx.notify();
+    }
 
     cx.spawn(async (cx) => {
       try {
@@ -771,6 +860,7 @@ export default class CockpitMod extends View {
       } finally {
         this.pollingSupervisor = false;
         setShared("supervisor.evaluating", false);
+        setShared("supervisor.forceEvaluating", false);
         cx.notify();
       }
     });
@@ -1263,14 +1353,28 @@ export default class CockpitMod extends View {
     const t = theme();
     const supSnap = shared("supervisor.snapshot");
     const live = agents();
-    const evaluating =
-      Boolean(shared("supervisor.evaluating")) ||
-      supSnap?.runtime_status === "Evaluating";
-    const watchingCount =
-      supSnap?.runtime_status?.Watching ??
-      (supSnap?.agents?.length ?? live.length);
+    const merged = mergeFleetRows(
+      live,
+      terminals(),
+      shared("cockpit.snapshot"),
+      supSnap
+    );
+    const liveMerged = merged.filter(
+      (a) => a.lifecycle?.state !== "finished" && a.state !== "finished"
+    );
+    const isSupIdle =
+      supSnap?.runtime_status === "Idle" ||
+      supSnap?.runtime_status?.Watching === 0 ||
+      liveMerged.length === 0;
+    const watchingCount = isSupIdle
+      ? 0
+      : (supSnap?.runtime_status?.Watching ?? liveMerged.length);
     const alertCount = (supSnap?.agents ?? []).filter((a) => a.action_card).length;
-    const blockedCount = live.filter((a) => a.status === "blocked").length;
+    const blockedCount = liveMerged.filter((a) => a.status === "blocked").length;
+    const evaluating =
+      (Boolean(shared("supervisor.evaluating")) ||
+        supSnap?.runtime_status === "Evaluating") &&
+      (liveMerged.length > 0 || Boolean(shared("supervisor.forceEvaluating")));
     const activeMode = supSnap?.mode ?? "SemiAuto";
     const isPaused = activeMode === "Paused";
     const llmModel = supSnap?.llm_model || "lfm3:1.7b";
@@ -1420,7 +1524,7 @@ export default class CockpitMod extends View {
           .child(
             this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
               this.refreshCockpit(cx, true);
-              this.tickSupervisor(cx);
+              this.tickSupervisor(cx, true);
             })
           )
           .child(
@@ -1485,6 +1589,7 @@ export default class CockpitMod extends View {
     const allTerms = terminals();
     const merged = mergeFleetRows(live, allTerms, snap, supSnap);
     const parts = partitionAgents(merged);
+    const liveCount = parts.blocked.length + parts.active.length;
 
     const orderedAddrs = [
       ...parts.blocked.map((a) => a.address),
@@ -1512,10 +1617,12 @@ export default class CockpitMod extends View {
 
     const renderAgentCard = (a) => {
       const isSelected = a.address === selAddr;
-      const isBlocked = a.status === "blocked";
-      const isWorking = a.status === "working";
-      const isDone = a.status === "done" || a.lifecycle?.state === "finished";
-      const hasAlert = Boolean(a.action_card);
+      const isFinished =
+        a.lifecycle?.state === "finished" || a.state === "finished";
+      const isBlocked = !isFinished && a.status === "blocked";
+      const isWorking = !isFinished && a.status === "working";
+      const isDone = isFinished || a.status === "done";
+      const hasAlert = !isFinished && Boolean(a.action_card);
       const statusLabel = isBlocked
         ? (a.kind ?? "NEEDS YOU").toUpperCase()
         : isWorking
@@ -1720,7 +1827,7 @@ export default class CockpitMod extends View {
               .text_color(t.muted)
               .child("COCKPIT FLEET")
           )
-          .child(this.pillBadge(t, `${merged.length}`, t.accent))
+          .child(this.pillBadge(t, `${liveCount}`, t.accent))
           .child(div().flex_1())
           .child(
             this.actionBtn(
@@ -1781,7 +1888,7 @@ export default class CockpitMod extends View {
           .mx(10)
           .mt(8)
           .mb(6)
-          .child(filterSeg("all", `Todos (${merged.length})`))
+          .child(filterSeg("all", `Todos (${liveCount})`))
           .child(filterSeg("blocked", `Needs (${parts.blocked.length})`))
           .child(filterSeg("active", `Work (${parts.active.length})`))
           .child(filterSeg("finished", `Done (${parts.finished.length})`))
@@ -1794,7 +1901,11 @@ export default class CockpitMod extends View {
           .overflow_y_scrollbar()
           .py(4)
           .gap(7)
-          .when(merged.length === 0, (el) =>
+          .when(
+            liveCount === 0 &&
+              this.filterTab !== "finished" &&
+              !this.showFinished,
+            (el) =>
             el.child(
               this.cardBox(t)
                 .mx(10)
@@ -1857,6 +1968,37 @@ export default class CockpitMod extends View {
                   .child(this.showFinished ? "▾" : "▸")
               )
           )
+          .when(
+            this.filterTab === "finished" && parts.finished.length > 0,
+            (el) =>
+              el.child(
+                h_flex()
+                  .mx(10)
+                  .px(4)
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    div()
+                      .text_size(11)
+                      .text_color(t.dim)
+                      .child(`Finished (${parts.finished.length})`)
+                  )
+                  .child(
+                    this.actionBtn(
+                      t,
+                      "ck-clear-finished",
+                      "Clear Done",
+                      (_e, cx) => {
+                        const addrs = parts.finished.map((a) => a.address);
+                        if (addrs.length > 0) {
+                          hc(["rm", ...addrs]);
+                          this.refreshCockpit(cx, true);
+                        }
+                      }
+                    )
+                  )
+              )
+          )
           .children(showFinished.map(renderAgentCard))
       )
       .child(
@@ -1903,6 +2045,9 @@ export default class CockpitMod extends View {
     const allTerms = terminals();
     const liveAgents = agents();
     const mergedFleet = mergeFleetRows(liveAgents, allTerms, snap, supSnap);
+    const liveMergedFleet = mergedFleet.filter(
+      (a) => a.lifecycle?.state !== "finished" && a.state !== "finished"
+    );
 
     const projects = buildProjectsList(
       homeSnap,
@@ -2006,7 +2151,7 @@ export default class CockpitMod extends View {
               .child(
                 kpiCard(
                   "FROTA DE AGENTES",
-                  `${mergedFleet.length}`,
+                  `${liveMergedFleet.length}`,
                   `(${blockedAgentsCount} blk)`,
                   blockedAgentsCount > 0 ? t.blocked : t.foreground
                 )
@@ -3261,6 +3406,15 @@ export default class CockpitMod extends View {
                               });
                           })
                         )
+                        .child(
+                          this.actionBtn(t, "ck-ctl-kill", "Kill", (_e, cx) => {
+                            hc(["kill", agent.address]);
+                            this.note = `Killed ${agent.address}`;
+                            this.refreshCockpit(cx, true);
+                            this.tickSupervisor(cx, true);
+                            cx.notify();
+                          })
+                        )
                     )
                     .child(
                       h_flex()
@@ -3545,7 +3699,7 @@ export default class CockpitMod extends View {
                               t,
                               "ck-audit-eval",
                               "⚡ Evaluate Now",
-                              (_e, cx) => this.tickSupervisor(cx)
+                              (_e, cx) => this.tickSupervisor(cx, true)
                             )
                           )
                       )
@@ -4108,6 +4262,9 @@ export default class CockpitMod extends View {
     const snap = shared("cockpit.snapshot");
     const supSnap = shared("supervisor.snapshot");
     const merged = mergeFleetRows(list, allTerms, snap, supSnap);
+    const liveMerged = merged.filter(
+      (a) => a.lifecycle?.state !== "finished" && a.state !== "finished"
+    );
     const providers = snap?.providers ?? {};
     const activeProviders = Object.entries(providers).filter(([, ph]) => {
       const st = String(ph?.status ?? ph?.state ?? "").toLowerCase();
@@ -4116,8 +4273,8 @@ export default class CockpitMod extends View {
     const llmModel = supSnap?.llm_model || "lfm3:1.7b";
     const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
     const numGpu = supSnap?.num_gpu ?? 0;
-    const blockedCount = merged.filter((a) => a.status === "blocked").length;
-    const workingCount = merged.filter((a) => a.status === "working").length;
+    const blockedCount = liveMerged.filter((a) => a.status === "blocked").length;
+    const workingCount = liveMerged.filter((a) => a.status === "working").length;
     const modeLabel = supSnap?.mode_label ?? "Semi-Auto (Whitelist)";
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
@@ -4195,7 +4352,7 @@ export default class CockpitMod extends View {
           .text_color(t.accent)
           .child(`⎇ ${ellipsize(space?.branch ?? "main", 22)}`)
       )
-      .child(div().child(`${merged.length} agents (${workingCount} working)`))
+      .child(div().child(`${liveMerged.length} agents (${workingCount} working)`))
       .when(activeProviders.length > 0, (el) =>
         el.children(
           activeProviders.map(([prov, ph]) =>

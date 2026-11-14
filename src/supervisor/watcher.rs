@@ -53,13 +53,15 @@ pub struct WatcherEngine<H: HcBackend, C: CognitiveBackend> {
 
 impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
     pub fn new(config: SupervisorConfig, store: DurableStateStore, hc: H, cognitive: C) -> Self {
+        let zero_active_since = store.zero_active_since;
+        let model_loaded = store.model_loaded;
         Self {
             config,
             store,
             hc,
             cognitive,
-            zero_active_since: None,
-            model_loaded: false,
+            zero_active_since,
+            model_loaded,
             runtime_status: SupervisorRuntimeStatus::Idle,
         }
     }
@@ -80,7 +82,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
         if sessions.is_empty() {
             let zero_since = *self.zero_active_since.get_or_insert(now);
-            if now.saturating_sub(zero_since) >= self.config.idle_unload_secs {
+            if !self.model_loaded || now.saturating_sub(zero_since) >= self.config.idle_unload_secs {
                 if self.model_loaded {
                     let _ = self.cognitive.unload_model();
                     self.model_loaded = false;
@@ -90,6 +92,8 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             } else {
                 self.runtime_status = SupervisorRuntimeStatus::Watching(0);
             }
+            self.store.zero_active_since = self.zero_active_since;
+            self.store.model_loaded = self.model_loaded;
             self.store.save()?;
             return Ok(outcome);
         }
@@ -113,6 +117,8 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                     });
                 entry.session_name = session.session_name.clone();
             }
+            self.store.zero_active_since = self.zero_active_since;
+            self.store.model_loaded = self.model_loaded;
             self.store.save()?;
             return Ok(outcome);
         }
@@ -273,6 +279,8 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         }
 
         self.runtime_status = SupervisorRuntimeStatus::Watching(sessions.len());
+        self.store.zero_active_since = self.zero_active_since;
+        self.store.model_loaded = self.model_loaded;
         self.store.save()?;
         Ok(outcome)
     }
@@ -339,6 +347,9 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         self.cognitive.unload_model()?;
         self.model_loaded = false;
         self.runtime_status = SupervisorRuntimeStatus::Idle;
+        self.store.zero_active_since = self.zero_active_since;
+        self.store.model_loaded = self.model_loaded;
+        let _ = self.store.save();
         Ok(())
     }
 }

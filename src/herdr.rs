@@ -106,7 +106,87 @@ impl HcTerminal {
         }
     }
 
+    pub fn is_plain_shell_foreground(&self) -> bool {
+        let Some(fg) = &self.foreground else {
+            return false;
+        };
+        let normalize = |raw: &str| -> String {
+            let trimmed = raw.trim();
+            let base = std::path::Path::new(trimmed)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(trimmed);
+            base.trim_start_matches('-').to_ascii_lowercase()
+        };
+        let is_plain_shell = |name: &str| -> bool {
+            matches!(
+                normalize(name).as_str(),
+                "zsh"
+                    | "bash"
+                    | "fish"
+                    | "sh"
+                    | "nu"
+                    | "nushell"
+                    | "dash"
+                    | "ksh"
+                    | "csh"
+                    | "tcsh"
+                    | "tmux"
+                    | "screen"
+                    | "login"
+            )
+        };
+        let is_known_agent = |name: &str| -> bool {
+            matches!(
+                normalize(name).as_str(),
+                "claude"
+                    | "claude-code"
+                    | "claudecode"
+                    | "opencode"
+                    | "pi"
+                    | "codex"
+                    | "aider"
+                    | "goose"
+                    | "cursor"
+                    | "cursor-agent"
+                    | "amp"
+            )
+        };
+
+        let fg_name = fg.name.as_deref().unwrap_or("");
+        if is_plain_shell(fg_name) && !fg.argv.iter().any(|arg| is_known_agent(arg)) {
+            if let Some(st) = &self.status {
+                if matches!(st.state.as_str(), "working" | "blocked" | "done" | "error")
+                    && st
+                        .app
+                        .as_deref()
+                        .map(str::trim)
+                        .is_some_and(|app| !app.is_empty() && !is_plain_shell(app))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+        false
+    }
+
     pub fn raw_attention_state(&self, now_ms: i64) -> AttentionState {
+        if self.state == "finished" {
+            if self.exit_code.unwrap_or(0) != 0 {
+                return AttentionState::Error {
+                    message: self
+                        .reason
+                        .as_deref()
+                        .map(sanitize_terminal_text)
+                        .filter(|m| !m.is_empty()),
+                };
+            }
+            return AttentionState::Done { message: None };
+        }
+        if self.is_plain_shell_foreground() {
+            return AttentionState::Idle;
+        }
         if let Some(st) = &self.status {
             let msg = st
                 .msg
@@ -787,5 +867,23 @@ mod tests {
             tracker.effective_attention("t2", 2_700),
             AttentionState::Working { .. }
         ));
+    }
+
+    #[test]
+    fn test_finished_terminal_with_stale_blocked_label_returns_done() {
+        let mut labels = BTreeMap::new();
+        labels.insert("cockpit.state".into(), "blocked".into());
+        labels.insert("cockpit.kind".into(), "permission".into());
+        let term = HcTerminal {
+            address: "t99".into(),
+            state: "finished".into(),
+            exit_code: Some(0),
+            labels,
+            ..Default::default()
+        };
+        assert_eq!(
+            term.raw_attention_state(1_000),
+            AttentionState::Done { message: None }
+        );
     }
 }

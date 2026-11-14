@@ -440,6 +440,19 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
         }
 
         let (raw_status_state, status_app) = extract_status_fields(term.status.as_ref());
+        let fg_is_plain_shell = term.foreground.as_ref().is_some_and(|fg| {
+            fg.name.as_deref().is_some_and(is_plain_shell_program)
+                && !fg.argv.iter().any(|a| is_known_coding_agent(a))
+        });
+        let has_active_non_shell_osc = matches!(
+            raw_status_state.as_deref(),
+            Some("working") | Some("blocked") | Some("done") | Some("error") | Some("waiting")
+        ) && status_app
+            .as_deref()
+            .is_some_and(|app| !is_plain_shell_program(app));
+        if fg_is_plain_shell && !has_active_non_shell_osc {
+            continue;
+        }
         let status_state = match raw_status_state.as_deref() {
             Some(s) if !s.is_empty() && s != "idle" => raw_status_state,
             _ => term
@@ -625,5 +638,22 @@ mod tests {
                    └───────────────────────────────────────┘";
         let tail = extract_tail_lines(raw, 25).unwrap();
         assert_eq!(tail, "Running cargo test...\ntest result: ok. 42 passed");
+    }
+
+    #[test]
+    fn test_parse_hc_ls_json_filters_plain_shell_with_stale_agent_labels() {
+        let sample = r#"{
+            "terminals": [
+                {
+                    "address": "t7",
+                    "state": "live",
+                    "foreground": {"name": "zsh", "argv": ["/usr/bin/zsh"]},
+                    "status": null,
+                    "labels": {"cockpit.agent": "pi", "cockpit.state": "working"}
+                }
+            ]
+        }"#;
+        let sessions = parse_hc_ls_json(sample, None).unwrap();
+        assert!(sessions.is_empty());
     }
 }

@@ -23,6 +23,10 @@ static SLACK_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Classify `AgentKind` from explicit `cockpit.agent` label or foreground/launch process names.
 pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
+    if term.state != "finished" && term.is_plain_shell_foreground() {
+        return AgentKind::PlainShell;
+    }
+
     if let Some(lbl) = term.labels.get("cockpit.agent") {
         let lower = lbl.trim().to_ascii_lowercase();
         return match lower.as_str() {
@@ -96,11 +100,32 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
     if include_all {
         return true;
     }
+    if term.state != "finished" && term.is_plain_shell_foreground() {
+        return ["cockpit.issue", "cockpit.pr", "cockpit.slack", "cockpit.runbook"]
+            .iter()
+            .any(|k| term.labels.get(*k).is_some_and(|v| !v.trim().is_empty()));
+    }
     let kind = classify_agent_kind(term);
     if kind != AgentKind::PlainShell {
         return true;
     }
-    if term.labels.keys().any(|k| k.starts_with("cockpit.")) {
+    if term.labels.iter().any(|(k, v)| {
+        if !k.starts_with("cockpit.") || v.trim().is_empty() {
+            return false;
+        }
+        if kind == AgentKind::PlainShell {
+            let ignored = matches!(
+                k.as_str(),
+                "cockpit.state"
+                    | "cockpit.kind"
+                    | "cockpit.msg"
+                    | "cockpit.supervisor_state"
+                    | "cockpit.supervisor_decision"
+            ) || (k == "cockpit.agent" && v.trim().eq_ignore_ascii_case("shell"));
+            return !ignored;
+        }
+        true
+    }) {
         return true;
     }
     if let Some(st) = &term.status {
@@ -637,5 +662,30 @@ mod tests {
             ..Default::default()
         };
         assert!(should_include_terminal(&working_non_shell_app, false));
+    }
+
+    #[test]
+    fn test_should_include_terminal_filters_plain_shell_with_stale_agent_labels() {
+        use crate::herdr::HcForeground;
+
+        let mut labels = BTreeMap::new();
+        labels.insert("cockpit.agent".into(), "pi".into());
+        labels.insert("cockpit.state".into(), "working".into());
+        let term = HcTerminal {
+            address: "t7".into(),
+            name: Some("π - cockpit".into()),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("zsh".into()),
+                argv: vec!["/usr/bin/zsh".into()],
+                ..Default::default()
+            }),
+            status: None,
+            labels,
+            ..Default::default()
+        };
+        assert_eq!(classify_agent_kind(&term), AgentKind::PlainShell);
+        assert!(!should_include_terminal(&term, false));
+        assert!(should_include_terminal(&term, true));
     }
 }
