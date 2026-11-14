@@ -46,11 +46,15 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `2ce7dc3` — `feat(supervisor,mod): GPU toggle, LLM RAM/VRAM label, and blocked-only critical action cards`
+  - Pill da LLM mostra o consumo real (`● LLM: lfm3:1.7b (ollama · 1.2 GB RAM)` / `VRAM` quando na GPU) via `/api/ps` (`llm_ram_bytes`, `llm_vram_bytes`, `allow_gpu` no snapshot).
+  - Pill `num_gpu: 0 (CPU)` ↔ `num_gpu: all (GPU)` clicável; CLI `cockpit supervisor gpu <on|off> [--no-warm]`; persistido em `~/.local/state/cockpit/supervisor_gpu` (precedência: env `COCKPIT_ALLOW_GPU` → arquivo → TOML). Troca faz unload + warm-load. Padrão continua CPU (Zero-VRAM).
+  - `enforce_blocked_policy` (`src/supervisor/guardrails.rs`): só agentes realmente `blocked` geram Action Card; `Critical` só para comandos destrutivos detectados deterministicamente (últimas 8 linhas / payload); urgência `Critical` vinda do LLM é rebaixada para `Normal`; sem prompt pendente → sem payload; cards obsoletos são limpos no tick seguinte. `contains_forbidden_payload` respeita limites de palavra (`confirm ` não casa mais com `rm `).
+- `7a8c17b` — `fix(herdr-mod): pin top-bar mode switcher and simplify supervisor pill`
+  - Pill do supervisor mostra só `Supervisor: {Idle|Paused|Evaluating|Watching (N)}` (`min_w(196)`); clusters laterais `flex_1().min_w(0)` e central `flex_none()` → botões Semi-Auto / Alert Only / Paused / Poll Now / Unload LLM fixos no centro.
 - `3adf6b3` — `fix(fleet,supervisor): filter idle shells after agent exit, normalize finished rows, and stop idle LLM evals`
 - `0c5c727` — `fix(supervisor,mod): fix background agent selection, hc send --force, and lfm3 think:false`
 - `d414a7a` — `fix(cockpit): fix provider status field, hc connect discovery, hooks PATH, and LLM connection UI`
-- `df32ab8` — `fix(mod): replace invalid transparent color string with theme background token`
-- `56f11ae` — `feat(mod): align Herdr Cockpit Mod with Landing Page design & multi-theme support`
 
 ---
 
@@ -61,17 +65,25 @@ No terminal da máquina **host**:
 ```bash
 incus file pull ai-box/home/ubuntu/.local/bin/cockpit ~/.local/bin/cockpit && \
 chmod +x ~/.local/bin/cockpit && \
-pkill -f "cockpit daemon" 2>/dev/null || true && \
+pkill -f "cockpit daemon" 2>/dev/null; pkill -f "cockpit supervisor watch" 2>/dev/null; \
 ~/.local/bin/cockpit setup --set-default-layout && \
-~/.local/bin/cockpit supervisor tick --json && \
-~/.local/bin/cockpit status --refresh
+which -a cockpit && \
+~/.local/bin/cockpit supervisor status --json
 ```
+> ⚠️ Se `which -a cockpit` listar `~/.cargo/bin/cockpit` antes de `~/.local/bin/cockpit`, ele é um binário antigo e sombreia o novo (o mod chama `cockpit` puro). Substitua-o ou remova-o.
+
+### Alternar CPU/GPU do modelo do Supervisor
+```bash
+cockpit supervisor gpu on    # num_gpu: 99 (offload total) + warm-load
+cockpit supervisor gpu off   # num_gpu: 0 (Zero-VRAM, padrão)
+```
+> ⚠️ O daemon `cockpit supervisor watch` só lê a config ao iniciar — reinicie-o após alternar.
 
 ### Rodar Testes e Build no Container (`ai-box`)
 ```bash
 cargo test --quiet
 node --check assets/herdr-app/mods/cockpit/main.js
-cargo build --release && cp target/release/cockpit ~/.local/bin/cockpit && cockpit setup --set-default-layout
+cargo build --release && cp target/release/cockpit ~/.local/bin/cockpit && cp target/release/cockpit ~/.cargo/bin/cockpit && cockpit setup --set-default-layout
 ```
 
 ### Verificar Diagnóstico Completo (Hooks, Herdr Mod, Providers e Ollama)
@@ -83,9 +95,10 @@ cockpit supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. Validar na máquina host o ciclo completo do teste multi-agente com o novo binário (`3adf6b3`):
-   - Auto-reply instantâneo (~5s com `think: false` e `hc send --force`) em prompts seguros `(y/n)`.
-   - Bloqueio determinístico (`ALERT_OPERATOR` + Action Card no Inspector) em comandos destrutivos (`git push --force`, `rm -rf`).
-   - Clique nos cards de agentes em background (`hc run --bg`) abrindo diretamente o Inspector e permitindo `Approve`, `Ignore`, `Attach Tab` ou `Kill`.
-   - Limpeza automática para `0 agents` e `Supervisor: Idle` assim que os agentes/terminais são encerrados.
-2. Evoluir a `landing-page/` ou adicionar novos fluxos de automação/integração conforme necessidade nos testes reais.
+1. Validar no host com o binário `2ce7dc3` (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
+   - Barra superior: botões centrais fixos enquanto a pill passa por `Idle` → `Watching (3)` → `Evaluating`; consumo de RAM/VRAM aparecendo na pill da LLM.
+   - Toggle `num_gpu` na pill: carregamento na GPU real (não testado no container, sem GPU) e VRAM refletida na pill.
+   - `sim-safe` → `AUTO_REPLY` (~5s); `sim-danger` → Action Card `Critical`; agente apenas `WORKING`/aguardando subagente → **nenhum** Action Card (regressão do falso `Critical` com `HooksError`).
+   - Clique em cards de agentes em background abrindo o Inspector (`Approve`, `Ignore`, `Attach Tab`, `Kill`) e limpeza para `0 agents` / `Supervisor: Idle`.
+2. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
+3. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
