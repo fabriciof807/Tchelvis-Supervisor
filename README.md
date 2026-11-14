@@ -172,65 +172,102 @@ cockpit supervisor unload
 cockpit supervisor watch
 ```
 
-### 4. Configuration & LLM Backends
+### 4. Switching LLM Backends (`Ollama`, `llama.cpp`, `LM Studio`, or Cloud API)
 
-Cockpit supports **Ollama** (default), **`llama.cpp` (`llama-server`)**, **LM Studio**, and **OpenAI-compatible Cloud APIs** via `~/.config/cockpit/supervisor.toml` or environment variables:
+By default, the Durable Supervisor uses **Ollama** with **`lfm3:1.7b`** in CPU-only mode (`num_gpu: 0`). You can switch the cognitive evaluation backend at any time via `~/.config/cockpit/supervisor.toml` or environment variables—no rebuild required.
 
-- **Environment Variables**:
-  - `COCKPIT_LLM_BACKEND`: `ollama` (default), `llama-cpp`, `lm-studio`, or `openai-compatible`
-  - `COCKPIT_LLM_HOST` / `OLLAMA_HOST` (default: `http://localhost:11434`, or backend default)
-  - `OLLAMA_FALLBACK_HOST` (Ollama fallback endpoint)
-  - `COCKPIT_LLM_MODEL` / `OLLAMA_MODEL` (default: `lfm3:1.7b`)
-  - `COCKPIT_LLM_API_KEY` (or `OPENAI_API_KEY` / `OPENROUTER_API_KEY`)
-  - `COCKPIT_ALLOW_GPU` (default: `false`, enforcing `num_gpu: 0` on Ollama)
-  - `HC_BIN` (override path to `hc` binary)
+#### Option A: Ollama (Default — Local Zero-VRAM + 180s Auto-Unload)
 
-- **Backend Examples (`~/.config/cockpit/supervisor.toml`)**:
+1. Pull the model:
+   ```bash
+   ollama pull lfm3:1.7b
+   ```
+2. Configure `~/.config/cockpit/supervisor.toml`:
+   ```toml
+   llm_backend = "ollama"
+   ollama_host = "http://localhost:11434"
+   ollama_fallback_host = "http://10.121.213.1:11434"
+   ollama_model = "lfm3:1.7b"
+   allow_gpu = false
+   idle_unload_secs = 180
+   ```
 
-  1. **Ollama (Default, Local Zero-VRAM)**:
-     ```toml
-     llm_backend = "ollama"
-     ollama_host = "http://localhost:11434"
-     ollama_model = "lfm3:1.7b"
-     allow_gpu = false
-     ```
+#### Option B: `llama.cpp` (`llama-server`)
 
-  2. **`llama.cpp` (`llama-server`)**:
-     ```toml
-     llm_backend = "llama-cpp"
-     ollama_host = "http://localhost:8080"
-     ollama_model = "lfm3:1.7b"
-     ```
+1. Start `llama-server` with a GGUF model (use `-ngl 0` for CPU-only inference):
+   ```bash
+   llama-server -m /path/to/lfm3-1.7b-q4_k_m.gguf --host 127.0.0.1 --port 8080 -ngl 0
+   ```
+2. Configure `~/.config/cockpit/supervisor.toml`:
+   ```toml
+   llm_backend = "llama-cpp"
+   ollama_host = "http://localhost:8080"
+   ollama_model = "lfm3-1.7b"
+   ```
+   *(Or switch via env vars: `COCKPIT_LLM_BACKEND=llama-cpp COCKPIT_LLM_HOST=http://localhost:8080 cockpit tui`)*
 
-  3. **LM Studio**:
-     ```toml
-     llm_backend = "lm-studio"
-     ollama_host = "http://localhost:1234"
-     ollama_model = "lfm3:1.7b"
-     ```
+#### Option C: LM Studio
 
-  4. **External / Cloud API (OpenAI, OpenRouter, Groq, DeepSeek, Gemini)**:
-     ```toml
-     llm_backend = "openai-compatible"
-     ollama_host = "https://openrouter.ai/api/v1" # or "https://api.openai.com"
-     ollama_model = "openai/gpt-4o-mini"
-     ```
-     ```bash
-     export COCKPIT_LLM_API_KEY="sk-..."
-     ```
+1. Open **LM Studio**, load `liquid/lfm3-1.7b` (or any instruction model supporting structured JSON), and start the Local Server (default port `1234`).
+2. Configure `~/.config/cockpit/supervisor.toml`:
+   ```toml
+   llm_backend = "lm-studio"
+   ollama_host = "http://localhost:1234"
+   ollama_model = "liquid/lfm3-1.7b"
+   ```
+   *(Or switch via env vars: `COCKPIT_LLM_BACKEND=lm-studio COCKPIT_LLM_MODEL="liquid/lfm3-1.7b" cockpit tui`)*
 
-- **Provider Integrations (`~/.config/cockpit/config.toml`)**:
-  Cockpit works out of the box with local git worktrees, local `RUNBOOK.md` files, and authenticated `gh` / `glab` CLIs. To enable additional read-only integrations, export credentials in your environment (Cockpit never stores plaintext tokens on disk):
+#### Option D: External / Cloud API (No Local Model — OpenRouter, OpenAI, Groq, Gemini, DeepSeek)
 
-  | Provider | Configuration |
-  | :--- | :--- |
-  | **GitHub** | Uses `gh auth status` automatically, or `export GITHUB_TOKEN=...` |
-  | **GitLab** | Uses `glab auth status` automatically, or `export GITLAB_TOKEN=...` |
-  | **Jira** | Add `[jira] base_url = "https://your-org.atlassian.net"` in `~/.config/cockpit/config.toml` and `export COCKPIT_JIRA_TOKEN=...` |
-  | **Linear** | `export COCKPIT_LINEAR_TOKEN=...` |
-  | **Slack** | `export COCKPIT_SLACK_TOKEN=...` |
+If you prefer not to run any model locally, point Cockpit at any OpenAI-compatible `/v1/chat/completions` endpoint:
 
-### 5. Uninstall
+1. Configure `~/.config/cockpit/supervisor.toml`:
+   ```toml
+   llm_backend = "openai-compatible"
+   # Examples:
+   # - OpenRouter: "https://openrouter.ai/api/v1"
+   # - OpenAI:     "https://api.openai.com/v1"
+   # - Groq:       "https://api.groq.com/openai/v1"
+   # - Gemini:     "https://generativelanguage.googleapis.com/v1beta/openai"
+   # - DeepSeek:   "https://api.deepseek.com/v1"
+   ollama_host = "https://openrouter.ai/api/v1"
+   ollama_model = "liquid/lfm-3-1.7b" # or "openai/gpt-4o-mini"
+   ```
+2. Export your API key in the environment (never stored on disk unless you explicitly set `api_key` in `supervisor.toml`):
+   ```bash
+   export COCKPIT_LLM_API_KEY="sk-..."
+   # Also automatically reads OPENAI_API_KEY or OPENROUTER_API_KEY
+   ```
+3. Verify the backend connection:
+   ```bash
+   cockpit supervisor tick --json
+   ```
+
+#### Environment Variable Reference
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `COCKPIT_LLM_BACKEND` | `ollama`, `llama-cpp`, `lm-studio`, or `openai-compatible` | `ollama` |
+| `COCKPIT_LLM_HOST` / `OLLAMA_HOST` | Primary HTTP(S) base URL for the selected backend | `http://localhost:11434` (`:8080` for `llama-cpp`, `:1234` for `lm-studio`, `https://api.openai.com` for `openai-compatible`) |
+| `OLLAMA_FALLBACK_HOST` | Optional fallback host when primary is unreachable | `http://10.121.213.1:11434` |
+| `COCKPIT_LLM_MODEL` / `OLLAMA_MODEL` | Model identifier sent in chat completion requests | `lfm3:1.7b` |
+| `COCKPIT_LLM_API_KEY` | Bearer token for `openai-compatible` (or `OPENAI_API_KEY` / `OPENROUTER_API_KEY`) | None |
+| `COCKPIT_ALLOW_GPU` | Allow GPU layers on Ollama (`false` forces `num_gpu: 0`) | `false` |
+| `HC_BIN` | Override path to `hc` binary | `hc` |
+
+### 5. Optional Provider Integrations (`~/.config/cockpit/config.toml`)
+
+Cockpit works out of the box with local git worktrees, local `RUNBOOK.md` files, and authenticated `gh` / `glab` CLIs. To enable additional read-only integrations, export credentials in your environment (Cockpit never stores plaintext tokens on disk):
+
+| Provider | Configuration |
+| :--- | :--- |
+| **GitHub** | Uses `gh auth status` automatically, or `export GITHUB_TOKEN=...` |
+| **GitLab** | Uses `glab auth status` automatically, or `export GITLAB_TOKEN=...` |
+| **Jira** | Add `[jira] base_url = "https://your-org.atlassian.net"` in `~/.config/cockpit/config.toml` and `export COCKPIT_JIRA_TOKEN=...` |
+| **Linear** | `export COCKPIT_LINEAR_TOKEN=...` |
+| **Slack** | `export COCKPIT_SLACK_TOKEN=...` |
+
+### 6. Uninstall
 
 ```bash
 # Roll back hooks, shell blocks, and Herdr Desktop mod files (keeps cache/config)
