@@ -110,6 +110,16 @@ pub trait HcBackend: Send + Sync {
     fn capture_output(&self, agent_id: &str, lines: usize) -> Result<String>;
     /// Sends input text + Enter to `agent_id` via `hc send`.
     fn send_input(&self, agent_id: &str, payload: &str, force: bool) -> Result<()>;
+    /// Sends a named key (e.g. `"enter"`, `"esc"`) to `agent_id` via `hc keys`.
+    fn send_keys(&self, agent_id: &str, key: &str) -> Result<()>;
+    /// Returns `(is_blocked, pending_msg)` for `agent_id` from `hc`.
+    fn pending_prompt_info(&self, agent_id: &str) -> Result<(bool, String)> {
+        let sessions = self.list_sessions()?;
+        let Some(s) = sessions.into_iter().find(|s| s.agent_id == agent_id) else {
+            return Ok((false, String::new()));
+        };
+        Ok((s.is_blocked(), String::new()))
+    }
     /// Sets metadata labels on an `hc` terminal (`hc label <agent_id> k=v...`).
     fn set_labels(&self, agent_id: &str, labels: &[(&str, &str)]) -> Result<()>;
 }
@@ -240,6 +250,77 @@ impl HcBackend for HcCliAdapter {
         Ok(())
     }
 
+    fn send_keys(&self, agent_id: &str, key: &str) -> Result<()> {
+        let output = Command::new(&self.config.hc_bin)
+            .args(["keys", agent_id, key])
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to execute `{} keys {agent_id} {key}`",
+                    self.config.hc_bin
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "`hc keys {agent_id} {key}` exited with {}: {}",
+                output.status,
+                stderr
+            ));
+        }
+        Ok(())
+    }
+
+    fn pending_prompt_info(&self, agent_id: &str) -> Result<(bool, String)> {
+        let output = Command::new(&self.config.hc_bin)
+            .args(["ls", "--json"])
+            .output()
+            .with_context(|| format!("Failed to execute `{} ls --json`", self.config.hc_bin))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow!(
+                "`hc ls --json` exited with {}: {}",
+                output.status,
+                stderr
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed: RawHcListOutput = serde_json::from_str(&stdout)
+            .with_context(|| "Failed to parse `hc ls --json` output")?;
+        let Some(term) = parsed.terminals.into_iter().find(|t| t.address == agent_id) else {
+            return Ok((false, String::new()));
+        };
+        if term.state == "finished" {
+            return Ok((false, String::new()));
+        }
+        let (status_state, _) = extract_status_fields(term.status.as_ref());
+        let label_state = term
+            .labels
+            .get("cockpit.state")
+            .map(|s| s.trim().to_ascii_lowercase());
+        let is_blocked = matches!(status_state.as_deref(), Some("blocked" | "waiting"))
+            || matches!(label_state.as_deref(), Some("blocked" | "waiting"));
+        let msg = term
+            .status
+            .as_ref()
+            .and_then(|v| v.get("msg").or_else(|| v.get("message")))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                term.labels
+                    .get("cockpit.msg")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        Ok((is_blocked, msg))
+    }
+
     fn set_labels(&self, agent_id: &str, labels: &[(&str, &str)]) -> Result<()> {
         if !self.config.sync_hc_labels || labels.is_empty() {
             return Ok(());
@@ -269,6 +350,8 @@ fn is_known_coding_agent(token: &str) -> bool {
             | "opencode"
             | "pi"
             | "codex"
+            | "antigravity"
+            | "agy"
             | "aider"
             | "goose"
             | "cursor"
@@ -619,12 +702,13 @@ mod tests {
                 {"address":"t11","agent":"zsh","cwd":"/home/ubuntu/projetos/teste","state":"live","turn":5,"where":"teste / 1"},
                 {"address":"t12","agent":"bash","cwd":"/home/ubuntu/projetos/foo","state":"live","status":"working"},
                 {"address":"t13","agent":"zsh","state":"live","foreground":{"name":"opencode","argv":["opencode"]},"where":"ops"},
-                {"address":"t14","state":"live","status":{"state":"working","app":"codex"},"where":"api"}
+                {"address":"t14","state":"live","status":{"state":"working","app":"codex"},"where":"api"},
+                {"address":"t15","agent":"zsh","state":"live","status":{"state":"working","app":"antigravity"},"where":"web"}
             ]
         }"#;
 
         let sessions = parse_hc_ls_json(sample, Some("t10")).unwrap();
-        assert_eq!(sessions.len(), 3);
+        assert_eq!(sessions.len(), 4);
         assert_eq!(sessions[0].agent_id, "t7");
         assert_eq!(sessions[0].session_name, "teste / 1 (pi)");
         assert_eq!(sessions[0].status.as_deref(), Some("done"));
@@ -632,6 +716,9 @@ mod tests {
         assert_eq!(sessions[2].agent_id, "t14");
         assert_eq!(sessions[2].status.as_deref(), Some("working"));
         assert_eq!(sessions[2].agent_program.as_deref(), Some("codex"));
+        assert_eq!(sessions[3].agent_id, "t15");
+        assert_eq!(sessions[3].status.as_deref(), Some("working"));
+        assert_eq!(sessions[3].agent_program.as_deref(), Some("antigravity"));
     }
 
     #[test]

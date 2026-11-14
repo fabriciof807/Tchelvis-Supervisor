@@ -349,6 +349,7 @@ pub fn output_json_schema() -> Value {
         "properties": {
             "updated_summary": {
                 "type": "string",
+                "maxLength": 200,
                 "description": "Resumo de 1 frase em português sobre o que o agente está fazendo agora."
             },
             "detected_state": {
@@ -365,10 +366,12 @@ pub fn output_json_schema() -> Value {
             },
             "hc_command_payload": {
                 "type": "string",
+                "maxLength": 120,
                 "description": "Texto exato a ser enviado para o agente via hc (vazio se NO_OP)."
             },
             "reason_for_operator": {
                 "type": "string",
+                "maxLength": 200,
                 "description": "Mensagem curta em português explicando por que a atenção do operador é necessária."
             }
         },
@@ -454,6 +457,7 @@ impl OllamaClient {
             "options": {
                 "temperature": self.config.temperature,
                 "num_gpu": self.config.effective_num_gpu(),
+                "num_predict": 384,
             },
             "messages": [
                 {
@@ -479,6 +483,7 @@ impl OllamaClient {
             "model": self.config.ollama_model,
             "stream": false,
             "temperature": self.config.temperature,
+            "max_tokens": 384,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -863,5 +868,28 @@ mod tests {
             extract_ollama_model_memory(&json!({"models":[]}), "lfm3:1.7b"),
             None
         );
+    }
+
+    #[test]
+    fn schema_strings_have_max_length() {
+        let schema = output_json_schema();
+        let props = &schema["properties"];
+        assert_eq!(props["updated_summary"]["maxLength"], 200);
+        assert_eq!(props["reason_for_operator"]["maxLength"], 200);
+        assert_eq!(props["hc_command_payload"]["maxLength"], 120);
+    }
+
+    #[test]
+    fn openai_body_has_max_tokens() {
+        let client = OllamaClient::new(SupervisorConfig::default());
+        let body = client.build_openai_chat_request_body(&sample_state(), "Allow? (y/n)");
+        assert_eq!(body["max_tokens"], 384);
+    }
+
+    #[test]
+    fn ollama_body_has_num_predict() {
+        let client = OllamaClient::new(SupervisorConfig::default());
+        let body = client.build_chat_request_body(&sample_state(), "Allow? (y/n)");
+        assert_eq!(body["options"]["num_predict"], 384);
     }
 }

@@ -155,6 +155,8 @@ impl HcTerminal {
                     | "opencode"
                     | "pi"
                     | "codex"
+                    | "antigravity"
+                    | "agy"
                     | "aider"
                     | "goose"
                     | "cursor"
@@ -909,11 +911,7 @@ mod tests {
             state: "live".into(),
             foreground: Some(HcForeground {
                 name: Some("herdr-core".into()),
-                argv: vec![
-                    "herdr-core".into(),
-                    "attach".into(),
-                    "lore-agy".into(),
-                ],
+                argv: vec!["herdr-core".into(), "attach".into(), "lore-agy".into()],
                 cwd: None,
                 pid: Some(1234),
             }),

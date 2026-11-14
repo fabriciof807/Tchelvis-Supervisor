@@ -199,8 +199,21 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             let state_snapshot = state.clone();
             self.runtime_status = SupervisorRuntimeStatus::Evaluating(session.agent_id.clone());
 
-            let Ok(raw_eval) = self.cognitive.evaluate(&state_snapshot, &output) else {
-                continue;
+            let raw_eval = match self.cognitive.evaluate(&state_snapshot, &output) {
+                Ok(eval) => eval,
+                Err(e) => {
+                    let msg: String = format!("{e:#}").chars().take(300).collect();
+                    tracing::warn!(
+                        agent_id = %session.agent_id,
+                        error = %msg,
+                        "LLM evaluation failed"
+                    );
+                    if let Some(state) = self.store.agents.get_mut(&session.agent_id) {
+                        state.last_eval_error = Some(msg);
+                        state.last_eval_error_at = Some(now);
+                    }
+                    continue;
+                }
             };
             self.model_loaded = true;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
@@ -221,6 +234,8 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 .agents
                 .get_mut(&session.agent_id)
                 .expect("agent state must exist");
+            state.last_eval_error = None;
+            state.last_eval_error_at = None;
             state.rolling_summary = eval.updated_summary.clone();
             state.lifecycle_state = eval.detected_state;
             state.last_evaluated_hash = current_hash.clone();
@@ -415,6 +430,10 @@ mod tests {
             Ok(())
         }
 
+        fn send_keys(&self, _agent_id: &str, _key: &str) -> Result<()> {
+            Ok(())
+        }
+
         fn set_labels(&self, agent_id: &str, labels: &[(&str, &str)]) -> Result<()> {
             let pairs = labels
                 .iter()
@@ -433,6 +452,7 @@ mod tests {
         unload_calls: Mutex<usize>,
         available: Mutex<bool>,
         next_eval: Mutex<CognitiveEvaluation>,
+        next_error: Mutex<Option<String>>,
     }
 
     impl MockCognitive {
@@ -442,6 +462,7 @@ mod tests {
                 unload_calls: Mutex::new(0),
                 available: Mutex::new(true),
                 next_eval: Mutex::new(next_eval),
+                next_error: Mutex::new(None),
             }
         }
     }
@@ -453,6 +474,9 @@ mod tests {
             _recent_output: &str,
         ) -> Result<CognitiveEvaluation> {
             *self.eval_calls.lock().unwrap() += 1;
+            if let Some(err) = self.next_error.lock().unwrap().as_ref() {
+                anyhow::bail!("{err}");
+            }
             Ok(self.next_eval.lock().unwrap().clone())
         }
 
@@ -795,5 +819,40 @@ mod tests {
         let o2 = engine.tick(1005).unwrap();
         assert_eq!(o2.evaluated_agents, vec!["t1"]);
         assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn eval_error_is_recorded_and_cleared() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Allow read-only inspection? (y/n)"],
+        );
+        let cognitive = MockCognitive::new(alert_eval(Urgency::Normal, "y"));
+        *cognitive.next_error.lock().unwrap() = Some("kv cache full".to_string());
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        // Tick 1: evaluate fails -> error recorded, hash not marked evaluated, runtime_status not Evaluating
+        let o1 = engine.tick(1000).unwrap();
+        assert!(o1.evaluated_agents.is_empty());
+        assert_eq!(
+            engine.store.agents["t1"].last_eval_error.as_deref(),
+            Some("kv cache full")
+        );
+        assert_eq!(engine.store.agents["t1"].last_eval_error_at, Some(1000));
+        assert_eq!(
+            engine.store.agents["t1"].last_evaluated_hash,
+            compute_sha256("")
+        );
+        assert_eq!(engine.runtime_status, SupervisorRuntimeStatus::Watching(1));
+
+        // Tick 2: evaluate succeeds -> error cleared
+        *engine.cognitive.next_error.lock().unwrap() = None;
+        let o2 = engine.tick(1005).unwrap();
+        assert_eq!(o2.evaluated_agents, vec!["t1"]);
+        assert_eq!(engine.store.agents["t1"].last_eval_error, None);
+        assert_eq!(engine.store.agents["t1"].last_eval_error_at, None);
     }
 }

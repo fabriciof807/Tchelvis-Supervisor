@@ -34,6 +34,7 @@ pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
             "opencode" => AgentKind::OpenCode,
             "pi" => AgentKind::Pi,
             "codex" => AgentKind::Codex,
+            "antigravity" | "agy" => AgentKind::Antigravity,
             "shell" | "" => AgentKind::PlainShell,
             _ => AgentKind::CustomAgent,
         };
@@ -71,6 +72,7 @@ pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
             "opencode" => return AgentKind::OpenCode,
             "pi" => return AgentKind::Pi,
             "codex" => return AgentKind::Codex,
+            "antigravity" | "agy" => return AgentKind::Antigravity,
             "aider" | "goose" | "cursor-agent" | "amp" => return AgentKind::CustomAgent,
             _ => {}
         }
@@ -538,6 +540,15 @@ pub fn build_initial_agent_row(
         }
     }
 
+    let prompt_destructive = match &attention_state {
+        AttentionState::Blocked { message, .. } => {
+            let msg = message.as_deref().unwrap_or("");
+            crate::supervisor::guardrails::detect_destructive(msg, "").is_some()
+                || crate::supervisor::guardrails::contains_forbidden_payload(msg).is_some()
+        }
+        _ => false,
+    };
+
     AgentRow {
         address: sanitize_terminal_text(&term.address),
         name: sanitize_terminal_text(&term.display_name()),
@@ -545,6 +556,7 @@ pub fn build_initial_agent_row(
         agent_kind,
         lifecycle: term.lifecycle(),
         attention_state,
+        prompt_destructive,
         blocked_children,
         turn: term.turn,
         reported: term.reported,
@@ -692,5 +704,46 @@ mod tests {
         assert_eq!(classify_agent_kind(&term), AgentKind::PlainShell);
         assert!(!should_include_terminal(&term, false));
         assert!(should_include_terminal(&term, true));
+    }
+
+    #[test]
+    fn classifies_antigravity_by_status_app() {
+        use crate::herdr::{HcForeground, HcStatus};
+
+        let term = HcTerminal {
+            address: "t20".into(),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("zsh".into()),
+                argv: vec!["/bin/zsh".into()],
+                ..Default::default()
+            }),
+            status: Some(HcStatus {
+                state: "working".into(),
+                app: Some("antigravity".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify_agent_kind(&term), AgentKind::Antigravity);
+        assert!(should_include_terminal(&term, false));
+    }
+
+    #[test]
+    fn classifies_agy_by_foreground() {
+        use crate::herdr::HcForeground;
+
+        let term = HcTerminal {
+            address: "t21".into(),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("agy".into()),
+                argv: vec!["/usr/local/bin/agy".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(classify_agent_kind(&term), AgentKind::Antigravity);
+        assert!(should_include_terminal(&term, false));
     }
 }

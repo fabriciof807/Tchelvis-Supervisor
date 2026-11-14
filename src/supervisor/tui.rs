@@ -32,6 +32,8 @@ pub struct AgentCardView {
     pub auto_reply_log: Vec<AutoReplyAuditEntry>,
     pub action_card: Option<PendingOperatorAction>,
     pub last_output_preview: String,
+    #[serde(default)]
+    pub eval_error: Option<String>,
 }
 
 /// Top-level IPC snapshot exposed to Cockpit (`--status-json` / IPC file) and TUI.
@@ -153,6 +155,7 @@ pub fn build_desktop_mod_snapshot_from_parts(
                 auto_reply_log: agent.auto_reply_log.clone(),
                 action_card: agent.pending_operator_action.clone(),
                 last_output_preview: agent.last_output_preview.clone(),
+                eval_error: agent.last_eval_error.clone(),
             }
         })
         .collect();

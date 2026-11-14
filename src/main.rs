@@ -245,6 +245,13 @@ enum SupervisorCommands {
         /// Agent / terminal ID
         agent_id: String,
     },
+    /// Send a deterministic Enter/Esc response to a blocked terminal's pending prompt
+    Respond {
+        /// Terminal / agent ID
+        terminal: String,
+        /// Action: approve or deny
+        action: String,
+    },
     /// Set or cycle the supervisor operating mode (semi-auto, alert-only, paused, cycle)
     Mode {
         /// Target mode or "cycle"
@@ -576,6 +583,16 @@ async fn main() -> Result<()> {
                 let snap = tokio::task::spawn_blocking(move || ignore_action(&agent_id))
                     .await
                     .context("supervisor ignore task panicked")??;
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+                Ok(())
+            }
+            SupervisorCommands::Respond { terminal, action } => {
+                let parsed = cockpit::supervisor::RespondAction::parse(&action)?;
+                let snap = tokio::task::spawn_blocking(move || {
+                    cockpit::supervisor::respond_pending_prompt(&terminal, parsed)
+                })
+                .await
+                .context("supervisor respond task panicked")??;
                 println!("{}", serde_json::to_string_pretty(&snap)?);
                 Ok(())
             }

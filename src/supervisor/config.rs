@@ -1,4 +1,7 @@
-use super::container::{binary_on_path, detect_runtime, ContainerRuntime, LlmContainerConfig};
+use super::container::{
+    binary_on_path, detect_runtime, detect_runtime_candidates, detect_runtime_with_pref,
+    read_runtime_pref, ContainerRuntime, LlmContainerConfig,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -167,6 +170,16 @@ pub fn gpu_override_path() -> PathBuf {
         .join("state")
         .join("cockpit")
         .join("supervisor_gpu")
+}
+
+/// Path of the persisted last-working container runtime (`~/.local/state/cockpit/container_runtime`).
+pub fn runtime_pref_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    PathBuf::from(home)
+        .join(".local")
+        .join("state")
+        .join("cockpit")
+        .join("container_runtime")
 }
 
 /// Reads the persisted GPU toggle (`on` / `off`); `None` when absent or unreadable.
@@ -392,9 +405,22 @@ impl SupervisorConfig {
         }
     }
 
-    /// Detects the configured container runtime (`kiri` -> `podman` -> `docker`), respecting overrides.
+    /// Detects the configured container runtime (`remembered` -> `kiri` -> `podman` -> `docker`), respecting overrides.
     pub fn detected_container_runtime(&self) -> Option<ContainerRuntime> {
-        detect_runtime(&self.llm_container.runtime, binary_on_path)
+        detect_runtime_with_pref(
+            &self.llm_container.runtime,
+            read_runtime_pref(&runtime_pref_path()),
+            binary_on_path,
+        )
+    }
+
+    /// Returns ordered candidate container runtimes for `load_model` fallback.
+    pub fn runtime_candidates(&self) -> Vec<ContainerRuntime> {
+        detect_runtime_candidates(
+            &self.llm_container.runtime,
+            read_runtime_pref(&runtime_pref_path()),
+            binary_on_path,
+        )
     }
 
     /// Returns `true` when the Supervisor's LLM runs as a managed `llama.cpp` container.

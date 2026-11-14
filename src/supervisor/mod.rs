@@ -155,9 +155,10 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
 pub fn load_model() -> Result<DesktopModSnapshot> {
     let config = SupervisorConfig::load();
     if config.container_mode_active() {
-        let rt = config.detected_container_runtime().ok_or_else(|| {
-            anyhow::anyhow!("Nenhum runtime de container encontrado (kiri/podman/docker)")
-        })?;
+        let candidates = config.runtime_candidates();
+        if candidates.is_empty() {
+            anyhow::bail!("Nenhum runtime de container encontrado (kiri/podman/docker)");
+        }
         let ollama_roots = container::default_ollama_roots();
         let model = container::resolve_model_source(
             &config.llm_container,
@@ -167,14 +168,23 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
         let model_id = models::effective_model(&config, &ollama_roots)
             .map(|m| m.id)
             .unwrap_or_default();
-        let mgr = container::LlmContainer::new(
-            rt,
-            config.llm_container.clone(),
-            container::SystemContainerCli,
-        );
-        mgr.start(config.effective_num_gpu(), &model, &model_id)?;
         let host = config.effective_primary_host();
-        container::wait_healthy(&host, Duration::from_secs(90))?;
+        let pref_path = config::runtime_pref_path();
+        container::start_with_fallback(
+            &candidates,
+            config.effective_num_gpu(),
+            &model,
+            &model_id,
+            Some(&pref_path),
+            |rt| {
+                container::LlmContainer::new(
+                    rt,
+                    config.llm_container.clone(),
+                    container::SystemContainerCli,
+                )
+            },
+            || container::wait_healthy(&host, Duration::from_secs(90)),
+        )?;
     } else {
         let client = OllamaClient::new(config.clone());
         client.warm_model()?;
@@ -426,5 +436,125 @@ pub fn run_supervisor_daemon() -> Result<()> {
         }
         let interval = engine.config.poll_interval_secs.max(1);
         std::thread::sleep(Duration::from_secs(interval));
+    }
+}
+
+/// Operator response to a deterministic pending prompt (no LLM needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RespondAction {
+    Approve,
+    Deny,
+}
+
+impl RespondAction {
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approve" => Ok(Self::Approve),
+            "deny" => Ok(Self::Deny),
+            other => anyhow::bail!("Invalid respond action '{other}'; expected approve or deny"),
+        }
+    }
+}
+
+/// Maps a pending-prompt response action to the `hc keys` key name.
+pub fn respond_keys(action: RespondAction) -> &'static str {
+    match action {
+        RespondAction::Approve => "enter",
+        RespondAction::Deny => "esc",
+    }
+}
+
+/// Server-side guard for `cockpit supervisor respond`.
+pub fn validate_respond_guard(
+    agent_id: &str,
+    action: RespondAction,
+    is_blocked: bool,
+    pending_msg: &str,
+    recent_output: &str,
+) -> Result<&'static str> {
+    if !is_blocked {
+        anyhow::bail!("Nenhum prompt pendente em {agent_id}");
+    }
+    if action == RespondAction::Approve
+        && (guardrails::detect_destructive(pending_msg, "").is_some()
+            || guardrails::contains_forbidden_payload(pending_msg).is_some()
+            || guardrails::detect_destructive(recent_output, "").is_some())
+    {
+        anyhow::bail!("Comando destrutivo: aprove manualmente no terminal (Open)");
+    }
+    Ok(respond_keys(action))
+}
+
+/// Sends a deterministic Enter/Esc response to a blocked terminal after server-side guardrail checks.
+pub fn respond_pending_prompt(terminal: &str, action: RespondAction) -> Result<DesktopModSnapshot> {
+    let mut engine = build_default_engine()?;
+    let (is_blocked, pending_msg) = engine.hc.pending_prompt_info(terminal)?;
+    let recent_output = if action == RespondAction::Approve {
+        engine.hc.capture_output(terminal, 25).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let key = validate_respond_guard(terminal, action, is_blocked, &pending_msg, &recent_output)?;
+    engine.hc.send_keys(terminal, key)?;
+    let _ = engine.hc.set_labels(
+        terminal,
+        &[
+            ("cockpit.state", "working"),
+            ("cockpit.kind", ""),
+            ("cockpit.msg", ""),
+        ],
+    );
+    if let Some(agent) = engine.store.agents.get_mut(terminal) {
+        agent.pending_operator_action = None;
+        let _ = engine.store.save();
+    }
+    sync_runtime_status(&mut engine);
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approve_maps_to_enter_deny_to_esc() {
+        assert_eq!(respond_keys(RespondAction::Approve), "enter");
+        assert_eq!(respond_keys(RespondAction::Deny), "esc");
+    }
+
+    #[test]
+    fn approve_refused_for_destructive_prompt() {
+        let err = validate_respond_guard(
+            "t1",
+            RespondAction::Approve,
+            true,
+            "Approve Bash: rm -rf build",
+            "",
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Comando destrutivo: aprove manualmente no terminal (Open)"));
+
+        // Deny is still allowed even when the prompt is destructive.
+        assert_eq!(
+            validate_respond_guard(
+                "t1",
+                RespondAction::Deny,
+                true,
+                "Approve Bash: rm -rf build",
+                "",
+            )
+            .unwrap(),
+            "esc"
+        );
+    }
+
+    #[test]
+    fn respond_requires_blocked() {
+        let err = validate_respond_guard("t1", RespondAction::Approve, false, "", "").unwrap_err();
+        assert!(err.to_string().contains("Nenhum prompt pendente em t1"));
     }
 }

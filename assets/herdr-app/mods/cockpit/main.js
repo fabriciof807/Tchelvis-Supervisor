@@ -208,6 +208,21 @@ function programIcon(prog, size, color) {
     : image(prog.icon).w(size).h(size).flex_none();
 }
 
+function agentGlyph(kindOrLabel, color) {
+  const key = String(kindOrLabel ?? "").trim().toLowerCase();
+  let glyph = "›_";
+  if (key.includes("claude")) glyph = "✦";
+  else if (key.includes("codex")) glyph = "◎";
+  else if (key === "pi" || key.includes("π")) glyph = "π";
+  else if (key.includes("opencode")) glyph = "</>";
+  else if (key.includes("antigravity") || key.includes("agy")) glyph = "✧";
+  return div()
+    .text_size(11.5)
+    .text_color(color)
+    .flex_none()
+    .child(glyph);
+}
+
 function formatTimestamp(ts) {
   if (!ts) return "--:--:--";
   const d = new Date(ts * 1000);
@@ -278,6 +293,8 @@ const KNOWN_AGENTS = new Set([
   "codex",
   "pi",
   "opencode",
+  "antigravity",
+  "agy",
   "aider",
   "goose",
   "cursor",
@@ -539,6 +556,8 @@ function isPlainShellRow(name, programName, labels, term = null) {
     "opencode",
     "pi",
     "codex",
+    "antigravity",
+    "agy",
     "aider",
     "goose",
     "cursor",
@@ -790,6 +809,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       pinned: Boolean(a.pinned),
       seq: a.seq ?? 0,
       sup_lifecycle: sup?.lifecycle_state ?? null,
+      prompt_destructive: Boolean(enriched?.prompt_destructive),
       action_card: isFinished ? null : (sup?.action_card ?? null),
       audit_badge: sup?.audit_badge ?? null,
       auto_reply_log: sup?.auto_reply_log ?? [],
@@ -867,6 +887,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       pinned: false,
       seq: 0,
       sup_lifecycle: sup?.lifecycle_state ?? null,
+      prompt_destructive: Boolean(sa?.prompt_destructive),
       action_card: isFinished ? null : (sup?.action_card ?? null),
       audit_badge: sup?.audit_badge ?? null,
       auto_reply_log: sup?.auto_reply_log ?? [],
@@ -1342,6 +1363,40 @@ export default class CockpitMod extends View {
       ["supervisor", "ignore", agentId],
       `Alerta ignorado para ${agentId}`
     );
+  }
+
+  respondPendingPrompt(cx, agentId, action) {
+    if (!agentId || this.busy) return;
+    this.busy = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "cockpit",
+          ["supervisor", "respond", agentId, action],
+          { timeout: 15000 }
+        );
+        if (res.code === 0 && res.stdout) {
+          const snap = parseSnapshotOutput(res.stdout);
+          if (snap) {
+            setShared("supervisor.snapshot", snap);
+            setShared("supervisor.lastError", "");
+          }
+          this.note =
+            action === "approve"
+              ? `Prompt aprovado em ${agentId}`
+              : `Prompt negado em ${agentId}`;
+          this.refreshCockpit(cx, true);
+        } else {
+          this.note = res.stderr?.trim() || `Command failed (${res.code})`;
+        }
+      } catch (e) {
+        this.note = `Error: ${String(e)}`;
+      } finally {
+        this.busy = false;
+        cx.notify();
+      }
+    });
   }
 
   refreshCockpit(cx, forceRefresh = false) {
@@ -2565,6 +2620,10 @@ export default class CockpitMod extends View {
                 .font_semibold()
                 .text_color(t.address ?? t.accent)
                 .child(a.address)
+            )
+            .child(
+              programIcon(a.program, 13, t.muted) ??
+                agentGlyph(a.program_label, t.muted)
             )
             .child(
               div()
@@ -4197,7 +4256,7 @@ export default class CockpitMod extends View {
       const key = String(
         entry?.brand || entry?.id || entry?.name || ""
       ).toLowerCase();
-      if (key.includes("antigravity")) return "✨";
+      if (key.includes("antigravity") || key.includes("agy")) return "✨";
       if (key.includes("opencode")) return "</>";
       if (key.includes("deepseek")) return "🐟";
       if (key.includes("anthropic") || key.includes("claude")) return "✦";
@@ -4839,6 +4898,7 @@ export default class CockpitMod extends View {
       (supSnap?.agents ?? []).find((a) => a.agent_id === agent?.address) ??
       null;
     const actionCard = supAgent?.action_card ?? agent?.action_card ?? null;
+    const evalError = supAgent?.eval_error ?? agent?.eval_error ?? null;
     if (actionCard && agent) {
       const nextKey = `${agent.address}:${actionCard.triggered_at ?? ""}`;
       if (this.editingField !== "command" && this.commandDraftKey !== nextKey) {
@@ -5387,6 +5447,14 @@ export default class CockpitMod extends View {
                           )
                         )
                     )
+                    .when(Boolean(evalError), (el3) =>
+                      el3.child(
+                        div()
+                          .text_size(11)
+                          .text_color(t.working)
+                          .child(`⚠ LLM evaluation failed: ${evalError}`)
+                      )
+                    )
                 )
                 .when(Boolean(actionCard), (el3) =>
                   el3.child(
@@ -5516,6 +5584,116 @@ export default class CockpitMod extends View {
                           )
                       )
                   )
+                )
+                .when(
+                  !actionCard &&
+                    agent?.status === "blocked" &&
+                    ["permission", "question", "auth"].includes(
+                      String(agent?.kind ?? "").toLowerCase()
+                    ),
+                  (el3) => {
+                    const supMode = supSnap?.mode ?? "SemiAuto";
+                    const isSemiAuto = supMode === "SemiAuto";
+                    const isDestructive = Boolean(agent?.prompt_destructive);
+                    const kindLabel = String(agent?.kind ?? "blocked").toUpperCase();
+                    return el3.child(
+                      v_flex()
+                        .id("ck-pending-prompt-card")
+                        .p(11)
+                        .gap(8)
+                        .rounded(10)
+                        .border(1)
+                        .border_color(withAlpha(t.blocked, "77", t.blocked))
+                        .bg(t.surface)
+                        .child(
+                          h_flex()
+                            .gap(6)
+                            .items_center()
+                            .justify_between()
+                            .child(
+                              h_flex()
+                                .gap(6)
+                                .items_center()
+                                .child(this.pillBadge(t, kindLabel, t.blocked))
+                                .when(isDestructive, (el4) =>
+                                  el4.child(
+                                    this.pillBadge(t, "destrutivo", t.blocked)
+                                  )
+                                )
+                            )
+                            .child(
+                              div()
+                                .text_size(10.5)
+                                .text_color(t.muted)
+                                .child("Pending prompt")
+                            )
+                        )
+                        .child(
+                          div()
+                            .text_size(12)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              agent?.message ||
+                                "Aguardando resposta no terminal."
+                            )
+                        )
+                        .child(
+                          h_flex()
+                            .gap(8)
+                            .items_center()
+                            .when(isSemiAuto && !isDestructive, (el4) =>
+                              el4.child(
+                                this.actionBtn(
+                                  t,
+                                  "ck-pending-approve",
+                                  "Approve",
+                                  (_e, cx) =>
+                                    this.respondPendingPrompt(
+                                      cx,
+                                      agent.address,
+                                      "approve"
+                                    ),
+                                  true,
+                                  false
+                                )
+                              )
+                            )
+                            .when(isSemiAuto, (el4) =>
+                              el4.child(
+                                this.actionBtn(
+                                  t,
+                                  "ck-pending-deny",
+                                  "Deny",
+                                  (_e, cx) =>
+                                    this.respondPendingPrompt(
+                                      cx,
+                                      agent.address,
+                                      "deny"
+                                    ),
+                                  false,
+                                  isDestructive
+                                )
+                              )
+                            )
+                            .child(
+                              this.actionBtn(
+                                t,
+                                "ck-pending-open",
+                                "Open",
+                                (_e, cx) =>
+                                  void this.focusOrAttachTerminal(
+                                    cx,
+                                    agent,
+                                    false
+                                  ),
+                                false,
+                                false
+                              )
+                            )
+                        )
+                    );
+                  }
                 )
                 .when(!actionCard, (el3) =>
                   el3.child(

@@ -133,6 +133,7 @@ pub enum AgentKind {
     OpenCode,
     Pi,
     Codex,
+    Antigravity,
     CustomAgent,
     #[default]
     PlainShell,
@@ -145,6 +146,7 @@ impl AgentKind {
             AgentKind::OpenCode => "opencode",
             AgentKind::Pi => "pi",
             AgentKind::Codex => "codex",
+            AgentKind::Antigravity => "antigravity",
             AgentKind::CustomAgent => "custom",
             AgentKind::PlainShell => "shell",
         }
@@ -429,6 +431,8 @@ pub struct AgentRow {
     pub lifecycle: AgentLifecycle,
     pub attention_state: AttentionState,
     #[serde(default)]
+    pub prompt_destructive: bool,
+    #[serde(default)]
     pub blocked_children: Vec<String>,
     #[serde(default)]
     pub turn: u64,
@@ -551,6 +555,8 @@ pub struct AgentSummaryRow {
     pub lifecycle: AgentLifecycle,
     pub attention_state: AttentionState,
     #[serde(default)]
+    pub prompt_destructive: bool,
+    #[serde(default)]
     pub blocked_children: Vec<String>,
     pub cwd: String,
     #[serde(default)]
@@ -581,6 +587,7 @@ impl AgentSummaryRow {
             agent_kind: row.agent_kind,
             lifecycle: row.lifecycle.clone(),
             attention_state: row.attention_state.clone(),
+            prompt_destructive: row.prompt_destructive,
             blocked_children: row.blocked_children.clone(),
             cwd: row.workspace.cwd.clone(),
             git_branch: row.workspace.git_branch.clone(),

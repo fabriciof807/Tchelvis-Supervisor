@@ -124,6 +124,10 @@ pub struct AgentDurableState {
     pub auto_reply_log: Vec<AutoReplyAuditEntry>,
     #[serde(default)]
     pub last_output_preview: String,
+    #[serde(default)]
+    pub last_eval_error: Option<String>,
+    #[serde(default)]
+    pub last_eval_error_at: Option<u64>,
 }
 
 impl AgentDurableState {
@@ -149,6 +153,8 @@ impl AgentDurableState {
             last_hc_status: None,
             auto_reply_log: Vec::new(),
             last_output_preview: String::new(),
+            last_eval_error: None,
+            last_eval_error_at: None,
         }
     }
 
@@ -248,8 +254,8 @@ impl DurableStateStore {
                 .with_context(|| format!("Failed to create state directory {:?}", parent))?;
         }
         let tmp_path = self.file_path.with_extension("json.tmp");
-        let serialized = serde_json::to_string_pretty(self)
-            .context("Failed to serialize DurableStateStore")?;
+        let serialized =
+            serde_json::to_string_pretty(self).context("Failed to serialize DurableStateStore")?;
         fs::write(&tmp_path, serialized)
             .with_context(|| format!("Failed to write temporary state file {:?}", tmp_path))?;
         fs::rename(&tmp_path, &self.file_path)

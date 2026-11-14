@@ -120,19 +120,130 @@ pub fn detect_runtime(
     override_: &str,
     is_on_path: impl Fn(&str) -> bool,
 ) -> Option<ContainerRuntime> {
-    match override_.trim().to_ascii_lowercase().as_str() {
-        "kiri" => is_on_path("kiri").then_some(ContainerRuntime::Kiri),
-        "podman" => is_on_path("podman").then_some(ContainerRuntime::Podman),
-        "docker" => is_on_path("docker").then_some(ContainerRuntime::Docker),
-        "auto" | "" => [
-            ContainerRuntime::Kiri,
-            ContainerRuntime::Podman,
-            ContainerRuntime::Docker,
-        ]
+    detect_runtime_with_pref(override_, None, is_on_path)
+}
+
+/// Detects the preferred container runtime, prioritizing `remembered` in `auto` mode.
+pub fn detect_runtime_with_pref(
+    override_: &str,
+    remembered: Option<ContainerRuntime>,
+    is_on_path: impl Fn(&str) -> bool,
+) -> Option<ContainerRuntime> {
+    detect_runtime_candidates(override_, remembered, is_on_path)
         .into_iter()
-        .find(|rt| is_on_path(rt.bin())),
+        .next()
+}
+
+/// Returns ordered candidate container runtimes for `override_`.
+/// Explicit overrides (`kiri`/`podman`/`docker`) never fall back to other runtimes.
+pub fn detect_runtime_candidates(
+    override_: &str,
+    remembered: Option<ContainerRuntime>,
+    is_on_path: impl Fn(&str) -> bool,
+) -> Vec<ContainerRuntime> {
+    match override_.trim().to_ascii_lowercase().as_str() {
+        "kiri" => is_on_path("kiri")
+            .then_some(ContainerRuntime::Kiri)
+            .into_iter()
+            .collect(),
+        "podman" => is_on_path("podman")
+            .then_some(ContainerRuntime::Podman)
+            .into_iter()
+            .collect(),
+        "docker" => is_on_path("docker")
+            .then_some(ContainerRuntime::Docker)
+            .into_iter()
+            .collect(),
+        "auto" | "" => {
+            let mut order = Vec::with_capacity(4);
+            if let Some(rt) = remembered {
+                order.push(rt);
+            }
+            for rt in [
+                ContainerRuntime::Kiri,
+                ContainerRuntime::Podman,
+                ContainerRuntime::Docker,
+            ] {
+                if !order.contains(&rt) {
+                    order.push(rt);
+                }
+            }
+            order
+                .into_iter()
+                .filter(|rt| is_on_path(rt.bin()))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Reads the remembered container runtime preference (`kiri` / `podman` / `docker`).
+pub fn read_runtime_pref(path: &Path) -> Option<ContainerRuntime> {
+    match fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "kiri" => Some(ContainerRuntime::Kiri),
+        "podman" => Some(ContainerRuntime::Podman),
+        "docker" => Some(ContainerRuntime::Docker),
         _ => None,
     }
+}
+
+/// Persists the remembered container runtime atomically.
+pub fn write_runtime_pref(path: &Path, rt: ContainerRuntime) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, format!("{}\n", rt.bin()))?;
+    fs::rename(&tmp, path)
+}
+
+/// Attempts `start` + `wait_health` across `candidates` in order, cleaning up failed containers
+/// and persisting the first runtime that succeeds.
+pub fn start_with_fallback<C, F, H>(
+    candidates: &[ContainerRuntime],
+    ngl: u32,
+    model: &ModelSource,
+    model_id: &str,
+    pref_path: Option<&Path>,
+    mut make_mgr: F,
+    mut wait_health: H,
+) -> Result<ContainerRuntime>
+where
+    C: ContainerCli,
+    F: FnMut(ContainerRuntime) -> LlmContainer<C>,
+    H: FnMut() -> Result<()>,
+{
+    if candidates.is_empty() {
+        anyhow::bail!("Nenhum runtime de container encontrado (kiri/podman/docker)");
+    }
+    let mut errors = Vec::new();
+    for &rt in candidates {
+        let mgr = make_mgr(rt);
+        match mgr.start(ngl, model, model_id).and_then(|()| wait_health()) {
+            Ok(()) => {
+                if let Some(p) = pref_path {
+                    let _ = write_runtime_pref(p, rt);
+                }
+                return Ok(rt);
+            }
+            Err(e) => {
+                let _ = mgr.cli.run(
+                    rt.bin(),
+                    &["rm".to_string(), "-f".to_string(), mgr.config.name.clone()],
+                );
+                errors.push(format!("{}: {e:#}", rt.bin()));
+            }
+        }
+    }
+    anyhow::bail!(
+        "Falha ao iniciar o container LLM em todos os runtimes ({})",
+        errors.join("; ")
+    )
 }
 
 /// Output captured from a container CLI invocation.
@@ -497,6 +608,14 @@ pub fn build_run_args(
         "-c".to_string(),
         cfg.ctx_size.to_string(),
     ]);
+    let has_parallel = cfg
+        .extra_args
+        .iter()
+        .any(|a| a == "-np" || a == "--parallel" || a.starts_with("--parallel="));
+    if !has_parallel {
+        args.push("-np".to_string());
+        args.push("1".to_string());
+    }
     args.extend(cfg.extra_args.iter().cloned());
     args
 }
@@ -1192,5 +1311,141 @@ mod tests {
         let calls = mgr.cli.calls();
         assert_eq!(calls.len(), 3);
         assert!(!calls.iter().any(|c| c.1[0] == "rm" || c.1[0] == "run"));
+    }
+
+    #[test]
+    fn run_args_default_single_slot() {
+        let cfg = LlmContainerConfig::default();
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            0,
+            &model,
+            Path::new("/tmp"),
+            "hf:org/tiny:Q4_K_M",
+        );
+        assert!(args.windows(2).any(|w| w == ["-np", "1"]));
+    }
+
+    #[test]
+    fn run_args_respect_user_parallel() {
+        let cfg = LlmContainerConfig {
+            extra_args: vec!["--parallel".to_string(), "2".to_string()],
+            ..Default::default()
+        };
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            0,
+            &model,
+            Path::new("/tmp"),
+            "hf:org/tiny:Q4_K_M",
+        );
+        assert!(!args.windows(2).any(|w| w == ["-np", "1"]));
+        assert!(args.windows(2).any(|w| w == ["--parallel", "2"]));
+    }
+
+    #[test]
+    fn auto_prefers_remembered_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let pref_path = dir.path().join("container_runtime");
+        write_runtime_pref(&pref_path, ContainerRuntime::Docker).unwrap();
+        let remembered = read_runtime_pref(&pref_path);
+        assert_eq!(remembered, Some(ContainerRuntime::Docker));
+
+        let candidates =
+            detect_runtime_candidates("auto", remembered, |b| matches!(b, "podman" | "docker"));
+        assert_eq!(
+            candidates,
+            vec![ContainerRuntime::Docker, ContainerRuntime::Podman]
+        );
+        assert_eq!(
+            detect_runtime_with_pref("auto", remembered, |b| matches!(b, "podman" | "docker")),
+            Some(ContainerRuntime::Docker)
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_ignores_pref() {
+        let candidates = detect_runtime_candidates("podman", Some(ContainerRuntime::Docker), |b| {
+            matches!(b, "podman" | "docker")
+        });
+        assert_eq!(candidates, vec![ContainerRuntime::Podman]);
+    }
+
+    #[test]
+    fn fallback_tries_next_runtime_on_run_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let pref_path = dir.path().join("container_runtime");
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let candidates = vec![ContainerRuntime::Podman, ContainerRuntime::Docker];
+
+        let chosen = start_with_fallback(
+            &candidates,
+            0,
+            &model,
+            "hf:org/tiny:Q4_K_M",
+            Some(&pref_path),
+            |rt| {
+                let cli = match rt {
+                    ContainerRuntime::Podman => FakeCli::new(vec![
+                        err_out(1, "no such container"),  // inspect -> Missing
+                        err_out(125, "newuidmap failed"), // run fails 125
+                        ok_out(""),                       // rm -f cleanup
+                    ]),
+                    ContainerRuntime::Docker => FakeCli::new(vec![
+                        err_out(1, "no such container"), // inspect -> Missing
+                        ok_out("cid\n"),                 // run succeeds
+                    ]),
+                    ContainerRuntime::Kiri => unreachable!(),
+                };
+                LlmContainer::new(rt, LlmContainerConfig::default(), cli)
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(chosen, ContainerRuntime::Docker);
+        assert_eq!(
+            read_runtime_pref(&pref_path),
+            Some(ContainerRuntime::Docker)
+        );
+    }
+
+    #[test]
+    fn fallback_reports_all_errors() {
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let candidates = vec![ContainerRuntime::Podman, ContainerRuntime::Docker];
+
+        let err = start_with_fallback(
+            &candidates,
+            0,
+            &model,
+            "hf:org/tiny:Q4_K_M",
+            None,
+            |rt| {
+                let msg = match rt {
+                    ContainerRuntime::Podman => "podman broke",
+                    ContainerRuntime::Docker => "docker daemon down",
+                    ContainerRuntime::Kiri => unreachable!(),
+                };
+                let cli = FakeCli::new(vec![
+                    err_out(1, "no such container"),
+                    err_out(125, msg),
+                    ok_out(""),
+                ]);
+                LlmContainer::new(rt, LlmContainerConfig::default(), cli)
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("podman:"));
+        assert!(text.contains("podman broke"));
+        assert!(text.contains("docker:"));
+        assert!(text.contains("docker daemon down"));
     }
 }
