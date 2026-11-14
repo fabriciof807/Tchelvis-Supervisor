@@ -23,7 +23,7 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
     - Máquina de estados determinística (`SemiAuto`, `AlertOnly`, `Paused`) com persistência em `~/.local/state/cockpit/supervisor_state.json` (incluindo `zero_active_since` e `model_loaded`).
     - Auto-resposta usa `hc send --force` para responder diálogos de terminais em estado `blocked` e limpa os labels `cockpit.state=working`, `cockpit.kind=""`, `cockpit.msg=""`.
     - Guardrails determinísticos bloqueiam comandos destrutivos (`git push --force`, `rm -rf`, `DROP TABLE`, etc.) no output ou no payload, convertendo automaticamente para `ALERT_OPERATOR` (`Urgency::Critical`), e normalizam respostas de prompts `(y/n)` / `[y/n]` para `"y"`.
-    - **Zero-Idle Unload**: quando `active_sessions == 0`, o modelo `lfm3:1.7b` é descarregado imediatamente da RAM no Ollama e o status passa para `Supervisor: Idle (0 MB)`.
+    - **Zero-Idle Unload**: quando `active_sessions == 0`, o modelo `lfm3:1.7b` é descarregado imediatamente da RAM no Ollama e o status passa para `Supervisor: Idle`.
   - **`tui.rs`**: Probe ao vivo do servidor Ollama (`/api/tags` + `/api/ps`) expondo `llm_connected`, `model_installed`, `model_loaded` e `llm_status_detail` no `DesktopModSnapshot` e no `cockpit doctor`.
 - **`src/home.rs`**:
   - Gerenciamento de **Projetos em Desenvolvimento** e **Tarefas do Dia** (`~/.local/share/cockpit/daily_tasks.json`) via `cockpit home --json` e `cockpit task <list|add|toggle|remove|clear-done>`.
@@ -81,5 +81,5 @@ cockpit supervisor status --json
    - Auto-reply instantâneo (~5s com `think: false` e `hc send --force`) em prompts seguros `(y/n)`.
    - Bloqueio determinístico (`ALERT_OPERATOR` + Action Card no Inspector) em comandos destrutivos (`git push --force`, `rm -rf`).
    - Clique nos cards de agentes em background (`hc run --bg`) abrindo diretamente o Inspector e permitindo `Approve`, `Ignore`, `Attach Tab` ou `Kill`.
-   - Limpeza automática para `0 agents` e `Supervisor: Idle (0 MB)` assim que os agentes/terminais são encerrados.
+   - Limpeza automática para `0 agents` e `Supervisor: Idle` assim que os agentes/terminais são encerrados.
 2. Evoluir a `landing-page/` ou adicionar novos fluxos de automação/integração conforme necessidade nos testes reais.

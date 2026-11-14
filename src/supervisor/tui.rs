@@ -757,7 +757,7 @@ mod tests {
 
         let idle_snap =
             build_desktop_mod_snapshot_from_parts(&SupervisorRuntimeStatus::Idle, false, &store);
-        assert_eq!(idle_snap.pill_text, "Supervisor: Idle (0 MB)");
+        assert_eq!(idle_snap.pill_text, "Supervisor: Idle");
         assert_eq!(idle_snap.mode_label, "Semi-Auto (Whitelist)");
         assert!(!idle_snap.model_loaded);
         assert!(idle_snap.agents.is_empty());

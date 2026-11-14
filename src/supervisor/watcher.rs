@@ -23,9 +23,9 @@ pub enum SupervisorRuntimeStatus {
 impl SupervisorRuntimeStatus {
     pub fn pill_text(&self) -> String {
         match self {
-            Self::Idle => "Supervisor: Idle (0 MB)".to_string(),
+            Self::Idle => "Supervisor: Idle".to_string(),
             Self::Watching(n) => format!("Supervisor: Watching ({n})"),
-            Self::Evaluating(_) => "Supervisor: Evaluating...".to_string(),
+            Self::Evaluating(_) => "Supervisor: Evaluating".to_string(),
         }
     }
 }

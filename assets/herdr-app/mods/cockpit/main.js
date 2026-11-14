@@ -1261,9 +1261,11 @@ export default class CockpitMod extends View {
     const accentCol = activeColor ?? t.accent;
     return h_flex()
       .id(id)
+      .flex_none()
       .h(22)
       .px(8)
       .items_center()
+      .justify_center()
       .rounded(4)
       .border(1)
       .border_color(
@@ -1405,7 +1407,7 @@ export default class CockpitMod extends View {
     const macNoFs = w?.platform === "macos" && !w?.fullscreen;
 
     const watchColor = t.project ?? t.accent;
-    let statusPillText = "Supervisor: Idle (0 MB)";
+    let statusPillText = "Supervisor: Idle";
     let statusPillColor = t.done;
     let statusPillBg = withAlpha(t.done, "1F", t.surface);
     let statusPillBorder = withAlpha(t.done, "58", t.border);
@@ -1418,13 +1420,13 @@ export default class CockpitMod extends View {
       statusPillBorder = t.border;
       dotColor = t.dim;
     } else if (evaluating) {
-      statusPillText = "Supervisor: Evaluating · lfm3:1.7b";
+      statusPillText = "Supervisor: Evaluating";
       statusPillColor = t.accent;
       statusPillBg = withAlpha(t.accent, "1F", t.surface);
       statusPillBorder = withAlpha(t.accent, "66", t.accent);
       dotColor = t.accent;
     } else if (watchingCount > 0) {
-      statusPillText = `Supervisor: Watching (${watchingCount}) · lfm3:1.7b (CPU-only)`;
+      statusPillText = `Supervisor: Watching (${watchingCount})`;
       statusPillColor = t.foreground;
       statusPillBg = withAlpha(watchColor, "1F", t.surface);
       statusPillBorder = withAlpha(watchColor, "58", t.border);
@@ -1444,14 +1446,23 @@ export default class CockpitMod extends View {
       .bg(t.chrome)
       .border_b(1)
       .border_color(t.border)
-      // Left Cluster: Live Supervisor Status Pill + Telemetry Badges
+      // Left Cluster: Live Supervisor Status Pill + Telemetry Badges.
+      // Left and right clusters share flex_1 (basis 0) so the center cluster
+      // stays pinned to the middle regardless of the supervisor state text.
       .child(
         h_flex()
+          .flex_1()
+          .min_w(0)
+          .overflow_hidden()
           .gap(6)
           .items_center()
           .child(
             h_flex()
               .id("ck-status-pill")
+              .flex_none()
+              // Fixed floor fits "Supervisor: Watching (99)" + dot/spinner so
+              // the badges to its right don't jitter between states.
+              .min_w(196)
               .h(24)
               .px(10)
               .gap(6)
@@ -1478,9 +1489,6 @@ export default class CockpitMod extends View {
                   .text_color(statusPillColor)
                   .child(statusPillText)
               )
-              .when(Boolean(supSnap?.model_loaded), (el) =>
-                el.child(this.pillBadge(t, "LLM RAM", t.accent))
-              )
           )
           .child(this.pillBadge(t, llmPillText, llmPillColor))
           .child(this.pillBadge(t, `num_gpu: ${numGpu}`, t.done))
@@ -1497,10 +1505,10 @@ export default class CockpitMod extends View {
             el.child(this.pillBadge(t, `${blockedCount} Needs You`, t.blocked))
           )
       )
-      .child(div().flex_1())
       // Center Cluster: Segmented Mode Switcher + Poll Now + Unload LLM
       .child(
         h_flex()
+          .flex_none()
           .gap(6)
           .items_center()
           .child(
@@ -1537,10 +1545,12 @@ export default class CockpitMod extends View {
             )
           )
       )
-      .child(div().flex_1())
       // Right Cluster: Unified Segmented View Switcher + Switch Layout
       .child(
         h_flex()
+          .flex_1()
+          .min_w(0)
+          .justify_end()
           .gap(6)
           .items_center()
           .child(
