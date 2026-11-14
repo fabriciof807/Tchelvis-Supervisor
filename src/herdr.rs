@@ -107,9 +107,6 @@ impl HcTerminal {
     }
 
     pub fn is_plain_shell_foreground(&self) -> bool {
-        let Some(fg) = &self.foreground else {
-            return false;
-        };
         let normalize = |raw: &str| -> String {
             let trimmed = raw.trim();
             let base = std::path::Path::new(trimmed)
@@ -117,6 +114,17 @@ impl HcTerminal {
                 .and_then(|s| s.to_str())
                 .unwrap_or(trimmed);
             base.trim_start_matches('-').to_ascii_lowercase()
+        };
+        let is_attach_argv = |argv: &[String]| -> bool {
+            argv.first()
+                .is_some_and(|arg| matches!(normalize(arg).as_str(), "herdr-core" | "hc"))
+                && argv.iter().any(|arg| arg == "attach")
+        };
+        if is_attach_argv(&self.argv) {
+            return true;
+        }
+        let Some(fg) = &self.foreground else {
+            return false;
         };
         let is_plain_shell = |name: &str| -> bool {
             matches!(
@@ -134,6 +142,8 @@ impl HcTerminal {
                     | "tmux"
                     | "screen"
                     | "login"
+                    | "herdr-core"
+                    | "hc"
             )
         };
         let is_known_agent = |name: &str| -> bool {
@@ -154,6 +164,11 @@ impl HcTerminal {
         };
 
         let fg_name = fg.name.as_deref().unwrap_or("");
+        if matches!(normalize(fg_name).as_str(), "herdr-core" | "hc")
+            && fg.argv.iter().any(|arg| arg == "attach")
+        {
+            return true;
+        }
         if is_plain_shell(fg_name) && !fg.argv.iter().any(|arg| is_known_agent(arg)) {
             if let Some(st) = &self.status {
                 if matches!(st.state.as_str(), "working" | "blocked" | "done" | "error")
@@ -885,5 +900,38 @@ mod tests {
             term.raw_attention_state(1_000),
             AttentionState::Done { message: None }
         );
+    }
+
+    #[test]
+    fn test_attach_client_foreground_is_treated_as_plain_shell() {
+        let term = HcTerminal {
+            address: "t50".into(),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("herdr-core".into()),
+                argv: vec![
+                    "herdr-core".into(),
+                    "attach".into(),
+                    "lore-agy".into(),
+                ],
+                cwd: None,
+                pid: Some(1234),
+            }),
+            ..Default::default()
+        };
+        assert!(term.is_plain_shell_foreground());
+
+        let attached_to_named_agent = HcTerminal {
+            address: "t51".into(),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("hc".into()),
+                argv: vec!["hc".into(), "attach".into(), "claude".into()],
+                cwd: None,
+                pid: Some(5678),
+            }),
+            ..Default::default()
+        };
+        assert!(attached_to_named_agent.is_plain_shell_foreground());
     }
 }

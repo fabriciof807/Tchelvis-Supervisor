@@ -298,7 +298,24 @@ fn is_plain_shell_program(token: &str) -> bool {
             | "tmux"
             | "screen"
             | "login"
+            | "herdr-core"
+            | "hc"
     )
+}
+
+fn is_attach_client_invocation(program: Option<&str>, args: &[String]) -> bool {
+    let prog_matches = program
+        .map(normalize_program_token)
+        .is_some_and(|p| p == "herdr-core" || p == "hc");
+    let argv0_matches = args
+        .first()
+        .map(|s| normalize_program_token(s))
+        .is_some_and(|p| p == "herdr-core" || p == "hc");
+    (prog_matches || argv0_matches)
+        && args
+            .iter()
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| normalize_program_token(arg) == "attach")
 }
 
 fn is_supervisor_or_cockpit_name(token: &str) -> bool {
@@ -352,6 +369,11 @@ pub fn is_coding_agent_terminal(
         || name.is_some_and(is_supervisor_or_cockpit_name)
         || fg_name.is_some_and(is_supervisor_or_cockpit_name)
     {
+        return false;
+    }
+
+    let fg_argv = foreground.map(|f| f.argv.as_slice()).unwrap_or(&[]);
+    if is_attach_client_invocation(fg_name, fg_argv) || is_attach_client_invocation(None, argv) {
         return false;
     }
 
@@ -648,5 +670,45 @@ mod tests {
         }"#;
         let sessions = parse_hc_ls_json(sample, None).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hc_ls_json_filters_herdr_attach_clients() {
+        let sample = r#"{
+            "terminals": [
+                {
+                    "address": "t20",
+                    "state": "live",
+                    "foreground": {"name": "herdr-core", "argv": ["herdr-core", "attach", "lore-agy"]},
+                    "argv": ["herdr-core", "attach", "lore-agy"]
+                },
+                {
+                    "address": "t21",
+                    "state": "live",
+                    "foreground": {"name": "hc", "argv": ["hc", "attach", "claude"]},
+                    "argv": ["hc", "attach", "claude"]
+                },
+                {
+                    "address": "t22",
+                    "state": "live",
+                    "argv": ["/home/ubuntu/.local/bin/herdr-core", "attach", "codex"]
+                }
+            ]
+        }"#;
+        let sessions = parse_hc_ls_json(sample, None).unwrap();
+        assert!(sessions.is_empty());
+        assert!(!is_coding_agent_terminal(
+            None,
+            Some("claude"),
+            Some(&RawHcForeground {
+                name: Some("hc".to_string()),
+                argv: vec!["hc".into(), "attach".into(), "claude".into()],
+            }),
+            &[],
+            false,
+            None,
+            None,
+            &BTreeMap::new(),
+        ));
     }
 }

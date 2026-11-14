@@ -452,14 +452,60 @@ export function buildProjectsList(
   return list;
 }
 
+function normProgToken(val) {
+  return String(val ?? "")
+    .trim()
+    .toLowerCase()
+    .split(/[\\/]/)
+    .pop()
+    .replace(/^-/, "");
+}
+
+function extractAttachTargetFromArgs(args, fallbackProgram = null) {
+  if (!Array.isArray(args) || args.length === 0) return null;
+  const first = normProgToken(args[0]);
+  const fb = normProgToken(fallbackProgram);
+  const isAttachCli =
+    first === "herdr-core" ||
+    first === "hc" ||
+    fb === "herdr-core" ||
+    fb === "hc";
+  if (!isAttachCli) return null;
+
+  let attachIdx = -1;
+  for (let i = 0; i < args.length; i += 1) {
+    const raw = String(args[i] ?? "").trim();
+    if (raw === "--") break;
+    if (normProgToken(raw) === "attach") {
+      attachIdx = i;
+      break;
+    }
+  }
+  if (attachIdx < 0) return null;
+
+  for (let i = attachIdx + 1; i < args.length; i += 1) {
+    const raw = String(args[i] ?? "").trim();
+    if (!raw || raw === "--" || raw.startsWith("-")) continue;
+    return raw;
+  }
+  return "";
+}
+
+function extractAttachTargetFromTerminal(term, programName = null) {
+  if (!term) return null;
+  const fgTarget = extractAttachTargetFromArgs(
+    term?.foreground?.argv,
+    term?.foreground?.name ?? programName
+  );
+  if (fgTarget !== null) return fgTarget;
+  return extractAttachTargetFromArgs(term?.argv, term?.program ?? programName);
+}
+
 function isPlainShellRow(name, programName, labels, term = null) {
-  const norm = (val) =>
-    String(val ?? "")
-      .trim()
-      .toLowerCase()
-      .split(/[\\/]/)
-      .pop()
-      .replace(/^-/, "");
+  const norm = normProgToken;
+  if (extractAttachTargetFromTerminal(term, programName) !== null) {
+    return true;
+  }
   const plainShells = new Set([
     "zsh",
     "bash",
@@ -472,8 +518,20 @@ function isPlainShellRow(name, programName, labels, term = null) {
     "cockpit",
     "herdr-supervisor",
     "cockpit-supervisor",
+    "herdr-core",
+    "hc",
   ]);
-  const fgShells = new Set(["zsh", "bash", "fish", "sh", "nu", "nushell", "dash"]);
+  const fgShells = new Set([
+    "zsh",
+    "bash",
+    "fish",
+    "sh",
+    "nu",
+    "nushell",
+    "dash",
+    "herdr-core",
+    "hc",
+  ]);
   const knownAgents = new Set([
     "claude",
     "claude-code",
@@ -518,6 +576,112 @@ function isPlainShellRow(name, programName, labels, term = null) {
   return /\((zsh|bash|fish|sh|nu|dash|tmux)\)$/i.test(String(name ?? "").trim());
 }
 
+async function delayMs(ms) {
+  if (typeof globalThis.setTimeout === "function") {
+    return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+  }
+  const secs = String(Math.max(0.05, ms / 1000).toFixed(2));
+  await exec("sleep", [secs], { timeout: Math.max(1000, ms + 500) }).catch(
+    () => null
+  );
+}
+
+function resolveCoreTermName(term, fallbackName, address) {
+  const direct = String(term?.name ?? "").trim();
+  if (direct && direct !== address) return direct;
+  const fb = String(fallbackName ?? "").trim();
+  if (
+    fb &&
+    fb !== address &&
+    !fb.includes(" / ") &&
+    !/\s\([^)]+\)$/.test(fb) &&
+    !fb.includes(" ")
+  ) {
+    return fb;
+  }
+  return direct || null;
+}
+
+function findPaneForTerminal(
+  allPanes,
+  allTerminals,
+  address,
+  termName = null,
+  knownPaneId = null
+) {
+  const paneList = Array.isArray(allPanes) ? allPanes : [];
+  if (knownPaneId) {
+    const byId = paneList.find((p) => (p.pane ?? p.id) === knownPaneId);
+    if (byId) return byId;
+  }
+  const direct = paneList.find((p) => p.terminal === address);
+  if (direct) return direct;
+
+  const termList = Array.isArray(allTerminals) ? allTerminals : [];
+  const attachMatchesTarget = (target) => {
+    if (!target) return false;
+    const shortTarget = target.includes("/") ? target.split("/").pop() : target;
+    return (
+      target === address ||
+      shortTarget === address ||
+      (Boolean(termName) && (target === termName || shortTarget === termName))
+    );
+  };
+  const wrapperAddrs = new Set(
+    termList
+      .filter((t) => attachMatchesTarget(extractAttachTargetFromTerminal(t)))
+      .map((t) => t.address)
+  );
+  if (wrapperAddrs.size > 0) {
+    const wrappedPane = paneList.find((p) => wrapperAddrs.has(p.terminal));
+    if (wrappedPane) return wrappedPane;
+  }
+
+  return knownPaneId ? { pane: knownPaneId } : null;
+}
+
+function resolveAttachedTargetAddress(
+  wrapperTermAddr,
+  allTerminals,
+  extraAgents = []
+) {
+  if (!wrapperTermAddr) return wrapperTermAddr;
+  const termList = Array.isArray(allTerminals) ? allTerminals : [];
+  const wrapper = termList.find((t) => t.address === wrapperTermAddr);
+  const rawTarget = extractAttachTargetFromTerminal(wrapper);
+  if (!rawTarget) return wrapperTermAddr;
+
+  const shortTarget = rawTarget.includes("/")
+    ? rawTarget.split("/").pop()
+    : rawTarget;
+  const matchedTerm = termList.find(
+    (t) =>
+      t &&
+      t.address !== wrapperTermAddr &&
+      extractAttachTargetFromTerminal(t) === null &&
+      (t.address === rawTarget ||
+        t.address === shortTarget ||
+        t.name === rawTarget ||
+        t.name === shortTarget)
+  );
+  if (matchedTerm?.address) return matchedTerm.address;
+
+  const matchedExtra = (Array.isArray(extraAgents) ? extraAgents : []).find(
+    (a) =>
+      a &&
+      a.address !== wrapperTermAddr &&
+      (a.address === rawTarget ||
+        a.address === shortTarget ||
+        a.name === rawTarget ||
+        a.name === shortTarget ||
+        a.term_name === rawTarget ||
+        a.term_name === shortTarget ||
+        a.attach_target === rawTarget ||
+        a.attach_target === shortTarget)
+  );
+  return matchedExtra?.address ?? wrapperTermAddr;
+}
+
 export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
   const snapMap = new Map(
     (snap?.agents ?? []).map((a) => [a.address, a])
@@ -527,6 +691,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
   );
   const hasLiveTermList = Array.isArray(allTerminals) && allTerminals.length > 0;
   const termMap = new Map(allTerminals.map((t) => [t.address, t]));
+  const allPanes = panes() ?? [];
   const seen = new Set();
   const rows = [];
 
@@ -547,9 +712,24 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       continue;
     }
     seen.add(a.address);
-    const pane = panes().find((p) => p.terminal === a.address);
+    const termName = resolveCoreTermName(
+      term,
+      enriched.name || a.tab_name || a.title,
+      a.address
+    );
+    const pane = findPaneForTerminal(
+      allPanes,
+      allTerminals,
+      a.address,
+      termName,
+      a.pane
+    );
     const resolvedCwd =
-      pane?.cwd ?? enriched?.workspace?.cwd ?? term?.cwd ?? null;
+      (pane?.terminal === a.address ? pane?.cwd : null) ??
+      enriched?.workspace?.cwd ??
+      term?.cwd ??
+      pane?.cwd ??
+      null;
     const projectName =
       a.space_name || extractRepoName(resolvedCwd, "") || rawName;
     const programLabel = resolveProgramName(
@@ -575,6 +755,8 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     rows.push({
       address: a.address,
       pane: a.pane ?? pane?.pane ?? null,
+      term_name: termName,
+      attach_target: termName || a.address,
       space_name: a.space_name ?? "",
       tab_name: a.tab_name ?? a.title ?? a.address,
       name: displayName,
@@ -629,7 +811,16 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       continue;
     }
     seen.add(sa.address);
-    const resolvedCwd = sa?.workspace?.cwd ?? term?.cwd ?? null;
+    const termName = resolveCoreTermName(term, sa.name, sa.address);
+    const pane = findPaneForTerminal(
+      allPanes,
+      allTerminals,
+      sa.address,
+      termName,
+      null
+    );
+    const resolvedCwd =
+      sa?.workspace?.cwd ?? term?.cwd ?? pane?.cwd ?? null;
     const projectName = extractRepoName(resolvedCwd, "") || rawName;
     const programLabel = resolveProgramName(
       term.program,
@@ -645,7 +836,9 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
         : baseStatus;
     rows.push({
       address: sa.address,
-      pane: null,
+      pane: pane?.pane ?? null,
+      term_name: termName,
+      attach_target: termName || sa.address,
       space_name: "",
       tab_name: rawName,
       name: displayName,
@@ -661,7 +854,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
         sup?.action_card?.reason_for_operator ??
         null,
       program: term.program ?? null,
-      branch: sa?.workspace?.git_branch ?? null,
+      branch: sa?.workspace?.git_branch ?? pane?.branch ?? null,
       cwd: resolvedCwd,
       labels: rowLabels,
       correlation_tier: sa?.correlation_tier ?? null,
@@ -702,14 +895,23 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       continue;
     }
     seen.add(sup.agent_id);
-    const pane = panes().find((p) => p.terminal === sup.agent_id);
-    const resolvedCwd = pane?.cwd ?? term?.cwd ?? null;
+    const termName = resolveCoreTermName(term, sup.session_name, sup.agent_id);
+    const pane = findPaneForTerminal(
+      allPanes,
+      allTerminals,
+      sup.agent_id,
+      termName,
+      null
+    );
+    const resolvedCwd = term?.cwd ?? pane?.cwd ?? null;
     const projectName = extractRepoName(resolvedCwd, "") || rawName;
     const programLabel = resolveProgramName(rowProgram, rowLabels, null);
     const displayName = resolveDisplayName(rawName, projectName, sup.agent_id);
     rows.push({
       address: sup.agent_id,
       pane: pane?.pane ?? null,
+      term_name: termName,
+      attach_target: termName || sup.agent_id,
       space_name: "",
       tab_name: rawName,
       name: displayName,
@@ -737,6 +939,69 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       auto_reply_log: sup.auto_reply_log ?? [],
       rolling_summary: sup.rolling_summary ?? null,
       last_output_preview: sup.last_output_preview ?? "",
+    });
+  }
+
+  for (const term of allTerminals ?? []) {
+    const addr = term?.address;
+    if (!addr || seen.has(addr)) continue;
+    if (term?.state === "finished") continue;
+    const rawName = term.name || term.title || addr;
+    const rowProgram = term.program ?? term?.foreground?.name ?? null;
+    const rowLabels = term?.labels ?? {};
+    if (isPlainShellRow(rawName, rowProgram, rowLabels, term)) {
+      continue;
+    }
+    seen.add(addr);
+    const termName = resolveCoreTermName(term, term.name || term.title, addr);
+    const pane = findPaneForTerminal(
+      allPanes,
+      allTerminals,
+      addr,
+      termName,
+      null
+    );
+    const resolvedCwd = term?.cwd ?? pane?.cwd ?? null;
+    const projectName = extractRepoName(resolvedCwd, "") || rawName;
+    const programLabel = resolveProgramName(rowProgram, rowLabels, null);
+    const displayName = resolveDisplayName(rawName, projectName, addr);
+    const rawTermStatus =
+      typeof term?.status === "string" ? term.status : term?.status?.state;
+    const status =
+      rawTermStatus ||
+      term?.report?.state ||
+      rowLabels?.["cockpit.state"] ||
+      "idle";
+    rows.push({
+      address: addr,
+      pane: pane?.pane ?? null,
+      term_name: termName,
+      attach_target: termName || addr,
+      space_name: "",
+      tab_name: rawName,
+      name: displayName,
+      project_name: projectName,
+      program_label: programLabel,
+      status,
+      kind: term?.report?.kind ?? term?.status?.kind ?? null,
+      message: term?.report?.msg ?? term?.status?.msg ?? null,
+      program: rowProgram,
+      branch: pane?.branch ?? null,
+      cwd: resolvedCwd,
+      labels: rowLabels,
+      correlation_tier: null,
+      context: null,
+      blocked_children: [],
+      lifecycle: { state: term?.state ?? "live" },
+      focused: false,
+      pinned: false,
+      seq: 0,
+      sup_lifecycle: null,
+      action_card: null,
+      audit_badge: null,
+      auto_reply_log: [],
+      rolling_summary: null,
+      last_output_preview: "",
     });
   }
 
@@ -818,7 +1083,14 @@ export default class CockpitMod extends View {
 
   selectedAddress() {
     const f = focused();
-    const fTerm = f?.terminal ?? null;
+    const rawFTerm = f?.terminal ?? null;
+    const fTerm = rawFTerm
+      ? resolveAttachedTargetAddress(
+          rawFTerm,
+          terminals() ?? [],
+          shared("cockpit.snapshot")?.agents ?? []
+        )
+      : null;
     const lastFocus = shared("cockpit.lastFocusedTerminal") ?? null;
     if (fTerm && fTerm !== lastFocus) {
       setShared("cockpit.lastFocusedTerminal", fTerm);
@@ -833,6 +1105,75 @@ export default class CockpitMod extends View {
     const supSnap = shared("supervisor.snapshot");
     const firstAlert = (supSnap?.agents ?? []).find((a) => a.action_card)?.agent_id;
     return firstAlert ?? supSnap?.agents?.[0]?.agent_id ?? null;
+  }
+
+  async focusOrAttachTerminal(cx, agentRow, forceAttach = false) {
+    const addr = agentRow?.address;
+    if (!addr) return;
+    const allTerms = terminals() ?? [];
+    const allPanes = panes() ?? [];
+    const term = allTerms.find((t) => t.address === addr);
+    const termName =
+      agentRow.term_name ??
+      resolveCoreTermName(term, agentRow.tab_name ?? agentRow.name, addr);
+    const attachTarget = agentRow.attach_target || termName || addr;
+
+    const openAttachTab = () => {
+      this.attachingTargets ??= new Map();
+      const now = Date.now();
+      const lastAttempt = this.attachingTargets.get(addr) ?? 0;
+      if (now - lastAttempt < 1200) return;
+      this.attachingTargets.set(addr, now);
+      const sp = (spaces() ?? []).find((s) => s.active);
+      run("tab.new", {
+        space: sp?.id,
+        name: termName || addr,
+        argv: ["herdr-core", "attach", attachTarget],
+      });
+      cx?.notify?.();
+    };
+
+    if (forceAttach) {
+      openAttachTab();
+      return;
+    }
+
+    const livePane = findPaneForTerminal(
+      allPanes,
+      allTerms,
+      addr,
+      termName,
+      agentRow.pane ?? null
+    );
+    if (livePane?.pane) {
+      run("pane.focus", { pane: livePane.pane });
+    } else {
+      run("agent.focus", { terminal: addr });
+    }
+
+    await delayMs(200);
+
+    const termsAfter = terminals() ?? [];
+    const panesAfter = panes() ?? [];
+    const paneAfter = findPaneForTerminal(
+      panesAfter,
+      termsAfter,
+      addr,
+      termName,
+      null
+    );
+    const rawFocusedTerm = focused()?.terminal ?? null;
+    const mappedFocused = rawFocusedTerm
+      ? resolveAttachedTargetAddress(
+          rawFocusedTerm,
+          termsAfter,
+          shared("cockpit.snapshot")?.agents ?? []
+        )
+      : null;
+
+    if (!paneAfter?.pane && mappedFocused !== addr) {
+      openAttachTab();
+    }
   }
 
   fetchSupervisorStatus(cx) {
@@ -1943,7 +2284,14 @@ export default class CockpitMod extends View {
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
           const curFocus = focused()?.terminal ?? null;
-          setShared("cockpit.lastFocusedTerminal", curFocus);
+          const resolvedCurFocus = curFocus
+            ? resolveAttachedTargetAddress(
+                curFocus,
+                terminals() ?? [],
+                shared("cockpit.snapshot")?.agents ?? []
+              )
+            : null;
+          setShared("cockpit.lastFocusedTerminal", resolvedCurFocus);
           setShared("cockpit.selected", a.address);
           setShared("cockpit.viewMode", "inspector");
           setShared("cockpit.usageOnlyDrawer", false);
@@ -1951,11 +2299,7 @@ export default class CockpitMod extends View {
           if (findNode(layout(), "cockpit-inspector")?.hidden) {
             run("layout.toggle", { id: "cockpit-inspector" });
           }
-          if (a.pane) {
-            run("pane.focus", { pane: a.pane });
-          } else {
-            run("agent.focus", { terminal: a.address });
-          }
+          void this.focusOrAttachTerminal(cx, a, false);
           this.refreshInspector(cx);
           cx.notify();
         })
@@ -4269,12 +4613,11 @@ export default class CockpitMod extends View {
                             "ck-ctl-focus",
                             "Focus Terminal",
                             () => {
-                              if (agent.pane)
-                                run("pane.focus", { pane: agent.pane });
-                              else
-                                run("terminal.peek", {
-                                  terminal: agent.address,
-                                });
+                              void this.focusOrAttachTerminal(
+                                cx,
+                                agent,
+                                false
+                              );
                             },
                             true
                           )
@@ -4286,12 +4629,11 @@ export default class CockpitMod extends View {
                               "ck-ctl-attach",
                               "Attach Tab",
                               () => {
-                                const sp = spaces().find((s) => s.active);
-                                run("tab.new", {
-                                  space: sp?.id,
-                                  name: agent.address,
-                                  argv: ["hc", "attach", agent.address],
-                                });
+                                void this.focusOrAttachTerminal(
+                                  cx,
+                                  agent,
+                                  true
+                                );
                               }
                             )
                           )
