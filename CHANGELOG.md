@@ -12,6 +12,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Supervisor model selection (M1).** Pick a GGUF model already on the machine for the `llama.cpp` container, without downloading anything new.
+  - **Discovery:** scans the Ollama store, the Hugging Face / llama.cpp / LM Studio caches, and folders from `[llm_container] model_dirs` or `COCKPIT_MODEL_DIRS`.
+  - **Filter:** by parameter count (`≤2B / ≤4B / ≤8B / All`, default ≤4B). Embedding and projector models are hidden.
+  - **CLI:** `cockpit supervisor model list|set|filter|reset`.
+  - **Persistence:** the choice is written into `supervisor.toml` (`[llm_container] model_id`), preserving comments. Switching while loaded recreates the container (`cockpit.model_id` label).
+  - **Herdr mod:** a picker card opens from the top-bar LLM pill or the Inspector's LLM card.
 - **Agent-facing install guide** (`docs/agent-install.md`) and an `llms.txt` index, so AI agents given the repository URL can detect installed components and install only what is missing (e.g. just the LLM container).
 - **Managed `llama.cpp` supervisor LLM container** (`6a38eee`)
   - **Container runtime:** auto-detected in the order Kiri, Podman, Docker. Override with `[llm_container] runtime` or `COCKPIT_CONTAINER_RUNTIME`.
@@ -38,6 +44,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Live LLM health** (`d414a7a`): connection and model status in the top bar, Home, Doctor, and `cockpit doctor`.
 
 ### Changed
+- `supervisor.toml` may now contain only some keys. Missing keys fall back to defaults instead of the whole file being ignored, and parse errors are logged.
 - **Project renamed** to **Tchelvis Supervisor**. The GitHub repository moved to `fabriciof807/Tchelvis-Supervisor` and is now public; the README was rewritten in English around the container setup (`fb01886`).
 - **Default supervisor model** is now `lfm3:1.7b` (previously `qwen2.5:1.5b-instruct`). Evaluations run with `think: false` for fast CPU responses (`4c842ec`, `0c5c727`).
 - **Action Card policy** (`2ce7dc3`):

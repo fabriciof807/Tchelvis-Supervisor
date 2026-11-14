@@ -26,8 +26,8 @@ with the UI track.
 
 | # | Milestone | Depends on | Status |
 | :-- | :-- | :-- | :-- |
-| M0 | Container validation & config hardening | — | **Next** |
-| M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | Designed |
+| M0 | Container validation & config hardening | — | Host validation in progress; partial TOML done (M1) |
+| M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | **Implemented**; UI to validate on host |
 | M1b | Fallback model when the chosen one stops working | M1 | Planned |
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |

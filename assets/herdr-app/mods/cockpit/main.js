@@ -1033,6 +1033,13 @@ export default class CockpitMod extends View {
     this.usageOnlyDrawer = Boolean(shared("cockpit.usageOnlyDrawer"));
     this.usageMenuOpen = false;
     this.selectedUsageEntryId = shared("cockpit.usageEntryId") ?? null;
+    this.modelPickerOpen = Boolean(shared("cockpit.modelPickerOpen"));
+    this.modelPickerOnlyDrawer = Boolean(shared("cockpit.modelPickerOnlyDrawer"));
+    this.modelList = shared("cockpit.modelList") ?? null;
+    this.modelListLoading = Boolean(shared("cockpit.modelListLoading"));
+    this.modelListError = String(shared("cockpit.modelListError") ?? "");
+    this.modelListShowAll = Boolean(shared("cockpit.modelListShowAll"));
+    this.modelSwitchingId = shared("cockpit.modelSwitchingId") ?? null;
     this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
@@ -1832,6 +1839,10 @@ export default class CockpitMod extends View {
       this.closeUsagePopup(cx);
       return;
     }
+    this.modelPickerOpen = false;
+    this.modelPickerOnlyDrawer = false;
+    setShared("cockpit.modelPickerOpen", false);
+    setShared("cockpit.modelPickerOnlyDrawer", false);
     this.usageOpen = true;
     this.usageMenuOpen = false;
     setShared("cockpit.usageOpen", true);
@@ -1868,6 +1879,149 @@ export default class CockpitMod extends View {
     cx?.notify();
   }
 
+  toggleModelPicker(cx) {
+    const inspectorHidden = Boolean(
+      findNode(layout(), "cockpit-inspector")?.hidden
+    );
+    const pickerOpen = Boolean(
+      shared("cockpit.modelPickerOpen") ?? this.modelPickerOpen
+    );
+    if (pickerOpen && !inspectorHidden) {
+      this.closeModelPicker(cx);
+      return;
+    }
+    this.usageOpen = false;
+    this.usageMenuOpen = false;
+    this.usageOnlyDrawer = false;
+    setShared("cockpit.usageOpen", false);
+    setShared("cockpit.usageOnlyDrawer", false);
+
+    this.modelPickerOpen = true;
+    this.modelListShowAll = false;
+    setShared("cockpit.modelPickerOpen", true);
+    setShared("cockpit.modelListShowAll", false);
+    if (inspectorHidden) {
+      this.modelPickerOnlyDrawer = true;
+      setShared("cockpit.modelPickerOnlyDrawer", true);
+      run("layout.toggle", { id: "cockpit-inspector" });
+    } else {
+      this.modelPickerOnlyDrawer = false;
+      setShared("cockpit.modelPickerOnlyDrawer", false);
+    }
+    this.fetchModelList(cx, false);
+    cx?.notify();
+  }
+
+  closeModelPicker(cx) {
+    const onlyDrawer = Boolean(
+      shared("cockpit.modelPickerOnlyDrawer") ?? this.modelPickerOnlyDrawer
+    );
+    this.modelPickerOpen = false;
+    this.modelPickerOnlyDrawer = false;
+    this.modelListShowAll = false;
+    setShared("cockpit.modelPickerOpen", false);
+    setShared("cockpit.modelPickerOnlyDrawer", false);
+    setShared("cockpit.modelListShowAll", false);
+    if (onlyDrawer && !findNode(layout(), "cockpit-inspector")?.hidden) {
+      run("layout.hide", { id: "cockpit-inspector" });
+    }
+    cx?.notify();
+  }
+
+  _runModelListCmd(cx, args) {
+    this.modelListLoading = true;
+    this.modelListError = "";
+    setShared("cockpit.modelListLoading", true);
+    setShared("cockpit.modelListError", "");
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("cockpit", args, { timeout: 30000 });
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          this.modelList = parsed;
+          setShared("cockpit.modelList", parsed);
+          this.modelListError = "";
+          setShared("cockpit.modelListError", "");
+        } else {
+          const err = res.stderr?.trim() || `Command failed (${res.code})`;
+          this.modelListError = err;
+          setShared("cockpit.modelListError", err);
+        }
+      } catch (e) {
+        const err = `Error: ${String(e)}`;
+        this.modelListError = err;
+        setShared("cockpit.modelListError", err);
+      } finally {
+        this.modelListLoading = false;
+        setShared("cockpit.modelListLoading", false);
+        cx.notify();
+      }
+    });
+  }
+
+  fetchModelList(cx, showAll = null) {
+    const useAll =
+      showAll !== null
+        ? Boolean(showAll)
+        : Boolean(shared("cockpit.modelListShowAll") ?? this.modelListShowAll);
+    const args = ["supervisor", "model", "list", "--json"];
+    if (useAll) args.push("--all");
+    this._runModelListCmd(cx, args);
+  }
+
+  setModelFilter(cx, f) {
+    const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
+    if (switching) return;
+    this.modelListShowAll = false;
+    setShared("cockpit.modelListShowAll", false);
+    this._runModelListCmd(cx, ["supervisor", "model", "filter", f]);
+  }
+
+  selectModel(cx, id) {
+    const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
+    if (switching || !id) return;
+    this.modelSwitchingId = id;
+    this.modelListError = "";
+    setShared("cockpit.modelSwitchingId", id);
+    setShared("cockpit.modelListError", "");
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      let ok = false;
+      try {
+        const res = await exec("cockpit", ["supervisor", "model", "set", id], {
+          timeout: 300000,
+        });
+        if (res.code === 0 && res.stdout) {
+          const snap = parseSnapshotOutput(res.stdout);
+          if (snap) {
+            setShared("supervisor.snapshot", snap);
+            setShared("supervisor.lastError", "");
+          }
+          ok = true;
+        } else {
+          const err = res.stderr?.trim() || `Command failed (${res.code})`;
+          this.modelListError = err;
+          setShared("cockpit.modelListError", err);
+        }
+      } catch (e) {
+        const err = `Error: ${String(e)}`;
+        this.modelListError = err;
+        setShared("cockpit.modelListError", err);
+      } finally {
+        this.modelSwitchingId = null;
+        setShared("cockpit.modelSwitchingId", null);
+        if (ok) {
+          this.fetchModelList(cx, null);
+        } else {
+          cx.notify();
+        }
+      }
+    });
+  }
+
   openDrawerView(cx, tab, toggleIfActive = false) {
     const normalizedTab = tab === "usage" ? "inspector" : tab;
     const inspectorHidden = Boolean(
@@ -1876,6 +2030,9 @@ export default class CockpitMod extends View {
     const onlyUsage = Boolean(
       shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
     );
+    const onlyModel = Boolean(
+      shared("cockpit.modelPickerOnlyDrawer") ?? this.modelPickerOnlyDrawer
+    );
     const rawView =
       shared("cockpit.viewMode") || this.inspectorTab || "inspector";
     const currentView = rawView === "usage" ? "inspector" : rawView;
@@ -1883,13 +2040,18 @@ export default class CockpitMod extends View {
       toggleIfActive &&
       !inspectorHidden &&
       !onlyUsage &&
+      !onlyModel &&
       currentView === normalizedTab
     ) {
       this.usageOpen = false;
       this.usageOnlyDrawer = false;
       this.usageMenuOpen = false;
+      this.modelPickerOpen = false;
+      this.modelPickerOnlyDrawer = false;
       setShared("cockpit.usageOpen", false);
       setShared("cockpit.usageOnlyDrawer", false);
+      setShared("cockpit.modelPickerOpen", false);
+      setShared("cockpit.modelPickerOnlyDrawer", false);
       run("layout.toggle", { id: "cockpit-inspector" });
       cx?.notify();
       return;
@@ -1897,6 +2059,10 @@ export default class CockpitMod extends View {
     if (onlyUsage) {
       this.usageOnlyDrawer = false;
       setShared("cockpit.usageOnlyDrawer", false);
+    }
+    if (onlyModel) {
+      this.modelPickerOnlyDrawer = false;
+      setShared("cockpit.modelPickerOnlyDrawer", false);
     }
     setShared("cockpit.viewMode", normalizedTab);
     this.inspectorTab = normalizedTab;
@@ -2115,7 +2281,14 @@ export default class CockpitMod extends View {
                   .child(statusPillText)
               )
           )
-          .child(this.pillBadge(t, llmPillText, llmPillColor))
+          .child(
+            this.pillBadge(t, llmPillText, llmPillColor)
+              .id("ck-llm-pill")
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", (_e, clickCx) => clickCx.stop_propagation())
+              .on_click((_e, clickCx) => this.toggleModelPicker(clickCx ?? cx))
+          )
           .child(
             this.pillBadge(
               t,
@@ -3701,6 +3874,301 @@ export default class CockpitMod extends View {
       );
   }
 
+  renderModelPicker(cx, themeArg = null, standalone = true) {
+    const t = themeArg ?? theme();
+    const listData = shared("cockpit.modelList") ?? this.modelList ?? null;
+    const isLoading = Boolean(
+      shared("cockpit.modelListLoading") ?? this.modelListLoading
+    );
+    const listError = String(
+      shared("cockpit.modelListError") ?? this.modelListError ?? ""
+    ).trim();
+    const showAll = Boolean(
+      shared("cockpit.modelListShowAll") ?? this.modelListShowAll
+    );
+    const switchingId =
+      shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId ?? null;
+
+    const models = Array.isArray(listData?.models) ? listData.models : [];
+    const hiddenCount = Number(listData?.hidden_count ?? 0);
+    const activeFilter = String(listData?.filter || "4b").toLowerCase();
+    const managed = listData ? listData.managed !== false : true;
+    const envWarning = listData?.env_override_ignored
+      ? String(listData.env_override_ignored)
+      : "";
+
+    const filterOpts = [
+      ["2b", "≤2B"],
+      ["4b", "≤4B"],
+      ["8b", "≤8B"],
+      ["all", "All"],
+    ];
+
+    let root = v_flex().id("ck-model-picker").p(10).gap(8).bg(t.chrome);
+    if (standalone) {
+      root = root.rounded(10).border(1).border_color(t.border);
+    }
+
+    return root
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .justify_between()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(div().text_size(13).text_color(t.accent).child("🧠"))
+              .child(
+                div()
+                  .text_size(12.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("Supervisor model")
+              )
+          )
+          .child(
+            h_flex()
+              .flex_none()
+              .gap(6)
+              .items_center()
+              .child(
+                this.segmentedTrack(t).children(
+                  filterOpts.map(([val, label]) =>
+                    this.segmentBtn(
+                      t,
+                      `ck-model-filter-${val}`,
+                      label,
+                      activeFilter === val,
+                      (_e, clickCx) => this.setModelFilter(clickCx ?? cx, val)
+                    )
+                  )
+                )
+              )
+              .child(
+                h_flex()
+                  .id("ck-model-close")
+                  .flex_none()
+                  .h(24)
+                  .w(24)
+                  .items_center()
+                  .justify_center()
+                  .rounded(6)
+                  .border(1)
+                  .border_color(t.border)
+                  .bg(t.surface)
+                  .text_size(12)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_mouse_down("left", (_e, clickCx) =>
+                    clickCx.stop_propagation()
+                  )
+                  .on_click((_e, clickCx) =>
+                    this.closeModelPicker(clickCx ?? cx)
+                  )
+                  .child("×")
+              )
+          )
+      )
+      .when(Boolean(envWarning), (el) =>
+        el.child(
+          h_flex()
+            .px(8)
+            .py(5)
+            .rounded(6)
+            .border(1)
+            .border_color(withAlpha(t.working, "66", t.working))
+            .bg(withAlpha(t.working, "1A", t.surface))
+            .text_size(11)
+            .text_color(t.working)
+            .child(
+              `${envWarning} is set in the environment and ignored in container mode`
+            )
+        )
+      )
+      .when(Boolean(listError), (el) =>
+        el.child(
+          h_flex()
+            .px(8)
+            .py(5)
+            .rounded(6)
+            .border(1)
+            .border_color(withAlpha(t.blocked, "66", t.blocked))
+            .bg(withAlpha(t.blocked, "1A", t.surface))
+            .text_size(11)
+            .text_color(t.blocked)
+            .child(listError)
+        )
+      )
+      .when(isLoading && !listData, (el) =>
+        el.child(
+          div()
+            .py(10)
+            .text_size(11.5)
+            .text_color(t.muted)
+            .child("Scanning…")
+        )
+      )
+      .when(!isLoading && listData && !managed, (el) =>
+        el.child(
+          div()
+            .py(6)
+            .text_size(11.5)
+            .text_color(t.muted)
+            .child(
+              "Model selection applies to the managed LLM container (COCKPIT_LLM_CONTAINER=on)."
+            )
+        )
+      )
+      .when(listData && managed && models.length === 0 && !isLoading, (el) =>
+        el.child(
+          div()
+            .py(6)
+            .text_size(11.5)
+            .text_color(t.muted)
+            .child(
+              "No local GGUF models found. Add folders with [llm_container] model_dirs or pull a model with Ollama."
+            )
+        )
+      )
+      .when(models.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .gap(4)
+            .max_h(260)
+            .overflow_y_scrollbar()
+            .children(
+              models.map((m, idx) => {
+                const isSwitching = switchingId === m.id;
+                const isNonChat = Boolean(m.kind && m.kind !== "chat");
+                const isClickable = !isNonChat && !switchingId;
+                const metaParts = [
+                  m.params_label || "?",
+                  m.source || "",
+                  Number(m.size_bytes) > 0 ? fmtBytes(m.size_bytes) : "",
+                  m.quant || "",
+                  isNonChat ? String(m.kind) : "",
+                ].filter(Boolean);
+
+                let row = h_flex()
+                  .id(`ck-model-row-${idx}`)
+                  .px(8)
+                  .py(6)
+                  .gap(8)
+                  .items_center()
+                  .justify_between()
+                  .rounded(6)
+                  .border(1)
+                  .border_color(
+                    m.in_use
+                      ? withAlpha(t.accent, "66", t.accent)
+                      : t.border
+                  )
+                  .bg(m.in_use ? t.selected : t.surface);
+
+                if (isClickable) {
+                  row = row
+                    .cursor_pointer()
+                    .hover((s) =>
+                      s.bg(m.in_use ? t.selected : t.hover)
+                    )
+                    .on_mouse_down("left", (_e, clickCx) =>
+                      clickCx.stop_propagation()
+                    )
+                    .on_click((_e, clickCx) =>
+                      this.selectModel(clickCx ?? cx, m.id)
+                    );
+                }
+
+                return row
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .flex_none()
+                          .text_size(11.5)
+                          .text_color(
+                            isNonChat
+                              ? t.dim
+                              : m.in_use
+                                ? t.accent
+                                : t.muted
+                          )
+                          .child(m.in_use ? "●" : "○")
+                      )
+                      .child(
+                        div()
+                          .text_size(11.5)
+                          .font_semibold()
+                          .text_color(isNonChat ? t.dim : t.foreground)
+                          .child(ellipsize(m.display_name || m.id, 34))
+                      )
+                  )
+                  .child(
+                    div()
+                      .flex_none()
+                      .text_size(10.5)
+                      .text_color(
+                        isSwitching
+                          ? t.accent
+                          : isNonChat
+                            ? t.dim
+                            : t.muted
+                      )
+                      .child(
+                        isSwitching
+                          ? "◌ Switching…"
+                          : metaParts.join(" · ")
+                      )
+                  );
+              })
+            )
+        )
+      )
+      .child(
+        h_flex()
+          .pt(2)
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .child(
+            hiddenCount > 0 && !showAll
+              ? div()
+                  .id("ck-model-show-hidden")
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.text_color(t.foreground))
+                  .on_mouse_down("left", (_e, clickCx) =>
+                    clickCx.stop_propagation()
+                  )
+                  .on_click((_e, clickCx) => {
+                    this.modelListShowAll = true;
+                    setShared("cockpit.modelListShowAll", true);
+                    this.fetchModelList(clickCx ?? cx, true);
+                  })
+                  .child(`${hiddenCount} hidden by filter`)
+              : div()
+          )
+          .child(
+            this.actionBtn(
+              t,
+              "ck-model-rescan",
+              isLoading ? "Scanning…" : "↻ Rescan",
+              (_e, clickCx) => {
+                if (!isLoading) this.fetchModelList(clickCx ?? cx, null);
+              }
+            )
+          )
+      );
+  }
+
   renderUsagePopover(cx, themeArg = null, standalone = true) {
     const t = themeArg ?? theme();
     const usageSnap = shared("cockpit.usage") ?? this.usageSnap ?? null;
@@ -4360,6 +4828,12 @@ export default class CockpitMod extends View {
     const usageOnlyDrawer = Boolean(
       shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
     );
+    const modelPickerOpen = Boolean(
+      shared("cockpit.modelPickerOpen") ?? this.modelPickerOpen
+    );
+    const modelPickerOnlyDrawer = Boolean(
+      shared("cockpit.modelPickerOnlyDrawer") ?? this.modelPickerOnlyDrawer
+    );
 
     const supAgent =
       (supSnap?.agents ?? []).find((a) => a.agent_id === agent?.address) ??
@@ -4479,6 +4953,16 @@ export default class CockpitMod extends View {
         .child(this.renderUsagePopover(cx, t, true));
     }
 
+    if (modelPickerOpen && modelPickerOnlyDrawer) {
+      return v_flex()
+        .id("ck-inspector-root")
+        .size_full()
+        .track_focus(this.handle)
+        .text_color(t.foreground)
+        .on_key_down((e, cx) => this.handleKeyDown(e, cx, agent))
+        .child(this.renderModelPicker(cx, t, true));
+    }
+
     return v_flex()
       .id("ck-inspector-root")
       .size_full()
@@ -4511,6 +4995,7 @@ export default class CockpitMod extends View {
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "home");
                     setShared("cockpit.usageOnlyDrawer", false);
+                    setShared("cockpit.modelPickerOnlyDrawer", false);
                     this.inspectorTab = "home";
                     this.fetchHomeSnapshot(cx);
                     cx.notify();
@@ -4526,6 +5011,7 @@ export default class CockpitMod extends View {
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "inspector");
                     setShared("cockpit.usageOnlyDrawer", false);
+                    setShared("cockpit.modelPickerOnlyDrawer", false);
                     this.inspectorTab = "inspector";
                     this.refreshInspector(cx);
                     cx.notify();
@@ -4541,6 +5027,7 @@ export default class CockpitMod extends View {
                   (_e, cx) => {
                     setShared("cockpit.viewMode", "doctor");
                     setShared("cockpit.usageOnlyDrawer", false);
+                    setShared("cockpit.modelPickerOnlyDrawer", false);
                     this.inspectorTab = "doctor";
                     if (!this.doctorReport) this.runDoctorCheck(cx);
                     cx.notify();
@@ -4555,6 +5042,7 @@ export default class CockpitMod extends View {
               this.refreshInspector(cx);
               this.fetchHomeSnapshot(cx);
               if (usageOpen) this.fetchUsageSnapshot(cx, true, false);
+              if (modelPickerOpen) this.fetchModelList(cx, null);
               if (activeView === "doctor") this.runDoctorCheck(cx);
             })
           )
@@ -4563,8 +5051,12 @@ export default class CockpitMod extends View {
               this.usageOpen = false;
               this.usageOnlyDrawer = false;
               this.usageMenuOpen = false;
+              this.modelPickerOpen = false;
+              this.modelPickerOnlyDrawer = false;
               setShared("cockpit.usageOpen", false);
               setShared("cockpit.usageOnlyDrawer", false);
+              setShared("cockpit.modelPickerOpen", false);
+              setShared("cockpit.modelPickerOnlyDrawer", false);
               run("layout.hide", { id: "cockpit-inspector" });
             })
           )
@@ -4592,6 +5084,15 @@ export default class CockpitMod extends View {
                 })
                 .child("dismiss")
             )
+        )
+      )
+      .when(modelPickerOpen, (el) =>
+        el.child(
+          v_flex()
+            .flex_none()
+            .border_b(1)
+            .border_color(t.border)
+            .child(this.renderModelPicker(cx, t, false))
         )
       )
       .when(activeView === "home", (el) =>
@@ -4813,12 +5314,21 @@ export default class CockpitMod extends View {
                 .child(sectionTitle("SUPERVISOR & GUARDRAILS"))
                 .child(
                   v_flex()
+                    .id("ck-inspector-llm-card")
                     .p(10)
                     .gap(4)
                     .rounded(8)
                     .border(1)
                     .border_color(t.border)
                     .bg(t.background)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover))
+                    .on_mouse_down("left", (_e, clickCx) =>
+                      clickCx.stop_propagation()
+                    )
+                    .on_click((_e, clickCx) =>
+                      this.toggleModelPicker(clickCx ?? cx)
+                    )
                     .child(
                       h_flex()
                         .justify_between()

@@ -60,6 +60,15 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ---
 
+### Atualização — M1 seleção de modelo (`1e045db` backend, commit do mod em seguida)
+- Plano/spec: `docs/superpowers/plans/2026-11-14-m1-model-selection.md`, `docs/superpowers/specs/2026-11-14-m1-model-selection-design.md`.
+- Backend: `gguf.rs` (leitor de cabeçalho), `models.rs` (varredura Ollama/HF/llama.cpp/LM Studio/pastas + filtro), `config_write.rs` (`toml_edit`), `ModelId` + label `cockpit.model_id`, CLI `cockpit supervisor model list|set|filter|reset`. `supervisor.toml` parcial agora é aceito.
+- Mod: card "Supervisor model" na gaveta direita, aberto pela pílula LLM (`ck-llm-pill`) ou pelo card LLM do Inspector (`ck-inspector-llm-card`).
+- Validado no `ai-box`: 121 testes; CLI com GGUFs sintéticos; smoke Docker com SmolLM2 135M/360M (troca com container rodando recria em ~2,3 s; troca com container parado só grava; label `cockpit.model_id` confere). **Falta validar o card no Herdr Desktop do host.**
+- Swarm do Antigravity travou 2× sem escrever código (workers ficaram `waiting`, coordenador encerra o turno); Hydrogen solo funcionou mas encerra antes de validar — o coordenador validou.
+
+---
+
 ## 2. Histórico de Commits Recentes (`main`)
 
 - `6a38eee` — `feat(supervisor,mod): managed llama.cpp container with explicit Load/Unload lifecycle`
