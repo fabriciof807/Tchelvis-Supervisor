@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
 
-use super::config::SupervisorConfig;
+use super::config::{LlmBackendKind, SupervisorConfig};
 use super::state::{AgentDurableState, LifecycleState, Urgency};
 
 /// Decision emitted by the cognitive evaluation layer.
@@ -82,6 +82,7 @@ pub fn build_user_prompt_payload(state: &AgentDurableState, recent_hc_output: &s
 pub fn output_json_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "updated_summary": {
                 "type": "string",
@@ -119,9 +120,15 @@ pub fn output_json_schema() -> Value {
     })
 }
 
-/// Strips optional markdown code fences and parses a `CognitiveEvaluation` JSON string.
+/// Strips optional `<think>...</think>` blocks and markdown code fences, then parses a `CognitiveEvaluation` JSON string.
 pub fn parse_evaluation_json(raw: &str) -> Result<CognitiveEvaluation> {
-    let trimmed = raw.trim();
+    let mut trimmed = raw.trim();
+    if let Some(after_open) = trimmed.strip_prefix("<think>") {
+        if let Some(end_idx) = after_open.find("</think>") {
+            trimmed = after_open[end_idx + "</think>".len()..].trim();
+        }
+    }
+
     let stripped = if let Some(rest) = trimmed.strip_prefix("```") {
         let without_lang = rest
             .strip_prefix("json")
@@ -138,6 +145,28 @@ pub fn parse_evaluation_json(raw: &str) -> Result<CognitiveEvaluation> {
 
     serde_json::from_str::<CognitiveEvaluation>(stripped)
         .with_context(|| format!("Failed to deserialize CognitiveEvaluation from: {stripped}"))
+}
+
+/// Returns the OpenAI-compatible chat completions path for a given base host URL.
+pub fn openai_chat_completions_path(host: &str) -> &'static str {
+    if host.trim_end_matches('/').ends_with("/v1") {
+        "/chat/completions"
+    } else {
+        "/v1/chat/completions"
+    }
+}
+
+/// Extracts `choices[0].message.content` from an OpenAI-compatible chat completions response.
+pub fn extract_openai_chat_content(response: &Value) -> Result<&str> {
+    response
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .with_context(|| {
+            format!("OpenAI-compatible response missing 'choices[0].message.content': {response}")
+        })
 }
 
 /// Synchronous HTTP client for Ollama `/api/chat` and `/api/generate` endpoints.
@@ -179,6 +208,38 @@ impl OllamaClient {
         })
     }
 
+    /// Builds an OpenAI-compatible `/v1/chat/completions` request payload with strict JSON schema.
+    pub fn build_openai_chat_request_body(
+        &self,
+        state: &AgentDurableState,
+        recent_output: &str,
+    ) -> Value {
+        let user_payload = build_user_prompt_payload(state, recent_output);
+        json!({
+            "model": self.config.ollama_model,
+            "stream": false,
+            "temperature": self.config.temperature,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "supervisor_evaluation",
+                    "strict": true,
+                    "schema": output_json_schema()
+                }
+            },
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": user_payload.to_string(),
+                }
+            ]
+        })
+    }
+
     /// Builds the `/api/generate` unload request payload (`keep_alive: 0`).
     pub fn build_unload_request_body(&self) -> Value {
         json!({
@@ -193,11 +254,17 @@ impl OllamaClient {
             .timeout(Duration::from_secs(self.config.ollama_timeout_secs))
             .build();
 
-        let response = agent
-            .post(&url)
-            .set("Content-Type", "application/json")
+        let mut req = agent.post(&url).set("Content-Type", "application/json");
+        if let Some(key) = &self.config.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {trimmed}"));
+            }
+        }
+
+        let response = req
             .send_json(body)
-            .with_context(|| format!("Ollama POST request to {url} failed"))?;
+            .with_context(|| format!("LLM POST request to {url} failed"))?;
 
         response
             .into_json::<Value>()
@@ -230,23 +297,44 @@ impl CognitiveBackend for OllamaClient {
         state: &AgentDurableState,
         recent_output: &str,
     ) -> Result<CognitiveEvaluation> {
-        let body = self.build_chat_request_body(state, recent_output);
-        let response = self.post_json_with_fallback("/api/chat", &body)?;
-        let content = response
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .with_context(|| {
-                format!("Ollama /api/chat response missing 'message.content': {response}")
-            })?;
+        match self.config.llm_backend {
+            LlmBackendKind::Ollama => {
+                let body = self.build_chat_request_body(state, recent_output);
+                let response = self.post_json_with_fallback("/api/chat", &body)?;
+                let content = response
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .with_context(|| {
+                        format!("Ollama /api/chat response missing 'message.content': {response}")
+                    })?;
 
-        parse_evaluation_json(content)
+                parse_evaluation_json(content)
+            }
+            LlmBackendKind::LlamaCpp
+            | LlmBackendKind::LmStudio
+            | LlmBackendKind::OpenAiCompatible => {
+                let host = self.config.effective_primary_host();
+                let path = openai_chat_completions_path(&host);
+                let body = self.build_openai_chat_request_body(state, recent_output);
+                let response = self.post_json_to_host(&host, path, &body)?;
+                let content = extract_openai_chat_content(&response)?;
+                parse_evaluation_json(content)
+            }
+        }
     }
 
     fn unload_model(&self) -> Result<()> {
-        let body = self.build_unload_request_body();
-        let _ = self.post_json_with_fallback("/api/generate", &body)?;
-        Ok(())
+        match self.config.llm_backend {
+            LlmBackendKind::Ollama => {
+                let body = self.build_unload_request_body();
+                let _ = self.post_json_with_fallback("/api/generate", &body)?;
+                Ok(())
+            }
+            LlmBackendKind::LlamaCpp
+            | LlmBackendKind::LmStudio
+            | LlmBackendKind::OpenAiCompatible => Ok(()),
+        }
     }
 }
 
@@ -398,5 +486,71 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][0]["content"], SYSTEM_PROMPT);
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn test_build_openai_chat_request_body_structure() {
+        let mut config = SupervisorConfig::default();
+        config.llm_backend = LlmBackendKind::OpenAiCompatible;
+        config.ollama_model = "openai/gpt-4o-mini".to_string();
+        let client = OllamaClient::new(config);
+        let state = sample_state();
+
+        let body = client.build_openai_chat_request_body(&state, "cargo test");
+        assert_eq!(body["model"], "openai/gpt-4o-mini");
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(
+            body["response_format"]["json_schema"]["name"],
+            "supervisor_evaluation"
+        );
+        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"],
+            output_json_schema()
+        );
+        assert_eq!(
+            body["response_format"]["json_schema"]["schema"]["additionalProperties"],
+            false
+        );
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], SYSTEM_PROMPT);
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn test_extract_openai_chat_content_and_think_stripping() {
+        let response = json!({
+            "choices": [
+                {
+                    "message": {
+                        "content": "<think>\nAnalisando estado do agente...\n</think>\n```json\n{\"updated_summary\":\"Rodando testes.\",\"detected_state\":\"WORKING\",\"decision\":\"NO_OP\",\"urgency\":\"low\",\"hc_command_payload\":\"\",\"reason_for_operator\":\"\"}\n```"
+                    }
+                }
+            ]
+        });
+
+        let content = extract_openai_chat_content(&response).expect("should extract content");
+        let parsed = parse_evaluation_json(content).expect("should strip <think> and fences");
+        assert_eq!(parsed.detected_state, LifecycleState::Working);
+        assert_eq!(parsed.decision, SupervisorDecision::NoOp);
+        assert_eq!(parsed.urgency, Urgency::Low);
+        assert_eq!(parsed.updated_summary, "Rodando testes.");
+    }
+
+    #[test]
+    fn test_openai_chat_completions_path() {
+        assert_eq!(
+            openai_chat_completions_path("http://localhost:8080"),
+            "/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_chat_completions_path("https://openrouter.ai/api/v1"),
+            "/chat/completions"
+        );
+        assert_eq!(
+            openai_chat_completions_path("https://openrouter.ai/api/v1/"),
+            "/chat/completions"
+        );
     }
 }

@@ -12,7 +12,7 @@ Cockpit unifies an **Attention-First Fleet Queue & Context Correlator** with a *
 
 - **`cockpit` Unified Binary**: Rust CLI + Unix Domain Socket (UDS) Daemon (`cockpit daemon`) + Durable FSM Supervisor (`src/supervisor/`) + Ratatui TUI (`cockpit tui`) + Herdr Desktop Mod (`assets/herdr-app/`).
 - **Smart Agent Session Detection**: Automatically monitors active coding agent sessions (`claude`, `opencode`, `pi`, `codex`, `aider`, `goose`, `cursor-agent`, `amp`, active `OSC 7501` agent status hooks, or `cockpit.*` labeled sessions) while ignoring plain idle shells (`zsh`, `bash`, `fish`, `sh`, `nu`, `dash`, `tmux`, `screen`) and supervisor/cockpit UI processes.
-- **Zero-VRAM Durable Supervisor**: Evaluates stalled or blocked agents using a deterministic watcher + local Ollama LLM (`qwen2.5:1.5b-instruct` with `num_gpu: 0` CPU-only inference by default), automatically unloading the model (`keep_alive: 0`) after **180s** of zero active sessions.
+- **Zero-VRAM Durable Supervisor**: Evaluates stalled or blocked agents using a deterministic watcher + local LLM (`lfm3:1.7b` via Ollama with `num_gpu: 0` CPU-only inference by default, or `llama.cpp`, `LM Studio`, and OpenAI-compatible cloud APIs), automatically unloading Ollama models (`keep_alive: 0`) after **180s** of zero active sessions.
 - **State Persistence**: Supervisor state is persisted in `~/.local/state/cockpit/supervisor_state.json` with automatic pruning of closed or plain-shell terminals.
 
 ---
@@ -46,7 +46,7 @@ Manage your fleet from **Herdr Desktop** (`herdr-app`) using the 4-zone `cockpit
 - **Linux** (`x86_64` or `aarch64`)
 - **[Herdr](https://herdr.dev)** (`hc` CLI `0.1.20+` in `PATH`; optional `herdr-app` for the desktop UI)
 - **Rust toolchain** (`cargo` 1.75+) to build from source
-- **Ollama** (optional, for Durable Supervisor LLM evaluations; defaults to `http://127.0.0.1:11434` with `qwen2.5:1.5b-instruct`)
+- **Ollama** (or `llama.cpp`, `LM Studio`, or an OpenAI-compatible API; optional, for Durable Supervisor LLM evaluations; defaults to `http://localhost:11434` with `lfm3:1.7b`)
 
 ### Step-by-Step Build & Install from Source
 
@@ -67,6 +67,23 @@ cockpit setup --set-default-layout
 
 # 4. Verify the installation and environment health
 cockpit doctor
+```
+
+### Installing & Configuring Ollama (Recommended)
+
+```bash
+# Install Ollama on Linux and pull the default Cockpit supervisor model
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull lfm3:1.7b
+```
+
+If you run `cockpit` inside an `incus` container while Ollama runs on the host, expose Ollama on all interfaces so the container can reach it:
+
+```bash
+sudo systemctl edit ollama.service
+# Add under [Service]:
+# Environment="OLLAMA_HOST=0.0.0.0:11434"
+sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
 
 ### Host / Container (`incus`) Workflow
@@ -155,14 +172,52 @@ cockpit supervisor unload
 cockpit supervisor watch
 ```
 
-### 4. Configuration & Optional Provider Integrations
+### 4. Configuration & LLM Backends
 
-- **Supervisor Config (`~/.config/cockpit/supervisor.toml`)** & Environment Variables:
-  - `OLLAMA_HOST` (default: `http://127.0.0.1:11434`)
-  - `OLLAMA_FALLBACK_HOST`
-  - `OLLAMA_MODEL` (default: `qwen2.5:1.5b-instruct`)
-  - `COCKPIT_ALLOW_GPU` (default: `false`, enforcing `num_gpu: 0`)
+Cockpit supports **Ollama** (default), **`llama.cpp` (`llama-server`)**, **LM Studio**, and **OpenAI-compatible Cloud APIs** via `~/.config/cockpit/supervisor.toml` or environment variables:
+
+- **Environment Variables**:
+  - `COCKPIT_LLM_BACKEND`: `ollama` (default), `llama-cpp`, `lm-studio`, or `openai-compatible`
+  - `COCKPIT_LLM_HOST` / `OLLAMA_HOST` (default: `http://localhost:11434`, or backend default)
+  - `OLLAMA_FALLBACK_HOST` (Ollama fallback endpoint)
+  - `COCKPIT_LLM_MODEL` / `OLLAMA_MODEL` (default: `lfm3:1.7b`)
+  - `COCKPIT_LLM_API_KEY` (or `OPENAI_API_KEY` / `OPENROUTER_API_KEY`)
+  - `COCKPIT_ALLOW_GPU` (default: `false`, enforcing `num_gpu: 0` on Ollama)
   - `HC_BIN` (override path to `hc` binary)
+
+- **Backend Examples (`~/.config/cockpit/supervisor.toml`)**:
+
+  1. **Ollama (Default, Local Zero-VRAM)**:
+     ```toml
+     llm_backend = "ollama"
+     ollama_host = "http://localhost:11434"
+     ollama_model = "lfm3:1.7b"
+     allow_gpu = false
+     ```
+
+  2. **`llama.cpp` (`llama-server`)**:
+     ```toml
+     llm_backend = "llama-cpp"
+     ollama_host = "http://localhost:8080"
+     ollama_model = "lfm3:1.7b"
+     ```
+
+  3. **LM Studio**:
+     ```toml
+     llm_backend = "lm-studio"
+     ollama_host = "http://localhost:1234"
+     ollama_model = "lfm3:1.7b"
+     ```
+
+  4. **External / Cloud API (OpenAI, OpenRouter, Groq, DeepSeek, Gemini)**:
+     ```toml
+     llm_backend = "openai-compatible"
+     ollama_host = "https://openrouter.ai/api/v1" # or "https://api.openai.com"
+     ollama_model = "openai/gpt-4o-mini"
+     ```
+     ```bash
+     export COCKPIT_LLM_API_KEY="sk-..."
+     ```
 
 - **Provider Integrations (`~/.config/cockpit/config.toml`)**:
   Cockpit works out of the box with local git worktrees, local `RUNBOOK.md` files, and authenticated `gh` / `glab` CLIs. To enable additional read-only integrations, export credentials in your environment (Cockpit never stores plaintext tokens on disk):

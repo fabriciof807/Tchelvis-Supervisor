@@ -35,14 +35,60 @@ impl Default for HcAdapterConfig {
     }
 }
 
+/// Supported LLM inference backends for the Cockpit Durable Supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum LlmBackendKind {
+    #[default]
+    #[serde(alias = "ollama")]
+    Ollama,
+    #[serde(alias = "llamacpp", alias = "llama_cpp", alias = "llama.cpp")]
+    LlamaCpp,
+    #[serde(alias = "lmstudio", alias = "lm_studio")]
+    LmStudio,
+    #[serde(alias = "openai", alias = "api", alias = "cloud", alias = "openai_compatible")]
+    OpenAiCompatible,
+}
+
+impl LlmBackendKind {
+    /// Parses a backend identifier from CLI flags, env vars, or config strings.
+    pub fn from_str_loose(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ollama" => Some(Self::Ollama),
+            "llama-cpp" | "llamacpp" | "llama_cpp" | "llama.cpp" => Some(Self::LlamaCpp),
+            "lm-studio" | "lmstudio" | "lm_studio" => Some(Self::LmStudio),
+            "openai-compatible" | "openai" | "api" | "cloud" | "openai_compatible" => {
+                Some(Self::OpenAiCompatible)
+            }
+            _ => None,
+        }
+    }
+
+    /// Returns the canonical kebab-case identifier for this backend.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::LlamaCpp => "llama-cpp",
+            Self::LmStudio => "lm-studio",
+            Self::OpenAiCompatible => "openai-compatible",
+        }
+    }
+}
+
 /// Complete configuration for the Cockpit Durable Supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupervisorConfig {
-    /// Primary Ollama HTTP endpoint (default: `http://localhost:11434`).
+    /// Selected LLM backend (`ollama`, `llama-cpp`, `lm-studio`, `openai-compatible`).
+    #[serde(default)]
+    pub llm_backend: LlmBackendKind,
+    /// Optional Bearer API key for OpenAI-compatible / cloud LLM endpoints.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Primary LLM HTTP endpoint (default: `http://localhost:11434`).
     pub ollama_host: String,
     /// Fallback Ollama HTTP endpoint (e.g. host `http://10.121.213.1:11434`).
     pub ollama_fallback_host: Option<String>,
-    /// Local LLM model name (default: `qwen2.5:1.5b-instruct`, configurable up to `3b`).
+    /// LLM model name (default: `lfm3:1.7b`).
     pub ollama_model: String,
     /// Sampling temperature (default: `0.1`).
     pub temperature: f32,
@@ -84,6 +130,33 @@ fn resolve_allow_gpu_from_env() -> Option<bool> {
     None
 }
 
+fn resolve_llm_backend_from_env() -> Option<LlmBackendKind> {
+    env::var("COCKPIT_LLM_BACKEND")
+        .ok()
+        .and_then(|v| LlmBackendKind::from_str_loose(&v))
+}
+
+fn resolve_llm_host_from_env() -> Option<String> {
+    env::var("COCKPIT_LLM_HOST")
+        .ok()
+        .or_else(|| env::var("OLLAMA_HOST").ok())
+        .map(|h| normalize_host(&h))
+}
+
+fn resolve_llm_model_from_env() -> Option<String> {
+    env::var("COCKPIT_LLM_MODEL")
+        .ok()
+        .or_else(|| env::var("OLLAMA_MODEL").ok())
+}
+
+fn resolve_api_key_from_env() -> Option<String> {
+    env::var("COCKPIT_LLM_API_KEY")
+        .ok()
+        .or_else(|| env::var("OPENAI_API_KEY").ok())
+        .or_else(|| env::var("OPENROUTER_API_KEY").ok())
+        .filter(|k| !k.trim().is_empty())
+}
+
 impl Default for SupervisorConfig {
     fn default() -> Self {
         let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
@@ -97,16 +170,20 @@ impl Default for SupervisorConfig {
                     .join("supervisor_state.json")
             });
 
+        let llm_backend = resolve_llm_backend_from_env().unwrap_or_default();
+        let api_key = resolve_api_key_from_env();
         let ollama_host =
-            env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string());
+            resolve_llm_host_from_env().unwrap_or_else(|| "http://localhost:11434".to_string());
         let ollama_fallback_host = env::var("OLLAMA_FALLBACK_HOST")
             .ok()
             .or_else(|| Some("http://10.121.213.1:11434".to_string()));
         let ollama_model =
-            env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:1.5b-instruct".to_string());
+            resolve_llm_model_from_env().unwrap_or_else(|| "lfm3:1.7b".to_string());
         let allow_gpu = resolve_allow_gpu_from_env().unwrap_or(false);
 
         Self {
+            llm_backend,
+            api_key,
             ollama_host: normalize_host(&ollama_host),
             ollama_fallback_host: ollama_fallback_host.map(|h| normalize_host(&h)),
             ollama_model,
@@ -171,13 +248,19 @@ impl SupervisorConfig {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(host) = env::var("OLLAMA_HOST") {
-            self.ollama_host = normalize_host(&host);
+        if let Some(backend) = resolve_llm_backend_from_env() {
+            self.llm_backend = backend;
+        }
+        if let Some(api_key) = resolve_api_key_from_env() {
+            self.api_key = Some(api_key);
+        }
+        if let Some(host) = resolve_llm_host_from_env() {
+            self.ollama_host = host;
         }
         if let Ok(fallback) = env::var("OLLAMA_FALLBACK_HOST") {
             self.ollama_fallback_host = Some(normalize_host(&fallback));
         }
-        if let Ok(model) = env::var("OLLAMA_MODEL") {
+        if let Some(model) = resolve_llm_model_from_env() {
             self.ollama_model = model;
         }
         if let Some(allow_gpu) = resolve_allow_gpu_from_env() {
@@ -188,6 +271,22 @@ impl SupervisorConfig {
         }
         if let Ok(hc_bin) = env::var("HC_BIN") {
             self.hc.hc_bin = hc_bin;
+        }
+    }
+
+    /// Returns the effective primary host for the configured `llm_backend`.
+    /// When `ollama_host` is still the Ollama default (`http://localhost:11434`),
+    /// switches to each backend's standard default endpoint.
+    pub fn effective_primary_host(&self) -> String {
+        if self.ollama_host == "http://localhost:11434" {
+            match self.llm_backend {
+                LlmBackendKind::Ollama => self.ollama_host.clone(),
+                LlmBackendKind::LlamaCpp => "http://localhost:8080".to_string(),
+                LlmBackendKind::LmStudio => "http://localhost:1234".to_string(),
+                LlmBackendKind::OpenAiCompatible => "https://api.openai.com".to_string(),
+            }
+        } else {
+            self.ollama_host.clone()
         }
     }
 
@@ -229,5 +328,81 @@ mod tests {
         cfg.allow_gpu = false;
         assert_eq!(cfg.effective_num_gpu(), 0);
         assert_eq!(cfg.idle_unload_secs, 180);
+    }
+
+    #[test]
+    fn test_default_model_is_lfm3() {
+        // Unless overridden by env, default model should be lfm3:1.7b
+        if env::var("COCKPIT_LLM_MODEL").is_err() && env::var("OLLAMA_MODEL").is_err() {
+            let cfg = SupervisorConfig::default();
+            assert_eq!(cfg.ollama_model, "lfm3:1.7b");
+            assert_eq!(cfg.llm_backend, LlmBackendKind::Ollama);
+        }
+    }
+
+    #[test]
+    fn test_llm_backend_kind_from_str_loose() {
+        assert_eq!(
+            LlmBackendKind::from_str_loose("ollama"),
+            Some(LlmBackendKind::Ollama)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("llama-cpp"),
+            Some(LlmBackendKind::LlamaCpp)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("llamacpp"),
+            Some(LlmBackendKind::LlamaCpp)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("llama.cpp"),
+            Some(LlmBackendKind::LlamaCpp)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("lm-studio"),
+            Some(LlmBackendKind::LmStudio)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("lmstudio"),
+            Some(LlmBackendKind::LmStudio)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("openai-compatible"),
+            Some(LlmBackendKind::OpenAiCompatible)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("openai"),
+            Some(LlmBackendKind::OpenAiCompatible)
+        );
+        assert_eq!(
+            LlmBackendKind::from_str_loose("api"),
+            Some(LlmBackendKind::OpenAiCompatible)
+        );
+        assert_eq!(LlmBackendKind::from_str_loose("unknown"), None);
+    }
+
+    #[test]
+    fn test_effective_primary_host() {
+        let mut cfg = SupervisorConfig::default();
+        cfg.ollama_host = "http://localhost:11434".to_string();
+
+        cfg.llm_backend = LlmBackendKind::Ollama;
+        assert_eq!(cfg.effective_primary_host(), "http://localhost:11434");
+
+        cfg.llm_backend = LlmBackendKind::LlamaCpp;
+        assert_eq!(cfg.effective_primary_host(), "http://localhost:8080");
+
+        cfg.llm_backend = LlmBackendKind::LmStudio;
+        assert_eq!(cfg.effective_primary_host(), "http://localhost:1234");
+
+        cfg.llm_backend = LlmBackendKind::OpenAiCompatible;
+        assert_eq!(cfg.effective_primary_host(), "https://api.openai.com");
+
+        // Explicit custom host is preserved for any backend
+        cfg.ollama_host = "https://openrouter.ai/api/v1".to_string();
+        assert_eq!(
+            cfg.effective_primary_host(),
+            "https://openrouter.ai/api/v1"
+        );
     }
 }
