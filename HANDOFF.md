@@ -131,10 +131,17 @@ cockpit supervisor status --json
    - Toggle GPU (`:server-cuda` + `--gpus all`) e runtime `kiri`/`podman` se instalados.
    - Botão `▶ Load LLM` ⇄ `⏻ Unload LLM` e pílula `DESATIVADO`/`INICIANDO…`/RAM na barra superior.
    - Considerar tornar todos os campos de `SupervisorConfig` `#[serde(default)]` (TOML parcial).
-2. Validar no host com o binário mais recente (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
+2. **Backlog combinado com o usuário (2026-11-14) — próximas sessões**:
+   - **Escolha do modelo do container**: permitir selecionar o modelo/GGUF (`model_path` / `hf_repo` / modelo do Ollama) via `cockpit tui` e via mod do Herdr, persistido como o toggle de GPU.
+   - **Inspector com mais terminais**: permitir ver mais terminais/agentes na aba Inspector ao mesmo tempo.
+   - **Ícones no lugar de emojis**: substituir emojis da UI do mod (e TUI quando fizer sentido) por ícones.
+   - **Áreas mais compactas**: ex. aba do agent quick launcher (`+ Agent`).
+   - **Ferramentas mais simples de usar**: simplificar fluxos/controles hoje verbosos.
+   - **Distribuição**: pacotes AUR, Homebrew (tap) e imagem Docker, além do build from source.
+3. Validar no host com o binário mais recente (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
    - Barra superior: botões centrais fixos enquanto a pill passa por `Idle` → `Watching (3)` → `Evaluating`; consumo de RAM/VRAM aparecendo na pill da LLM.
    - Toggle `num_gpu` na pill: carregamento na GPU real (não testado no container, sem GPU) e VRAM refletida na pill.
    - `sim-safe` → `AUTO_REPLY` (~5s); `sim-danger` → Action Card `Critical`; agente apenas `WORKING`/aguardando subagente → **nenhum** Action Card (regressão do falso `Critical` com `HooksError`).
    - Clique em cards de agentes em background abrindo o Inspector (`Approve`, `Ignore`, `Attach Tab`, `Kill`) e limpeza para `0 agents` / `Supervisor: Idle`.
-3. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
-4. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
+4. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
+5. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
