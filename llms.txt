@@ -1,0 +1,15 @@
+# Tchelvis Supervisor
+
+> Local-first fleet dashboard, TUI/CLI, and durable LLM supervisor for coding agents running through Herdr (`hc`). Ships as a single Rust binary (`cockpit`, to be renamed `tchelvis`), with an optional Herdr Desktop mod and a supervisor LLM served by a managed `llama.cpp` container that is loaded and unloaded on demand. Linux only.
+
+AI agents asked to install, update, or partially install this project (for example, only the LLM container when the CLI is already installed) should follow the agent install guide first.
+
+## Docs
+
+- [Agent install guide](https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/docs/agent-install.md): detection steps, components, partial install procedures, verification, and troubleshooting, written for AI agents
+- [README](https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/README.md): full user documentation, CLI reference, configuration reference, and alternative LLM backends
+- [Changelog](https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/CHANGELOG.md): changes per version
+
+## Optional
+
+- [Roadmap](https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/ROADMAP.md): planned milestones and recorded decisions

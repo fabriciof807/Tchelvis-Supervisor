@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Agent-facing install guide** (`docs/agent-install.md`) and an `llms.txt` index, so AI agents given the repository URL can detect installed components and install only what is missing (e.g. just the LLM container).
 - **Managed `llama.cpp` supervisor LLM container** (`6a38eee`)
   - **Container runtime:** auto-detected in the order Kiri, Podman, Docker. Override with `[llm_container] runtime` or `COCKPIT_CONTAINER_RUNTIME`.
   - **Container:** named `cockpit-supervisor-llm`, running `ghcr.io/ggml-org/llama.cpp:server` (or `:server-cuda` with GPU offload), served on `127.0.0.1:11435`.

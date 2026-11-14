@@ -4,6 +4,10 @@ A local-first fleet dashboard, CLI, and Durable FSM Supervisor for tracking and 
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+> **AI agents:** to install, update, or partially install this project (e.g. only the LLM container
+> when the CLI is already installed), follow [`docs/agent-install.md`](docs/agent-install.md).
+> An index for LLMs is available at [`llms.txt`](llms.txt).
+
 ---
 
 ## Overview & Architecture
