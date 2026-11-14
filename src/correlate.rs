@@ -72,6 +72,10 @@ pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
         }
     }
 
+    if term.name.as_deref().is_some_and(|n| n.contains("π -")) {
+        return AgentKind::Pi;
+    }
+
     AgentKind::PlainShell
 }
 

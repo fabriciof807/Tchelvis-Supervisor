@@ -492,7 +492,13 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       enriched?.agent_kind
     );
     const displayName = resolveDisplayName(rawName, projectName, a.address);
-    const baseStatus = a.status ?? enriched?.attention_state?.state ?? "idle";
+    const baseStatus =
+      a.status && a.status !== "idle"
+        ? a.status
+        : enriched?.attention_state?.state &&
+            enriched.attention_state.state !== "idle"
+          ? enriched.attention_state.state
+          : rowLabels?.["cockpit.state"] || a.status || "idle";
     const status = sup?.action_card ? "blocked" : baseStatus;
     rows.push({
       address: a.address,
@@ -685,6 +691,7 @@ export default class CockpitMod extends View {
     } else if (role === "inspector") {
       this.refreshInspector(cx);
       this.fetchHomeSnapshot(cx);
+      this.runDoctorCheckSilent(cx);
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
       }
@@ -850,6 +857,20 @@ export default class CockpitMod extends View {
         this.fetchingInspect = false;
         cx.notify();
       }
+    });
+  }
+
+  runDoctorCheckSilent(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("cockpit", ["doctor", "--json"], {
+          timeout: 10000,
+        });
+        if (res.code === 0 && res.stdout) {
+          this.doctorReport = JSON.parse(res.stdout);
+          cx.notify();
+        }
+      } catch (_e) {}
     });
   }
 
@@ -1245,6 +1266,25 @@ export default class CockpitMod extends View {
     const blockedCount = live.filter((a) => a.status === "blocked").length;
     const activeMode = supSnap?.mode ?? "SemiAuto";
     const isPaused = activeMode === "Paused";
+    const llmModel = supSnap?.llm_model || "lfm3:1.7b";
+    const llmBackend = supSnap?.llm_backend || "ollama";
+    const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
+    const modelInstalled = supSnap ? Boolean(supSnap.model_installed) : false;
+    const modelLoaded = Boolean(supSnap?.model_loaded);
+    const numGpu = supSnap?.num_gpu ?? 0;
+
+    let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
+    let llmPillColor = t.muted;
+    if (llmConnected && modelInstalled) {
+      llmPillText = `● LLM: ${llmModel} (${llmBackend} · ${modelLoaded ? "EM RAM" : "PRONTO"})`;
+      llmPillColor = t.done;
+    } else if (llmConnected && !modelInstalled) {
+      llmPillText = `⚠ LLM: ${llmModel} (NÃO INSTALADO)`;
+      llmPillColor = t.working;
+    } else if (supSnap) {
+      llmPillText = `○ LLM: ${llmModel} (OFFLINE)`;
+      llmPillColor = t.blocked;
+    }
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
@@ -1331,7 +1371,8 @@ export default class CockpitMod extends View {
                 el.child(this.pillBadge(t, "LLM RAM", t.accent))
               )
           )
-          .child(this.pillBadge(t, "num_gpu: 0", t.done))
+          .child(this.pillBadge(t, llmPillText, llmPillColor))
+          .child(this.pillBadge(t, `num_gpu: ${numGpu}`, t.done))
           .when(alertCount > 0, (el) =>
             el.child(
               this.pillBadge(
@@ -1969,9 +2010,13 @@ export default class CockpitMod extends View {
               .child(
                 kpiCard(
                   "SUPERVISOR DURÁVEL",
-                  "0 MB VRAM",
-                  "lfm3:1.7b · num_gpu=0",
-                  t.done
+                  supSnap
+                    ? supSnap.llm_connected
+                      ? `${supSnap.llm_model || "lfm3:1.7b"} · ON`
+                      : `${supSnap.llm_model || "lfm3:1.7b"} · OFF`
+                    : `${supSnap?.llm_model || "lfm3:1.7b"} · …`,
+                  `${supSnap?.llm_backend || "ollama"} · num_gpu=${supSnap?.num_gpu ?? 0} (0 MB VRAM)`,
+                  supSnap?.llm_connected ? t.done : supSnap ? t.blocked : t.muted
                 )
               )
           )
@@ -2605,8 +2650,16 @@ export default class CockpitMod extends View {
       const s = String(st ?? "").toLowerCase();
       if (s === "pass" || s === "ok" || s === "active" || s === "ready")
         return t.done;
-      if (s === "warn" || s === "degraded") return t.working;
-      if (s === "fail" || s === "error") return t.blocked;
+      if (
+        s === "warn" ||
+        s === "degraded" ||
+        s === "rate_limited" ||
+        s === "missing_scope" ||
+        s === "auth_expired"
+      )
+        return t.working;
+      if (s === "fail" || s === "error" || s === "offline") return t.blocked;
+      if (s === "inactive") return t.muted;
       return t.muted;
     };
 
@@ -2758,7 +2811,8 @@ export default class CockpitMod extends View {
       )
       .children(
         Object.entries(providers).map(([prov, ph], idx) => {
-          const col = checkStatusColor(ph?.state);
+          const rawStatus = ph?.status ?? ph?.state ?? "unknown";
+          const col = checkStatusColor(rawStatus);
           return v_flex()
             .id(`ck-doc-prov-${idx}`)
             .p(9)
@@ -2782,7 +2836,7 @@ export default class CockpitMod extends View {
                 .child(
                   this.pillBadge(
                     t,
-                    String(ph?.state ?? "unknown").toUpperCase(),
+                    String(rawStatus).toUpperCase(),
                     col
                   )
                 )
@@ -3219,6 +3273,65 @@ export default class CockpitMod extends View {
                 )
                 // 2. Supervisor Action Card / Status (SUPERVISOR & GUARDRAILS)
                 .child(sectionTitle("SUPERVISOR & GUARDRAILS"))
+                .child(
+                  v_flex()
+                    .p(10)
+                    .gap(4)
+                    .rounded(8)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .child(
+                      h_flex()
+                        .justify_between()
+                        .items_center()
+                        .gap(6)
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              `🧠 ${supSnap?.llm_model || "lfm3:1.7b"} (${supSnap?.llm_backend || "ollama"} · num_gpu=${supSnap?.num_gpu ?? 0})`
+                            )
+                        )
+                        .child(
+                          this.pillBadge(
+                            t,
+                            supSnap?.llm_connected
+                              ? supSnap?.model_loaded
+                                ? "CONECTADO · EM RAM"
+                                : supSnap?.model_installed
+                                  ? "CONECTADO · PRONTO"
+                                  : "MODELO AUSENTE"
+                              : supSnap
+                                ? "OFFLINE"
+                                : "VERIFICANDO…",
+                            supSnap?.llm_connected
+                              ? supSnap?.model_loaded
+                                ? t.accent
+                                : supSnap?.model_installed
+                                  ? t.done
+                                  : t.working
+                              : supSnap
+                                ? t.blocked
+                                : t.muted
+                          )
+                        )
+                    )
+                    .child(
+                      div()
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .child(
+                          ellipsize(
+                            supSnap?.llm_status_detail ||
+                              "Verificando conexão com o motor LLM local…",
+                            76
+                          )
+                        )
+                    )
+                )
                 .when(Boolean(actionCard), (el3) =>
                   el3.child(
                     v_flex()
@@ -3958,9 +4071,12 @@ export default class CockpitMod extends View {
     const merged = mergeFleetRows(list, allTerms, snap, supSnap);
     const providers = snap?.providers ?? {};
     const activeProviders = Object.entries(providers).filter(([, ph]) => {
-      const st = String(ph?.state ?? "").toLowerCase();
+      const st = String(ph?.status ?? ph?.state ?? "").toLowerCase();
       return st === "active" || st === "ready";
     });
+    const llmModel = supSnap?.llm_model || "lfm3:1.7b";
+    const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
+    const numGpu = supSnap?.num_gpu ?? 0;
     const blockedCount = merged.filter((a) => a.status === "blocked").length;
     const workingCount = merged.filter((a) => a.status === "working").length;
     const modeLabel = supSnap?.mode_label ?? "Semi-Auto (Whitelist)";
@@ -4028,7 +4144,13 @@ export default class CockpitMod extends View {
           )
           .child(`MODE: ${modeLabel}`)
       )
-      .child(div().text_color(t.done).child("GPU: num_gpu=0 (0 MB VRAM)"))
+      .child(
+        div()
+          .text_color(llmConnected ? t.done : supSnap ? t.blocked : t.muted)
+          .child(
+            `LLM: ${llmModel} (${llmConnected ? "ONLINE" : supSnap ? "OFFLINE" : "…"} · num_gpu=${numGpu})`
+          )
+      )
       .child(
         div()
           .text_color(t.accent)
@@ -4040,7 +4162,7 @@ export default class CockpitMod extends View {
           activeProviders.map(([prov, ph]) =>
             this.pillBadge(
               t,
-              `${prov}: ${String(ph?.state ?? "active").toUpperCase()}`,
+              `${prov}: ${String(ph?.status ?? ph?.state ?? "active").toUpperCase()}`,
               t.done
             )
           )

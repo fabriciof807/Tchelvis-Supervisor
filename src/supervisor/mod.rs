@@ -15,7 +15,7 @@ use ollama::{CognitiveBackend, OllamaClient};
 use state::{unix_now_secs, DurableStateStore, SupervisorMode};
 use std::path::PathBuf;
 use std::time::Duration;
-use tui::{build_desktop_mod_snapshot, DesktopModSnapshot};
+use tui::{build_desktop_mod_snapshot, enrich_snapshot_with_llm_health, DesktopModSnapshot};
 use watcher::{SupervisorRuntimeStatus, TickOutcome, WatcherEngine};
 
 /// Combined output for single-tick / `--once` supervisor invocations.
@@ -52,7 +52,8 @@ pub fn run_tui() -> Result<()> {
 pub fn run_tick_once() -> Result<OnceOutput> {
     let mut engine = build_default_engine()?;
     let tick_outcome = engine.tick(unix_now_secs())?;
-    let snapshot = build_desktop_mod_snapshot(&engine);
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
     Ok(OnceOutput {
         snapshot,
         tick_outcome,
@@ -83,7 +84,9 @@ fn sync_runtime_status<H: HcBackend, C: CognitiveBackend>(engine: &mut WatcherEn
 pub fn current_status() -> Result<DesktopModSnapshot> {
     let mut engine = build_default_engine()?;
     sync_runtime_status(&mut engine);
-    Ok(build_desktop_mod_snapshot(&engine))
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
 }
 
 /// Approves a pending operator action for `agent_id` and returns the updated `DesktopModSnapshot`.
@@ -128,7 +131,9 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
         }
     }
     sync_runtime_status(&mut engine);
-    Ok(build_desktop_mod_snapshot(&engine))
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
 }
 
 /// Explicitly unloads the configured Ollama model (`keep_alive: 0`) and returns the updated `DesktopModSnapshot`.
@@ -137,7 +142,9 @@ pub fn unload_model() -> Result<DesktopModSnapshot> {
     engine.cognitive.unload_model()?;
     engine.model_loaded = false;
     sync_runtime_status(&mut engine);
-    Ok(build_desktop_mod_snapshot(&engine))
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
 }
 
 /// Runs the supervisor deterministic watcher loop, persisting `DesktopModSnapshot` JSON

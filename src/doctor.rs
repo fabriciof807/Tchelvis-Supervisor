@@ -173,18 +173,15 @@ pub async fn run_doctor(
     )
     .map(|s| s.mode.label().to_string())
     .unwrap_or_else(|_| "unknown".to_string());
-    let gpu_mode = if sup_cfg.effective_num_gpu() == 0 {
-        "num_gpu=0 (CPU-only)".to_string()
-    } else {
-        format!("num_gpu={}", sup_cfg.effective_num_gpu())
-    };
+    let health = crate::supervisor::ollama::probe_llm_health(&sup_cfg);
     checks.push(DoctorCheck {
         name: "supervisor".into(),
-        status: "ok".into(),
-        detail: format!(
-            "ollama_host={}, model_name={}, {}, mode={}",
-            sup_cfg.ollama_host, sup_cfg.ollama_model, gpu_mode, sup_mode
-        ),
+        status: if health.connected && health.model_installed {
+            "ok".into()
+        } else {
+            "warn".into()
+        },
+        detail: format!("{} · mode={}", health.detail, sup_mode),
     });
 
     let report = DoctorReport {

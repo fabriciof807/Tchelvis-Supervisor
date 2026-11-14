@@ -20,19 +20,37 @@ pub struct HcAdapterConfig {
 
 impl Default for HcAdapterConfig {
     fn default() -> Self {
-        let default_bin = if PathBuf::from("/home/ubuntu/.local/bin/hc").exists() {
-            "/home/ubuntu/.local/bin/hc".to_string()
-        } else {
-            "hc".to_string()
-        };
+        let default_bin = resolve_default_hc_bin();
         Self {
-            hc_bin: env::var("HC_BIN").unwrap_or(default_bin),
+            hc_bin: env::var("HC_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(default_bin),
             list_sessions_cmd: "hc ls --json".to_string(),
             capture_output_cmd: "hc read {agent_id} --lines {lines} --json".to_string(),
             send_input_cmd: "hc send {agent_id} {payload}".to_string(),
             sync_hc_labels: true,
         }
     }
+}
+
+fn resolve_default_hc_bin() -> String {
+    if let Ok(home) = env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        for candidate in [
+            home_path.join(".local/bin/hc"),
+            home_path.join(".cargo/bin/hc"),
+        ] {
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    let ubuntu_hc = PathBuf::from("/home/ubuntu/.local/bin/hc");
+    if ubuntu_hc.exists() {
+        return "/home/ubuntu/.local/bin/hc".to_string();
+    }
+    "hc".to_string()
 }
 
 /// Supported LLM inference backends for the Cockpit Durable Supervisor.

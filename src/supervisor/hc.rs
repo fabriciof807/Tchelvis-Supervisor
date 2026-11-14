@@ -4,7 +4,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::env;
-use std::process::Command;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 
 /// Normalized representation of an active or recently transitioned `hc` session.
@@ -61,6 +62,8 @@ struct RawHcTerminal {
     address: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     agent: Option<String>,
     #[serde(default)]
@@ -133,8 +136,43 @@ impl HcCliAdapter {
     }
 }
 
+impl HcCliAdapter {
+    fn list_sessions_via_connect(&self) -> Result<Vec<HcSession>> {
+        let mut child = Command::new(&self.config.hc_bin)
+            .arg("connect")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("Failed to spawn `{} connect`", self.config.hc_bin))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let req = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"terminal.list\",\"params\":{\"all\":false}}\n";
+            stdin.write_all(req)?;
+            let _ = stdin.flush();
+        }
+
+        let mut line = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            let mut reader = BufReader::new(stdout);
+            reader.read_line(&mut line)?;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+
+        if line.trim().is_empty() {
+            return Err(anyhow!("`hc connect` returned empty response"));
+        }
+        parse_hc_ls_json(&line, self.self_terminal_id.as_deref())
+    }
+}
+
 impl HcBackend for HcCliAdapter {
     fn list_sessions(&self) -> Result<Vec<HcSession>> {
+        if let Ok(sessions) = self.list_sessions_via_connect() {
+            return Ok(sessions);
+        }
+
         let output = Command::new(&self.config.hc_bin)
             .args(["ls", "--json"])
             .output()
@@ -377,8 +415,18 @@ pub fn is_coding_agent_terminal(
 /// Parses `hc ls --json` output into normalized `HcSession` items, filtering out finished
 /// terminals, plain shells without coding agents, and the supervisor's own terminal.
 pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Result<Vec<HcSession>> {
-    let parsed: RawHcListOutput =
+    let val: serde_json::Value =
         serde_json::from_str(raw_json.trim()).context("Failed to parse `hc ls --json` output")?;
+    let parsed: RawHcListOutput = if val
+        .get("result")
+        .and_then(|r| r.get("terminals"))
+        .is_some()
+    {
+        serde_json::from_value(val["result"].clone())
+            .context("Failed to parse `hc connect` terminal.list result")?
+    } else {
+        serde_json::from_value(val).context("Failed to parse `hc ls --json` terminals")?
+    };
 
     let mut sessions = Vec::new();
     for term in parsed.terminals {
@@ -391,7 +439,26 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             continue;
         }
 
-        let (status_state, status_app) = extract_status_fields(term.status.as_ref());
+        let (raw_status_state, status_app) = extract_status_fields(term.status.as_ref());
+        let status_state = match raw_status_state.as_deref() {
+            Some(s) if !s.is_empty() && s != "idle" => raw_status_state,
+            _ => term
+                .labels
+                .get("cockpit.state")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .or(raw_status_state),
+        };
+
+        let title_indicates_pi = term.title.as_deref().is_some_and(|t| {
+            let trimmed = t.trim();
+            trimmed.starts_with("π ") || trimmed.starts_with("π-") || trimmed.contains("π -")
+        });
+        let mut effective_labels = term.labels.clone();
+        if !effective_labels.contains_key("cockpit.agent") && title_indicates_pi {
+            effective_labels.insert("cockpit.agent".to_string(), "pi".to_string());
+        }
+
         if !is_coding_agent_terminal(
             term.agent.as_deref(),
             term.name.as_deref(),
@@ -400,7 +467,7 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             term.reported,
             status_state.as_deref(),
             status_app.as_deref(),
-            &term.labels,
+            &effective_labels,
         ) {
             continue;
         }
@@ -418,10 +485,25 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             .unwrap_or_else(|| term.address.clone());
 
         let agent_label = term
-            .agent
-            .clone()
+            .labels
+            .get("cockpit.agent")
+            .cloned()
             .or_else(|| status_app.clone())
-            .or_else(|| term.foreground.as_ref().and_then(|f| f.name.clone()));
+            .or_else(|| {
+                term.foreground
+                    .as_ref()
+                    .and_then(|f| f.name.clone())
+                    .filter(|n| !is_plain_shell_program(n))
+            })
+            .or_else(|| term.agent.clone().filter(|n| !is_plain_shell_program(n)))
+            .or_else(|| {
+                if term.title.as_deref().is_some_and(|t| t.contains("π -")) {
+                    Some("pi".to_string())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| term.agent.clone());
 
         let session_name = match &agent_label {
             Some(agent) if !base_name.contains(agent) => format!("{base_name} ({agent})"),

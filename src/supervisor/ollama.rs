@@ -47,6 +47,157 @@ pub trait CognitiveBackend: Send + Sync {
     fn unload_model(&self) -> Result<()>;
 }
 
+/// Live connectivity and model availability status for the configured local/remote LLM backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct LlmHealthStatus {
+    pub backend: String,
+    pub host: String,
+    pub model: String,
+    pub num_gpu: u32,
+    pub connected: bool,
+    pub model_installed: bool,
+    pub model_loaded: bool,
+    pub detail: String,
+}
+
+fn ollama_model_matches(candidate: &str, target: &str) -> bool {
+    if candidate == target {
+        return true;
+    }
+    if candidate.starts_with(&format!("{target}:")) {
+        return true;
+    }
+    let cand_base = candidate.split(':').next().unwrap_or("");
+    !cand_base.is_empty() && target.starts_with(cand_base) && candidate == target
+}
+
+fn extract_ollama_model_names(val: &Value) -> Vec<String> {
+    val.get("models")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    item.get("name")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("model").and_then(|v| v.as_str()))
+                        .map(ToString::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Probes the configured LLM backend (`Ollama`, `LlamaCpp`, `LmStudio`, or `OpenAiCompatible`)
+/// with a short timeout to determine reachability, installed model presence, and RAM residency.
+pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
+    let primary_host = config.effective_primary_host();
+    let num_gpu = config.effective_num_gpu();
+    let mut status = LlmHealthStatus {
+        backend: config.llm_backend.as_str().to_string(),
+        host: primary_host.clone(),
+        model: config.ollama_model.clone(),
+        num_gpu,
+        connected: false,
+        model_installed: false,
+        model_loaded: false,
+        detail: String::new(),
+    };
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_millis(1200))
+        .build();
+
+    match config.llm_backend {
+        LlmBackendKind::Ollama => {
+            let mut hosts = vec![primary_host.clone()];
+            if let Some(ref fb) = config.ollama_fallback_host {
+                let trimmed = fb.trim_end_matches('/').to_string();
+                if !trimmed.is_empty() && trimmed != primary_host {
+                    hosts.push(trimmed);
+                }
+            }
+
+            let mut active_host: Option<String> = None;
+            let mut installed_names: Vec<String> = Vec::new();
+            for host in &hosts {
+                let url = format!("{}/api/tags", host.trim_end_matches('/'));
+                if let Ok(resp) = agent.get(&url).call() {
+                    if let Ok(val) = resp.into_json::<Value>() {
+                        installed_names = extract_ollama_model_names(&val);
+                        active_host = Some(host.clone());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(active) = active_host {
+                status.host = active.clone();
+                status.connected = true;
+                status.model_installed = installed_names
+                    .iter()
+                    .any(|name| ollama_model_matches(name, &config.ollama_model));
+
+                let ps_url = format!("{}/api/ps", active.trim_end_matches('/'));
+                if let Ok(resp) = agent.get(&ps_url).call() {
+                    if let Ok(val) = resp.into_json::<Value>() {
+                        let loaded_names = extract_ollama_model_names(&val);
+                        status.model_loaded = loaded_names
+                            .iter()
+                            .any(|name| ollama_model_matches(name, &config.ollama_model));
+                    }
+                }
+
+                status.detail = if status.model_installed && status.model_loaded {
+                    format!(
+                        "Conectado ({active}) · {} carregado em RAM (num_gpu={})",
+                        config.ollama_model, num_gpu
+                    )
+                } else if status.model_installed {
+                    format!(
+                        "Conectado ({active}) · {} pronto (standby 0B · num_gpu={})",
+                        config.ollama_model, num_gpu
+                    )
+                } else {
+                    format!(
+                        "Ollama online ({active}), mas modelo '{}' não encontrado (rode: ollama pull {})",
+                        config.ollama_model, config.ollama_model
+                    )
+                };
+            } else {
+                status.detail = format!("Offline ({primary_host}) · inicie com: ollama serve");
+            }
+        }
+        LlmBackendKind::LlamaCpp | LlmBackendKind::LmStudio => {
+            let base = primary_host.trim_end_matches('/');
+            let models_url = format!("{base}/v1/models");
+            let health_url = format!("{base}/health");
+            let ok = agent.get(&models_url).call().is_ok() || agent.get(&health_url).call().is_ok();
+            if ok {
+                status.connected = true;
+                status.model_installed = true;
+                status.detail = format!("Conectado ({primary_host}) · {}", config.ollama_model);
+            } else {
+                status.detail = format!("Offline ({primary_host})");
+            }
+        }
+        LlmBackendKind::OpenAiCompatible => {
+            let has_key = config
+                .api_key
+                .as_ref()
+                .is_some_and(|k| !k.trim().is_empty());
+            status.connected = has_key;
+            status.model_installed = has_key;
+            status.detail = if has_key {
+                format!("API configurada ({primary_host}) · {}", config.ollama_model)
+            } else {
+                "API Key ausente (defina COCKPIT_LLM_API_KEY)".to_string()
+            };
+        }
+    }
+
+    status
+}
+
 /// Embedded system prompt for the Cockpit Durable Supervisor.
 pub const SYSTEM_PROMPT: &str = r#"You are the Cockpit Durable Supervisor, an autonomous triage controller monitoring software engineering agents via Herdr Core (hc).
 Your job is to analyze an agent's durable state and its last 25 lines of terminal output, then output a strict JSON decision.

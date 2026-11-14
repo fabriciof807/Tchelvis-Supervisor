@@ -42,6 +42,20 @@ pub struct DesktopModSnapshot {
     pub mode_label: String,
     pub mode: SupervisorMode,
     pub model_loaded: bool,
+    #[serde(default)]
+    pub llm_backend: String,
+    #[serde(default)]
+    pub llm_host: String,
+    #[serde(default)]
+    pub llm_model: String,
+    #[serde(default)]
+    pub num_gpu: u32,
+    #[serde(default)]
+    pub llm_connected: bool,
+    #[serde(default)]
+    pub model_installed: bool,
+    #[serde(default)]
+    pub llm_status_detail: String,
     pub agents: Vec<AgentCardView>,
 }
 
@@ -49,7 +63,32 @@ pub struct DesktopModSnapshot {
 pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
     engine: &WatcherEngine<H, C>,
 ) -> DesktopModSnapshot {
-    build_desktop_mod_snapshot_from_parts(&engine.runtime_status, engine.model_loaded, &engine.store)
+    let mut snap = build_desktop_mod_snapshot_from_parts(
+        &engine.runtime_status,
+        engine.model_loaded,
+        &engine.store,
+    );
+    snap.llm_backend = engine.config.llm_backend.as_str().to_string();
+    snap.llm_host = engine.config.effective_primary_host();
+    snap.llm_model = engine.config.ollama_model.clone();
+    snap.num_gpu = engine.config.effective_num_gpu();
+    snap
+}
+
+/// Enriches a `DesktopModSnapshot` with live LLM connectivity and model availability status.
+pub fn enrich_snapshot_with_llm_health(
+    snap: &mut DesktopModSnapshot,
+    config: &super::config::SupervisorConfig,
+) {
+    let health = super::ollama::probe_llm_health(config);
+    snap.llm_backend = health.backend;
+    snap.llm_host = health.host;
+    snap.llm_model = health.model;
+    snap.num_gpu = health.num_gpu;
+    snap.llm_connected = health.connected;
+    snap.model_installed = health.model_installed;
+    snap.model_loaded = snap.model_loaded || health.model_loaded;
+    snap.llm_status_detail = health.detail;
 }
 
 /// Builds a `DesktopModSnapshot` from decoupled state components.
@@ -91,6 +130,13 @@ pub fn build_desktop_mod_snapshot_from_parts(
         mode_label: store.mode.label().to_string(),
         mode: store.mode,
         model_loaded,
+        llm_backend: String::new(),
+        llm_host: String::new(),
+        llm_model: String::new(),
+        num_gpu: 0,
+        llm_connected: true,
+        model_installed: true,
+        llm_status_detail: String::new(),
         agents,
     }
 }

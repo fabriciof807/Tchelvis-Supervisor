@@ -107,33 +107,68 @@ impl HcTerminal {
     }
 
     pub fn raw_attention_state(&self, now_ms: i64) -> AttentionState {
-        let Some(st) = &self.status else {
-            return AttentionState::Idle;
-        };
-        let msg = st
-            .msg
-            .as_deref()
-            .map(sanitize_terminal_text)
-            .filter(|m| !m.is_empty());
-        match st.state.as_str() {
-            "blocked" => {
-                let kind = match st.kind.as_deref() {
-                    Some("auth") => BlockedKind::Auth,
-                    Some("permission") => BlockedKind::Permission,
-                    Some("question") | None => BlockedKind::Question,
-                    Some(_) => BlockedKind::Unknown,
-                };
-                AttentionState::Blocked {
-                    kind,
-                    message: msg,
-                    since_ms: self.status_ms.unwrap_or(now_ms),
+        if let Some(st) = &self.status {
+            let msg = st
+                .msg
+                .as_deref()
+                .map(sanitize_terminal_text)
+                .filter(|m| !m.is_empty());
+            match st.state.as_str() {
+                "blocked" => {
+                    let kind = match st.kind.as_deref() {
+                        Some("auth") => BlockedKind::Auth,
+                        Some("permission") => BlockedKind::Permission,
+                        Some("question") | None => BlockedKind::Question,
+                        Some(_) => BlockedKind::Unknown,
+                    };
+                    return AttentionState::Blocked {
+                        kind,
+                        message: msg,
+                        since_ms: self.status_ms.unwrap_or(now_ms),
+                    };
                 }
+                "working" => return AttentionState::Working { message: msg },
+                "done" => return AttentionState::Done { message: msg },
+                "error" | "failed" => return AttentionState::Error { message: msg },
+                "" | "idle" => {}
+                _ => return AttentionState::Idle,
             }
-            "working" => AttentionState::Working { message: msg },
-            "done" => AttentionState::Done { message: msg },
-            "error" | "failed" => AttentionState::Error { message: msg },
-            _ => AttentionState::Idle,
         }
+
+        if let Some(lbl_state) = self.labels.get("cockpit.state") {
+            let msg = self
+                .labels
+                .get("cockpit.msg")
+                .map(String::as_str)
+                .map(sanitize_terminal_text)
+                .filter(|m| !m.is_empty());
+            match lbl_state.trim().to_ascii_lowercase().as_str() {
+                "blocked" => {
+                    let kind = match self
+                        .labels
+                        .get("cockpit.kind")
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .as_deref()
+                    {
+                        Some("auth") => BlockedKind::Auth,
+                        Some("permission") => BlockedKind::Permission,
+                        Some("question") | Some("") | None => BlockedKind::Question,
+                        Some(_) => BlockedKind::Unknown,
+                    };
+                    return AttentionState::Blocked {
+                        kind,
+                        message: msg,
+                        since_ms: self.status_ms.unwrap_or(now_ms),
+                    };
+                }
+                "working" => return AttentionState::Working { message: msg },
+                "done" => return AttentionState::Done { message: msg },
+                "error" | "failed" => return AttentionState::Error { message: msg },
+                _ => {}
+            }
+        }
+
+        AttentionState::Idle
     }
 }
 
@@ -517,9 +552,33 @@ pub struct HerdrClient {
     hc_bin: String,
 }
 
+fn resolve_default_hc_bin() -> String {
+    if let Ok(bin) = std::env::var("HC_BIN") {
+        if !bin.trim().is_empty() {
+            return bin;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = std::path::PathBuf::from(home);
+        for candidate in [
+            home_path.join(".local/bin/hc"),
+            home_path.join(".cargo/bin/hc"),
+        ] {
+            if candidate.exists() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    let ubuntu_hc = std::path::PathBuf::from("/home/ubuntu/.local/bin/hc");
+    if ubuntu_hc.exists() {
+        return "/home/ubuntu/.local/bin/hc".to_string();
+    }
+    "hc".to_string()
+}
+
 impl Default for HerdrClient {
     fn default() -> Self {
-        Self::new("hc")
+        Self::new(resolve_default_hc_bin())
     }
 }
 
