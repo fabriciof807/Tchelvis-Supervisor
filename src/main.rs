@@ -262,6 +262,39 @@ enum SupervisorCommands {
         #[arg(long)]
         no_warm: bool,
     },
+    /// List, select, filter, or reset the managed llama.cpp container model
+    Model {
+        #[command(subcommand)]
+        action: ModelCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// List local GGUF models
+    List {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+        /// Override max parameter filter (`2b|4b|8b|all`)
+        #[arg(long, value_name = "2b|4b|8b|all")]
+        max_params: Option<String>,
+        /// Include embeddings, projectors, and models above the filter
+        #[arg(long)]
+        all: bool,
+    },
+    /// Select a model by id (`ollama:<name>`, `file:<path>`, `hf:<repo>`)
+    Set {
+        /// Model id
+        id: String,
+    },
+    /// Persist the max parameter filter (`2b|4b|8b|all`)
+    Filter {
+        /// Filter bucket (`2b|4b|8b|all`)
+        max_params: String,
+    },
+    /// Clear `llm_container.model_id` from supervisor.toml
+    Reset,
 }
 
 const VALID_LABEL_KEYS: [&str; 7] = [
@@ -589,6 +622,69 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
                 Ok(())
             }
+            SupervisorCommands::Model { action } => match action {
+                ModelCommand::List {
+                    json,
+                    max_params,
+                    all,
+                } => {
+                    let parsed_filter = match max_params {
+                        Some(raw) => Some(
+                            cockpit::supervisor::models::MaxParams::parse(&raw).ok_or_else(
+                                || {
+                                    anyhow::anyhow!(
+                                        "Invalid --max-params '{}'; expected 2b, 4b, 8b, or all",
+                                        raw
+                                    )
+                                },
+                            )?,
+                        ),
+                        None => None,
+                    };
+                    let out = tokio::task::spawn_blocking(move || {
+                        cockpit::supervisor::list_models(parsed_filter, all)
+                    })
+                    .await
+                    .context("supervisor model list task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                    } else {
+                        print_model_table(&out);
+                    }
+                    Ok(())
+                }
+                ModelCommand::Set { id } => {
+                    let snap =
+                        tokio::task::spawn_blocking(move || cockpit::supervisor::set_model(&id))
+                            .await
+                            .context("supervisor model set task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&snap)?);
+                    Ok(())
+                }
+                ModelCommand::Filter { max_params } => {
+                    let filter = cockpit::supervisor::models::MaxParams::parse(&max_params)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Invalid filter '{}'; expected 2b, 4b, 8b, or all",
+                                max_params
+                            )
+                        })?;
+                    let out = tokio::task::spawn_blocking(move || {
+                        cockpit::supervisor::set_model_filter(filter)
+                    })
+                    .await
+                    .context("supervisor model filter task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                ModelCommand::Reset => {
+                    let snap = tokio::task::spawn_blocking(cockpit::supervisor::reset_model)
+                        .await
+                        .context("supervisor model reset task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&snap)?);
+                    Ok(())
+                }
+            },
         },
         Commands::Home { json } => {
             let paths_clone = paths.clone();
@@ -998,5 +1094,54 @@ fn truncate_col(s: &str, max_chars: usize) -> String {
         let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+fn format_size_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return "-".to_string();
+    }
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else {
+        format!("{:.0} MiB", b / MIB)
+    }
+}
+
+fn print_model_table(out: &cockpit::supervisor::models::ModelListOutput) {
+    if !out.managed {
+        println!("Container mode is off or no runtime was found.");
+        return;
+    }
+    if let Some(ref note) = out.env_override_ignored {
+        println!("Note: {note} is set in the environment and ignored in container mode.");
+    }
+    if out.models.is_empty() {
+        println!("No local GGUF models found (filter: {}).", out.filter);
+        return;
+    }
+    println!(
+        "{:<2} {:<28} {:<7} {:<15} {:<9} {:<8} {}",
+        "·", "NAME", "PARAMS", "SOURCE", "SIZE", "QUANT", "ID"
+    );
+    for m in &out.models {
+        let dot = if m.in_use { "●" } else { " " };
+        let quant = m.quant.as_deref().unwrap_or("-");
+        println!(
+            "{:<2} {:<28} {:<7} {:<15} {:<9} {:<8} {}",
+            dot,
+            truncate_col(&m.display_name, 28),
+            m.params_label,
+            truncate_col(&m.source, 15),
+            format_size_bytes(m.size_bytes),
+            quant,
+            m.id,
+        );
+    }
+    if out.hidden_count > 0 {
+        println!("({} hidden by filter '{}')", out.hidden_count, out.filter);
     }
 }

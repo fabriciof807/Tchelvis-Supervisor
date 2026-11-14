@@ -85,10 +85,16 @@ pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
     );
     snap.llm_backend = engine.config.effective_backend().as_str().to_string();
     snap.llm_host = engine.config.effective_primary_host();
-    snap.llm_model = engine.config.ollama_model.clone();
+    snap.llm_managed = engine.config.container_mode_active();
+    snap.llm_model = if snap.llm_managed {
+        super::models::effective_model(&engine.config, &super::container::default_ollama_roots())
+            .map(|m| m.display_name)
+            .unwrap_or_else(|| engine.config.ollama_model.clone())
+    } else {
+        engine.config.ollama_model.clone()
+    };
     snap.num_gpu = engine.config.effective_num_gpu();
     snap.allow_gpu = snap.num_gpu != 0;
-    snap.llm_managed = engine.config.container_mode_active();
     snap
 }
 

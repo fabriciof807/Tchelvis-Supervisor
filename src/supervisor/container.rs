@@ -57,6 +57,14 @@ pub struct LlmContainerConfig {
     pub hf_repo: Option<String>,
     /// Extra CLI arguments appended to `llama-server`.
     pub extra_args: Vec<String>,
+    /// Selected model identifier (`ollama:<name>`, `file:<path>`, or `hf:<repo>`).
+    pub model_id: Option<String>,
+    /// Maximum parameter filter for model listing (`2b` | `4b` | `8b` | `all`).
+    pub model_filter: String,
+    /// Additional directories to scan for local `.gguf` files.
+    pub model_dirs: Vec<PathBuf>,
+    /// Reserved for M1b; not read.
+    pub fallback_model_id: Option<String>,
 }
 
 impl Default for LlmContainerConfig {
@@ -72,6 +80,10 @@ impl Default for LlmContainerConfig {
             model_path: None,
             hf_repo: None,
             extra_args: Vec::new(),
+            model_id: None,
+            model_filter: "4b".to_string(),
+            model_dirs: Vec::new(),
+            fallback_model_id: None,
         }
     }
 }
@@ -258,16 +270,72 @@ pub fn default_hf_cache_dir() -> PathBuf {
         .join("llama.cpp")
 }
 
+/// Parsed model selection identifier (`ollama:<name>`, `file:<path>`, `hf:<repo>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelId {
+    Ollama(String),
+    File(PathBuf),
+    Hf(String),
+}
+
+impl ModelId {
+    /// Parses a model id by splitting on the FIRST `:` only.
+    pub fn parse(s: &str) -> Result<Self> {
+        let trimmed = s.trim();
+        let (scheme, rest) = trimmed
+            .split_once(':')
+            .ok_or_else(|| anyhow!("ID de modelo inválido (esperado prefixo:valor): {s}"))?;
+        if rest.is_empty() {
+            bail!("ID de modelo inválido (valor vazio): {s}");
+        }
+        match scheme {
+            "ollama" => Ok(Self::Ollama(rest.to_string())),
+            "file" => Ok(Self::File(PathBuf::from(rest))),
+            "hf" => Ok(Self::Hf(rest.to_string())),
+            other => bail!("Esquema de modelo desconhecido '{other}': {s}"),
+        }
+    }
+
+    /// Formats back into the canonical `<scheme>:<value>` id string.
+    pub fn as_id(&self) -> String {
+        match self {
+            Self::Ollama(n) => format!("ollama:{n}"),
+            Self::File(p) => format!("file:{}", p.display()),
+            Self::Hf(r) => format!("hf:{r}"),
+        }
+    }
+}
+
 /// Resolves the model source in precedence order:
-/// 1. `llm_container.model_path`
-/// 2. `llm_container.hf_repo`
-/// 3. Ollama store manifest/blob matching `ollama_model` across `search_roots`
-/// 4. Clear pt-BR error.
+/// 1. `llm_container.model_id`
+/// 2. `llm_container.model_path`
+/// 3. `llm_container.hf_repo`
+/// 4. Ollama store manifest/blob matching `ollama_model` across `search_roots`
+/// 5. Clear pt-BR error.
 pub fn resolve_model_source(
     cfg: &LlmContainerConfig,
     ollama_model: &str,
     search_roots: &[PathBuf],
 ) -> Result<ModelSource> {
+    if let Some(ref raw_id) = cfg.model_id {
+        let trimmed = raw_id.trim();
+        if !trimmed.is_empty() {
+            return match ModelId::parse(trimmed)? {
+                ModelId::Ollama(name) => resolve_ollama_gguf_blob(&name, search_roots)
+                    .map(ModelSource::File)
+                    .ok_or_else(|| anyhow!("Modelo selecionado não encontrado: {name}")),
+                ModelId::File(path) => {
+                    if path.exists() {
+                        Ok(ModelSource::File(path))
+                    } else {
+                        bail!("Modelo selecionado não encontrado: {}", path.display());
+                    }
+                }
+                ModelId::Hf(repo) => Ok(ModelSource::HfRepo(repo)),
+            };
+        }
+    }
+
     if let Some(ref path) = cfg.model_path {
         if !path.as_os_str().is_empty() {
             return Ok(ModelSource::File(path.clone()));
@@ -290,7 +358,10 @@ pub fn resolve_model_source(
     ))
 }
 
-fn resolve_ollama_gguf_blob(ollama_model: &str, search_roots: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn resolve_ollama_gguf_blob(
+    ollama_model: &str,
+    search_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let trimmed = ollama_model.trim();
     if trimmed.is_empty() {
         return None;
@@ -301,7 +372,10 @@ fn resolve_ollama_gguf_blob(ollama_model: &str, search_roots: &[PathBuf]) -> Opt
         _ => (trimmed, "latest"),
     };
 
-    let rel_manifest = if name_part.contains('/') {
+    let slash_count = name_part.matches('/').count();
+    let rel_manifest = if slash_count >= 2 {
+        PathBuf::from("manifests").join(name_part).join(tag)
+    } else if slash_count == 1 {
         PathBuf::from("manifests")
             .join("registry.ollama.ai")
             .join(name_part)
@@ -351,6 +425,7 @@ pub fn build_run_args(
     ngl: u32,
     model: &ModelSource,
     hf_cache_dir: &Path,
+    model_id: &str,
 ) -> Vec<String> {
     let mut args = vec![
         "run".to_string(),
@@ -359,6 +434,8 @@ pub fn build_run_args(
         cfg.name.clone(),
         "--label".to_string(),
         format!("cockpit.ngl={ngl}"),
+        "--label".to_string(),
+        format!("cockpit.model_id={model_id}"),
         "-p".to_string(),
         format!("127.0.0.1:{}:8080", cfg.port),
     ];
@@ -580,8 +657,28 @@ impl<C: ContainerCli> LlmContainer<C> {
         out.stdout.trim().parse::<u32>().ok()
     }
 
-    /// Starts (or recreates when `ngl` changed) the `llama.cpp` container.
-    pub fn start(&self, ngl: u32, model: &ModelSource) -> Result<()> {
+    /// Reads the `cockpit.model_id` label from an existing container.
+    pub fn container_model_id(&self) -> Option<String> {
+        let args = vec![
+            "inspect".to_string(),
+            "-f".to_string(),
+            "{{index .Config.Labels \"cockpit.model_id\"}}".to_string(),
+            self.config.name.clone(),
+        ];
+        let out = self.cli.run(self.runtime.bin(), &args).ok()?;
+        if out.status_code != 0 {
+            return None;
+        }
+        let val = out.stdout.trim();
+        if val.is_empty() || val == "<no value>" {
+            None
+        } else {
+            Some(val.to_string())
+        }
+    }
+
+    /// Starts (or recreates when `ngl` or `model_id` changed) the `llama.cpp` container.
+    pub fn start(&self, ngl: u32, model: &ModelSource, model_id: &str) -> Result<()> {
         if matches!(model, ModelSource::HfRepo(_)) {
             // Pre-create the cache so the runtime does not create the bind mount as root.
             fs::create_dir_all(&self.hf_cache_dir)
@@ -589,32 +686,54 @@ impl<C: ContainerCli> LlmContainer<C> {
         }
         match self.state()? {
             ContainerState::Missing => {
-                let run_args =
-                    build_run_args(&self.config, self.runtime, ngl, model, &self.hf_cache_dir);
+                let run_args = build_run_args(
+                    &self.config,
+                    self.runtime,
+                    ngl,
+                    model,
+                    &self.hf_cache_dir,
+                    model_id,
+                );
                 self.run_checked(&run_args)?;
             }
             ContainerState::Stopped => {
-                if self.container_ngl() == Some(ngl) {
+                let matches = self.container_ngl() == Some(ngl)
+                    && self.container_model_id().as_deref() == Some(model_id);
+                if matches {
                     self.run_checked(&["start".to_string(), self.config.name.clone()])?;
                 } else {
                     let _ = self.cli.run(
                         self.runtime.bin(),
                         &["rm".to_string(), "-f".to_string(), self.config.name.clone()],
                     );
-                    let run_args =
-                        build_run_args(&self.config, self.runtime, ngl, model, &self.hf_cache_dir);
+                    let run_args = build_run_args(
+                        &self.config,
+                        self.runtime,
+                        ngl,
+                        model,
+                        &self.hf_cache_dir,
+                        model_id,
+                    );
                     self.run_checked(&run_args)?;
                 }
             }
             ContainerState::Running => {
-                if self.container_ngl() != Some(ngl) {
+                let matches = self.container_ngl() == Some(ngl)
+                    && self.container_model_id().as_deref() == Some(model_id);
+                if !matches {
                     self.run_checked(&[
                         "rm".to_string(),
                         "-f".to_string(),
                         self.config.name.clone(),
                     ])?;
-                    let run_args =
-                        build_run_args(&self.config, self.runtime, ngl, model, &self.hf_cache_dir);
+                    let run_args = build_run_args(
+                        &self.config,
+                        self.runtime,
+                        ngl,
+                        model,
+                        &self.hf_cache_dir,
+                        model_id,
+                    );
                     self.run_checked(&run_args)?;
                 }
             }
@@ -768,7 +887,14 @@ mod tests {
         let file_model = ModelSource::File(PathBuf::from("/data/models/lfm3.gguf"));
 
         // Docker CPU
-        let args = build_run_args(&cfg, ContainerRuntime::Docker, 0, &file_model, &cache);
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            0,
+            &file_model,
+            &cache,
+            "file:/data/models/lfm3.gguf",
+        );
         assert!(!args.contains(&"--gpus".to_string()));
         assert!(!args.contains(&"--device".to_string()));
         assert!(args.contains(&"ghcr.io/ggml-org/llama.cpp:server".to_string()));
@@ -779,7 +905,14 @@ mod tests {
 
         // Docker GPU + HfRepo
         let hf_model = ModelSource::HfRepo("LiquidAI/LFM2-1.2B-GGUF:Q4_K_M".into());
-        let args = build_run_args(&cfg, ContainerRuntime::Docker, 99, &hf_model, &cache);
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            99,
+            &hf_model,
+            &cache,
+            "hf:LiquidAI/LFM2-1.2B-GGUF:Q4_K_M",
+        );
         assert!(args.windows(2).any(|w| w == ["--gpus", "all"]));
         assert!(args.contains(&"ghcr.io/ggml-org/llama.cpp:server-cuda".to_string()));
         assert!(args.contains(&"/tmp/hf-cache:/root/.cache/llama.cpp".to_string()));
@@ -790,7 +923,14 @@ mod tests {
         assert!(args.contains(&"cockpit.ngl=99".to_string()));
 
         // Podman GPU
-        let args = build_run_args(&cfg, ContainerRuntime::Podman, 99, &file_model, &cache);
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Podman,
+            99,
+            &file_model,
+            &cache,
+            "file:/data/models/lfm3.gguf",
+        );
         assert!(args
             .windows(2)
             .any(|w| w == ["--device", "nvidia.com/gpu=all"]));
@@ -859,6 +999,7 @@ mod tests {
     #[test]
     fn test_container_start_stop_state_machine() {
         let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let mid = "hf:org/tiny:Q4_K_M";
 
         // Missing -> run
         let cli = FakeCli::new(vec![
@@ -866,21 +1007,22 @@ mod tests {
             ok_out("container_id\n"),     // run
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model).unwrap();
+        mgr.start(0, &model, mid).unwrap();
         let calls = mgr.cli.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].1[0], "run");
 
-        // Stopped with matching ngl -> start
+        // Stopped with matching ngl and model_id -> start
         let cli = FakeCli::new(vec![
-            ok_out("false\n"), // state() -> Stopped
-            ok_out("0\n"),     // container_ngl() -> 0
-            ok_out(""),        // start
+            ok_out("false\n"),              // state() -> Stopped
+            ok_out("0\n"),                  // container_ngl() -> 0
+            ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id()
+            ok_out(""),                     // start
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model).unwrap();
+        mgr.start(0, &model, mid).unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls[2].1, vec!["start", "cockpit-supervisor-llm"]);
+        assert_eq!(calls[3].1, vec!["start", "cockpit-supervisor-llm"]);
 
         // Stopped with different ngl -> rm -f + run
         let cli = FakeCli::new(vec![
@@ -890,19 +1032,20 @@ mod tests {
             ok_out("cid\n"),   // run
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(99, &model).unwrap();
+        mgr.start(99, &model, mid).unwrap();
         let calls = mgr.cli.calls();
         assert_eq!(calls[2].1, vec!["rm", "-f", "cockpit-supervisor-llm"]);
         assert_eq!(calls[3].1[0], "run");
 
-        // Running with same ngl -> no-op
+        // Running with same ngl and model_id -> no-op
         let cli = FakeCli::new(vec![
-            ok_out("true\n"), // state() -> Running
-            ok_out("0\n"),    // container_ngl() -> 0
+            ok_out("true\n"),               // state() -> Running
+            ok_out("0\n"),                  // container_ngl() -> 0
+            ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id()
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model).unwrap();
-        assert_eq!(mgr.cli.calls().len(), 2);
+        mgr.start(0, &model, mid).unwrap();
+        assert_eq!(mgr.cli.calls().len(), 3);
 
         // Stop when Running -> stop -t 2
         let cli = FakeCli::new(vec![ok_out("true\n"), ok_out("")]);
@@ -950,5 +1093,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("não respondeu"));
+    }
+
+    #[test]
+    fn model_id_roundtrip_with_spaces_and_colons() {
+        let parsed = ModelId::parse("file:/m/my model:v2.gguf").unwrap();
+        assert_eq!(parsed, ModelId::File(PathBuf::from("/m/my model:v2.gguf")));
+        assert_eq!(parsed.as_id(), "file:/m/my model:v2.gguf");
+
+        let ol = ModelId::parse("ollama:hf.co/org/repo:Q8_0").unwrap();
+        assert_eq!(ol, ModelId::Ollama("hf.co/org/repo:Q8_0".to_string()));
+        assert_eq!(ol.as_id(), "ollama:hf.co/org/repo:Q8_0");
+
+        assert!(ModelId::parse("bogus").is_err());
+    }
+
+    #[test]
+    fn resolve_prefers_model_id_over_model_path_and_hf_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let selected_file = dir.path().join("selected.gguf");
+        let other_file = dir.path().join("other.gguf");
+        fs::write(&selected_file, b"gguf").unwrap();
+        fs::write(&other_file, b"gguf").unwrap();
+
+        let cfg = LlmContainerConfig {
+            model_id: Some(format!("file:{}", selected_file.display())),
+            model_path: Some(other_file),
+            hf_repo: Some("org/repo".to_string()),
+            ..Default::default()
+        };
+        let resolved = resolve_model_source(&cfg, "lfm3:1.7b", &[]).unwrap();
+        assert_eq!(resolved, ModelSource::File(selected_file));
+    }
+
+    #[test]
+    fn resolve_missing_ollama_selection_errors() {
+        let cfg = LlmContainerConfig {
+            model_id: Some("ollama:missing:1b".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_model_source(&cfg, "lfm3:1.7b", &[]).unwrap_err();
+        assert!(err.to_string().contains("missing:1b"));
+    }
+
+    #[test]
+    fn resolve_missing_file_selection_errors() {
+        let cfg = LlmContainerConfig {
+            model_id: Some("file:/nonexistent/path/model.gguf".to_string()),
+            ..Default::default()
+        };
+        let err = resolve_model_source(&cfg, "lfm3:1.7b", &[]).unwrap_err();
+        assert!(err.to_string().contains("/nonexistent/path/model.gguf"));
+    }
+
+    #[test]
+    fn run_args_include_model_id_label() {
+        let cfg = LlmContainerConfig::default();
+        let cache = PathBuf::from("/tmp/hf-cache");
+        let file_model = ModelSource::File(PathBuf::from("/models/lfm3.gguf"));
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            0,
+            &file_model,
+            &cache,
+            "ollama:lfm3:1.7b",
+        );
+        assert!(args.contains(&"cockpit.model_id=ollama:lfm3:1.7b".to_string()));
+    }
+
+    #[test]
+    fn stopped_with_same_ngl_but_other_model_recreates() {
+        let model = ModelSource::HfRepo("org/new:Q4_K_M".into());
+        let cli = FakeCli::new(vec![
+            ok_out("false\n"),            // state() -> Stopped
+            ok_out("0\n"),                // container_ngl() -> 0
+            ok_out("ollama:lfm3:1.7b\n"), // container_model_id() -> old model
+            ok_out(""),                   // rm -f
+            ok_out("cid\n"),              // run
+        ]);
+        let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
+        mgr.start(0, &model, "hf:org/new:Q4_K_M").unwrap();
+        let calls = mgr.cli.calls();
+        assert_eq!(calls[3].1, vec!["rm", "-f", "cockpit-supervisor-llm"]);
+        assert_eq!(calls[4].1[0], "run");
+    }
+
+    #[test]
+    fn running_with_same_labels_is_noop() {
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let cli = FakeCli::new(vec![
+            ok_out("true\n"),               // state() -> Running
+            ok_out("0\n"),                  // container_ngl() -> 0
+            ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id() -> same
+        ]);
+        let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
+        mgr.start(0, &model, "hf:org/tiny:Q4_K_M").unwrap();
+        let calls = mgr.cli.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(!calls.iter().any(|c| c.1[0] == "rm" || c.1[0] == "run"));
     }
 }

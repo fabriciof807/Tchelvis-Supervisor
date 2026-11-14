@@ -1,7 +1,10 @@
 pub mod config;
+pub mod config_write;
 pub mod container;
+pub mod gguf;
 pub mod guardrails;
 pub mod hc;
+pub mod models;
 pub mod ollama;
 pub mod state;
 pub mod tui;
@@ -155,17 +158,21 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
         let rt = config.detected_container_runtime().ok_or_else(|| {
             anyhow::anyhow!("Nenhum runtime de container encontrado (kiri/podman/docker)")
         })?;
+        let ollama_roots = container::default_ollama_roots();
         let model = container::resolve_model_source(
             &config.llm_container,
             &config.ollama_model,
-            &container::default_ollama_roots(),
+            &ollama_roots,
         )?;
+        let model_id = models::effective_model(&config, &ollama_roots)
+            .map(|m| m.id)
+            .unwrap_or_default();
         let mgr = container::LlmContainer::new(
             rt,
             config.llm_container.clone(),
             container::SystemContainerCli,
         );
-        mgr.start(config.effective_num_gpu(), &model)?;
+        mgr.start(config.effective_num_gpu(), &model, &model_id)?;
         let host = config.effective_primary_host();
         container::wait_healthy(&host, Duration::from_secs(90))?;
     } else {
@@ -216,12 +223,16 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
             );
             if matches!(mgr.state(), Ok(container::ContainerState::Running)) {
                 if warm {
+                    let ollama_roots = container::default_ollama_roots();
                     let model = container::resolve_model_source(
                         &config.llm_container,
                         &config.ollama_model,
-                        &container::default_ollama_roots(),
+                        &ollama_roots,
                     )?;
-                    mgr.start(config.effective_num_gpu(), &model)?;
+                    let model_id = models::effective_model(&config, &ollama_roots)
+                        .map(|m| m.id)
+                        .unwrap_or_default();
+                    mgr.start(config.effective_num_gpu(), &model, &model_id)?;
                     let host = config.effective_primary_host();
                     container::wait_healthy(&host, Duration::from_secs(90))?;
                     loaded_after = true;
@@ -246,6 +257,148 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
     Ok(snapshot)
+}
+
+/// Lists local GGUF models with parameter filtering and effective-model marking.
+pub fn list_models(
+    filter_override: Option<models::MaxParams>,
+    show_all: bool,
+) -> Result<models::ModelListOutput> {
+    let cfg = SupervisorConfig::load();
+    let filter = filter_override
+        .or_else(|| models::MaxParams::parse(&cfg.llm_container.model_filter))
+        .unwrap_or(models::MaxParams::B4);
+
+    if !cfg.container_mode_active() {
+        return Ok(models::ModelListOutput {
+            models: Vec::new(),
+            hidden_count: 0,
+            filter: filter.as_str().to_string(),
+            selected_id: cfg.llm_container.model_id,
+            managed: false,
+            env_override_ignored: None,
+        });
+    }
+
+    let roots = models::ScanRoots::from_env_and_config(&cfg.llm_container);
+    let scanned = models::scan_local_models(&roots);
+    let eff = models::effective_model(&cfg, &roots.ollama);
+    let (model_list, hidden_count) =
+        models::build_model_list(scanned, filter, eff.as_ref(), show_all);
+
+    let model_id_set = cfg
+        .llm_container
+        .model_id
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let eff_display = eff.as_ref().map(|e| e.display_name.as_str()).unwrap_or("");
+    let cockpit_env = std::env::var("COCKPIT_LLM_MODEL").ok();
+    let ollama_env = std::env::var("OLLAMA_MODEL").ok();
+    let env_note = models::env_override_note(
+        model_id_set,
+        eff_display,
+        cockpit_env.as_deref(),
+        ollama_env.as_deref(),
+    );
+
+    Ok(models::ModelListOutput {
+        models: model_list,
+        hidden_count,
+        filter: filter.as_str().to_string(),
+        selected_id: cfg.llm_container.model_id,
+        managed: true,
+        env_override_ignored: env_note,
+    })
+}
+
+fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
+    let Some(rt) = cfg.detected_container_runtime() else {
+        return Ok(());
+    };
+    let mgr =
+        container::LlmContainer::new(rt, cfg.llm_container.clone(), container::SystemContainerCli);
+    if !matches!(mgr.state(), Ok(container::ContainerState::Running)) {
+        return Ok(());
+    }
+    let ollama_roots = container::default_ollama_roots();
+    let model =
+        container::resolve_model_source(&cfg.llm_container, &cfg.ollama_model, &ollama_roots)?;
+    let eff = models::effective_model(cfg, &ollama_roots);
+    let display = eff
+        .as_ref()
+        .map(|e| e.display_name.as_str())
+        .unwrap_or("modelo selecionado");
+    let eff_id = eff.as_ref().map(|e| e.id.as_str()).unwrap_or("");
+
+    let start_and_wait = mgr
+        .start(cfg.effective_num_gpu(), &model, eff_id)
+        .and_then(|_| {
+            container::wait_healthy(&cfg.effective_primary_host(), Duration::from_secs(90))
+        });
+    if let Err(err) = start_and_wait {
+        let _ = mgr.stop();
+        anyhow::bail!("Falha ao carregar modelo {display}: {err}");
+    }
+    Ok(())
+}
+
+fn snapshot_from_config(cfg: SupervisorConfig) -> Result<DesktopModSnapshot> {
+    let mut engine = build_engine_from_config(cfg)?;
+    sync_runtime_status(&mut engine);
+    let mut snapshot = build_desktop_mod_snapshot(&engine);
+    enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
+    Ok(snapshot)
+}
+
+/// Persists a selected model id into `supervisor.toml` and recreates the container if running.
+pub fn set_model(id: &str) -> Result<DesktopModSnapshot> {
+    let cfg = SupervisorConfig::load();
+    if !cfg.container_mode_active() {
+        anyhow::bail!(
+            "Model selection applies to the managed llama.cpp container (container mode is off or no runtime was found)"
+        );
+    }
+
+    let roots = models::ScanRoots::from_env_and_config(&cfg.llm_container);
+    let scanned = models::scan_local_models(&roots);
+    let scanned_ids: Vec<String> = scanned.iter().map(|m| m.id.clone()).collect();
+    let eff = models::effective_model(&cfg, &roots.ollama);
+    models::validate_model_choice(id, &scanned_ids, eff.as_ref().map(|e| e.id.as_str()))?;
+
+    if cfg.llm_container.model_id.as_deref() == Some(id) {
+        return snapshot_from_config(cfg);
+    }
+
+    let ollama_name = match container::ModelId::parse(id)? {
+        container::ModelId::Ollama(name) => Some(name),
+        _ => None,
+    };
+    config_write::write_model_selection(
+        &config::supervisor_config_path(),
+        id,
+        ollama_name.as_deref(),
+    )?;
+
+    let new_cfg = SupervisorConfig::load();
+    recreate_container_if_running(&new_cfg)?;
+    snapshot_from_config(new_cfg)
+}
+
+/// Persists the `max_params` filter into `supervisor.toml` and returns the updated model list.
+pub fn set_model_filter(filter: models::MaxParams) -> Result<models::ModelListOutput> {
+    config_write::write_model_filter(&config::supervisor_config_path(), filter.as_str())?;
+    list_models(None, false)
+}
+
+/// Clears `llm_container.model_id` from `supervisor.toml` and recreates the container if running.
+pub fn reset_model() -> Result<DesktopModSnapshot> {
+    config_write::clear_model_selection(&config::supervisor_config_path())?;
+    let new_cfg = SupervisorConfig::load();
+    if new_cfg.container_mode_active() {
+        recreate_container_if_running(&new_cfg)?;
+    }
+    snapshot_from_config(new_cfg)
 }
 
 /// Runs the supervisor deterministic watcher loop, persisting `DesktopModSnapshot` JSON

@@ -2,10 +2,11 @@ use super::container::{binary_on_path, detect_runtime, ContainerRuntime, LlmCont
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Configurable `hc` CLI command templates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HcAdapterConfig {
     /// Path or binary name for `hc` (default: `/home/ubuntu/.local/bin/hc` or `hc`).
     pub hc_bin: String,
@@ -101,6 +102,7 @@ impl LlmBackendKind {
 
 /// Complete configuration for the Cockpit Durable Supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SupervisorConfig {
     /// Selected LLM backend (`ollama`, `llama-cpp`, `lm-studio`, `openai-compatible`).
     #[serde(default)]
@@ -288,6 +290,26 @@ impl Default for SupervisorConfig {
     }
 }
 
+/// Returns the supervisor config path under `home`: cockpit path if it exists,
+/// else legacy (`~/.config/herdr/supervisor.toml`) if it exists, else the cockpit path.
+pub fn supervisor_config_path_in(home: &Path) -> PathBuf {
+    let cockpit_cfg = home.join(".config").join("cockpit").join("supervisor.toml");
+    if cockpit_cfg.exists() {
+        return cockpit_cfg;
+    }
+    let legacy_cfg = home.join(".config").join("herdr").join("supervisor.toml");
+    if legacy_cfg.exists() {
+        return legacy_cfg;
+    }
+    cockpit_cfg
+}
+
+/// Returns the active `supervisor.toml` path for the current user's `$HOME`.
+pub fn supervisor_config_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+    supervisor_config_path_in(Path::new(&home))
+}
+
 impl SupervisorConfig {
     /// Returns the legacy Herdr state file path (`~/.local/share/herdr/supervisor_state.json`).
     pub fn legacy_state_file_path() -> PathBuf {
@@ -302,30 +324,29 @@ impl SupervisorConfig {
     /// Load configuration from `~/.config/cockpit/supervisor.toml` (or legacy `~/.config/herdr/supervisor.toml`),
     /// merged with environment variable overrides.
     pub fn load() -> Self {
-        let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-        let cockpit_cfg = PathBuf::from(&home)
-            .join(".config")
-            .join("cockpit")
-            .join("supervisor.toml");
-        let legacy_cfg = PathBuf::from(&home)
-            .join(".config")
-            .join("herdr")
-            .join("supervisor.toml");
-
-        let chosen_path = if cockpit_cfg.exists() {
-            Some(cockpit_cfg)
-        } else if legacy_cfg.exists() {
-            Some(legacy_cfg)
-        } else {
-            None
-        };
-
+        let config_path = supervisor_config_path();
         let mut cfg = Self::default();
-        if let Some(config_path) = chosen_path {
-            if let Ok(raw) = fs::read_to_string(&config_path) {
-                if let Ok(parsed) = toml::from_str::<SupervisorConfig>(&raw) {
-                    cfg = parsed;
-                    cfg.apply_env_overrides();
+        if config_path.exists() {
+            match fs::read_to_string(&config_path) {
+                Ok(raw) => match toml::from_str::<SupervisorConfig>(&raw) {
+                    Ok(parsed) => {
+                        cfg = parsed;
+                        cfg.apply_env_overrides();
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %config_path.display(),
+                            error = %err,
+                            "Failed to parse supervisor config; using defaults"
+                        );
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(
+                        path = %config_path.display(),
+                        error = %err,
+                        "Failed to read supervisor config; using defaults"
+                    );
                 }
             }
         }
@@ -573,5 +594,40 @@ mod tests {
         cfg.llm_container.mode = "auto".to_string();
         assert!(!cfg.container_mode_active_with(|_| false));
         assert!(cfg.container_mode_active_with(|b| b == "docker"));
+    }
+
+    #[test]
+    fn partial_toml_with_only_llm_container_parses() {
+        let raw = "[llm_container]\nmodel_id = \"ollama:qwen2.5:3b\"\nmodel_dirs = [\"/m\"]\n";
+        let parsed: SupervisorConfig = toml::from_str(raw).unwrap();
+        assert_eq!(
+            parsed.llm_container.model_id.as_deref(),
+            Some("ollama:qwen2.5:3b")
+        );
+        assert_eq!(parsed.llm_container.model_dirs, vec![PathBuf::from("/m")]);
+        assert_eq!(parsed.llm_container.model_filter, "4b");
+        assert_eq!(parsed.poll_interval_secs, 12);
+        assert_eq!(parsed.hc.list_sessions_cmd, "hc ls --json");
+        assert_eq!(parsed.llm_container.port, 11435);
+    }
+
+    #[test]
+    fn supervisor_config_path_prefers_cockpit_then_legacy() {
+        let home = tempfile::tempdir().unwrap();
+        let cockpit = home.path().join(".config/cockpit/supervisor.toml");
+        let legacy = home.path().join(".config/herdr/supervisor.toml");
+
+        // Neither exists -> cockpit path
+        assert_eq!(supervisor_config_path_in(home.path()), cockpit);
+
+        // Only legacy exists -> legacy path
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "poll_interval_secs = 15\n").unwrap();
+        assert_eq!(supervisor_config_path_in(home.path()), legacy);
+
+        // Both exist -> cockpit path
+        fs::create_dir_all(cockpit.parent().unwrap()).unwrap();
+        fs::write(&cockpit, "poll_interval_secs = 20\n").unwrap();
+        assert_eq!(supervisor_config_path_in(home.path()), cockpit);
     }
 }

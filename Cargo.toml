@@ -23,6 +23,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "process", "io-util", "sync", "time", "signal", "fs"] }
 toml = "0.8"
+toml_edit = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 ureq = { version = "2.12", features = ["json"] }

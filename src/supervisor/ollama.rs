@@ -140,10 +140,17 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
     let num_gpu = config.effective_num_gpu();
     let effective_backend = config.effective_backend();
     let managed = config.container_mode_active();
+    let model_name = if managed {
+        super::models::effective_model(config, &super::container::default_ollama_roots())
+            .map(|m| m.display_name)
+            .unwrap_or_else(|| config.ollama_model.clone())
+    } else {
+        config.ollama_model.clone()
+    };
     let mut status = LlmHealthStatus {
         backend: effective_backend.as_str().to_string(),
         host: primary_host.clone(),
-        model: config.ollama_model.clone(),
+        model: model_name,
         num_gpu,
         ram_bytes: None,
         vram_bytes: None,
@@ -191,7 +198,7 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
                     status.vram_bytes = None;
                     status.detail = format!(
                         "Conectado ({primary_host}) · {} ({})",
-                        config.ollama_model,
+                        status.model,
                         gpu_mode_label(num_gpu)
                     );
                 } else {
