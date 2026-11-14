@@ -48,8 +48,13 @@ const MODE_OPTIONS = [
 ];
 
 function withAlpha(color, alphaHex, fallback) {
-  if (typeof color === "string" && /^#[0-9a-fA-F]{6}$/.test(color)) {
-    return `${color}${alphaHex}`;
+  if (typeof color === "string") {
+    if (/^#[0-9a-fA-F]{6}$/.test(color)) {
+      return `${color}${alphaHex}`;
+    }
+    if (/^#[0-9a-fA-F]{8}$/.test(color)) {
+      return `${color.slice(0, 7)}${alphaHex}`;
+    }
   }
   return fallback ?? color;
 }
@@ -1144,9 +1149,9 @@ export default class CockpitMod extends View {
       .rounded(4)
       .border(1)
       .border_color(
-        isActive ? withAlpha(accentCol, "66", accentCol) : "transparent"
+        isActive ? withAlpha(accentCol, "66", accentCol) : t.background
       )
-      .bg(isActive ? t.selected : "transparent")
+      .bg(isActive ? t.selected : t.background)
       .text_size(11)
       .font_semibold()
       .text_color(isActive ? accentCol : t.muted)
@@ -1214,15 +1219,15 @@ export default class CockpitMod extends View {
   lifecycleColors(t, state) {
     switch (state) {
       case "WAITING_CONFIRMATION":
-        return { fg: t.blocked, bg: t.blocked + "24" };
+        return { fg: t.blocked, bg: withAlpha(t.blocked, "24", t.raised) };
       case "STUCK_LOOP":
       case "ERROR":
-        return { fg: t.blocked, bg: t.blocked + "30" };
+        return { fg: t.blocked, bg: withAlpha(t.blocked, "30", t.raised) };
       case "COMPLETED":
-        return { fg: t.done, bg: t.done + "24" };
+        return { fg: t.done, bg: withAlpha(t.done, "24", t.raised) };
       case "WORKING":
       default:
-        return { fg: t.working, bg: t.working + "22" };
+        return { fg: t.working, bg: withAlpha(t.working, "22", t.raised) };
     }
   }
 
