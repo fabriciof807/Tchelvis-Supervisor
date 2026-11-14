@@ -1146,11 +1146,56 @@ export default class CockpitMod extends View {
       resolveCoreTermName(term, agentRow.tab_name ?? agentRow.name, addr);
     const attachTarget = agentRow.attach_target || termName || addr;
 
-    const openAttachTab = () => {
+    const recordDebug = (
+      action,
+      {
+        livePane = null,
+        paneAfter = null,
+        rawFocusedTerm = null,
+        mappedFocused = null,
+      } = {}
+    ) => {
+      setShared("cockpit.attachDebug", {
+        addr,
+        livePane: livePane?.pane ?? null,
+        paneAfter: paneAfter?.pane ?? null,
+        rawFocusedTerm,
+        mappedFocused,
+        action,
+        at: Date.now(),
+      });
+    };
+
+    const isFinished =
+      term?.state === "finished" ||
+      ((agentRow?.status === "done" ||
+        agentRow?.status === "error" ||
+        agentRow?.lifecycle?.state === "finished" ||
+        agentRow?.state === "finished") &&
+        (!term || term.state === "finished"));
+
+    if (isFinished) {
+      const sp = (spaces() ?? []).find((s) => s.active);
+      const displayName = termName || agentRow.name || addr;
+      run("tab.new", {
+        space: sp?.id,
+        name: `${displayName} (log)`,
+        argv: ["sh", "-c", 'herdr-core read "$1" | less -R', "sh", addr],
+      });
+      recordDebug("finished-transcript");
+      cx?.notify?.();
+      return;
+    }
+
+    const openAttachTab = (debugCtx = {}) => {
       this.attachingTargets ??= new Map();
       const now = Date.now();
       const lastAttempt = this.attachingTargets.get(addr) ?? 0;
-      if (now - lastAttempt < 1200) return;
+      if (now - lastAttempt < 1200) {
+        recordDebug("debounced", debugCtx);
+        cx?.notify?.();
+        return;
+      }
       this.attachingTargets.set(addr, now);
       const sp = (spaces() ?? []).find((s) => s.active);
       run("tab.new", {
@@ -1158,6 +1203,7 @@ export default class CockpitMod extends View {
         name: termName || addr,
         argv: ["herdr-core", "attach", attachTarget],
       });
+      recordDebug("attach-tab", debugCtx);
       cx?.notify?.();
     };
 
@@ -1199,8 +1245,16 @@ export default class CockpitMod extends View {
         )
       : null;
 
-    if (!paneAfter?.pane && mappedFocused !== addr) {
-      openAttachTab();
+    if (!paneAfter?.pane) {
+      openAttachTab({ livePane, paneAfter, rawFocusedTerm, mappedFocused });
+    } else {
+      recordDebug("focused-pane", {
+        livePane,
+        paneAfter,
+        rawFocusedTerm,
+        mappedFocused,
+      });
+      cx?.notify?.();
     }
   }
 
@@ -5369,6 +5423,20 @@ export default class CockpitMod extends View {
                           )
                         )
                     )
+                    .when(Boolean(shared("cockpit.attachDebug")), (el) => {
+                      const dbg = shared("cockpit.attachDebug");
+                      const focusedLabel =
+                        dbg.mappedFocused || dbg.rawFocusedTerm || "none";
+                      const paneLabel = dbg.paneAfter ?? dbg.livePane ?? "none";
+                      return el.child(
+                        div()
+                          .text_size(10.5)
+                          .text_color(t.muted)
+                          .child(
+                            `attach: ${dbg.action ?? "none"} · focused=${focusedLabel} · pane=${paneLabel}`
+                          )
+                      );
+                    })
                 )
                 // 2. Supervisor Action Card / Status (SUPERVISOR & GUARDRAILS)
                 .child(sectionTitle("SUPERVISOR & GUARDRAILS"))

@@ -58,6 +58,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Herdr mod design** (`56f11ae`, `58213b9`): aligned with the landing-page design, with multi-theme GPUI support and better readability.
 
 ### Fixed
+- **Host test fixes** (`50db329` and the following commit):
+  - **Antigravity (`agy`) detection:** agy sessions are recognized as agents instead of plain shells.
+  - **Supervisor LLM evaluations:** they now finish:
+    - `-np 1` gives a single slot with the whole context;
+    - free-text fields are length-limited and `max_tokens` is set to 384;
+    - evaluation errors are shown in the Inspector instead of being dropped.
+  - **Blocked agents:** they show a **Pending prompt** card that does not depend on the LLM:
+    - Approve / Deny / Open in Semi-Auto, only Open in Alert Only / Paused;
+    - destructive prompts cannot be approved, and the new `cockpit supervisor respond` refuses them server-side.
+  - **Container runtime:** in auto mode, the next runtime is tried when the first fails (e.g. broken rootless Podman), and the one that worked is remembered.
+  - **Fleet cards:** show the agent's icon.
+  - **Clicking a background session:**
+    - a live session now opens an attach tab whenever it has no visible pane, including `hc run --bg` sessions;
+    - a finished session opens its transcript.
+
+    The Inspector shows which path the click took.
 - **Background agents:** clicking a `herdr-core` session that has no pane now attaches it in a new tab. `herdr-core attach` / `hc attach` clients are no longer listed as duplicate agents (`27ad04e`).
 - **Agent list:**
   - Plain shells left behind after an agent exits are no longer shown as agents.

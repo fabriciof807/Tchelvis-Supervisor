@@ -69,6 +69,22 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ---
 
+### Atualização — correções do teste no host (`50db329` + Task 6)
+- Plano: `docs/superpowers/plans/2026-11-14-host-test-fixes.md`.
+- O que mudou:
+  - agy detectado como agente (`AgentKind::Antigravity`);
+  - avaliação LLM com limite (`-np 1`, `maxLength`, `max_tokens 384`) e erro visível (`last_eval_error`);
+  - card **Pending prompt** + `cockpit supervisor respond <t> approve|deny` (Enter/Esc; destrutivo recusado);
+  - fallback de runtime (`~/.local/state/cockpit/container_runtime`);
+  - ícone do agente na Fleet;
+  - clique em sessão em background sempre abre a aba de attach se não houver painel; sessão encerrada abre o histórico (`herdr-core read | less -R`).
+- **Validar no host:**
+  - clicar numa sessão agy viva (`hc run --bg`) deve abrir a aba de attach. A linha `attach: …` no Inspector mostra o caminho; se não abrir, anotar essa linha;
+  - card Pending prompt em sessão PERMISSION;
+  - repetir o teste multi-agente com o lfm3 (a avaliação deve terminar ou mostrar o erro).
+
+---
+
 ## 2. Histórico de Commits Recentes (`main`)
 
 - `6a38eee` — `feat(supervisor,mod): managed llama.cpp container with explicit Load/Unload lifecycle`
