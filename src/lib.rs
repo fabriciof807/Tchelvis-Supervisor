@@ -11,3 +11,4 @@ pub mod providers;
 pub mod setup;
 pub mod store;
 pub mod supervisor;
+pub mod usage;

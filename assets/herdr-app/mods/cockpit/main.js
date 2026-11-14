@@ -761,11 +761,15 @@ export default class CockpitMod extends View {
     this.inspectCache = {}; // address -> InspectResponse
     this.doctorReport = null;
     this.homeSnap = shared("cockpit.home") ?? null;
+    this.usageSnap = shared("cockpit.usage") ?? null;
+    this.fetchingUsage = false;
+    this.usageFetchedAtMs = 0;
+    this.usageFilter = "accounts"; // "accounts" | "alerts" | "catalog"
     this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
     this.taskFilter = "pending"; // "pending" | "all" | "done"
-    this.inspectorTab = shared("cockpit.viewMode") || "inspector"; // "home" | "inspector" | "doctor"
+    this.inspectorTab = shared("cockpit.viewMode") || "inspector"; // "usage" | "home" | "inspector" | "doctor"
     this.handle = cx.focus_handle();
 
     const role = props()?.role ?? "fleet";
@@ -784,11 +788,16 @@ export default class CockpitMod extends View {
     } else if (role === "inspector") {
       this.refreshInspector(cx);
       this.fetchHomeSnapshot(cx);
+      this.fetchUsageSnapshot(cx, false, false);
       this.runDoctorCheckSilent(cx);
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
       }
       cx.timer.every(6000, (cx) => this.refreshInspector(cx));
+      cx.timer.every(60000, (cx) => {
+        const view = shared("cockpit.viewMode") || this.inspectorTab;
+        if (view === "usage") this.fetchUsageSnapshot(cx, false, false);
+      });
     } else if (role === "pill" || role === "status") {
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
@@ -1102,6 +1111,118 @@ export default class CockpitMod extends View {
     });
   }
 
+  fetchUsageSnapshot(cx, force = false, detect = false) {
+    if (this.fetchingUsage) return;
+    this.fetchingUsage = true;
+    if (force || detect) {
+      this.note = detect
+        ? "Detectando contas locais no ai-usagebar…"
+        : "Atualizando limites via ai-usagebar…";
+    }
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      let snap = null;
+      try {
+        const args = ["usage", "--json"];
+        if (detect) args.push("--detect");
+        const res = await exec("cockpit", args, { timeout: 22000 });
+        if (res.code === 0 && res.stdout) {
+          snap = JSON.parse(res.stdout);
+        }
+      } catch (_e) {
+        // Fallback directly to ai-usagebar CLI if cockpit binary lacks `usage`
+      }
+
+      // Direct fallback if cockpit failed or didn't find ai-usagebar in its PATH
+      if (!snap || !snap.installed) {
+        try {
+          if (detect) {
+            const detRes = await exec("ai-usagebar", ["detect", "--json"], {
+              timeout: 10000,
+            }).catch(() => null);
+            if (!detRes || detRes.code !== 0) {
+              await exec("ai-usagebar", ["detect"], { timeout: 10000 }).catch(
+                () => null
+              );
+            }
+          }
+          const [vRes, uRes] = await Promise.all([
+            exec("ai-usagebar", ["vendors", "--json"], { timeout: 6000 }).catch(
+              () => null
+            ),
+            exec("ai-usagebar", ["usage", "--json"], { timeout: 18000 }),
+          ]);
+
+          let vendors = [];
+          if (vRes?.stdout?.trim()) {
+            try {
+              const vp = JSON.parse(vRes.stdout);
+              vendors = Array.isArray(vp) ? vp : vp?.vendors ?? [];
+            } catch (_ve) {}
+          }
+
+          let primary = null;
+          let overview_vendors = null;
+          let entries = [];
+          let errMsg = null;
+          if (uRes?.stdout?.trim()) {
+            const up = JSON.parse(uRes.stdout);
+            primary = up?.primary ?? null;
+            overview_vendors = up?.overview_vendors ?? null;
+            entries = Array.isArray(up?.entries) ? up.entries : [];
+          } else if (uRes?.stderr?.trim()) {
+            errMsg = uRes.stderr.trim();
+          }
+
+          snap = {
+            installed: true,
+            binary_path: "ai-usagebar",
+            tui_binary_path: "ai-usagebar-tui",
+            fetched_at_secs: Math.floor(Date.now() / 1000),
+            error: errMsg,
+            primary,
+            overview_vendors,
+            entries,
+            vendors,
+          };
+        } catch (_fallbackErr) {
+          if (!snap) {
+            snap = {
+              installed: false,
+              binary_path: null,
+              tui_binary_path: null,
+              fetched_at_secs: Math.floor(Date.now() / 1000),
+              error:
+                "ai-usagebar não encontrado no sistema. Instale com `cargo binstall ai-usagebar` ou `yay -S ai-usagebar-bin`.",
+              primary: null,
+              overview_vendors: null,
+              entries: [],
+              vendors: [],
+            };
+          }
+        }
+      }
+
+      if (snap) {
+        this.usageSnap = snap;
+        this.usageFetchedAtMs = Date.now();
+        setShared("cockpit.usage", snap);
+        if (force || detect) {
+          if (!snap.installed) {
+            this.note = "ai-usagebar não encontrado no sistema";
+          } else if (snap.error && (!snap.entries || snap.entries.length === 0)) {
+            this.note = ellipsize(snap.error, 56);
+          } else {
+            this.note = `Uso atualizado (${snap.entries?.length ?? 0} contas)`;
+          }
+        }
+      }
+      this.fetchingUsage = false;
+      cx.notify();
+    });
+  }
+
   runTaskCommand(cx, args, onSuccess) {
     if (this.busy) return;
     this.busy = true;
@@ -1327,7 +1448,12 @@ export default class CockpitMod extends View {
     setShared("cockpit.viewMode", tab);
     this.inspectorTab = tab;
     if (tab === "home") this.fetchHomeSnapshot(cx);
-    else if (tab === "doctor" && !this.doctorReport) this.runDoctorCheck(cx);
+    else if (
+      tab === "usage" &&
+      (!this.usageSnap || Date.now() - (this.usageFetchedAtMs ?? 0) > 60000)
+    ) {
+      this.fetchUsageSnapshot(cx, false, false);
+    } else if (tab === "doctor" && !this.doctorReport) this.runDoctorCheck(cx);
     else if (tab === "inspector") this.refreshInspector(cx);
     if (inspectorHidden) {
       run("layout.toggle", { id: "cockpit-inspector" });
@@ -1603,6 +1729,15 @@ export default class CockpitMod extends View {
           .items_center()
           .child(
             this.segmentedTrack(t)
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-pill-view-usage",
+                  "📊 Uso",
+                  rightView === "usage" && !inspectorHidden,
+                  (_e, cx) => this.openDrawerView(cx, "usage", true)
+                )
+              )
               .child(
                 this.segmentBtn(
                   t,
@@ -3072,6 +3207,828 @@ export default class CockpitMod extends View {
       );
   }
 
+  renderUsageBody(cx, themeArg = null) {
+    const t = themeArg ?? theme();
+    const usageSnap = this.usageSnap ?? shared("cockpit.usage") ?? null;
+    const entries = Array.isArray(usageSnap?.entries) ? usageSnap.entries : [];
+    const vendors = Array.isArray(usageSnap?.vendors) ? usageSnap.vendors : [];
+
+    const severityColor = (severity, pct) => {
+      const s = String(severity ?? "").toLowerCase();
+      const n = Number(pct ?? 0);
+      if (s === "critical" || n >= 95) return t.blocked;
+      if (s === "high" || n >= 80) return t.working;
+      if (s === "mid" || n >= 50) return t.accent;
+      if (s === "low") return t.done;
+      return n >= 50 ? t.accent : t.done;
+    };
+
+    const capsuleMeter = (pct, col) => {
+      const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+      const filled =
+        clamped > 0 ? Math.max(1, Math.round((clamped / 100) * 20)) : 0;
+      const segs = [];
+      for (let i = 0; i < 20; i++) {
+        segs.push(
+          div()
+            .flex_1()
+            .h(6)
+            .rounded(2)
+            .bg(i < filled ? col : withAlpha(t.border, "66", t.background))
+        );
+      }
+      return h_flex().gap(2).items_center().children(segs);
+    };
+
+    const kpiCard = (label, value, sub, valueColor = t.foreground) =>
+      v_flex()
+        .flex_1()
+        .min_w(0)
+        .p(10)
+        .gap(4)
+        .rounded(10)
+        .border(1)
+        .border_color(t.border)
+        .bg(t.surface)
+        .child(
+          div()
+            .text_size(10.5)
+            .font_semibold()
+            .text_color(t.muted)
+            .child(label)
+        )
+        .child(
+          div()
+            .text_size(15)
+            .font_semibold()
+            .text_color(valueColor)
+            .child(ellipsize(value, 22))
+        )
+        .when(Boolean(sub), (el) =>
+          el.child(
+            div()
+              .text_size(11)
+              .text_color(t.muted)
+              .child(ellipsize(sub, 30))
+          )
+        );
+
+    const vendorById = new Map();
+    for (const v of vendors) {
+      if (v?.id) vendorById.set(String(v.id), v);
+    }
+
+    const entryHasAlert = (entry) => {
+      if (entry?.status === "error" || entry?.error || entry?.stale) return true;
+      const metrics = Array.isArray(entry?.metrics) ? entry.metrics : [];
+      for (const m of metrics) {
+        const sev = String(m?.severity ?? "").toLowerCase();
+        if (sev === "high" || sev === "critical" || Number(m?.percent ?? 0) >= 80) {
+          return true;
+        }
+      }
+      const secs = Array.isArray(entry?.sections) ? entry.sections : [];
+      for (const s of secs) {
+        const sev = String(s?.severity ?? "").toLowerCase();
+        if (sev === "high" || sev === "critical" || Number(s?.percent ?? 0) >= 80) {
+          return true;
+        }
+      }
+      return false;
+    };
+
+    const alertEntries = entries.filter(entryHasAlert);
+    const readyCount = entries.filter((e) => e?.status !== "error" && !e?.error).length;
+    const errorCount = entries.length - readyCount;
+    const enabledVendorsCount = vendors.filter((v) => v?.enabled).length;
+
+    let maxPct = 0;
+    let maxSeverity = "low";
+    let maxLabel = "Sem métricas";
+    for (const e of entries) {
+      const metrics = Array.isArray(e?.metrics) ? e.metrics : [];
+      for (const m of metrics) {
+        const pct = Number(m?.percent ?? 0);
+        if (pct >= maxPct) {
+          maxPct = pct;
+          maxSeverity = m?.severity ?? "low";
+          maxLabel = `${e?.short_name || e?.name || "AI"} · ${m?.label || "uso"}`;
+        }
+      }
+    }
+
+    const activeFilter = this.usageFilter || "accounts";
+    const shownEntries = activeFilter === "alerts" ? alertEntries : entries;
+
+    const statusBadgeText =
+      this.fetchingUsage && !usageSnap
+        ? "CARREGANDO…"
+        : usageSnap && !usageSnap.installed
+          ? "NÃO INSTALADO"
+          : entries.length === 0
+            ? "SEM CONTAS"
+            : `${readyCount}/${entries.length} PRONTAS`;
+    const statusBadgeColor =
+      this.fetchingUsage && !usageSnap
+        ? t.accent
+        : usageSnap && !usageSnap.installed
+          ? t.blocked
+          : entries.length === 0 || errorCount > 0
+            ? t.working
+            : t.done;
+
+    const launchTabCmd = (tabName, cmdArgs) => {
+      const sp = spaces().find((s) => s.active);
+      run("tab.new", {
+        space: sp?.id,
+        name: tabName,
+        argv: cmdArgs,
+      });
+    };
+
+    const renderEntryCard = (entry, idx) => {
+      const isErr = entry?.status === "error" || Boolean(entry?.error);
+      const entryId = String(entry?.id ?? `entry-${idx}`);
+      const brandKey = String(entry?.brand || entryId.split("@")[0] || "");
+      const vendorMeta = vendorById.get(brandKey);
+      const shortTag = String(
+        entry?.short_name || brandKey || "AI"
+      ).toUpperCase();
+      const titleText = entry?.display_name || entry?.name || entryId;
+      const isPrimary =
+        Boolean(usageSnap?.primary) && usageSnap.primary === entry?.id;
+      const borderCol = isErr
+        ? withAlpha(t.blocked, "88", t.blocked)
+        : entryHasAlert(entry)
+          ? withAlpha(t.working, "77", t.working)
+          : isPrimary
+            ? t.accent
+            : t.border;
+
+      const rawSections =
+        Array.isArray(entry?.sections) && entry.sections.length > 0
+          ? entry.sections
+          : (Array.isArray(entry?.metrics) ? entry.metrics : []).map((m) => ({
+              type: "metric",
+              ...m,
+            }));
+
+      const sectionEls = [];
+      let lastGroup = null;
+      for (let sIdx = 0; sIdx < rawSections.length; sIdx++) {
+        const sec = rawSections[sIdx];
+        if (!sec) continue;
+        if (sec.type === "spacer") {
+          lastGroup = null;
+          sectionEls.push(div().h(3));
+          continue;
+        }
+        if (sec.type === "metric") {
+          const grp = sec.group ? String(sec.group) : null;
+          if (grp && grp !== lastGroup) {
+            lastGroup = grp;
+            sectionEls.push(
+              div()
+                .pt(3)
+                .text_size(10)
+                .font_semibold()
+                .text_color(t.dim)
+                .child(grp.toUpperCase())
+            );
+          } else if (!grp) {
+            lastGroup = null;
+          }
+          const pct = Number(sec.percent ?? 0);
+          const col = severityColor(sec.severity, pct);
+          const rightVal =
+            sec.headline === "value"
+              ? `${sec.value ?? ""} (${pct}%)`
+              : `${pct}%${
+                  sec.value && sec.value !== `${pct}%` ? ` · ${sec.value}` : ""
+                }`;
+
+          sectionEls.push(
+            v_flex()
+              .id(`ck-usage-sec-${idx}-${sIdx}`)
+              .gap(4)
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .justify_between()
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(5)
+                      .items_center()
+                      .child(
+                        div()
+                          .text_size(11.5)
+                          .font_semibold()
+                          .text_color(t.foreground)
+                          .child(ellipsize(sec.label || "Quota", 28))
+                      )
+                      .when(Boolean(sec.model_pool), (el) =>
+                        el.child(this.badge(t, "pool", t.muted))
+                      )
+                  )
+                  .child(
+                    div()
+                      .flex_none()
+                      .text_size(11.5)
+                      .font_semibold()
+                      .text_color(col)
+                      .child(ellipsize(rightVal, 24))
+                  )
+              )
+              .child(capsuleMeter(pct, col))
+              .when(Boolean(sec.detail), (el) =>
+                el.child(
+                  div()
+                    .text_size(10.5)
+                    .text_color(t.muted)
+                    .child(ellipsize(sec.detail, 76))
+                )
+              )
+          );
+        } else if (sec.type === "text") {
+          lastGroup = null;
+          const hasMeter = sec.percent !== undefined && sec.percent !== null;
+          const col = hasMeter
+            ? severityColor(sec.severity, sec.percent)
+            : t.foreground;
+          sectionEls.push(
+            v_flex()
+              .gap(3)
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .justify_between()
+                  .when(Boolean(sec.label), (el) =>
+                    el.child(
+                      div()
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .child(ellipsize(sec.label, 24))
+                    )
+                  )
+                  .child(
+                    div()
+                      .text_size(11)
+                      .font_semibold()
+                      .text_color(col)
+                      .child(ellipsize(sec.value ?? "", 46))
+                  )
+              )
+              .when(hasMeter, (el) =>
+                el.child(capsuleMeter(sec.percent, col))
+              )
+          );
+        } else if (sec.type === "block") {
+          lastGroup = null;
+          const bodyLines = Array.isArray(sec.body) ? sec.body : [];
+          sectionEls.push(
+            v_flex()
+              .p(7)
+              .gap(2)
+              .rounded(6)
+              .border(1)
+              .border_color(t.border)
+              .bg(t.background)
+              .when(Boolean(sec.label), (el) =>
+                el.child(
+                  div()
+                    .text_size(10.5)
+                    .font_semibold()
+                    .text_color(t.muted)
+                    .child(ellipsize(sec.label, 34))
+                )
+              )
+              .children(
+                bodyLines.map((line) =>
+                  div()
+                    .text_size(10.5)
+                    .text_color(t.muted)
+                    .child(ellipsize(line, 74))
+                )
+              )
+          );
+        }
+      }
+
+      return v_flex()
+        .id(`ck-usage-entry-${idx}`)
+        .p(10)
+        .gap(7)
+        .rounded(10)
+        .border(1)
+        .border_color(borderCol)
+        .bg(t.surface)
+        .child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .justify_between()
+            .child(
+              h_flex()
+                .flex_1()
+                .min_w(0)
+                .gap(6)
+                .items_center()
+                .child(
+                  this.pillBadge(
+                    t,
+                    shortTag,
+                    isErr ? t.blocked : isPrimary ? t.accent : t.done
+                  )
+                )
+                .child(
+                  div()
+                    .text_size(12.5)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(ellipsize(titleText, 24))
+                )
+                .when(Boolean(entry?.plan), (el) =>
+                  el.child(this.badge(t, ellipsize(entry.plan, 16), t.accent))
+                )
+            )
+            .child(
+              h_flex()
+                .flex_none()
+                .gap(4)
+                .items_center()
+                .when(Boolean(entry?.stale), (el) =>
+                  el.child(this.badge(t, "STALE", t.working))
+                )
+                .when(isErr, (el) =>
+                  el.child(this.badge(t, "ERROR", t.blocked))
+                )
+            )
+        )
+        .when(Boolean(entry?.activity), (el) =>
+          el.child(
+            div()
+              .text_size(10.5)
+              .text_color(t.accent)
+              .child(
+                `⚡ ${entry.activity.working ?? 0} working · ${entry.activity.waiting ?? 0} waiting`
+              )
+          )
+        )
+        .when(Boolean(entry?.error), (el) =>
+          el.child(
+            v_flex()
+              .p(8)
+              .gap(6)
+              .rounded(6)
+              .border(1)
+              .border_color(withAlpha(t.blocked, "66", t.blocked))
+              .bg(withAlpha(t.blocked, "18", t.background))
+              .child(
+                div()
+                  .text_size(11)
+                  .text_color(t.blocked)
+                  .child(ellipsize(entry.error, 180))
+              )
+              .when(Boolean(vendorMeta?.login), (el2) =>
+                el2.child(
+                  h_flex().child(
+                    this.actionBtn(
+                      t,
+                      `ck-usage-login-${idx}`,
+                      `🔑 ${vendorMeta.login}`,
+                      () =>
+                        launchTabCmd(
+                          brandKey || "login",
+                          String(vendorMeta.login).trim().split(/\s+/)
+                        )
+                    )
+                  )
+                )
+              )
+          )
+        )
+        .when(!entry?.error && sectionEls.length > 0, (el) =>
+          el.child(v_flex().gap(7).children(sectionEls))
+        );
+    };
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .overflow_y_scrollbar()
+      .p(12)
+      .gap(10)
+      // 1. Header Card + Actions
+      .child(
+        v_flex()
+          .p(11)
+          .gap(8)
+          .rounded(10)
+          .border(1)
+          .border_color(t.border)
+          .bg(t.surface)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .justify_between()
+              .child(
+                div()
+                  .text_size(12.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("📊 AI USAGEBAR · LIMITES & COTAS")
+              )
+              .child(this.pillBadge(t, statusBadgeText, statusBadgeColor))
+          )
+          .when(
+            Boolean(usageSnap?.primary || usageSnap?.fetched_at_secs),
+            (el) =>
+              el.child(
+                div()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child(
+                    [
+                      usageSnap?.primary ? `primário: ${usageSnap.primary}` : null,
+                      usageSnap?.fetched_at_secs
+                        ? `atualizado ${formatTimestamp(usageSnap.fetched_at_secs)}`
+                        : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  )
+              )
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .flex_wrap()
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-usage-refresh",
+                  this.fetchingUsage ? "↻ Atualizando…" : "↻ Atualizar",
+                  (_e, cx) => this.fetchUsageSnapshot(cx, true, false),
+                  true
+                )
+              )
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-usage-detect",
+                  "🔍 Detectar Contas",
+                  (_e, cx) => this.fetchUsageSnapshot(cx, true, true)
+                )
+              )
+              .when(usageSnap?.installed !== false, (el) =>
+                el.child(
+                  this.actionBtn(t, "ck-usage-tui", "🖥 Abrir TUI", () =>
+                    launchTabCmd("ai-usagebar", [
+                      usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                    ])
+                  )
+                )
+              )
+          )
+      )
+      // 2. 2x2 KPI Cards
+      .when(usageSnap?.installed !== false, (el) =>
+        el.child(
+          v_flex()
+            .gap(8)
+            .child(
+              h_flex()
+                .gap(8)
+                .child(
+                  kpiCard(
+                    "CONTAS ATIVAS",
+                    `${readyCount} / ${entries.length}`,
+                    errorCount > 0 ? `${errorCount} com erro` : "ai-usagebar",
+                    t.foreground
+                  )
+                )
+                .child(
+                  kpiCard(
+                    "MAIOR USO",
+                    entries.length > 0 ? `${maxPct}%` : "—",
+                    maxLabel,
+                    entries.length > 0
+                      ? severityColor(maxSeverity, maxPct)
+                      : t.muted
+                  )
+                )
+            )
+            .child(
+              h_flex()
+                .gap(8)
+                .child(
+                  kpiCard(
+                    "ALERTAS / ERROS",
+                    `${alertEntries.length}`,
+                    alertEntries.length > 0
+                      ? ">= 80% ou falha"
+                      : "cotas saudáveis",
+                    alertEntries.length > 0 ? t.blocked : t.done
+                  )
+                )
+                .child(
+                  kpiCard(
+                    "PROVEDORES",
+                    `${enabledVendorsCount} / ${vendors.length}`,
+                    "habilitados no catálogo",
+                    t.accent
+                  )
+                )
+            )
+        )
+      )
+      // 3. Filter Switcher
+      .when(usageSnap?.installed !== false, (el) =>
+        el.child(
+          this.segmentedTrack(t)
+            .child(
+              this.segmentBtn(
+                t,
+                "ck-usage-flt-accounts",
+                `Contas (${entries.length})`,
+                activeFilter === "accounts",
+                (_e, cx) => {
+                  this.usageFilter = "accounts";
+                  cx.notify();
+                }
+              )
+            )
+            .child(
+              this.segmentBtn(
+                t,
+                "ck-usage-flt-alerts",
+                `Alertas (${alertEntries.length})`,
+                activeFilter === "alerts",
+                (_e, cx) => {
+                  this.usageFilter = "alerts";
+                  cx.notify();
+                },
+                alertEntries.length > 0 ? t.blocked : null
+              )
+            )
+            .child(
+              this.segmentBtn(
+                t,
+                "ck-usage-flt-catalog",
+                `Catálogo (${vendors.length})`,
+                activeFilter === "catalog",
+                (_e, cx) => {
+                  this.usageFilter = "catalog";
+                  cx.notify();
+                }
+              )
+            )
+        )
+      )
+      // 4. Missing Binary State
+      .when(Boolean(usageSnap && !usageSnap.installed), (el) =>
+        el.child(
+          this.cardBox(t)
+            .rounded(10)
+            .child(
+              div()
+                .text_size(12)
+                .font_semibold()
+                .text_color(t.blocked)
+                .child("ai-usagebar não encontrado")
+            )
+            .child(
+              div()
+                .text_size(11.5)
+                .text_color(t.muted)
+                .child(
+                  usageSnap?.error ||
+                    "Instale o binário ai-usagebar para ler cotas das suas contas."
+                )
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .flex_wrap()
+                .child(
+                  this.actionBtn(
+                    t,
+                    "ck-usage-inst-binstall",
+                    "Instalar (cargo binstall)",
+                    () =>
+                      launchTabCmd("install-usagebar", [
+                        "cargo",
+                        "binstall",
+                        "ai-usagebar",
+                      ]),
+                    true
+                  )
+                )
+                .child(
+                  this.actionBtn(
+                    t,
+                    "ck-usage-inst-yay",
+                    "Instalar (yay AUR)",
+                    () =>
+                      launchTabCmd("install-usagebar", [
+                        "yay",
+                        "-S",
+                        "ai-usagebar-bin",
+                      ])
+                  )
+                )
+            )
+        )
+      )
+      // 5. Loading / No enabled vendors state
+      .when(!usageSnap && this.fetchingUsage, (el) =>
+        el.child(
+          this.cardBox(t)
+            .rounded(10)
+            .child(
+              div()
+                .text_size(12)
+                .text_color(t.muted)
+                .child("Consultando limites e contas do ai-usagebar…")
+            )
+        )
+      )
+      .when(
+        Boolean(
+          usageSnap?.installed &&
+            activeFilter !== "catalog" &&
+            shownEntries.length === 0
+        ),
+        (el) =>
+          el.child(
+            this.cardBox(t)
+              .rounded(10)
+              .child(
+                div()
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(
+                    activeFilter === "alerts"
+                      ? "Nenhuma conta em alerta ou erro."
+                      : "Nenhuma conta habilitada no ai-usagebar."
+                  )
+              )
+              .when(
+                Boolean(usageSnap?.error && activeFilter === "accounts"),
+                (el2) =>
+                  el2.child(
+                    div()
+                      .text_size(11)
+                      .text_color(t.muted)
+                      .child(ellipsize(usageSnap.error, 160))
+                  )
+              )
+              .when(activeFilter === "accounts", (el2) =>
+                el2.child(
+                  h_flex()
+                    .gap(6)
+                    .flex_wrap()
+                    .child(
+                      this.actionBtn(
+                        t,
+                        "ck-usage-empty-detect",
+                        "🔍 Detectar Contas Localmente",
+                        (_e, cx) => this.fetchUsageSnapshot(cx, true, true),
+                        true
+                      )
+                    )
+                    .child(
+                      this.actionBtn(
+                        t,
+                        "ck-usage-empty-tui",
+                        "⚙ Configurar no TUI",
+                        () =>
+                          launchTabCmd("ai-usagebar", [
+                            usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                          ])
+                      )
+                    )
+                )
+              )
+          )
+      )
+      // 6. Entries Cards
+      .when(
+        Boolean(usageSnap?.installed && activeFilter !== "catalog"),
+        (el) => el.children(shownEntries.map(renderEntryCard))
+      )
+      // 7. Catalog Tab (`vendors --json`)
+      .when(
+        Boolean(usageSnap?.installed && activeFilter === "catalog"),
+        (el) =>
+          el.children(
+            vendors.map((v, vIdx) => {
+              const enabled = Boolean(v?.enabled);
+              const configured = Boolean(v?.configured);
+              const needsCred = v?.needs_credential !== false;
+              return v_flex()
+                .id(`ck-usage-cat-${vIdx}`)
+                .p(9)
+                .gap(5)
+                .rounded(8)
+                .border(1)
+                .border_color(enabled ? t.accent : t.border)
+                .bg(t.background)
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .justify_between()
+                    .child(
+                      h_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          this.pillBadge(
+                            t,
+                            String(v?.short_name || v?.id || "?").toUpperCase(),
+                            enabled ? t.done : t.muted
+                          )
+                        )
+                        .child(
+                          div()
+                            .text_size(12)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(ellipsize(v?.name || v?.id || "vendor", 24))
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .flex_none()
+                        .gap(4)
+                        .items_center()
+                        .child(
+                          this.badge(
+                            t,
+                            enabled ? "ENABLED" : "OFF",
+                            enabled ? t.done : t.muted
+                          )
+                        )
+                        .when(needsCred, (el2) =>
+                          el2.child(
+                            this.badge(
+                              t,
+                              configured ? "CONFIGURED" : "NO CREDS",
+                              configured ? t.accent : t.working
+                            )
+                          )
+                        )
+                    )
+                )
+                .when(Boolean(v?.env || v?.login || v?.kind), (el2) =>
+                  el2.child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .justify_between()
+                      .child(
+                        div()
+                          .text_size(10.5)
+                          .text_color(t.muted)
+                          .child(
+                            [
+                              v?.kind ? `auth: ${v.kind}` : null,
+                              v?.env ? `env: ${v.env}` : null,
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")
+                          )
+                      )
+                      .when(Boolean(v?.login), (el3) =>
+                        el3.child(
+                          this.actionBtn(
+                            t,
+                            `ck-usage-cat-login-${vIdx}`,
+                            `🔑 ${ellipsize(v.login, 18)}`,
+                            () =>
+                              launchTabCmd(
+                                String(v.id || "login"),
+                                String(v.login).trim().split(/\s+/)
+                              )
+                          )
+                        )
+                      )
+                  )
+                );
+            })
+          )
+      );
+  }
+
   renderInspector(cx) {
     const t = theme();
     const snap = shared("cockpit.snapshot");
@@ -3225,6 +4182,25 @@ export default class CockpitMod extends View {
               .child(
                 this.segmentBtn(
                   t,
+                  "ck-ins-tab-usage",
+                  "📊 Uso",
+                  activeView === "usage",
+                  (_e, cx) => {
+                    setShared("cockpit.viewMode", "usage");
+                    this.inspectorTab = "usage";
+                    if (
+                      !this.usageSnap ||
+                      Date.now() - (this.usageFetchedAtMs ?? 0) > 60000
+                    ) {
+                      this.fetchUsageSnapshot(cx, false, false);
+                    }
+                    cx.notify();
+                  }
+                )
+              )
+              .child(
+                this.segmentBtn(
+                  t,
                   "ck-ins-tab-home",
                   "🏠 Home",
                   activeView === "home",
@@ -3271,6 +4247,7 @@ export default class CockpitMod extends View {
               this.refreshCockpit(cx, true);
               this.refreshInspector(cx);
               this.fetchHomeSnapshot(cx);
+              if (activeView === "usage") this.fetchUsageSnapshot(cx, true, false);
               if (activeView === "doctor") this.runDoctorCheck(cx);
             })
           )
@@ -3304,6 +4281,9 @@ export default class CockpitMod extends View {
                 .child("dismiss")
             )
         )
+      )
+      .when(activeView === "usage", (el) =>
+        el.child(this.renderUsageBody(cx, t))
       )
       .when(activeView === "home", (el) =>
         el.child(this.renderHomeBody(cx, t))
@@ -4351,7 +5331,7 @@ export default class CockpitMod extends View {
         .cursor_pointer()
         .text_color(!inspectorHidden && rightView === tab ? t.accent : t.muted)
         .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, clickCx) => this.openDrawerView(clickCx ?? cx, tab, false))
+        .on_click((_e, clickCx) => this.openDrawerView(clickCx ?? cx, tab, true))
         .child(label);
 
     return h_flex()
@@ -4427,6 +5407,8 @@ export default class CockpitMod extends View {
       )
       .child(div().flex_1())
       // Right side: Quick view links
+      .child(viewLink("ck-status-usage", "Uso", "usage"))
+      .child(div().text_color(t.dim).child("·"))
       .child(viewLink("ck-status-home", "Home", "home"))
       .child(div().text_color(t.dim).child("·"))
       .child(viewLink("ck-status-inspector", "Inspector", "inspector"))

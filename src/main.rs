@@ -158,6 +158,15 @@ enum Commands {
         #[command(subcommand)]
         action: SupervisorCommands,
     },
+    /// Show AI account usage limits and quotas via ai-usagebar
+    Usage {
+        /// Output UsageBarSnapshot JSON
+        #[arg(long)]
+        json: bool,
+        /// Auto-detect local provider credentials before fetching (`ai-usagebar detect`)
+        #[arg(long)]
+        detect: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -698,6 +707,19 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             }
+        }
+        Commands::Usage { json, detect } => {
+            let snap = tokio::task::spawn_blocking(move || {
+                cockpit::usage::collect_usage_snapshot(detect)
+            })
+            .await
+            .context("usage snapshot task panicked")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                println!("{}", cockpit::usage::format_human_usage(&snap));
+            }
+            Ok(())
         }
     }
 }

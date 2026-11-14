@@ -113,15 +113,16 @@ cockpit daemon
 ```
 
 Select the **`cockpit`** layout in Herdr Desktop to use the multi-zone interface alongside your terminal panes:
-- **Top-Bar Pill (`cockpit-pill`, 36px)** above `spaces`: Displays `Supervisor: Watching (N)` / `Idle (0 MB)`, interactive mode switcher (`Semi-Auto (Whitelist)`, `Alert Only (Read-Only)`, `Paused`), `⚡ Poll Now`, `⏏ Unload LLM`, `🏠 Home`, `Inspector ▷`, and `Switch Layout`.
+- **Top-Bar Pill (`cockpit-pill`, 36px)** above `spaces`: Displays `Supervisor: Watching (N)` / `Idle`, LLM connection & RAM/VRAM status, `num_gpu` toggle, interactive mode switcher (`Semi-Auto (Whitelist)`, `Alert Only (Read-Only)`, `Paused`), `⚡ Poll Now`, `⏏ Unload LLM`, `📊 Uso`, `🏠 Home`, `Inspector`, `Doctor`, and `Switch Layout`.
 - **Left Sidebar (`cockpit-fleet`, 296px resizable)**: Attention-first Fleet Queue (`Needs You` / `Active` / `Done`), `🏠 Home` toggle, `+ Agent` quick-launcher, and filter tabs.
-- **Home Preview Panel (`cockpit-home`, 430px)**: Daily command center with KPI summary cards (Projects, Agents, Daily Tasks, Supervisor), interactive **Daily Tasks (`📋 TAREFAS DO DIA`)** with priority and project tags, **Projects in Development (`🚀 PROJETOS EM DESENVOLVIMENTO`)** merging live Herdr Spaces with git status, and **Immediate Attention (`⚡ ATENÇÃO IMEDIATA & FROTA`)** jump-to-inspector cards. Also accessible from the `[ 🏠 Home | 🔍 Inspector ]` toggle in the Inspector header.
-- **Right Panel (`cockpit-inspector`, 400px)**:
+- **Home Preview Panel (`cockpit-home`, 430px)**: Daily command center with KPI summary cards (Projects, Agents, Daily Tasks, Supervisor), interactive **Daily Tasks (`📋 TAREFAS DO DIA`)** with priority and project tags, **Projects in Development (`🚀 PROJETOS EM DESENVOLVIMENTO`)** merging live Herdr Spaces with git status, and **Immediate Attention (`⚡ ATENÇÃO IMEDIATA & FROTA`)** jump-to-inspector cards. Also accessible from the `[ 📊 Uso | 🏠 Home | 🔍 Inspector | 🩺 Doctor ]` tabs in the drawer header.
+- **Right Panel (`cockpit-inspector`, 400px)** (unified right drawer supporting `📊 Uso`, `🏠 Home`, `🔍 Inspector`, and `🩺 Doctor`):
+  - **AI Usage & Quotas (`📊 Uso` via `ai-usagebar`)**: Displays connected AI provider accounts, 20-segment quota meters, reset/pacing info, alert filters, vendor catalog, detect/refresh actions, and `ai-usagebar-tui` / vendor login integration.
   - **Action Cards**: Approve, edit the command payload, or ignore blocked/dangerous actions.
   - **Durable Supervisor & Auto-Reply Audit Log**: Live supervisor state, rolling summary, and recorded auto-replies.
   - **Output Preview (Last 25 Lines)**: Sanitized preview of the agent's latest terminal output with TUI borders and stale supervisor lines stripped.
   - **Controls & Correlation**: Focus, Peek, Pin, Interrupt, Split Shell, Send Message, `cockpit.*` labels, PR/CI/Ticket/Slack/Runbook cards, and Doctor Health summary.
-- **Bottom Bar (`cockpit-status`)**: Active supervisor mode, CPU-only (`num_gpu: 0`) / VRAM badge, workspace branch, fleet summary, provider health badges, and quick `🏠 Home` / `Inspector` toggles.
+- **Bottom Bar (`cockpit-status`)**: Active supervisor mode, CPU/GPU (`num_gpu`) badge, workspace branch, fleet summary, provider health badges, and quick `Uso · Home · Inspector · Doctor` toggles (`Uso` immediately to the left of `Home`).
 
 ### 2. Interactive TUI (`cockpit tui`)
 
@@ -162,6 +163,9 @@ cockpit label t1 issue=ENG-142 pr=88
 
 # Start the UDS background collector daemon for Herdr Desktop
 cockpit daemon
+
+# AI Account Usage & Quotas (via ai-usagebar)
+cockpit usage [--json] [--detect]
 
 # Home Overview & Daily Tasks CLI commands
 cockpit home [--json]
