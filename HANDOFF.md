@@ -51,6 +51,10 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `27ad04e` — `fix(fleet,herdr): auto-attach unattached herdr-core terminals on click`
+  - Auto-attach via `herdr-core attach <target>` em `focusOrAttachTerminal` (`main.js`) com verificação de foco após `200 ms` e debounce de `1200 ms`; `mergeFleetRows` recebeu Loop 4 (`terminals()`) + `findPaneForTerminal`, `selectedAddress()` recebeu `resolveAttachedTargetAddress`, e clientes `attach` agora são filtrados em `src/herdr.rs`, `src/supervisor/hc.rs` e `isPlainShellRow`.
+- `69c6d19` — `feat(mod): make AI Usage compact bottom-right popover with provider sub-tabs`
+  - Adicionado `cockpit usage [--json] [--detect]`; botão `Uso` exclusivo na barra inferior direita abrindo o popover compacto `AI Usage` com sub-abas horizontais por provedor.
 - `2ce7dc3` — `feat(supervisor,mod): GPU toggle, LLM RAM/VRAM label, and blocked-only critical action cards`
   - Pill da LLM mostra o consumo real (`● LLM: lfm3:1.7b (ollama · 1.2 GB RAM)` / `VRAM` quando na GPU) via `/api/ps` (`llm_ram_bytes`, `llm_vram_bytes`, `allow_gpu` no snapshot).
   - Pill `num_gpu: 0 (CPU)` ↔ `num_gpu: all (GPU)` clicável; CLI `cockpit supervisor gpu <on|off> [--no-warm]`; persistido em `~/.local/state/cockpit/supervisor_gpu` (precedência: env `COCKPIT_ALLOW_GPU` → arquivo → TOML). Troca faz unload + warm-load. Padrão continua CPU (Zero-VRAM).
@@ -100,10 +104,17 @@ cockpit supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. Validar no host com o binário `2ce7dc3` (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
+1. **Próxima Sessão — Prioridade Alta: Ciclo de vida da LLM em container (`llama.cpp`)**:
+   - **Auto-detecção de runtime**: Detectar automaticamente o motor de container na ordem `kiri` → `podman` → `docker` (com override configurável em `SupervisorConfig`), gerenciando um container nomeado (ex.: `cockpit-supervisor-llm`).
+   - **Motor / Imagem (`llama.cpp`)**: Usar `llama.cpp` (`llama-server` / `LlmBackendKind::LlamaCpp`) dentro do container em vez de depender do daemon do Ollama no host, garantindo **0 B de RAM/VRAM** e estado explicitamente offline/parado ao desligar o container.
+   - **Ciclo de vida explícito e botão único alternável (`Load LLM` ⇄ `Unload LLM`)**:
+     - Quando o container estiver parado/descarregado: a pílula da barra superior exibe explicitamente a LLM como desativada (`○ LLM: ... (DESATIVADO)`), ticks automáticos em background **não** sobem o container sozinhos e o botão único da barra superior exibe **`▶ Load LLM`**.
+     - Quando o usuário clicar explicitamente em **`▶ Load LLM`** (ou `⚡ Poll Now`): inicia o container `llama.cpp`, exibe o estado ativo + consumo RAM/VRAM na pílula e alterna o próprio botão no mesmo lugar para **`⏻ Unload LLM`** (sem criar um botão extra).
+     - Quando o usuário clicar em **`⏻ Unload LLM`**: para o container (`<runtime> stop`), zera o consumo e volta a pílula para desativada com o botão **`▶ Load LLM`**.
+2. Validar no host com o binário mais recente (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
    - Barra superior: botões centrais fixos enquanto a pill passa por `Idle` → `Watching (3)` → `Evaluating`; consumo de RAM/VRAM aparecendo na pill da LLM.
    - Toggle `num_gpu` na pill: carregamento na GPU real (não testado no container, sem GPU) e VRAM refletida na pill.
    - `sim-safe` → `AUTO_REPLY` (~5s); `sim-danger` → Action Card `Critical`; agente apenas `WORKING`/aguardando subagente → **nenhum** Action Card (regressão do falso `Critical` com `HooksError`).
    - Clique em cards de agentes em background abrindo o Inspector (`Approve`, `Ignore`, `Attach Tab`, `Kill`) e limpeza para `0 agents` / `Supervisor: Idle`.
-2. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
-3. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
+3. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
+4. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
