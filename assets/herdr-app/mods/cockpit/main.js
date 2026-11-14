@@ -43,9 +43,16 @@ const LAUNCH_AGENTS = [
 
 const MODE_OPTIONS = [
   { key: "semi-auto", match: "SemiAuto", label: "Semi-Auto (Whitelist)" },
-  { key: "alert-only", match: "AlertOnly", label: "Alert Only (Read-Only)" },
+  { key: "alert-only", match: "AlertOnly", label: "Alert Only" },
   { key: "paused", match: "Paused", label: "Paused" },
 ];
+
+function withAlpha(color, alphaHex, fallback) {
+  if (typeof color === "string" && /^#[0-9a-fA-F]{6}$/.test(color)) {
+    return `${color}${alphaHex}`;
+  }
+  return fallback ?? color;
+}
 
 /**
  * Partitions and sorts agent summary rows into pinned Blocked, Active (Working/Done/Idle/Error),
@@ -226,6 +233,60 @@ function pathBasename(p) {
   return parts[parts.length - 1] || clean;
 }
 
+function extractRepoName(cwd, fallback = "") {
+  const base = pathBasename(cwd);
+  return base || fallback;
+}
+
+const KNOWN_AGENTS = new Set([
+  "claude",
+  "codex",
+  "pi",
+  "opencode",
+  "aider",
+  "goose",
+  "cursor",
+  "amp",
+]);
+
+function resolveProgramName(rawProg, labels, enrichedKind) {
+  const labelAgent = String(labels?.["cockpit.agent"] ?? "")
+    .trim()
+    .toLowerCase();
+  const rawCandidate =
+    labelAgent ||
+    (typeof rawProg === "string"
+      ? rawProg
+      : rawProg?.name ?? rawProg?.command ?? enrichedKind ?? "");
+  const firstToken = String(rawCandidate ?? "")
+    .trim()
+    .split(/\s+/)[0]
+    .split(/[\\/]/)
+    .pop()
+    .replace(/^-/, "")
+    .toLowerCase();
+  if (!firstToken) return "";
+  for (const known of KNOWN_AGENTS) {
+    if (firstToken === known || firstToken.includes(known)) {
+      return known;
+    }
+  }
+  return firstToken;
+}
+
+function resolveDisplayName(rawName, projectName, address) {
+  const nameStr = String(rawName ?? "").trim();
+  const isTerminalId =
+    !nameStr ||
+    nameStr === address ||
+    /^t\d+[a-z]*$/i.test(nameStr) ||
+    /^[\w-]+\/t\d+[a-z]*$/i.test(nameStr);
+  if (isTerminalId && projectName && projectName !== address) {
+    return projectName;
+  }
+  return nameStr || projectName || address;
+}
+
 /**
  * Merges live Herdr `spaces()` with `homeSnap.projects` and live agent counts.
  */
@@ -384,7 +445,7 @@ function isPlainShellRow(name, programName, labels) {
   return /\((zsh|bash|fish|sh|nu|dash|tmux)\)$/i.test(String(name ?? "").trim());
 }
 
-function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
+export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
   const snapMap = new Map(
     (snap?.agents ?? []).map((a) => [a.address, a])
   );
@@ -399,7 +460,7 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     const term = termMap.get(a.address) ?? {};
     const enriched = snapMap.get(a.address) ?? {};
     const sup = supMap.get(a.address) ?? null;
-    const rowName =
+    const rawName =
       enriched.name ||
       sup?.session_name ||
       a.tab_name ||
@@ -410,12 +471,22 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     const rowLabels = term?.labels ?? {};
     if (
       !snapMap.has(a.address) &&
-      isPlainShellRow(rowName, rowProgram, rowLabels)
+      isPlainShellRow(rawName, rowProgram, rowLabels)
     ) {
       continue;
     }
     seen.add(a.address);
     const pane = panes().find((p) => p.terminal === a.address);
+    const resolvedCwd =
+      pane?.cwd ?? enriched?.workspace?.cwd ?? term?.cwd ?? null;
+    const projectName =
+      a.space_name || extractRepoName(resolvedCwd, "") || rawName;
+    const programLabel = resolveProgramName(
+      rowProgram,
+      rowLabels,
+      enriched?.agent_kind
+    );
+    const displayName = resolveDisplayName(rawName, projectName, a.address);
     const baseStatus = a.status ?? enriched?.attention_state?.state ?? "idle";
     const status = sup?.action_card ? "blocked" : baseStatus;
     rows.push({
@@ -423,7 +494,9 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       pane: a.pane ?? pane?.pane ?? null,
       space_name: a.space_name ?? "",
       tab_name: a.tab_name ?? a.title ?? a.address,
-      name: rowName,
+      name: displayName,
+      project_name: projectName,
+      program_label: programLabel,
       status,
       kind:
         enriched?.attention_state?.kind ??
@@ -441,12 +514,8 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
         pane?.branch ??
         enriched?.workspace?.git_branch ??
         null,
-      cwd:
-        pane?.cwd ??
-        enriched?.workspace?.cwd ??
-        term?.cwd ??
-        null,
-      labels: term?.labels ?? {},
+      cwd: resolvedCwd,
+      labels: rowLabels,
       correlation_tier: enriched?.correlation_tier ?? null,
       context: enriched?.context ?? null,
       blocked_children: enriched?.blocked_children ?? [],
@@ -468,14 +537,26 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     seen.add(sa.address);
     const term = termMap.get(sa.address) ?? {};
     const sup = supMap.get(sa.address) ?? null;
+    const rawName = sa.name || sup?.session_name || sa.address;
+    const resolvedCwd = sa?.workspace?.cwd ?? term?.cwd ?? null;
+    const projectName = extractRepoName(resolvedCwd, "") || rawName;
+    const rowLabels = term?.labels ?? {};
+    const programLabel = resolveProgramName(
+      term.program,
+      rowLabels,
+      sa?.agent_kind
+    );
+    const displayName = resolveDisplayName(rawName, projectName, sa.address);
     const baseStatus = sa?.attention_state?.state ?? "idle";
     const status = sup?.action_card ? "blocked" : baseStatus;
     rows.push({
       address: sa.address,
       pane: null,
       space_name: "",
-      tab_name: sa.name || sup?.session_name || sa.address,
-      name: sa.name || sup?.session_name || sa.address,
+      tab_name: rawName,
+      name: displayName,
+      project_name: projectName,
+      program_label: programLabel,
       status,
       kind:
         sa?.attention_state?.kind ??
@@ -486,8 +567,8 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
         null,
       program: term.program ?? null,
       branch: sa?.workspace?.git_branch ?? null,
-      cwd: sa?.workspace?.cwd ?? null,
-      labels: term?.labels ?? {},
+      cwd: resolvedCwd,
+      labels: rowLabels,
       correlation_tier: sa?.correlation_tier ?? null,
       context: sa?.context ?? null,
       blocked_children: sa?.blocked_children ?? [],
@@ -507,30 +588,36 @@ function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
   for (const sup of supSnap?.agents ?? []) {
     if (seen.has(sup.agent_id)) continue;
     const term = termMap.get(sup.agent_id) ?? {};
-    const rowName = sup.session_name || term.name || sup.agent_id;
+    const rawName = sup.session_name || term.name || sup.agent_id;
     const rowProgram = term.program ?? null;
     const rowLabels = term?.labels ?? {};
     if (
       !snapMap.has(sup.agent_id) &&
-      isPlainShellRow(rowName, rowProgram, rowLabels)
+      isPlainShellRow(rawName, rowProgram, rowLabels)
     ) {
       continue;
     }
     seen.add(sup.agent_id);
     const pane = panes().find((p) => p.terminal === sup.agent_id);
+    const resolvedCwd = pane?.cwd ?? term?.cwd ?? null;
+    const projectName = extractRepoName(resolvedCwd, "") || rawName;
+    const programLabel = resolveProgramName(rowProgram, rowLabels, null);
+    const displayName = resolveDisplayName(rawName, projectName, sup.agent_id);
     rows.push({
       address: sup.agent_id,
       pane: pane?.pane ?? null,
       space_name: "",
-      tab_name: rowName,
-      name: rowName,
+      tab_name: rawName,
+      name: displayName,
+      project_name: projectName,
+      program_label: programLabel,
       status: sup.action_card ? "blocked" : "working",
       kind: sup.action_card ? "permission" : null,
       message: sup.action_card?.reason_for_operator ?? null,
       program: rowProgram,
       branch: pane?.branch ?? null,
-      cwd: term?.cwd ?? null,
-      labels: term?.labels ?? {},
+      cwd: resolvedCwd,
+      labels: rowLabels,
       correlation_tier: null,
       context: null,
       blocked_children: [],
@@ -574,7 +661,7 @@ export default class CockpitMod extends View {
     this.taskPriority = "normal";
     this.taskProject = "";
     this.taskFilter = "pending"; // "pending" | "all" | "done"
-    this.inspectorTab = "agent"; // "agent" | "home"
+    this.inspectorTab = shared("cockpit.viewMode") || "inspector"; // "home" | "inspector" | "doctor"
     this.handle = cx.focus_handle();
 
     const role = props()?.role ?? "fleet";
@@ -1006,22 +1093,104 @@ export default class CockpitMod extends View {
       .bg(t.surface);
   }
 
+  pillBadge(t, text, fgColor, borderAlpha = "58", bgAlpha = "1F") {
+    return div()
+      .flex_none()
+      .px(8)
+      .py(2)
+      .rounded(999)
+      .border(1)
+      .border_color(withAlpha(fgColor, borderAlpha, t.border))
+      .bg(withAlpha(fgColor, bgAlpha, t.raised))
+      .text_size(10.5)
+      .font_semibold()
+      .text_color(fgColor)
+      .child(text);
+  }
+
   badge(t, text, fg, bg) {
     return div()
       .flex_none()
-      .px(6)
+      .px(7)
       .py(1)
-      .rounded(4)
-      .bg(bg)
+      .rounded(999)
+      .border(1)
+      .border_color(withAlpha(fg, "48", t.border))
+      .bg(bg ?? withAlpha(fg, "1F", t.raised))
       .text_size(10.5)
       .font_semibold()
       .text_color(fg)
       .child(text);
   }
 
+  segmentedTrack(t) {
+    return h_flex()
+      .p(2)
+      .gap(2)
+      .items_center()
+      .rounded(6)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.background);
+  }
+
+  segmentBtn(t, id, label, isActive, onClick, activeColor = null) {
+    const accentCol = activeColor ?? t.accent;
+    return h_flex()
+      .id(id)
+      .h(22)
+      .px(8)
+      .items_center()
+      .rounded(4)
+      .border(1)
+      .border_color(
+        isActive ? withAlpha(accentCol, "66", accentCol) : "transparent"
+      )
+      .bg(isActive ? t.selected : "transparent")
+      .text_size(11)
+      .font_semibold()
+      .text_color(isActive ? accentCol : t.muted)
+      .cursor_pointer()
+      .hover((s) =>
+        s.bg(isActive ? t.selected : t.hover).text_color(t.foreground)
+      )
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click(onClick)
+      .child(label);
+  }
+
+  openDrawerView(cx, tab, toggleIfActive = false) {
+    const inspectorHidden = Boolean(
+      findNode(layout(), "cockpit-inspector")?.hidden
+    );
+    const currentView =
+      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
+    if (toggleIfActive && !inspectorHidden && currentView === tab) {
+      run("layout.toggle", { id: "cockpit-inspector" });
+      return;
+    }
+    setShared("cockpit.viewMode", tab);
+    this.inspectorTab = tab;
+    if (tab === "home") this.fetchHomeSnapshot(cx);
+    else if (tab === "doctor" && !this.doctorReport) this.runDoctorCheck(cx);
+    else if (tab === "inspector") this.refreshInspector(cx);
+    if (inspectorHidden) {
+      run("layout.toggle", { id: "cockpit-inspector" });
+    }
+    cx.notify();
+  }
+
   actionBtn(t, id, label, onClick, accent = false, danger = false) {
-    const borderCol = danger ? t.blocked : accent ? t.accent : t.border;
-    const bgCol = danger ? t.blocked + "22" : accent ? t.selected : t.raised;
+    const borderCol = danger
+      ? withAlpha(t.blocked, "88", t.blocked)
+      : accent
+        ? withAlpha(t.accent, "88", t.accent)
+        : t.border;
+    const bgCol = danger
+      ? withAlpha(t.blocked, "22", t.raised)
+      : accent
+        ? t.selected
+        : t.raised;
     const fgCol = danger ? t.blocked : accent ? t.foreground : t.muted;
     return h_flex()
       .id(id)
@@ -1070,28 +1239,45 @@ export default class CockpitMod extends View {
     const alertCount = (supSnap?.agents ?? []).filter((a) => a.action_card).length;
     const blockedCount = live.filter((a) => a.status === "blocked").length;
     const activeMode = supSnap?.mode ?? "SemiAuto";
-    const pillText = evaluating
-      ? "Supervisor: Evaluating..."
-      : supSnap?.pill_text ??
-        (watchingCount > 0
-          ? `Supervisor: Watching (${watchingCount})`
-          : "Supervisor: Idle (0 MB)");
+    const isPaused = activeMode === "Paused";
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
-    const homeHidden = Boolean(
-      findNode(layout(), "cockpit-home")?.hidden
-    );
+    const rightView =
+      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
     const w = win();
     const macNoFs = w?.platform === "macos" && !w?.fullscreen;
 
-    const dotColor = evaluating
-      ? t.accent
-      : alertCount > 0 || blockedCount > 0
-        ? t.blocked
-        : watchingCount > 0
-          ? t.working
-          : t.dim;
+    const watchColor = t.project ?? t.accent;
+    let statusPillText = "Supervisor: Idle (0 MB)";
+    let statusPillColor = t.done;
+    let statusPillBg = withAlpha(t.done, "1F", t.surface);
+    let statusPillBorder = withAlpha(t.done, "58", t.border);
+    let dotColor = t.done;
+
+    if (isPaused) {
+      statusPillText = "Supervisor: Paused";
+      statusPillColor = t.muted;
+      statusPillBg = t.raised;
+      statusPillBorder = t.border;
+      dotColor = t.dim;
+    } else if (evaluating) {
+      statusPillText = "Supervisor: Evaluating · lfm3:1.7b";
+      statusPillColor = t.accent;
+      statusPillBg = withAlpha(t.accent, "1F", t.surface);
+      statusPillBorder = withAlpha(t.accent, "66", t.accent);
+      dotColor = t.accent;
+    } else if (watchingCount > 0) {
+      statusPillText = `Supervisor: Watching (${watchingCount}) · lfm3:1.7b (CPU-only)`;
+      statusPillColor = t.foreground;
+      statusPillBg = withAlpha(watchColor, "1F", t.surface);
+      statusPillBorder = withAlpha(watchColor, "58", t.border);
+      dotColor = watchColor;
+    }
+
+    if (alertCount > 0 || blockedCount > 0) {
+      statusPillBorder = withAlpha(t.blocked, "88", t.blocked);
+    }
 
     return h_flex()
       .size_full()
@@ -1102,131 +1288,139 @@ export default class CockpitMod extends View {
       .bg(t.chrome)
       .border_b(1)
       .border_color(t.border)
+      // Left Cluster: Live Supervisor Status Pill + Telemetry Badges
       .child(
-        // Status Pill
         h_flex()
-          .id("ck-status-pill")
-          .h(24)
-          .px(9)
           .gap(6)
           .items_center()
-          .rounded(12)
-          .border(1)
-          .border_color(alertCount > 0 || blockedCount > 0 ? t.blocked : t.border)
-          .bg(t.surface)
-          .when(evaluating, (el) =>
+          .child(
+            h_flex()
+              .id("ck-status-pill")
+              .h(24)
+              .px(10)
+              .gap(6)
+              .items_center()
+              .rounded(999)
+              .border(1)
+              .border_color(statusPillBorder)
+              .bg(statusPillBg)
+              .when(evaluating, (el) =>
+                el.child(
+                  svg("mods/workspace-chrome/spinner.svg")
+                    .size(11)
+                    .text_color(t.accent)
+                    .spin(900)
+                )
+              )
+              .when(!evaluating, (el) =>
+                el.child(div().size(7).rounded(4).bg(dotColor))
+              )
+              .child(
+                div()
+                  .text_size(11)
+                  .font_semibold()
+                  .text_color(statusPillColor)
+                  .child(statusPillText)
+              )
+              .when(Boolean(supSnap?.model_loaded), (el) =>
+                el.child(this.pillBadge(t, "LLM RAM", t.accent))
+              )
+          )
+          .child(this.pillBadge(t, "num_gpu: 0", t.done))
+          .when(alertCount > 0, (el) =>
             el.child(
-              svg("mods/workspace-chrome/spinner.svg")
-                .size(11)
-                .text_color(t.accent)
-                .spin(900)
+              this.pillBadge(
+                t,
+                `${alertCount} Alert${alertCount > 1 ? "s" : ""}`,
+                t.blocked
+              )
             )
           )
-          .when(!evaluating, (el) =>
-            el.child(div().size(7).rounded(4).bg(dotColor))
-          )
-          .child(
-            div()
-              .text_size(11.5)
-              .font_semibold()
-              .text_color(t.foreground)
-              .child(pillText)
-          )
-          .when(Boolean(supSnap?.model_loaded), (el) =>
-            el.child(this.badge(t, "LLM RAM", t.accent, t.raised))
-          )
-      )
-      .child(
-        // Mode Toggle Group
-        h_flex()
-          .gap(4)
-          .items_center()
-          .children(
-            MODE_OPTIONS.map((m) => {
-              const isCurrent = activeMode === m.match;
-              return h_flex()
-                .id(`ck-mode-${m.key}`)
-                .h(23)
-                .px(7)
-                .items_center()
-                .rounded(5)
-                .border(1)
-                .border_color(isCurrent ? t.accent : t.border)
-                .bg(isCurrent ? t.selected : t.raised)
-                .text_size(11)
-                .text_color(isCurrent ? t.foreground : t.muted)
-                .cursor_pointer()
-                .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                .on_click((_e, cx) =>
-                  this.runSupervisorAction(
-                    cx,
-                    ["supervisor", "mode", m.key],
-                    `Modo: ${m.label}`
-                  )
-                )
-                .child(m.label);
-            })
+          .when(blockedCount > 0, (el) =>
+            el.child(this.pillBadge(t, `${blockedCount} Needs You`, t.blocked))
           )
       )
       .child(div().flex_1())
-      .when(alertCount > 0, (el) =>
-        el.child(
-          this.badge(
-            t,
-            `${alertCount} Alert${alertCount > 1 ? "s" : ""}`,
-            t.blocked,
-            t.blocked + "24"
+      // Center Cluster: Segmented Mode Switcher + Poll Now + Unload LLM
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .child(
+            this.segmentedTrack(t).children(
+              MODE_OPTIONS.map((m) =>
+                this.segmentBtn(
+                  t,
+                  `ck-mode-${m.key}`,
+                  m.label,
+                  activeMode === m.match,
+                  (_e, cx) =>
+                    this.runSupervisorAction(
+                      cx,
+                      ["supervisor", "mode", m.key],
+                      `Modo: ${m.label}`
+                    )
+                )
+              )
+            )
           )
-        )
-      )
-      .when(blockedCount > 0, (el) =>
-        el.child(
-          this.badge(
-            t,
-            `${blockedCount} Blocked`,
-            t.blocked,
-            t.blocked + "24"
+          .child(
+            this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
+              this.refreshCockpit(cx, true);
+              this.tickSupervisor(cx);
+            })
           )
-        )
-      )
-      .child(
-        this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
-          this.refreshCockpit(cx, true);
-          this.tickSupervisor(cx);
-        })
-      )
-      .child(
-        this.actionBtn(t, "ck-pill-unload", "⏏ Unload LLM", (_e, cx) =>
-          this.runSupervisorAction(
-            cx,
-            ["supervisor", "unload"],
-            "Modelo Ollama descarregado"
+          .child(
+            this.actionBtn(t, "ck-pill-unload", "⏻ Unload LLM", (_e, cx) =>
+              this.runSupervisorAction(
+                cx,
+                ["supervisor", "unload"],
+                "Modelo Ollama descarregado"
+              )
+            )
           )
-        )
       )
+      .child(div().flex_1())
+      // Right Cluster: Unified Segmented View Switcher + Switch Layout
       .child(
-        this.actionBtn(
-          t,
-          "ck-pill-home",
-          "🏠 Home",
-          () => run("layout.toggle", { id: "cockpit-home" }),
-          !homeHidden
-        )
-      )
-      .child(
-        this.actionBtn(
-          t,
-          "ck-pill-inspector",
-          inspectorHidden ? "Inspector ◁" : "Inspector ▷",
-          () => run("layout.toggle", { id: "cockpit-inspector" }),
-          !inspectorHidden
-        )
-      )
-      .child(
-        this.actionBtn(t, "ck-pill-layout", "Switch Layout", () =>
-          run("layout.switch")
-        )
+        h_flex()
+          .gap(6)
+          .items_center()
+          .child(
+            this.segmentedTrack(t)
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-pill-view-home",
+                  "🏠 Home",
+                  rightView === "home" && !inspectorHidden,
+                  (_e, cx) => this.openDrawerView(cx, "home", true)
+                )
+              )
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-pill-view-inspector",
+                  "🔍 Inspector",
+                  rightView === "inspector" && !inspectorHidden,
+                  (_e, cx) => this.openDrawerView(cx, "inspector", true)
+                )
+              )
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-pill-view-doctor",
+                  "🩺 Doctor",
+                  rightView === "doctor" && !inspectorHidden,
+                  (_e, cx) => this.openDrawerView(cx, "doctor", true)
+                )
+              )
+          )
+          .child(
+            this.actionBtn(t, "ck-pill-layout", "Switch Layout", () =>
+              run("layout.switch")
+            )
+          )
       );
   }
 
@@ -1246,61 +1440,36 @@ export default class CockpitMod extends View {
     if (orderedAddrs.length) setAgentOrder(orderedAddrs);
 
     const selAddr = this.selectedAddress();
-    const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
-    );
-    const homeHidden = Boolean(
-      findNode(layout(), "cockpit-home")?.hidden
-    );
 
-    const filterChip = (key, label, count) => {
-      const on = this.filterTab === key;
-      return h_flex()
-        .id(`ck-filter-${key}`)
-        .h(25)
-        .px(8)
-        .gap(5)
-        .items_center()
-        .rounded(12)
-        .border(1)
-        .border_color(on ? t.accent : t.border)
-        .bg(on ? t.selected : t.surface)
-        .text_size(11)
-        .font_semibold()
-        .text_color(on ? t.foreground : t.muted)
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => {
+    const filterSeg = (key, label) =>
+      this.segmentBtn(
+        t,
+        `ck-filter-${key}`,
+        label,
+        this.filterTab === key,
+        (_e, cx) => {
           this.filterTab = key;
           cx.notify();
-        })
-        .child(label)
-        .when(count !== null, (el) =>
-          el.child(
-            div()
-              .px(5)
-              .py(1)
-              .rounded(8)
-              .bg(on ? t.accent + "28" : t.raised)
-              .text_size(10.5)
-              .text_color(on ? t.foreground : t.muted)
-              .child(String(count))
-          )
-        );
-    };
+        },
+        t.foreground
+      )
+        .flex_1()
+        .justify_center()
+        .px(4);
 
     const renderAgentCard = (a) => {
       const isSelected = a.address === selAddr;
       const isBlocked = a.status === "blocked";
       const isWorking = a.status === "working";
-      const isDone = a.status === "done";
-      const statusBadgeText = isBlocked
-        ? "⚠ NEEDS YOU"
+      const isDone = a.status === "done" || a.lifecycle?.state === "finished";
+      const hasAlert = Boolean(a.action_card);
+      const statusLabel = isBlocked
+        ? (a.kind ?? "NEEDS YOU").toUpperCase()
         : isWorking
-          ? "● WORKING"
+          ? "WORKING"
           : isDone
-            ? "✓ DONE"
-            : "○ IDLE";
+            ? "DONE"
+            : "IDLE";
       const statusColor = isBlocked
         ? t.blocked
         : isWorking
@@ -1308,135 +1477,99 @@ export default class CockpitMod extends View {
           : isDone
             ? t.done
             : t.muted;
-      const statusBg = isBlocked
-        ? t.blocked + "24"
-        : isWorking
-          ? t.working + "22"
-          : isDone
-            ? t.done + "22"
-            : t.raised;
       const pr = a.context?.pull_request;
       const issue = a.context?.issues?.[0]?.key ?? a.labels?.["cockpit.issue"];
       const tier = a.correlation_tier;
-      const hasAlert = Boolean(a.action_card);
-      const urgency = (a.action_card?.urgency ?? "normal").toUpperCase();
-      const supLc = a.sup_lifecycle
-        ? this.lifecycleColors(t, a.sup_lifecycle)
-        : null;
-      const cardTitle = a.space_name ? `${a.space_name} · ${a.name}` : a.name;
+      const tierLabel =
+        tier === "exact"
+          ? "Exact"
+          : tier === "inferred"
+            ? "Inferred"
+            : tier === "ambiguous"
+              ? "Ambiguous"
+              : "Local";
+      const tierColor =
+        tier === "exact"
+          ? t.done
+          : tier === "inferred"
+            ? t.accent
+            : tier === "ambiguous"
+              ? t.blocked
+              : t.muted;
+      const summaryLine = a.message || a.rolling_summary || "";
+      const cardBorder =
+        isBlocked || hasAlert
+          ? withAlpha(t.blocked, "88", t.blocked)
+          : isSelected
+            ? t.accent
+            : t.border;
 
       return v_flex()
         .id(`ck-row-${a.address}`)
-        .mx(8)
-        .p(11)
-        .gap(7)
+        .mx(10)
+        .p(10)
+        .gap(5)
         .rounded(8)
         .border(1)
-        .border_color(
-          isBlocked || hasAlert ? t.blocked : isSelected ? t.accent : t.border
-        )
+        .border_color(cardBorder)
         .bg(isSelected ? t.selected : t.surface)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
         .on_click((_e, cx) => {
           setShared("cockpit.selected", a.address);
+          setShared("cockpit.viewMode", "inspector");
+          this.inspectorTab = "inspector";
           if (a.pane) run("pane.focus", { pane: a.pane });
           else run("agent.focus", { terminal: a.address });
           cx.notify();
         })
+        // Row 1: Dot/Spinner + Terminal ID + Program Badge + Status Pill
         .child(
           h_flex()
             .gap(6)
             .items_center()
-            .when(Boolean(a.program?.icon), (el) =>
-              el.child(programIcon(a.program, 15, t.foreground))
-            )
-            .child(
-              div()
-                .flex_1()
-                .min_w(0)
-                .text_size(13)
-                .font_semibold()
-                .text_color(t.foreground)
-                .child(ellipsize(cardTitle, 30))
-            )
-            .child(
-              div()
-                .text_size(11)
-                .text_color(t.muted)
-                .child(a.address)
-            )
             .when(isWorking, (el) =>
               el.child(
                 svg("mods/workspace-chrome/spinner.svg")
-                  .size(12)
+                  .size(11)
                   .text_color(t.working)
                   .spin(900)
               )
             )
-            .child(this.badge(t, statusBadgeText, statusColor, statusBg))
-        )
-        .when(
-          Boolean(a.sup_lifecycle || hasAlert || a.audit_badge),
-          (el) =>
-            el.child(
-              h_flex()
-                .gap(5)
-                .flex_wrap()
-                .items_center()
-                .when(Boolean(a.sup_lifecycle && supLc), (el2) =>
-                  el2.child(
-                    this.badge(t, a.sup_lifecycle, supLc.fg, supLc.bg)
-                  )
-                )
-                .when(hasAlert, (el2) =>
-                  el2.child(
-                    this.badge(
-                      t,
-                      `ALERT · ${urgency}`,
-                      t.blocked,
-                      t.blocked + "28"
-                    )
-                  )
-                )
-                .when(Boolean(a.audit_badge), (el2) =>
-                  el2.child(
-                    this.badge(t, a.audit_badge, t.accent, t.raised)
-                  )
-                )
+            .when(!isWorking, (el) =>
+              el.child(div().size(7).rounded(4).bg(statusColor))
             )
+            .child(
+              div()
+                .text_size(12)
+                .font_semibold()
+                .text_color(t.address ?? t.accent)
+                .child(a.address)
+            )
+            .child(
+              div()
+                .text_size(12)
+                .font_semibold()
+                .text_color(t.foreground)
+                .child(ellipsize(a.program_label || "agent", 14))
+            )
+            .child(div().flex_1())
+            .child(this.pillBadge(t, statusLabel, statusColor))
         )
-        .when(isBlocked, (el) =>
-          el.child(
-            h_flex()
-              .gap(6)
-              .items_center()
-              .child(
-                this.badge(
-                  t,
-                  (a.kind ?? "question").toUpperCase(),
-                  t.blocked,
-                  t.blocked + "24"
-                )
-              )
-              .when(Boolean(a.message), (el2) =>
-                el2.child(
-                  div()
-                    .flex_1()
-                    .min_w(0)
-                    .text_size(12)
-                    .text_color(t.foreground)
-                    .child(ellipsize(a.message, 52))
-                )
-              )
-          )
+        // Row 2: Project & Summary
+        .child(
+          div()
+            .text_size(12.5)
+            .font_semibold()
+            .text_color(t.foreground)
+            .child(ellipsize(a.project_name || a.name, 34))
         )
-        .when(Boolean(a.rolling_summary), (el) =>
+        .when(Boolean(summaryLine), (el) =>
           el.child(
             div()
-              .text_size(12)
-              .text_color(t.muted)
-              .child(ellipsize(a.rolling_summary, 96))
+              .text_size(11.5)
+              .text_color(isBlocked ? t.foreground : t.muted)
+              .child(ellipsize(summaryLine, 52))
           )
         )
         .when(a.blocked_children?.length > 0, (el) =>
@@ -1447,45 +1580,50 @@ export default class CockpitMod extends View {
               .child(
                 ellipsize(
                   `↳ Subagent blocked: ${a.blocked_children.join(", ")}`,
-                  64
+                  48
                 )
               )
           )
         )
+        // Row 3: Branch & Correlation Footer
         .child(
           h_flex()
             .gap(6)
             .items_center()
-            .text_size(11)
-            .text_color(t.muted)
+            .pt(1)
             .when(Boolean(a.branch), (el) =>
               el.child(
                 div()
                   .flex_1()
                   .min_w(0)
-                  .child(`⎇ ${ellipsize(a.branch, 32)}`)
+                  .text_size(11)
+                  .text_color(t.accent)
+                  .child(`⎇ ${ellipsize(a.branch, 22)}`)
               )
             )
             .when(!a.branch, (el) =>
               el.child(
-                div().flex_1().text_color(t.muted).child("Local / No branch")
+                div()
+                  .flex_1()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child("Local / No branch")
               )
             )
             .when(Boolean(issue), (el) =>
-              el.child(this.badge(t, issue, t.accent, t.raised))
+              el.child(this.pillBadge(t, issue, t.accent))
             )
             .when(Boolean(pr), (el) =>
               el.child(
-                this.badge(
+                this.pillBadge(
                   t,
                   `#${pr.number} ${pr.ci_rollup ?? ""}`.trim(),
-                  pr.ci_rollup === "FAILURE" ? t.blocked : t.done,
-                  t.raised
+                  pr.ci_rollup === "FAILURE" ? t.blocked : t.done
                 )
               )
             )
-            .when(!pr && tier === "local_only", (el) =>
-              el.child(this.badge(t, "Local", t.muted, t.raised))
+            .when(!issue && !pr, (el) =>
+              el.child(this.pillBadge(t, tierLabel, tierColor))
             )
         );
     };
@@ -1505,31 +1643,23 @@ export default class CockpitMod extends View {
       .border_t(1)
       .border_color(t.border)
       .child(
-        // Header + GUI actions bar
+        // Header Bar (only COCKPIT FLEET + count pill + [+ Agent] + [↻])
         h_flex()
-          .h(38)
-          .px(10)
-          .gap(5)
+          .h(36)
+          .px(12)
+          .gap(6)
           .items_center()
           .border_b(1)
           .border_color(t.border)
           .child(
             div()
-              .text_size(13)
+              .text_size(11.5)
               .font_semibold()
-              .text_color(t.foreground)
+              .text_color(t.muted)
               .child("COCKPIT FLEET")
           )
+          .child(this.pillBadge(t, `${merged.length}`, t.accent))
           .child(div().flex_1())
-          .child(
-            this.actionBtn(
-              t,
-              "ck-btn-home",
-              "🏠 Home",
-              () => run("layout.toggle", { id: "cockpit-home" }),
-              !homeHidden
-            )
-          )
           .child(
             this.actionBtn(
               t,
@@ -1545,15 +1675,6 @@ export default class CockpitMod extends View {
           .child(
             this.actionBtn(t, "ck-btn-refresh", "↻", (_e, cx) =>
               this.refreshCockpit(cx, true)
-            )
-          )
-          .child(
-            this.actionBtn(
-              t,
-              "ck-btn-inspector",
-              inspectorHidden ? "Inspector ◁" : "Inspector ▷",
-              () => run("layout.toggle", { id: "cockpit-inspector" }),
-              !inspectorHidden
             )
           )
       )
@@ -1577,39 +1698,31 @@ export default class CockpitMod extends View {
                 .flex_wrap()
                 .children(
                   LAUNCH_AGENTS.map(([label, argv], idx) =>
-                    this.actionBtn(
-                      t,
-                      `ck-launch-${idx}`,
-                      label,
-                      (_e, cx) => {
-                        const sp = spaces().find((s) => s.active);
-                        run("tab.new", {
-                          space: sp?.id,
-                          name: label.toLowerCase(),
-                          argv: argv ?? undefined,
-                        });
-                        this.showLauncher = false;
-                        cx.notify();
-                      }
-                    )
+                    this.actionBtn(t, `ck-launch-${idx}`, label, (_e, cx) => {
+                      const sp = spaces().find((s) => s.active);
+                      run("tab.new", {
+                        space: sp?.id,
+                        name: label.toLowerCase(),
+                        argv: argv ?? undefined,
+                      });
+                      this.showLauncher = false;
+                      cx.notify();
+                    })
                   )
                 )
             )
         )
       )
       .child(
-        // Filter strip
-        h_flex()
-          .h(34)
-          .px(8)
-          .gap(5)
-          .items_center()
-          .border_b(1)
-          .border_color(t.border)
-          .child(filterChip("all", "All", merged.length))
-          .child(filterChip("blocked", "Needs You", parts.blocked.length))
-          .child(filterChip("active", "Active", parts.active.length))
-          .child(filterChip("finished", "Done", parts.finished.length))
+        // 4-Column Segmented Filter Bar
+        this.segmentedTrack(t)
+          .mx(10)
+          .mt(8)
+          .mb(6)
+          .child(filterSeg("all", `Todos (${merged.length})`))
+          .child(filterSeg("blocked", `Needs (${parts.blocked.length})`))
+          .child(filterSeg("active", `Work (${parts.active.length})`))
+          .child(filterSeg("finished", `Done (${parts.finished.length})`))
       )
       .child(
         // Fleet list
@@ -1617,12 +1730,12 @@ export default class CockpitMod extends View {
           .flex_1()
           .min_h(0)
           .overflow_y_scrollbar()
-          .py(8)
+          .py(4)
           .gap(7)
           .when(merged.length === 0, (el) =>
             el.child(
               this.cardBox(t)
-                .mx(8)
+                .mx(10)
                 .child(
                   div()
                     .text_size(13)
@@ -1648,59 +1761,9 @@ export default class CockpitMod extends View {
                         t,
                         "ck-empty-home",
                         "🏠 Home Overview",
-                        () => run("layout.toggle", { id: "cockpit-home" }),
+                        (_e, cx) => this.openDrawerView(cx, "home", false),
                         true
                       )
-                    )
-                    .child(
-                      this.actionBtn(
-                        t,
-                        "ck-empty-claude",
-                        "Claude Code",
-                        () => {
-                          const sp = spaces().find((s) => s.active);
-                          run("tab.new", {
-                            space: sp?.id,
-                            name: "claude",
-                            argv: ["claude"],
-                          });
-                        }
-                      )
-                    )
-                    .child(
-                      this.actionBtn(
-                        t,
-                        "ck-empty-opencode",
-                        "OpenCode",
-                        () => {
-                          const sp = spaces().find((s) => s.active);
-                          run("tab.new", {
-                            space: sp?.id,
-                            name: "opencode",
-                            argv: ["opencode"],
-                          });
-                        }
-                      )
-                    )
-                    .child(
-                      this.actionBtn(t, "ck-empty-pi", "Pi", () => {
-                        const sp = spaces().find((s) => s.active);
-                        run("tab.new", {
-                          space: sp?.id,
-                          name: "pi",
-                          argv: ["pi"],
-                        });
-                      })
-                    )
-                    .child(
-                      this.actionBtn(t, "ck-empty-codex", "Codex", () => {
-                        const sp = spaces().find((s) => s.active);
-                        run("tab.new", {
-                          space: sp?.id,
-                          name: "codex",
-                          argv: ["codex", "--no-daemon"],
-                        });
-                      })
                     )
                 )
             )
@@ -1733,11 +1796,44 @@ export default class CockpitMod extends View {
               )
           )
           .children(showFinished.map(renderAgentCard))
+      )
+      .child(
+        // Pinned Bottom Quick-Launcher Strip
+        v_flex()
+          .border_t(1)
+          .border_color(t.border)
+          .p(8)
+          .gap(5)
+          .bg(t.chrome)
+          .child(
+            div()
+              .text_size(10.5)
+              .font_semibold()
+              .text_color(t.dim)
+              .child("+ AGENT QUICK-LAUNCHER")
+          )
+          .child(
+            h_flex()
+              .gap(4)
+              .flex_wrap()
+              .children(
+                LAUNCH_AGENTS.map(([label, argv], idx) =>
+                  this.actionBtn(t, `ck-quick-${idx}`, `+${label}`, () => {
+                    const sp = spaces().find((s) => s.active);
+                    run("tab.new", {
+                      space: sp?.id,
+                      name: label.toLowerCase(),
+                      argv: argv ?? undefined,
+                    });
+                  })
+                )
+              )
+          )
       );
   }
 
-  renderHomeBody(cx) {
-    const t = theme();
+  renderHomeBody(cx, themeArg = null) {
+    const t = themeArg ?? theme();
     const homeSnap = this.homeSnap ?? shared("cockpit.home") ?? null;
     const snap = shared("cockpit.snapshot");
     const supSnap = shared("supervisor.snapshot");
@@ -1766,14 +1862,10 @@ export default class CockpitMod extends View {
     const activeProjectsCount = projects.filter(
       (p) => p.activeAgents > 0 || p.blockedAgents > 0 || p.isActiveSpace
     ).length;
-    const workingAgentsCount = mergedFleet.filter(
-      (a) => a.status === "working"
-    ).length;
     const blockedAgents = mergedFleet.filter(
       (a) => a.status === "blocked" || Boolean(a.action_card)
     );
     const blockedAgentsCount = blockedAgents.length;
-    const supModeLabel = supSnap?.mode_label ?? "Semi-Auto";
 
     const activeSpace = liveSpaces.find((s) => s.active);
     const projectChoices = [
@@ -1789,58 +1881,43 @@ export default class CockpitMod extends View {
       return true;
     });
 
-    const kpiCard = (label, value, sub, accentColor = t.foreground) =>
+    const kpiCard = (label, value, sub, valueColor = t.foreground) =>
       v_flex()
         .flex_1()
         .min_w(0)
-        .p(11)
+        .p(10)
         .gap(4)
-        .rounded(8)
+        .rounded(10)
         .border(1)
         .border_color(t.border)
         .bg(t.surface)
         .child(
           div()
-            .text_size(11)
+            .text_size(10.5)
             .font_semibold()
             .text_color(t.muted)
             .child(label)
         )
         .child(
           div()
-            .text_size(14)
+            .text_size(15)
             .font_semibold()
-            .text_color(accentColor)
-            .child(ellipsize(value, 26))
+            .text_color(valueColor)
+            .child(ellipsize(value, 24))
         )
-        .child(
-          div()
-            .text_size(11)
-            .text_color(t.muted)
-            .child(ellipsize(sub, 34))
+        .when(Boolean(sub), (el) =>
+          el.child(
+            div()
+              .text_size(11)
+              .text_color(t.muted)
+              .child(ellipsize(sub, 32))
+          )
         );
 
-    const priorityMeta = (prio) => {
-      if (prio === "high") {
-        return { label: "ALTA", fg: t.blocked, bg: t.blocked + "24" };
-      }
-      if (prio === "low") {
-        return { label: "BAIXA", fg: t.muted, bg: t.raised };
-      }
-      return { label: "NORMAL", fg: t.accent, bg: t.accent + "22" };
-    };
-
-    const projectStatusMeta = (st) => {
-      switch (st) {
-        case "blocked":
-          return { text: "⚠ BLOQUEADO", fg: t.blocked, bg: t.blocked + "24" };
-        case "active":
-          return { text: "● EM DEV", fg: t.working, bg: t.working + "22" };
-        case "open_tasks":
-          return { text: "📋 COM TAREFAS", fg: t.accent, bg: t.accent + "22" };
-        default:
-          return { text: "○ IDLE", fg: t.muted, bg: t.raised };
-      }
+    const priorityColor = (prio) => {
+      if (prio === "high") return t.blocked;
+      if (prio === "low") return t.muted;
+      return t.accent;
     };
 
     return v_flex()
@@ -1849,63 +1926,62 @@ export default class CockpitMod extends View {
       .overflow_y_scrollbar()
       .p(12)
       .gap(10)
-      // 1. KPI Summary Strip (2x2 grid)
+      // 1. 4 KPI Cards (2x2 grid)
       .child(
         v_flex()
-          .gap(7)
+          .gap(8)
           .child(
             h_flex()
-              .gap(7)
+              .gap(8)
               .child(
                 kpiCard(
-                  "PROJETOS",
-                  `${projects.length} (${activeProjectsCount} ativos)`,
+                  "PROJETOS ATIVOS",
+                  `${activeProjectsCount} / ${projects.length}`,
                   "Spaces & repositórios",
                   t.foreground
                 )
               )
               .child(
                 kpiCard(
-                  "AGENTES",
-                  `${workingAgentsCount} rodando`,
-                  blockedAgentsCount > 0
-                    ? `${blockedAgentsCount} bloqueados`
-                    : `${mergedFleet.length} na frota`,
-                  blockedAgentsCount > 0 ? t.blocked : t.working
+                  "FROTA DE AGENTES",
+                  `${mergedFleet.length}`,
+                  `(${blockedAgentsCount} blk)`,
+                  blockedAgentsCount > 0 ? t.blocked : t.foreground
                 )
               )
           )
           .child(
             h_flex()
-              .gap(7)
+              .gap(8)
               .child(
                 kpiCard(
                   "TAREFAS DO DIA",
-                  `${doneTasksCount}/${totalTasksCount} (${pct}%)`,
+                  `${doneTasksCount} / ${totalTasksCount} (${pct}%)`,
                   `${pendingTasksCount} pendentes`,
-                  pendingTasksCount > 0 ? t.accent : t.done
+                  t.done
                 )
               )
               .child(
                 kpiCard(
-                  "SUPERVISOR",
-                  ellipsize(supModeLabel, 18),
-                  "lfm3:1.7b · CPU",
-                  t.foreground
+                  "SUPERVISOR DURÁVEL",
+                  "0 MB VRAM",
+                  "lfm3:1.7b · num_gpu=0",
+                  t.done
                 )
               )
           )
       )
-      // 2. Section: TAREFAS DO DIA
+      // 2. Card 1: TAREFAS DO DIA
       .child(
         this.sectionTitle(
           t,
           "📋 TAREFAS DO DIA",
-          `${pendingTasksCount} pendentes`
+          "cockpit task"
         )
       )
       .child(
         this.cardBox(t)
+          .rounded(10)
           .child(
             h_flex()
               .gap(6)
@@ -1924,7 +2000,7 @@ export default class CockpitMod extends View {
                   )
                   .bg(t.background)
                   .text_size(12)
-                  .text_color(this.taskDraft ? t.foreground : t.muted)
+                  .text_color(this.taskDraft ? t.foreground : t.dim)
                   .cursor_text()
                   .on_click((_e, cx) => {
                     this.editingField = "task";
@@ -1936,69 +2012,62 @@ export default class CockpitMod extends View {
                       ? ellipsize(this.taskDraft, 56) +
                           (this.editingField === "task" ? "▏" : "")
                       : (this.editingField === "task" ? "▏" : "") +
-                          "Adicionar tarefa do dia (ex: Corrigir bug no login)…"
+                          "Nova tarefa (ex: revisar PR #94)…"
                   )
               )
               .child(
-                this.actionBtn(
-                  t,
-                  "ck-task-add",
-                  "+ Adicionar ↵",
-                  (_e, cx) => this.addTaskGui(cx),
-                  Boolean(this.taskDraft.trim())
-                )
+                h_flex()
+                  .id("ck-task-add")
+                  .h(26)
+                  .px(10)
+                  .items_center()
+                  .rounded(6)
+                  .bg(t.accent)
+                  .text_size(11.5)
+                  .font_semibold()
+                  .text_color(t.background)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(withAlpha(t.accent, "CC", t.accent)))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((_e, cx) => this.addTaskGui(cx))
+                  .child("+ Add")
               )
           )
-          // Priority & Project tag bar
+          // Priority & Project selector pills
           .child(
             h_flex()
               .gap(5)
               .flex_wrap()
               .items_center()
               .child(
-                div()
-                  .text_size(11)
-                  .text_color(t.muted)
-                  .child("Prioridade:")
-              )
-              .children(
-                [
-                  ["high", "Alta"],
-                  ["normal", "Normal"],
-                  ["low", "Baixa"],
-                ].map(([key, label]) => {
-                  const on = this.taskPriority === key;
-                  return h_flex()
-                    .id(`ck-task-prio-${key}`)
-                    .h(22)
-                    .px(7)
-                    .items_center()
-                    .rounded(10)
-                    .border(1)
-                    .border_color(on ? t.accent : t.border)
-                    .bg(on ? t.selected : t.raised)
-                    .text_size(11)
-                    .text_color(on ? t.foreground : t.muted)
-                    .cursor_pointer()
-                    .on_click((_e, cx) => {
-                      this.taskPriority = key;
-                      cx.notify();
-                    })
-                    .child(label);
-                })
+                this.segmentedTrack(t).children(
+                  ["high", "normal", "low"].map((key) =>
+                    this.segmentBtn(
+                      t,
+                      `ck-task-prio-${key}`,
+                      key,
+                      this.taskPriority === key,
+                      (_e, cx) => {
+                        this.taskPriority = key;
+                        cx.notify();
+                      },
+                      priorityColor(key)
+                    )
+                  )
+                )
               )
               .child(div().flex_1())
               .child(
                 h_flex()
                   .id("ck-task-project-cycle")
-                  .h(22)
+                  .h(24)
                   .px(8)
                   .gap(4)
                   .items_center()
-                  .rounded(10)
+                  .rounded(999)
                   .border(1)
                   .border_color(t.border)
-                  .bg(t.raised)
+                  .bg(t.background)
                   .text_size(11)
                   .text_color(t.accent)
                   .cursor_pointer()
@@ -2017,40 +2086,56 @@ export default class CockpitMod extends View {
           // Filter strip
           .child(
             h_flex()
-              .gap(5)
+              .gap(6)
               .flex_wrap()
               .items_center()
-              .children(
-                [
-                  ["pending", `Pendentes (${pendingTasksCount})`],
-                  ["all", `Todas (${totalTasksCount})`],
-                  ["done", `Concluídas (${doneTasksCount})`],
-                ].map(([key, label]) => {
-                  const on = this.taskFilter === key;
-                  return h_flex()
-                    .id(`ck-task-filter-${key}`)
-                    .h(22)
-                    .px(7)
-                    .items_center()
-                    .rounded(10)
-                    .border(1)
-                    .border_color(on ? t.accent : t.border)
-                    .bg(on ? t.selected : t.chrome)
-                    .text_size(11)
-                    .text_color(on ? t.foreground : t.muted)
-                    .cursor_pointer()
-                    .on_click((_e, cx) => {
-                      this.taskFilter = key;
-                      cx.notify();
-                    })
-                    .child(label);
-                })
+              .child(
+                this.segmentedTrack(t)
+                  .child(
+                    this.segmentBtn(
+                      t,
+                      "ck-task-filter-pending",
+                      `Pendentes (${pendingTasksCount})`,
+                      this.taskFilter === "pending",
+                      (_e, cx) => {
+                        this.taskFilter = "pending";
+                        cx.notify();
+                      }
+                    )
+                  )
+                  .child(
+                    this.segmentBtn(
+                      t,
+                      "ck-task-filter-all",
+                      `Todas (${totalTasksCount})`,
+                      this.taskFilter === "all",
+                      (_e, cx) => {
+                        this.taskFilter = "all";
+                        cx.notify();
+                      }
+                    )
+                  )
+                  .child(
+                    this.segmentBtn(
+                      t,
+                      "ck-task-filter-done",
+                      `Concluídas (${doneTasksCount})`,
+                      this.taskFilter === "done",
+                      (_e, cx) => {
+                        this.taskFilter = "done";
+                        cx.notify();
+                      }
+                    )
+                  )
               )
               .child(div().flex_1())
               .when(doneTasksCount > 0, (el) =>
                 el.child(
-                  this.actionBtn(t, "ck-task-clear-done", "Limpar concluídas", (_e, cx) =>
-                    this.clearDoneTasksGui(cx)
+                  this.actionBtn(
+                    t,
+                    "ck-task-clear-done",
+                    "Limpar concluídas",
+                    (_e, cx) => this.clearDoneTasksGui(cx)
                   )
                 )
               )
@@ -2071,7 +2156,7 @@ export default class CockpitMod extends View {
           )
           .children(
             filteredTasks.map((tk) => {
-              const pm = priorityMeta(tk.priority);
+              const prioCol = priorityColor(tk.priority);
               const projObj = tk.project
                 ? projects.find(
                     (p) =>
@@ -2081,23 +2166,24 @@ export default class CockpitMod extends View {
                 : null;
               return h_flex()
                 .id(`ck-task-row-${tk.id}`)
-                .p(8)
+                .px(10)
+                .py(7)
                 .gap(7)
                 .items_center()
                 .rounded(6)
                 .border(1)
                 .border_color(t.border)
-                .bg(t.raised)
+                .bg(t.background)
                 .child(
                   div()
                     .id(`ck-task-toggle-${tk.id}`)
                     .px(5)
-                    .py(2)
+                    .py(1)
                     .rounded(4)
-                    .bg(tk.done ? t.done + "24" : t.surface)
+                    .bg(tk.done ? withAlpha(t.done, "24", t.raised) : t.surface)
                     .border(1)
                     .border_color(tk.done ? t.done : t.border)
-                    .text_size(11.5)
+                    .text_size(11)
                     .font_semibold()
                     .text_color(tk.done ? t.done : t.muted)
                     .cursor_pointer()
@@ -2108,32 +2194,34 @@ export default class CockpitMod extends View {
                   div()
                     .flex_1()
                     .min_w(0)
-                    .text_size(12.5)
+                    .text_size(12)
                     .text_color(tk.done ? t.dim : t.foreground)
-                    .child(
-                      (tk.done ? "✓ " : "") + ellipsize(tk.title, 60)
-                    )
+                    .child(ellipsize(tk.title, 54))
                 )
-                .child(this.badge(t, pm.label, pm.fg, pm.bg))
                 .when(Boolean(tk.project), (el) =>
                   el.child(
                     div()
                       .id(`ck-task-proj-${tk.id}`)
-                      .px(6)
-                      .py(1)
-                      .rounded(4)
-                      .bg(t.surface)
-                      .border(1)
-                      .border_color(t.border)
-                      .text_size(10.5)
-                      .text_color(t.accent)
                       .cursor_pointer()
                       .on_click(() => {
                         if (projObj?.spaceId) {
                           run("space.focus", { space: projObj.spaceId });
                         }
                       })
-                      .child(ellipsize(tk.project, 16))
+                      .child(
+                        this.pillBadge(
+                          t,
+                          ellipsize(tk.project, 14),
+                          t.accent
+                        )
+                      )
+                  )
+                )
+                .child(
+                  this.pillBadge(
+                    t,
+                    String(tk.priority || "normal").toUpperCase(),
+                    prioCol
                   )
                 )
                 .child(
@@ -2152,7 +2240,7 @@ export default class CockpitMod extends View {
             })
           )
       )
-      // 3. Section: PROJETOS EM DESENVOLVIMENTO
+      // 3. Card 2: PROJETOS EM DESENVOLVIMENTO
       .child(
         this.sectionTitle(
           t,
@@ -2162,93 +2250,75 @@ export default class CockpitMod extends View {
       )
       .when(projects.length === 0, (el) =>
         el.child(
-          this.cardBox(t).child(
-            div()
-              .text_size(12)
-              .text_color(t.muted)
-              .child("Nenhum Space ou projeto git detectado ainda.")
-          )
+          this.cardBox(t)
+            .rounded(10)
+            .child(
+              div()
+                .text_size(12)
+                .text_color(t.muted)
+                .child("Nenhum Space ou projeto git detectado ainda.")
+            )
         )
       )
       .children(
-        projects.map((proj, idx) => {
-          const sm = projectStatusMeta(proj.status);
-          return this.cardBox(t)
+        projects.map((proj, idx) =>
+          v_flex()
             .id(`ck-home-proj-${idx}`)
+            .p(10)
+            .gap(5)
+            .rounded(8)
+            .border(1)
             .border_color(
               proj.status === "blocked"
-                ? t.blocked
+                ? withAlpha(t.blocked, "88", t.blocked)
                 : proj.isActiveSpace
                   ? t.accent
                   : t.border
             )
+            .bg(t.background)
             .child(
               h_flex()
                 .gap(6)
                 .items_center()
-                .flex_wrap()
                 .child(
                   div()
                     .text_size(13)
                     .font_semibold()
                     .text_color(t.foreground)
-                    .child(ellipsize(proj.name, 26))
+                    .child(ellipsize(proj.name, 22))
                 )
                 .when(proj.isActiveSpace, (el) =>
-                  el.child(this.badge(t, "ATIVO", t.accent, t.accent + "24"))
+                  el.child(this.pillBadge(t, "ATIVO", t.accent))
                 )
-                .child(this.badge(t, sm.text, sm.fg, sm.bg))
-                .when(Boolean(proj.branch), (el) =>
-                  el.child(
-                    this.badge(
-                      t,
-                      `⎇ ${ellipsize(proj.branch, 22)}`,
-                      t.muted,
-                      t.raised
+                .child(div().flex_1())
+                .child(
+                  div()
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .child(
+                      `${proj.dirtyCount} dirty · ${proj.activeAgents} active`
                     )
-                  )
                 )
+            )
+            .child(
+              div()
+                .text_size(11.5)
+                .text_color(t.accent)
+                .child(`⎇ ${ellipsize(proj.branch || "main", 34)}`)
             )
             .when(Boolean(proj.lastCommit || proj.path), (el) =>
               el.child(
                 div()
-                  .text_size(11.5)
-                  .text_color(t.muted)
-                  .child(ellipsize(proj.lastCommit || proj.path, 68))
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child(ellipsize(proj.lastCommit || proj.path, 54))
               )
             )
             .child(
               h_flex()
-                .gap(6)
-                .items_center()
+                .gap(5)
+                .pt(2)
                 .flex_wrap()
-                .child(
-                  this.badge(
-                    t,
-                    `${proj.activeAgents} agentes`,
-                    proj.activeAgents > 0 ? t.working : t.muted,
-                    t.raised
-                  )
-                )
-                .child(
-                  this.badge(
-                    t,
-                    `${proj.openTasks} tarefas`,
-                    proj.openTasks > 0 ? t.accent : t.muted,
-                    t.raised
-                  )
-                )
-                .when(proj.dirtyCount > 0, (el) =>
-                  el.child(
-                    this.badge(
-                      t,
-                      `${proj.dirtyCount} mod.`,
-                      t.blocked,
-                      t.blocked + "22"
-                    )
-                  )
-                )
-                .child(div().flex_1())
                 .when(Boolean(proj.spaceId), (el) =>
                   el.child(
                     this.actionBtn(t, `ck-proj-open-${idx}`, "Abrir Space", () =>
@@ -2273,7 +2343,7 @@ export default class CockpitMod extends View {
                   this.actionBtn(
                     t,
                     `ck-proj-agent-${idx}`,
-                    "+ Agente",
+                    "+ Claude",
                     () => {
                       const targetSpace =
                         proj.spaceId ?? activeSpace?.id ?? undefined;
@@ -2286,98 +2356,114 @@ export default class CockpitMod extends View {
                     true
                   )
                 )
-            );
-        })
-      )
-      // 4. Section: ATENÇÃO IMEDIATA & FROTA
-      .when(blockedAgents.length > 0, (el) =>
-        el
-          .child(
-            this.sectionTitle(
-              t,
-              "⚡ ATENÇÃO IMEDIATA & FROTA",
-              `${blockedAgents.length} aguardando`
             )
-          )
-          .children(
-            blockedAgents.map((a) =>
-              this.cardBox(t)
-                .id(`ck-home-alert-${a.address}`)
-                .border_color(t.blocked)
+        )
+      )
+      // 4. Card 3: ATENÇÃO IMEDIATA & FROTA
+      .child(
+        this.sectionTitle(
+          t,
+          "⚡ ATENÇÃO IMEDIATA & FROTA",
+          blockedAgents.length > 0
+            ? `${blockedAgents.length} aguardando`
+            : "nominal"
+        )
+      )
+      .when(blockedAgents.length === 0, (el) =>
+        el.child(
+          div()
+            .p(10)
+            .rounded(8)
+            .border(1)
+            .border_color(withAlpha(t.done, "58", t.done))
+            .bg(withAlpha(t.done, "18", t.surface))
+            .text_size(11.5)
+            .font_semibold()
+            .text_color(t.done)
+            .child("✓ Nenhum agente bloqueado. Frota operando nominalmente.")
+        )
+      )
+      .children(
+        blockedAgents.map((a) =>
+          v_flex()
+            .id(`ck-home-alert-${a.address}`)
+            .p(10)
+            .gap(5)
+            .rounded(8)
+            .border(1)
+            .border_color(withAlpha(t.blocked, "77", t.blocked))
+            .bg(t.background)
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .justify_between()
                 .child(
                   h_flex()
-                    .gap(6)
+                    .gap(5)
                     .items_center()
-                    .justify_between()
                     .child(
-                      div()
-                        .text_size(13)
-                        .font_semibold()
-                        .text_color(t.foreground)
-                        .child(
-                          ellipsize(
-                            a.space_name
-                              ? `${a.space_name} · ${a.name} (${a.address})`
-                              : `${a.name} (${a.address})`,
-                            38
-                          )
-                        )
-                    )
-                    .child(
-                      this.badge(
-                        t,
-                        "⚠ NEEDS YOU",
-                        t.blocked,
-                        t.blocked + "24"
-                      )
-                    )
-                )
-                .when(
-                  Boolean(
-                    a.action_card?.reason_for_operator ||
-                      a.message ||
-                      a.rolling_summary
-                  ),
-                  (el2) =>
-                    el2.child(
                       div()
                         .text_size(12)
+                        .font_semibold()
+                        .text_color(t.blocked)
+                        .child(a.address)
+                    )
+                    .child(
+                      div()
+                        .text_size(12)
+                        .font_semibold()
+                        .text_color(t.foreground)
+                        .child(ellipsize(a.program_label || "agent", 14))
+                    )
+                    .child(
+                      div()
+                        .text_size(11.5)
                         .text_color(t.muted)
-                        .child(
-                          ellipsize(
-                            a.action_card?.reason_for_operator ||
-                              a.message ||
-                              a.rolling_summary,
-                            96
-                          )
-                        )
+                        .child(ellipsize(`· ${a.project_name || a.name}`, 24))
                     )
                 )
                 .child(
-                  h_flex()
-                    .gap(6)
-                    .justify_end()
+                  this.actionBtn(
+                    t,
+                    `ck-home-inspect-${a.address}`,
+                    "Inspector →",
+                    (_e, cx) => {
+                      setShared("cockpit.selected", a.address);
+                      setShared("cockpit.viewMode", "inspector");
+                      this.inspectorTab = "inspector";
+                      this.refreshInspector(cx);
+                      if (findNode(layout(), "cockpit-inspector")?.hidden) {
+                        run("layout.toggle", { id: "cockpit-inspector" });
+                      }
+                      cx.notify();
+                    },
+                    true
+                  )
+                )
+            )
+            .when(
+              Boolean(
+                a.action_card?.reason_for_operator ||
+                  a.message ||
+                  a.rolling_summary
+              ),
+              (el2) =>
+                el2.child(
+                  div()
+                    .text_size(11.5)
+                    .text_color(t.muted)
                     .child(
-                      this.actionBtn(
-                        t,
-                        `ck-home-inspect-${a.address}`,
-                        "Abrir no Inspector ▷",
-                        (_e, cx) => {
-                          setShared("cockpit.selected", a.address);
-                          this.inspectorTab = "agent";
-                          if (
-                            findNode(layout(), "cockpit-inspector")?.hidden
-                          ) {
-                            run("layout.toggle", { id: "cockpit-inspector" });
-                          }
-                          cx.notify();
-                        },
-                        true
+                      ellipsize(
+                        a.action_card?.reason_for_operator ||
+                          a.message ||
+                          a.rolling_summary,
+                        84
                       )
                     )
                 )
             )
-          )
+        )
       );
   }
 
@@ -2465,6 +2551,249 @@ export default class CockpitMod extends View {
       .child(this.renderHomeBody(cx));
   }
 
+  renderDoctorBody(cx, themeArg = null) {
+    const t = themeArg ?? theme();
+    const snap = shared("cockpit.snapshot");
+    const supSnap = shared("supervisor.snapshot");
+    const report = this.doctorReport;
+    const overall = (report?.overall_status ?? "unknown").toUpperCase();
+    const overallCol =
+      overall === "PASS" || overall === "OK"
+        ? t.done
+        : overall === "WARN"
+          ? t.working
+          : overall === "FAIL"
+            ? t.blocked
+            : t.muted;
+
+    const defaultChecks = [
+      {
+        name: "hc_runtime",
+        status: "pass",
+        detail: "herdr-core runtime & IPC socket",
+      },
+      {
+        name: "hooks",
+        status: "unknown",
+        detail: "Claude / shell hook installation",
+      },
+      {
+        name: "herdr_mod",
+        status: "pass",
+        detail: "cockpit mod & layout loaded",
+      },
+      {
+        name: "storage_ipc",
+        status: "unknown",
+        detail: "SQLite WAL cache & local store",
+      },
+      {
+        name: "supervisor",
+        status: supSnap ? "pass" : "unknown",
+        detail: "lfm3:1.7b · num_gpu=0 (CPU-only)",
+      },
+    ];
+    const checks = report?.checks?.length ? report.checks : defaultChecks;
+    const providers = report?.providers ?? snap?.providers ?? {};
+
+    const checkStatusColor = (st) => {
+      const s = String(st ?? "").toLowerCase();
+      if (s === "pass" || s === "ok" || s === "active" || s === "ready")
+        return t.done;
+      if (s === "warn" || s === "degraded") return t.working;
+      if (s === "fail" || s === "error") return t.blocked;
+      return t.muted;
+    };
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .overflow_y_scrollbar()
+      .p(12)
+      .gap(10)
+      // Header Summary Card
+      .child(
+        v_flex()
+          .p(11)
+          .gap(8)
+          .rounded(10)
+          .border(1)
+          .border_color(t.border)
+          .bg(t.surface)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .justify_between()
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .child(
+                    div()
+                      .text_size(13)
+                      .font_semibold()
+                      .text_color(t.foreground)
+                      .child("🩺 SYSTEM & PROVIDER DIAGNOSTICS")
+                  )
+              )
+              .child(
+                this.pillBadge(
+                  t,
+                  report ? overall : "READY",
+                  report ? overallCol : t.accent
+                )
+              )
+          )
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(t.muted)
+              .child(
+                `cockpit v${report?.cockpit_version ?? version} · supervisor lfm3:1.7b · num_gpu=0`
+              )
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .flex_wrap()
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-doc-run",
+                  "Run Doctor",
+                  (_e, cx) => this.runDoctorCheck(cx),
+                  true
+                )
+              )
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-doc-setup",
+                  "Verify / Repair Hooks",
+                  (_e, cx) => this.runSetupGui(cx)
+                )
+              )
+          )
+      )
+      // System Checks
+      .child(
+        this.sectionTitle(
+          t,
+          "SYSTEM CHECKS",
+          `${checks.length} checks`
+        )
+      )
+      .child(
+        v_flex()
+          .gap(6)
+          .children(
+            checks.map((chk, idx) => {
+              const col = checkStatusColor(chk.status);
+              return v_flex()
+                .id(`ck-doc-chk-${idx}`)
+                .p(9)
+                .gap(3)
+                .rounded(8)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.background)
+                .child(
+                  h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap(6)
+                    .child(
+                      div()
+                        .text_size(12)
+                        .font_semibold()
+                        .text_color(t.foreground)
+                        .child(chk.name)
+                    )
+                    .child(
+                      this.pillBadge(
+                        t,
+                        String(chk.status ?? "unknown").toUpperCase(),
+                        col
+                      )
+                    )
+                )
+                .when(Boolean(chk.detail), (el) =>
+                  el.child(
+                    div()
+                      .text_size(11)
+                      .text_color(t.muted)
+                      .child(ellipsize(chk.detail, 72))
+                  )
+                );
+            })
+          )
+      )
+      // Provider Health Cards
+      .child(
+        this.sectionTitle(
+          t,
+          "PROVIDER HEALTH",
+          `${Object.keys(providers).length} providers`
+        )
+      )
+      .when(Object.keys(providers).length === 0, (el) =>
+        el.child(
+          this.cardBox(t)
+            .rounded(10)
+            .child(
+              div()
+                .text_size(11.5)
+                .text_color(t.dim)
+                .child(
+                  "Local-First Read-Only · Click 'Run Doctor' to probe configured providers."
+                )
+            )
+        )
+      )
+      .children(
+        Object.entries(providers).map(([prov, ph], idx) => {
+          const col = checkStatusColor(ph?.state);
+          return v_flex()
+            .id(`ck-doc-prov-${idx}`)
+            .p(9)
+            .gap(3)
+            .rounded(8)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.background)
+            .child(
+              h_flex()
+                .justify_between()
+                .items_center()
+                .gap(6)
+                .child(
+                  div()
+                    .text_size(12)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(prov)
+                )
+                .child(
+                  this.pillBadge(
+                    t,
+                    String(ph?.state ?? "unknown").toUpperCase(),
+                    col
+                  )
+                )
+            )
+            .when(Boolean(ph?.detail || ph?.message), (el) =>
+              el.child(
+                div()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child(ellipsize(ph.detail || ph.message, 72))
+              )
+            );
+        })
+      );
+  }
+
   renderInspector(cx) {
     const t = theme();
     const snap = shared("cockpit.snapshot");
@@ -2479,10 +2808,8 @@ export default class CockpitMod extends View {
       (addr && this.inspectCache[addr]?.agent) ||
       (snap?.agents ?? []).find((a) => a.address === agent?.address) ||
       agent;
-    const providers =
-      (addr && this.inspectCache[addr]?.providers) ||
-      snap?.providers ||
-      {};
+    const activeView =
+      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
 
     const supAgent =
       (supSnap?.agents ?? []).find((a) => a.agent_id === agent?.address) ??
@@ -2510,7 +2837,7 @@ export default class CockpitMod extends View {
         ? t.blocked
         : actionCard?.urgency === "low"
           ? t.muted
-          : t.accent;
+          : t.working;
     const auditLog = supAgent?.auto_reply_log ?? agent?.auto_reply_log ?? [];
     const auditBadge = supAgent?.audit_badge ?? agent?.audit_badge ?? null;
     const rollingSummary =
@@ -2542,22 +2869,53 @@ export default class CockpitMod extends View {
         }
         return true;
       })
-      .slice(-20);
-    const previewText = cleanedPreviewLines
-      .slice(-12)
-      .map((line) => (line.length > 96 ? `${line.slice(0, 95)}…` : line))
-      .join("\n");
+      .slice(-25);
 
     const sectionTitle = (title, subtitle = null) =>
       this.sectionTitle(t, title, subtitle);
-
-    const cardBox = () => this.cardBox(t);
 
     const pr = detailed?.context?.pull_request;
     const issues = detailed?.context?.issues ?? [];
     const slackThreads = detailed?.context?.slack_threads ?? [];
     const runbooks = detailed?.context?.runbooks ?? [];
     const labels = agent?.labels ?? {};
+
+    const agentStatusLabel = agent
+      ? agent.status === "blocked"
+        ? (agent.kind ?? "NEEDS YOU").toUpperCase()
+        : agent.status === "working"
+          ? "WORKING"
+          : agent.status === "done" || agent.lifecycle?.state === "finished"
+            ? "DONE"
+            : "IDLE"
+      : "IDLE";
+    const agentStatusColor = agent
+      ? agent.status === "blocked"
+        ? t.blocked
+        : agent.status === "working"
+          ? t.working
+          : agent.status === "done" || agent.lifecycle?.state === "finished"
+            ? t.done
+            : t.muted
+      : t.muted;
+
+    const corrTier = detailed?.correlation_tier ?? "local_only";
+    const corrTierLabel =
+      corrTier === "exact"
+        ? "Exact"
+        : corrTier === "inferred"
+          ? "Inferred"
+          : corrTier === "ambiguous"
+            ? "Ambiguous"
+            : "Local / No PR";
+    const corrTierColor =
+      corrTier === "exact"
+        ? t.done
+        : corrTier === "inferred"
+          ? t.accent
+          : corrTier === "ambiguous"
+            ? t.blocked
+            : t.muted;
 
     return v_flex()
       .id("ck-inspector-root")
@@ -2571,71 +2929,68 @@ export default class CockpitMod extends View {
       .overflow_hidden()
       .on_key_down((e, cx) => this.handleKeyDown(e, cx, agent))
       .child(
-        // Top bar
+        // Top Drawer Header (40px)
         h_flex()
-          .h(38)
+          .h(40)
           .px(12)
           .gap(6)
           .items_center()
           .border_b(1)
           .border_color(t.border)
+          .bg(t.chrome)
           .child(
-            // [ 🏠 Home | 🔍 Inspector ] view toggle
-            h_flex()
-              .gap(3)
-              .items_center()
+            this.segmentedTrack(t)
               .child(
-                this.actionBtn(
+                this.segmentBtn(
                   t,
                   "ck-ins-tab-home",
                   "🏠 Home",
+                  activeView === "home",
                   (_e, cx) => {
+                    setShared("cockpit.viewMode", "home");
                     this.inspectorTab = "home";
                     this.fetchHomeSnapshot(cx);
                     cx.notify();
-                  },
-                  this.inspectorTab === "home"
+                  }
                 )
               )
               .child(
-                this.actionBtn(
+                this.segmentBtn(
                   t,
-                  "ck-ins-tab-agent",
+                  "ck-ins-tab-inspector",
                   "🔍 Inspector",
+                  activeView === "inspector",
                   (_e, cx) => {
-                    this.inspectorTab = "agent";
+                    setShared("cockpit.viewMode", "inspector");
+                    this.inspectorTab = "inspector";
+                    this.refreshInspector(cx);
                     cx.notify();
-                  },
-                  this.inspectorTab === "agent"
+                  }
+                )
+              )
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-ins-tab-doctor",
+                  "🩺 Doctor",
+                  activeView === "doctor",
+                  (_e, cx) => {
+                    setShared("cockpit.viewMode", "doctor");
+                    this.inspectorTab = "doctor";
+                    if (!this.doctorReport) this.runDoctorCheck(cx);
+                    cx.notify();
+                  }
                 )
               )
           )
-          .child(
-            div()
-              .flex_1()
-              .min_w(0)
-              .text_size(12.5)
-              .font_semibold()
-              .text_color(t.foreground)
-              .child(
-                this.inspectorTab === "home"
-                  ? ""
-                  : agent
-                    ? ellipsize(`${agent.name} (${agent.address})`, 24)
-                    : ""
-              )
-          )
+          .child(div().flex_1())
           .child(
             this.actionBtn(t, "ck-ins-refresh", "↻", (_e, cx) => {
               this.refreshCockpit(cx, true);
               this.refreshInspector(cx);
               this.fetchHomeSnapshot(cx);
+              if (activeView === "doctor") this.runDoctorCheck(cx);
             })
-          )
-          .child(
-            this.actionBtn(t, "ck-ins-doctor", "Doctor", (_e, cx) =>
-              this.runDoctorCheck(cx)
-            )
           )
           .child(
             this.actionBtn(t, "ck-ins-close", "×", () =>
@@ -2668,75 +3023,223 @@ export default class CockpitMod extends View {
             )
         )
       )
-      .when(this.inspectorTab === "home", (el) =>
-        el.child(this.renderHomeBody(cx))
+      .when(activeView === "home", (el) =>
+        el.child(this.renderHomeBody(cx, t))
       )
-      .when(this.inspectorTab !== "home", (el) =>
+      .when(activeView === "doctor", (el) =>
+        el.child(this.renderDoctorBody(cx, t))
+      )
+      .when(activeView === "inspector", (el) =>
         el.child(
           v_flex()
             .flex_1()
             .min_h(0)
             .overflow_y_scrollbar()
             .p(12)
-            .gap(8)
+            .gap(10)
             .when(!agent, (el2) =>
               el2.child(
-                cardBox().child(
-                  div()
-                    .text_size(12)
-                    .text_color(t.muted)
-                    .child("Select an agent or open a terminal to inspect its context.")
-                )
+                this.cardBox(t)
+                  .rounded(10)
+                  .child(
+                    div()
+                      .text_size(12)
+                      .text_color(t.muted)
+                      .child(
+                        "Select an agent or open a terminal to inspect its context."
+                      )
+                  )
               )
             )
-          .when(Boolean(agent), (el) =>
-            el
-              // 0. Supervisor Operator Action Card (top of inspector when pending)
-              .when(Boolean(actionCard), (el2) =>
-                el2
-                  .child(sectionTitle("OPERATOR ACTION CARD"))
-                  .child(
+            .when(Boolean(agent), (el2) =>
+              el2
+                // 1. Selected Agent Telemetry Header Card
+                .child(
+                  v_flex()
+                    .p(11)
+                    .gap(8)
+                    .rounded(10)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.surface)
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          div()
+                            .text_size(12.5)
+                            .font_semibold()
+                            .text_color(t.address ?? t.accent)
+                            .child(agent.address)
+                        )
+                        .child(
+                          div()
+                            .text_size(12.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(ellipsize(agent.program_label || "agent", 14))
+                        )
+                        .child(
+                          div()
+                            .flex_1()
+                            .min_w(0)
+                            .text_size(12)
+                            .text_color(t.muted)
+                            .child(
+                              ellipsize(
+                                `· ${agent.project_name || agent.name}`,
+                                24
+                              )
+                            )
+                        )
+                        .child(
+                          this.pillBadge(t, agentStatusLabel, agentStatusColor)
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .gap(8)
+                        .items_center()
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .child(`branch: ⎇ ${ellipsize(agent.branch ?? "none", 22)}`)
+                        .child("·")
+                        .child(`cwd: ${ellipsize(agent.cwd ?? "", 36)}`)
+                    )
+                    .child(
+                      h_flex()
+                        .gap(5)
+                        .flex_wrap()
+                        .child(
+                          this.actionBtn(
+                            t,
+                            "ck-ctl-focus",
+                            "Focus Terminal",
+                            () => {
+                              if (agent.pane)
+                                run("pane.focus", { pane: agent.pane });
+                              else
+                                run("agent.focus", { terminal: agent.address });
+                            },
+                            true
+                          )
+                        )
+                        .child(
+                          this.actionBtn(t, "ck-ctl-peek", "Peek", () =>
+                            run("terminal.peek", { terminal: agent.address })
+                          )
+                        )
+                        .child(
+                          this.actionBtn(
+                            t,
+                            "ck-ctl-pin",
+                            agent.pinned ? "Unpin" : "Pin",
+                            () =>
+                              run("terminal.pin", {
+                                terminal: agent.address,
+                                pinned: !agent.pinned,
+                              })
+                          )
+                        )
+                        .child(
+                          this.actionBtn(
+                            t,
+                            "ck-ctl-int",
+                            "Interrupt",
+                            (_e, cx) => {
+                              hc(["interrupt", agent.address]);
+                              this.note = `Interrupted ${agent.address}`;
+                              cx.notify();
+                            }
+                          )
+                        )
+                        .child(
+                          this.actionBtn(t, "ck-ctl-split", "Split", () => {
+                            if (agent.pane)
+                              run("pane.split", {
+                                pane: agent.pane,
+                                direction: "down",
+                              });
+                          })
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          div()
+                            .id("ck-prompt-box")
+                            .flex_1()
+                            .min_w(0)
+                            .px(9)
+                            .py(5)
+                            .rounded(6)
+                            .border(1)
+                            .border_color(
+                              this.editingField === "prompt"
+                                ? t.accent
+                                : t.border
+                            )
+                            .bg(t.background)
+                            .text_size(12)
+                            .text_color(
+                              this.promptText ? t.foreground : t.dim
+                            )
+                            .cursor_text()
+                            .on_click((_e, cx) => {
+                              this.editingField = "prompt";
+                              this.handle.focus();
+                              cx.notify();
+                            })
+                            .child(
+                              this.promptText
+                                ? ellipsize(this.promptText, 48) +
+                                    (this.editingField === "prompt" ? "▏" : "")
+                                : (this.editingField === "prompt" ? "▏" : "") +
+                                    `Send message to ${agent.address}…`
+                            )
+                        )
+                        .child(
+                          this.actionBtn(
+                            t,
+                            "ck-prompt-send",
+                            "Send ↵",
+                            (_e, cx) => this.sendPromptGui(cx, agent.address),
+                            Boolean(this.promptText.trim())
+                          )
+                        )
+                    )
+                )
+                // 2. Supervisor Action Card / Status (SUPERVISOR & GUARDRAILS)
+                .child(sectionTitle("SUPERVISOR & GUARDRAILS"))
+                .when(Boolean(actionCard), (el3) =>
+                  el3.child(
                     v_flex()
                       .p(11)
                       .gap(8)
-                      .rounded(8)
+                      .rounded(10)
                       .border(1)
-                      .border_color(t.blocked)
-                      .bg(t.blocked + "12")
+                      .border_color(withAlpha(urgencyColor, "77", urgencyColor))
+                      .bg(t.surface)
                       .child(
                         h_flex()
                           .gap(6)
                           .items_center()
                           .justify_between()
                           .child(
-                            h_flex()
-                              .gap(6)
-                              .items_center()
-                              .child(
-                                this.badge(
-                                  t,
-                                  urgencyLabel,
-                                  urgencyColor,
-                                  urgencyColor + "24"
-                                )
-                              )
-                              .child(
-                                this.badge(
-                                  t,
-                                  actionCard.detected_state ??
-                                    "WAITING_CONFIRMATION",
-                                  t.foreground,
-                                  t.raised
-                                )
-                              )
-                          )
-                          .when(Boolean(actionCard.triggered_at), (el3) =>
-                            el3.child(
-                              div()
-                                .text_size(10.5)
-                                .text_color(t.dim)
-                                .child(formatTimestamp(actionCard.triggered_at))
+                            this.pillBadge(
+                              t,
+                              `Urgency::${urgencyLabel}`,
+                              urgencyColor
                             )
+                          )
+                          .child(
+                            div()
+                              .text_size(10.5)
+                              .text_color(t.muted)
+                              .child("Action Card")
                           )
                       )
                       .child(
@@ -2749,8 +3252,8 @@ export default class CockpitMod extends View {
                               "Atenção do operador necessária."
                           )
                       )
-                      .when(Boolean(actionCard.updated_summary), (el3) =>
-                        el3.child(
+                      .when(Boolean(actionCard.updated_summary), (el4) =>
+                        el4.child(
                           div()
                             .text_size(11.5)
                             .text_color(t.muted)
@@ -2762,7 +3265,7 @@ export default class CockpitMod extends View {
                           .text_size(10.5)
                           .font_semibold()
                           .text_color(t.dim)
-                          .child("Command Preview (clique para editar):")
+                          .child("hc_command_payload (editável):")
                       )
                       .child(
                         div()
@@ -2800,14 +3303,31 @@ export default class CockpitMod extends View {
                           .gap(8)
                           .items_center()
                           .child(
-                            this.actionBtn(
-                              t,
-                              "ck-action-approve",
-                              "Aprovar e Enviar",
-                              (_e, cx) =>
-                                this.approveActionCard(cx, agent.address),
-                              true
-                            )
+                            h_flex()
+                              .id("ck-action-approve")
+                              .flex_1()
+                              .h(26)
+                              .px(10)
+                              .items_center()
+                              .justify_center()
+                              .rounded(6)
+                              .border(1)
+                              .border_color(withAlpha(t.done, "66", t.done))
+                              .bg(withAlpha(t.done, "24", t.raised))
+                              .text_size(11.5)
+                              .font_semibold()
+                              .text_color(t.done)
+                              .cursor_pointer()
+                              .hover((s) =>
+                                s.bg(withAlpha(t.done, "38", t.hover))
+                              )
+                              .on_mouse_down("left", (_e, cx) =>
+                                cx.stop_propagation()
+                              )
+                              .on_click((_e, cx) =>
+                                this.approveActionCard(cx, agent.address)
+                              )
+                              .child("Aprovar e Enviar")
                           )
                           .child(
                             this.actionBtn(
@@ -2822,655 +3342,654 @@ export default class CockpitMod extends View {
                           )
                       )
                   )
-              )
-              // 1. Agent Controls Card (Focus, Peek, Pin, Interrupt, Send Prompt)
-              .child(sectionTitle("AGENT CONTROLS"))
-              .child(
-                cardBox()
-                  .child(
-                    h_flex()
-                      .gap(6)
-                      .flex_wrap()
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-ctl-focus",
-                          "Focus Terminal",
-                          () => {
-                            if (agent.pane)
-                              run("pane.focus", { pane: agent.pane });
-                            else
-                              run("agent.focus", { terminal: agent.address });
-                          },
-                          true
-                        )
-                      )
-                      .child(
-                        this.actionBtn(t, "ck-ctl-peek", "Peek", () =>
-                          run("terminal.peek", { terminal: agent.address })
-                        )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-ctl-pin",
-                          agent.pinned ? "Unpin" : "Pin",
-                          () =>
-                            run("terminal.pin", {
-                              terminal: agent.address,
-                              pinned: !agent.pinned,
-                            })
-                        )
-                      )
-                      .child(
-                        this.actionBtn(t, "ck-ctl-int", "Interrupt", (_e, cx) => {
-                          hc(["interrupt", agent.address]);
-                          this.note = `Interrupted ${agent.address}`;
-                          cx.notify();
-                        })
-                      )
-                      .child(
-                        this.actionBtn(t, "ck-ctl-split", "Split Shell", () => {
-                          if (agent.pane)
-                            run("pane.split", {
-                              pane: agent.pane,
-                              direction: "down",
-                            });
-                        })
-                      )
-                  )
-                  .child(
-                    h_flex()
-                      .gap(6)
-                      .pt(4)
-                      .items_center()
-                      .child(
-                        div()
-                          .id("ck-prompt-box")
-                          .flex_1()
-                          .px(9)
-                          .py(5)
-                          .rounded(6)
-                          .border(1)
-                          .border_color(
-                            this.editingField === "prompt"
-                              ? t.accent
-                              : t.border
-                          )
-                          .bg(t.background)
-                          .text_size(12)
-                          .text_color(
-                            this.promptText ? t.foreground : t.dim
-                          )
-                          .cursor_text()
-                          .on_click((_e, cx) => {
-                            this.editingField = "prompt";
-                            this.handle.focus();
-                            cx.notify();
-                          })
-                          .child(
-                            this.promptText
-                              ? this.promptText +
-                                  (this.editingField === "prompt" ? "▏" : "")
-                              : (this.editingField === "prompt" ? "▏" : "") +
-                                  `Send message to ${agent.address}…`
-                          )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-prompt-send",
-                          "Send ↵",
-                          (_e, cx) => this.sendPromptGui(cx, agent.address),
-                          Boolean(this.promptText.trim())
-                        )
-                      )
-                  )
-              )
-              // 1b. Supervisor & Auto-Reply Audit Log
-              .child(sectionTitle("SUPERVISOR & AUTO-REPLY AUDIT LOG"))
-              .child(
-                cardBox()
-                  .child(
-                    h_flex()
-                      .justify_between()
-                      .items_center()
-                      .gap(6)
-                      .child(
-                        this.badge(
-                          t,
-                          auditBadge || "Auto-assisted (0/2)",
-                          t.accent,
-                          t.raised
-                        )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-audit-eval",
-                          "⚡ Evaluate Now",
-                          (_e, cx) => this.tickSupervisor(cx)
-                        )
-                      )
-                  )
-                  .when(Boolean(rollingSummary), (el2) =>
-                    el2.child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(t.muted)
-                        .child(rollingSummary)
-                    )
-                  )
-                  .when(auditLog.length === 0, (el2) =>
-                    el2.child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(t.dim)
-                        .child("Nenhuma auto-resposta registrada para este agente.")
-                    )
-                  )
-                  .children(
-                    auditLog.map((entry, idx) =>
-                      v_flex()
-                        .id(`ck-audit-entry-${idx}`)
-                        .p(7)
-                        .gap(3)
-                        .rounded(6)
-                        .bg(t.raised)
-                        .border(1)
-                        .border_color(t.border)
-                        .child(
-                          h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                              div()
-                                .text_size(11)
-                                .font_semibold()
-                                .text_color(t.accent)
-                                .child(`hc send "${entry.payload ?? ""}"`)
-                            )
-                            .child(
-                              div()
-                                .text_size(10.5)
-                                .text_color(t.dim)
-                                .child(formatTimestamp(entry.timestamp))
-                            )
-                        )
-                        .when(Boolean(entry.summary), (el2) =>
-                          el2.child(
-                            div()
-                              .text_size(11)
-                              .text_color(t.muted)
-                              .child(entry.summary)
-                          )
-                        )
-                    )
-                  )
-              )
-              // 1c. Output Preview (Last 25 Lines)
-              .when(Boolean(previewText), (el) =>
-                el
-                  .child(sectionTitle("OUTPUT PREVIEW (LAST 25 LINES)"))
-                  .child(
-                    cardBox().child(
-                      div()
-                        .p(8)
-                        .rounded(6)
-                        .bg(t.background)
-                        .border(1)
-                        .border_color(t.border)
-                        .text_size(11)
-                        .text_color(t.muted)
-                        .child(previewText)
-                    )
-                  )
-              )
-              // 2. Provenance & Labels Management Card (GUI replacement for `cockpit label`)
-              .child(sectionTitle("CORRELATION & LABELS"))
-              .child(
-                cardBox()
-                  .child(
-                    h_flex()
-                      .justify_between()
-                      .items_center()
-                      .text_size(11.5)
-                      .child(
-                        div()
-                          .text_color(t.muted)
-                          .child(
-                            `Branch: ${agent.branch ?? "none"}`
-                          )
-                      )
-                      .child(
-                        this.badge(
-                          t,
-                          (
-                            detailed?.correlation_tier ?? "local_only"
-                          ).toUpperCase(),
-                          t.accent,
-                          t.raised
-                        )
-                      )
-                  )
-                  .child(
-                    div()
-                      .text_size(11.5)
-                      .text_color(t.muted)
-                      .child(ellipsize(agent.cwd ?? "", 58))
-                  )
-                  .child(
-                    h_flex()
-                      .gap(4)
-                      .flex_wrap()
-                      .children(
-                        Object.entries(labels)
-                          .filter(([k]) => k.startsWith("cockpit."))
-                          .map(([k, v]) =>
-                            h_flex()
-                              .id(`ck-lbl-chip-${k}`)
-                              .px(6)
-                              .py(2)
-                              .gap(5)
-                              .items_center()
-                              .rounded(5)
-                              .bg(t.raised)
-                              .border(1)
-                              .border_color(t.border)
-                              .text_size(11)
-                              .child(`${k.replace("cockpit.", "")}=${v}`)
-                              .child(
-                                div()
-                                  .id(`ck-lbl-del-${k}`)
-                                  .cursor_pointer()
-                                  .text_color(t.dim)
-                                  .hover((s) => s.text_color(t.blocked))
-                                  .on_click((_e, cx) =>
-                                    this.applyLabelGui(cx, agent.address, k, "")
-                                  )
-                                  .child("×")
-                              )
-                          )
-                      )
-                  )
-                  .child(
-                    h_flex()
-                      .gap(4)
-                      .pt(4)
-                      .items_center()
-                      .children(
-                        ["issue", "pr", "slack", "runbook"].map((k) =>
-                          this.actionBtn(
-                            t,
-                            `ck-lbl-type-${k}`,
-                            k,
-                            (_e, cx) => {
-                              this.labelKey = k;
-                              this.editingField = "label";
-                              this.handle.focus();
-                              cx.notify();
-                            },
-                            this.labelKey === k
-                          )
-                        )
-                      )
-                  )
-                  .child(
-                    h_flex()
-                      .gap(6)
-                      .items_center()
-                      .child(
-                        div()
-                          .id("ck-lbl-input")
-                          .flex_1()
-                          .px(8)
-                          .py(4)
-                          .rounded(6)
-                          .border(1)
-                          .border_color(
-                            this.editingField === "label"
-                              ? t.accent
-                              : t.border
-                          )
-                          .bg(t.background)
-                          .text_size(11.5)
-                          .text_color(
-                            this.labelValue ? t.foreground : t.dim
-                          )
-                          .cursor_text()
-                          .on_click((_e, cx) => {
-                            this.editingField = "label";
-                            this.handle.focus();
-                            cx.notify();
-                          })
-                          .child(
-                            this.labelValue
-                              ? `${this.labelKey}=${this.labelValue}` +
-                                  (this.editingField === "label" ? "▏" : "")
-                              : (this.editingField === "label" ? "▏" : "") +
-                                  `Set cockpit.${this.labelKey} (e.g. ENG-42)…`
-                          )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-lbl-save",
-                          "Tag",
-                          (_e, cx) =>
-                            this.applyLabelGui(
-                              cx,
-                              agent.address,
-                              this.labelKey,
-                              this.labelValue.trim()
-                            ),
-                          Boolean(this.labelValue.trim())
-                        )
-                      )
-                  )
-              )
-              // 3. Pull Request / CI / Reviews / Deployments Card
-              .child(sectionTitle("PULL REQUEST & CI CHECKS"))
-              .child(
-                pr
-                  ? cardBox()
+                )
+                .when(!actionCard, (el3) =>
+                  el3.child(
+                    v_flex()
+                      .p(11)
+                      .gap(7)
+                      .rounded(10)
+                      .border(1)
+                      .border_color(t.border)
+                      .bg(t.surface)
                       .child(
                         h_flex()
                           .justify_between()
                           .items_center()
+                          .gap(6)
+                          .child(
+                            div()
+                              .text_size(12)
+                              .font_semibold()
+                              .text_color(t.done)
+                              .child("✓ Sem Action Cards pendentes")
+                          )
+                          .child(
+                            this.pillBadge(
+                              t,
+                              auditBadge || "Auto-assisted",
+                              t.accent
+                            )
+                          )
+                      )
+                      .when(Boolean(rollingSummary), (el4) =>
+                        el4.child(
+                          div()
+                            .text_size(11.5)
+                            .text_color(t.muted)
+                            .child(rollingSummary)
+                        )
+                      )
+                      .child(
+                        h_flex()
+                          .justify_end()
+                          .child(
+                            this.actionBtn(
+                              t,
+                              "ck-audit-eval",
+                              "⚡ Evaluate Now",
+                              (_e, cx) => this.tickSupervisor(cx)
+                            )
+                          )
+                      )
+                  )
+                )
+                // 3. Output Preview (always visible when an agent is selected)
+                .child(sectionTitle("OUTPUT PREVIEW · LAST 25 LINES · SANITIZED"))
+                .child(
+                  v_flex()
+                    .p(10)
+                    .gap(3)
+                    .rounded(8)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .when(cleanedPreviewLines.length === 0, (el3) =>
+                      el3.child(
+                        div()
+                          .text_size(11.5)
+                          .text_color(t.dim)
+                          .child(
+                            "Nenhuma saída recente capturada para este terminal."
+                          )
+                      )
+                    )
+                    .children(
+                      cleanedPreviewLines.map((line, idx) => {
+                        const isCmd = line.trim().startsWith("$");
+                        const isWarn =
+                          line.includes("⚠") || line.includes("Interceptado");
+                        const isOk = line.includes("✓");
+                        const lineCol = isWarn
+                          ? t.blocked
+                          : isOk
+                            ? t.done
+                            : isCmd
+                              ? t.foreground
+                              : t.muted;
+                        return h_flex()
+                          .id(`ck-preview-line-${idx}`)
+                          .gap(8)
+                          .items_start()
+                          .child(
+                            div()
+                              .w(20)
+                              .flex_none()
+                              .text_size(10.5)
+                              .text_color(t.dim)
+                              .child(String(idx + 1))
+                          )
                           .child(
                             div()
                               .flex_1()
                               .min_w(0)
-                              .text_size(13)
-                              .font_semibold()
-                              .text_color(t.foreground)
-                              .child(ellipsize(`#${pr.number} · ${pr.title}`, 44))
-                          )
+                              .text_size(11)
+                              .text_color(lineCol)
+                              .child(ellipsize(line, 92))
+                          );
+                      })
+                    )
+                )
+                // 4. Auto-Reply Audit Log
+                .child(
+                  sectionTitle(
+                    "AUTO-REPLY AUDIT LOG",
+                    `${auditLog.length} eventos`
+                  )
+                )
+                .child(
+                  v_flex()
+                    .p(10)
+                    .gap(6)
+                    .rounded(10)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.surface)
+                    .when(auditLog.length === 0, (el3) =>
+                      el3.child(
+                        div()
+                          .text_size(11.5)
+                          .text_color(t.dim)
                           .child(
-                            this.actionBtn(
-                              t,
-                              "ck-open-pr",
-                              "Open PR ↗",
-                              () => openExternalUrl(pr.url)
-                            )
+                            "Nenhuma auto-resposta registrada para este agente."
                           )
                       )
-                      .child(
-                        h_flex()
-                          .gap(6)
-                          .items_center()
+                    )
+                    .children(
+                      auditLog.map((entry, idx) => {
+                        const dec = entry.decision || "AutoReply";
+                        const decCol =
+                          dec === "AlertOperator"
+                            ? t.blocked
+                            : dec === "ApprovedByHuman"
+                              ? t.done
+                              : dec === "IgnoredByHuman"
+                                ? t.muted
+                                : t.accent;
+                        return v_flex()
+                          .id(`ck-audit-entry-${idx}`)
+                          .p(8)
+                          .gap(4)
+                          .rounded(6)
+                          .border(1)
+                          .border_color(t.border)
+                          .bg(t.background)
                           .child(
-                            this.badge(
-                              t,
-                              pr.state ?? "OPEN",
-                              t.foreground,
-                              t.raised
-                            )
+                            h_flex()
+                              .justify_between()
+                              .items_center()
+                              .gap(6)
+                              .child(
+                                div()
+                                  .text_size(11)
+                                  .font_semibold()
+                                  .text_color(t.accent)
+                                  .child(
+                                    `${entry.agent_id ?? agent.address}`
+                                  )
+                              )
+                              .child(this.pillBadge(t, dec, decCol))
+                              .child(
+                                div()
+                                  .text_size(10.5)
+                                  .text_color(t.dim)
+                                  .child(formatTimestamp(entry.timestamp))
+                              )
                           )
                           .child(
-                            this.badge(
-                              t,
-                              `CI: ${pr.ci_rollup ?? "PENDING"}`,
-                              pr.ci_rollup === "FAILURE"
-                                ? t.blocked
-                                : t.done,
-                              t.raised
-                            )
+                            div()
+                              .text_size(11)
+                              .text_color(t.foreground)
+                              .child(
+                                ellipsize(
+                                  `payload: "${entry.payload ?? ""}"`,
+                                  64
+                                )
+                              )
                           )
-                          .when(Boolean(pr.review_decision), (el2) =>
-                            el2.child(
-                              this.badge(
-                                t,
-                                pr.review_decision,
-                                t.muted,
-                                t.raised
+                          .when(
+                            Boolean(entry.reason || entry.summary),
+                            (el3) =>
+                              el3.child(
+                                div()
+                                  .text_size(10.5)
+                                  .text_color(t.muted)
+                                  .child(
+                                    ellipsize(
+                                      entry.reason || entry.summary,
+                                      72
+                                    )
+                                  )
+                              )
+                          );
+                      })
+                    )
+                )
+                // 5. Read-Only Correlation
+                .child(
+                  h_flex()
+                    .pt(10)
+                    .pb(5)
+                    .gap(6)
+                    .items_center()
+                    .justify_between()
+                    .border_b(1)
+                    .border_color(t.border)
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .child(div().size(6).rounded(3).bg(t.accent))
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child("CORRELAÇÃO READ-ONLY")
+                        )
+                    )
+                    .child(this.pillBadge(t, corrTierLabel, corrTierColor))
+                )
+                .child(
+                  v_flex()
+                    .p(10)
+                    .gap(8)
+                    .rounded(10)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.surface)
+                    // Pull Request & CI
+                    .child(
+                      pr
+                        ? v_flex()
+                            .p(8)
+                            .gap(5)
+                            .rounded(6)
+                            .border(1)
+                            .border_color(t.border)
+                            .bg(t.background)
+                            .child(
+                              h_flex()
+                                .justify_between()
+                                .items_center()
+                                .gap(6)
+                                .child(
+                                  div()
+                                    .flex_1()
+                                    .min_w(0)
+                                    .text_size(12)
+                                    .font_semibold()
+                                    .text_color(t.foreground)
+                                    .child(
+                                      ellipsize(
+                                        `PR #${pr.number} · ${pr.title}`,
+                                        40
+                                      )
+                                    )
+                                )
+                                .child(
+                                  this.actionBtn(
+                                    t,
+                                    "ck-open-pr",
+                                    "Open ↗",
+                                    () => openExternalUrl(pr.url)
+                                  )
+                                )
+                            )
+                            .child(
+                              h_flex()
+                                .gap(6)
+                                .items_center()
+                                .child(
+                                  this.pillBadge(
+                                    t,
+                                    pr.state ?? "OPEN",
+                                    t.foreground
+                                  )
+                                )
+                                .child(
+                                  this.pillBadge(
+                                    t,
+                                    `CI: ${pr.ci_rollup ?? "PENDING"}`,
+                                    pr.ci_rollup === "FAILURE"
+                                      ? t.blocked
+                                      : t.done
+                                  )
+                                )
+                            )
+                            .children(
+                              (pr.checks ?? []).slice(0, 5).map((chk, idx) =>
+                                h_flex()
+                                  .id(`ck-chk-${idx}`)
+                                  .justify_between()
+                                  .items_center()
+                                  .text_size(11)
+                                  .child(
+                                    div()
+                                      .flex_1()
+                                      .min_w(0)
+                                      .text_color(
+                                        chk.status === "FAILURE"
+                                          ? t.blocked
+                                          : t.muted
+                                      )
+                                      .child(
+                                        ellipsize(
+                                          `• ${chk.name} (${chk.status})`,
+                                          44
+                                        )
+                                      )
+                                  )
+                                  .when(Boolean(chk.details_url), (el3) =>
+                                    el3.child(
+                                      div()
+                                        .id(`ck-chk-url-${idx}`)
+                                        .cursor_pointer()
+                                        .text_color(t.accent)
+                                        .on_click(() =>
+                                          openExternalUrl(chk.details_url)
+                                        )
+                                        .child("logs ↗")
+                                    )
+                                  )
                               )
                             )
-                          )
-                      )
-                      .children(
-                        (pr.checks ?? []).slice(0, 6).map((chk, idx) =>
+                        : div()
+                            .p(8)
+                            .rounded(6)
+                            .border(1)
+                            .border_color(t.border)
+                            .bg(t.background)
+                            .text_size(11.5)
+                            .text_color(t.dim)
+                            .child(
+                              "No open Pull/Merge Request linked to this branch."
+                            )
+                    )
+                    // Jira / Linear Issues
+                    .when(issues.length > 0, (el3) =>
+                      el3.children(
+                        issues.map((iss, i) =>
                           h_flex()
-                            .id(`ck-chk-${idx}`)
+                            .id(`ck-iss-${i}`)
+                            .p(8)
+                            .gap(6)
                             .justify_between()
                             .items_center()
-                            .text_size(11)
+                            .rounded(6)
+                            .border(1)
+                            .border_color(t.border)
+                            .bg(t.background)
                             .child(
                               div()
                                 .flex_1()
                                 .min_w(0)
-                                .text_color(
-                                  chk.status === "FAILURE"
-                                    ? t.blocked
-                                    : t.muted
-                                )
-                                .child(ellipsize(`• ${chk.name} (${chk.status})`, 46))
-                            )
-                            .when(Boolean(chk.details_url), (el2) =>
-                              el2.child(
-                                div()
-                                  .id(`ck-chk-url-${idx}`)
-                                  .cursor_pointer()
-                                  .text_color(t.accent)
-                                  .on_click(() =>
-                                    openExternalUrl(chk.details_url)
+                                .text_size(11.5)
+                                .text_color(t.foreground)
+                                .child(
+                                  ellipsize(
+                                    `${iss.key} · ${iss.title} [${iss.status}]`,
+                                    44
                                   )
-                                  .child("logs ↗")
+                                )
+                            )
+                            .when(Boolean(iss.url), (e) =>
+                              e.child(
+                                this.actionBtn(
+                                  t,
+                                  `ck-iss-open-${i}`,
+                                  "Open ↗",
+                                  () => openExternalUrl(iss.url)
+                                )
                               )
                             )
                         )
                       )
-                  : cardBox().child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(t.dim)
-                        .child("No open Pull/Merge Request linked to this branch.")
                     )
-              )
-              // 4. Tickets (Jira / Linear) & Slack Threads
-              .child(sectionTitle("ISSUES & SLACK THREADS"))
-              .child(
-                cardBox()
-                  .when(issues.length === 0 && slackThreads.length === 0, (e) =>
-                    e.child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(t.dim)
-                        .child(
-                          "No linked Jira/Linear tickets or Slack threads. Tag an issue above or include PROJ-123 in your branch name."
-                        )
-                    )
-                  )
-                  .children(
-                    issues.map((iss, i) =>
-                      h_flex()
-                        .id(`ck-iss-${i}`)
-                        .justify_between()
-                        .items_center()
-                        .text_size(11.5)
-                        .child(
-                          div()
-                            .flex_1()
-                            .min_w(0)
-                            .text_size(12)
-                            .text_color(t.foreground)
+                    // Slack Threads
+                    .when(slackThreads.length > 0, (el3) =>
+                      el3.children(
+                        slackThreads.map((th, i) =>
+                          h_flex()
+                            .id(`ck-slk-${i}`)
+                            .p(8)
+                            .gap(6)
+                            .justify_between()
+                            .items_center()
+                            .rounded(6)
+                            .border(1)
+                            .border_color(t.border)
+                            .bg(t.background)
                             .child(
-                              ellipsize(`${iss.key} · ${iss.title} [${iss.status}]`, 46)
+                              div()
+                                .flex_1()
+                                .min_w(0)
+                                .text_size(11.5)
+                                .text_color(t.foreground)
+                                .child(
+                                  ellipsize(
+                                    `Slack #${th.channel_id} (${th.reply_count ?? 0} replies)`,
+                                    42
+                                  )
+                                )
                             )
-                        )
-                        .when(Boolean(iss.url), (e) =>
-                          e.child(
-                            this.actionBtn(t, `ck-iss-open-${i}`, "Open ↗", () =>
-                              openExternalUrl(iss.url)
-                            )
-                          )
-                        )
-                    )
-                  )
-                  .children(
-                    slackThreads.map((th, i) =>
-                      h_flex()
-                        .id(`ck-slk-${i}`)
-                        .justify_between()
-                        .items_center()
-                        .text_size(11.5)
-                        .child(
-                          div()
-                            .flex_1()
-                            .min_w(0)
-                            .text_size(12)
-                            .text_color(t.foreground)
                             .child(
-                              ellipsize(`Slack #${th.channel_id} (${th.reply_count ?? 0} replies)`, 44)
+                              this.actionBtn(
+                                t,
+                                `ck-slk-open-${i}`,
+                                "Thread ↗",
+                                () => openExternalUrl(th.url)
+                              )
                             )
                         )
-                        .child(
-                          this.actionBtn(t, `ck-slk-open-${i}`, "Thread ↗", () =>
-                            openExternalUrl(th.url)
-                          )
-                        )
+                      )
                     )
-                  )
-              )
-              // 5. Local Markdown Runbooks
-              .child(sectionTitle("LOCAL RUNBOOKS"))
-              .child(
-                cardBox()
-                  .when(runbooks.length === 0, (e) =>
-                    e.child(
-                      div()
-                        .text_size(11.5)
-                        .text_color(t.dim)
-                        .child(
-                          "No matching RUNBOOK.md or docs/runbooks/*.md found."
+                    // Local Runbooks
+                    .when(runbooks.length > 0, (el3) =>
+                      el3.children(
+                        runbooks.map((rb, i) =>
+                          v_flex()
+                            .id(`ck-rb-${i}`)
+                            .p(8)
+                            .gap(2)
+                            .rounded(6)
+                            .border(1)
+                            .border_color(t.border)
+                            .bg(t.background)
+                            .child(
+                              h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                  div()
+                                    .text_size(11.5)
+                                    .font_semibold()
+                                    .text_color(t.foreground)
+                                    .child(rb.title)
+                                )
+                                .child(
+                                  div()
+                                    .text_size(10.5)
+                                    .text_color(t.dim)
+                                    .child(rb.match_reason ?? "")
+                                )
+                            )
+                            .child(
+                              div()
+                                .text_size(11)
+                                .text_color(t.muted)
+                                .child(ellipsize(rb.path, 52))
+                            )
                         )
+                      )
                     )
-                  )
-                  .children(
-                    runbooks.map((rb, i) =>
+                    // Labels (`cockpit.*`) + Segmented Tagger
+                    .child(
                       v_flex()
-                        .id(`ck-rb-${i}`)
-                        .gap(2)
+                        .p(8)
+                        .gap(6)
+                        .rounded(6)
+                        .border(1)
+                        .border_color(t.border)
+                        .bg(t.background)
+                        .when(
+                          Object.keys(labels).some((k) =>
+                            k.startsWith("cockpit.")
+                          ),
+                          (el3) =>
+                            el3.child(
+                              h_flex()
+                                .gap(4)
+                                .flex_wrap()
+                                .children(
+                                  Object.entries(labels)
+                                    .filter(([k]) => k.startsWith("cockpit."))
+                                    .map(([k, v]) =>
+                                      h_flex()
+                                        .id(`ck-lbl-chip-${k}`)
+                                        .px(7)
+                                        .py(2)
+                                        .gap(5)
+                                        .items_center()
+                                        .rounded(999)
+                                        .bg(t.surface)
+                                        .border(1)
+                                        .border_color(t.border)
+                                        .text_size(10.5)
+                                        .child(
+                                          `${k.replace("cockpit.", "")}=${v}`
+                                        )
+                                        .child(
+                                          div()
+                                            .id(`ck-lbl-del-${k}`)
+                                            .cursor_pointer()
+                                            .text_color(t.dim)
+                                            .hover((s) =>
+                                              s.text_color(t.blocked)
+                                            )
+                                            .on_click((_e, cx) =>
+                                              this.applyLabelGui(
+                                                cx,
+                                                agent.address,
+                                                k,
+                                                ""
+                                              )
+                                            )
+                                            .child("×")
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                        .child(
+                          this.segmentedTrack(t).children(
+                            ["issue", "pr", "slack", "runbook"].map((k) =>
+                              this.segmentBtn(
+                                t,
+                                `ck-lbl-type-${k}`,
+                                k,
+                                this.labelKey === k,
+                                (_e, cx) => {
+                                  this.labelKey = k;
+                                  this.editingField = "label";
+                                  this.handle.focus();
+                                  cx.notify();
+                                }
+                              )
+                            )
+                          )
+                        )
                         .child(
                           h_flex()
-                            .justify_between()
+                            .gap(6)
                             .items_center()
                             .child(
                               div()
+                                .id("ck-lbl-input")
+                                .flex_1()
+                                .min_w(0)
+                                .px(8)
+                                .py(4)
+                                .rounded(6)
+                                .border(1)
+                                .border_color(
+                                  this.editingField === "label"
+                                    ? t.accent
+                                    : t.border
+                                )
+                                .bg(t.surface)
                                 .text_size(11.5)
-                                .font_semibold()
-                                .child(rb.title)
+                                .text_color(
+                                  this.labelValue ? t.foreground : t.dim
+                                )
+                                .cursor_text()
+                                .on_click((_e, cx) => {
+                                  this.editingField = "label";
+                                  this.handle.focus();
+                                  cx.notify();
+                                })
+                                .child(
+                                  this.labelValue
+                                    ? `${this.labelKey}=${this.labelValue}` +
+                                        (this.editingField === "label"
+                                          ? "▏"
+                                          : "")
+                                    : (this.editingField === "label"
+                                        ? "▏"
+                                        : "") +
+                                        `Set cockpit.${this.labelKey} (e.g. ENG-42)…`
+                                )
                             )
                             .child(
-                              div()
-                                .text_size(10.5)
-                                .text_color(t.dim)
-                                .child(rb.match_reason ?? "")
+                              this.actionBtn(
+                                t,
+                                "ck-lbl-save",
+                                "Tag",
+                                (_e, cx) =>
+                                  this.applyLabelGui(
+                                    cx,
+                                    agent.address,
+                                    this.labelKey,
+                                    this.labelValue.trim()
+                                  ),
+                                Boolean(this.labelValue.trim())
+                              )
                             )
                         )
-                        .child(
-                          div()
-                            .text_size(11.5)
-                            .text_color(t.muted)
-                            .child(ellipsize(rb.path, 58))
-                        )
                     )
-                  )
-              )
-              // 6. Cockpit System & Provider Health (GUI replacement for `cockpit doctor` / `cockpit setup`)
-              .child(sectionTitle("COCKPIT SYSTEM & PROVIDERS"))
-              .child(
-                cardBox()
-                  .child(
-                    h_flex()
-                      .gap(6)
-                      .flex_wrap()
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-sys-setup",
-                          "Verify / Repair Hooks",
-                          (_e, cx) => this.runSetupGui(cx)
-                        )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-sys-files",
-                          "Files / Diff Panel",
-                          () => run("layout.toggle", { id: "panel" })
-                        )
-                      )
-                      .child(
-                        this.actionBtn(
-                          t,
-                          "ck-sys-layout",
-                          "Switch Layout",
-                          () => run("layout.switch")
-                        )
-                      )
-                  )
-                  .children(
-                    Object.entries(providers).map(([prov, ph]) =>
-                      h_flex()
-                        .justify_between()
-                        .items_center()
-                        .text_size(11.5)
-                        .child(div().text_color(t.muted).child(prov))
-                        .child(
-                          div()
-                            .text_color(
-                              ph?.state === "active"
-                                ? t.done
-                                : ph?.state === "inactive"
-                                  ? t.muted
-                                  : t.blocked
-                            )
-                            .child((ph?.state ?? "unknown").toUpperCase())
-                        )
-                    )
-                  )
-              )
-          )
+                )
+            )
         )
       );
   }
 
-  renderStatus() {
+  renderStatus(cx = null) {
     const t = theme();
     const space = spaces().find((s) => s.active);
     const list = agents();
+    const allTerms = terminals();
     const snap = shared("cockpit.snapshot");
     const supSnap = shared("supervisor.snapshot");
+    const merged = mergeFleetRows(list, allTerms, snap, supSnap);
     const providers = snap?.providers ?? {};
-    const blockedCount = list.filter((a) => a.status === "blocked").length;
-    const workingCount = list.filter((a) => a.status === "working").length;
+    const activeProviders = Object.entries(providers).filter(([, ph]) => {
+      const st = String(ph?.state ?? "").toLowerCase();
+      return st === "active" || st === "ready";
+    });
+    const blockedCount = merged.filter((a) => a.status === "blocked").length;
+    const workingCount = merged.filter((a) => a.status === "working").length;
     const modeLabel = supSnap?.mode_label ?? "Semi-Auto (Whitelist)";
-    const vramText = supSnap?.model_loaded
-      ? "CPU-only (num_gpu: 0) · RAM ~1.2 GB"
-      : "CPU-only (num_gpu: 0) · 0 MB";
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
-    const homeHidden = Boolean(
-      findNode(layout(), "cockpit-home")?.hidden
-    );
+    const rightView =
+      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
     const mac = win()?.platform === "macos";
     const b = keys().find(
       (k) => k.section === "global" && k.action === "app.palette"
     );
     const paletteHint = b ? b.keys.toUpperCase() : mac ? "⌘K" : "CTRL+SHIFT+P";
 
+    const viewLink = (id, label, tab) =>
+      div()
+        .id(id)
+        .cursor_pointer()
+        .text_color(!inspectorHidden && rightView === tab ? t.accent : t.muted)
+        .hover((s) => s.text_color(t.foreground))
+        .on_click((_e, clickCx) => this.openDrawerView(clickCx ?? cx, tab, false))
+        .child(label);
+
     return h_flex()
       .size_full()
-      .px(14)
-      .gap(12)
+      .px(12)
+      .gap(10)
       .items_center()
       .bg(t.chrome)
       .border_t(1)
       .border_color(t.border)
-      .text_size(11.5)
+      .text_size(11)
       .text_color(t.muted)
+      // Left side
       .child(
         h_flex()
           .gap(6)
@@ -3485,7 +4004,7 @@ export default class CockpitMod extends View {
             div()
               .font_semibold()
               .text_color(t.foreground)
-              .child("Cockpit")
+              .child(`Cockpit v${version}`)
           )
       )
       .child(
@@ -3495,68 +4014,44 @@ export default class CockpitMod extends View {
           .py(1)
           .rounded(4)
           .bg(t.raised)
+          .border(1)
+          .border_color(t.border)
           .cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .on_click((_e, cx) =>
-            this.runSupervisorAction(cx, ["supervisor", "mode", "cycle"])
+          .on_click((_e, clickCx) =>
+            this.runSupervisorAction(clickCx ?? cx, ["supervisor", "mode", "cycle"])
           )
-          .child(modeLabel)
+          .child(`MODE: ${modeLabel}`)
       )
-      .child(div().text_color(t.dim).child(vramText))
-      .child(div().child(space?.machine ?? "Local machine"))
-      .when(Boolean(space?.branch), (el) =>
-        el.child(div().child(`⎇ ${space.branch}`))
-      )
+      .child(div().text_color(t.done).child("GPU: num_gpu=0 (0 MB VRAM)"))
       .child(
-        div().child(
-          `${list.length} agents (${workingCount} working)`
-        )
+        div()
+          .text_color(t.accent)
+          .child(`⎇ ${ellipsize(space?.branch ?? "main", 22)}`)
       )
-      .when(blockedCount > 0, (el) =>
-        el.child(
-          div()
-            .px(6)
-            .py(1)
-            .rounded(4)
-            .bg(t.blocked + "26")
-            .text_color(t.blocked)
-            .font_semibold()
-            .child(`● ${blockedCount} needs you`)
-        )
-      )
-      .children(
-        Object.entries(providers).map(([prov, ph]) =>
-          this.badge(
-            t,
-            `${prov}: ${(ph?.state ?? "unknown").toUpperCase()}`,
-            ph?.state === "active"
-              ? t.done
-              : ph?.state === "inactive"
-                ? t.dim
-                : t.blocked,
-            t.raised
+      .child(div().child(`${merged.length} agents (${workingCount} working)`))
+      .when(activeProviders.length > 0, (el) =>
+        el.children(
+          activeProviders.map(([prov, ph]) =>
+            this.pillBadge(
+              t,
+              `${prov}: ${String(ph?.state ?? "active").toUpperCase()}`,
+              t.done
+            )
           )
         )
+      )
+      .when(activeProviders.length === 0, (el) =>
+        el.child(this.pillBadge(t, "Local-First Read-Only", t.muted))
       )
       .child(div().flex_1())
-      .child(
-        div()
-          .id("ck-status-home")
-          .cursor_pointer()
-          .text_color(homeHidden ? t.muted : t.accent)
-          .hover((s) => s.text_color(t.foreground))
-          .on_click(() => run("layout.toggle", { id: "cockpit-home" }))
-          .child("🏠 Home")
-      )
-      .child(
-        div()
-          .id("ck-status-inspector")
-          .cursor_pointer()
-          .text_color(inspectorHidden ? t.muted : t.accent)
-          .hover((s) => s.text_color(t.foreground))
-          .on_click(() => run("layout.toggle", { id: "cockpit-inspector" }))
-          .child(inspectorHidden ? "Show Inspector" : "Hide Inspector")
-      )
+      // Right side: Quick view links
+      .child(viewLink("ck-status-home", "Home", "home"))
+      .child(div().text_color(t.dim).child("·"))
+      .child(viewLink("ck-status-inspector", "Inspector", "inspector"))
+      .child(div().text_color(t.dim).child("·"))
+      .child(viewLink("ck-status-doctor", "Doctor", "doctor"))
+      .child(div().text_color(t.dim).child("·"))
       .child(
         div()
           .id("ck-status-palette")
@@ -3573,7 +4068,7 @@ export default class CockpitMod extends View {
     if (role === "pill") return this.renderPill(cx);
     if (role === "home") return this.renderHome(cx);
     if (role === "inspector") return this.renderInspector(cx);
-    if (role === "status") return this.renderStatus();
+    if (role === "status") return this.renderStatus(cx);
     return this.renderFleet(cx);
   }
 }

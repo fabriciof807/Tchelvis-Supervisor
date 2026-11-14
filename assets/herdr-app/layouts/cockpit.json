@@ -157,6 +157,7 @@
             {
               "id": "cockpit-home",
               "type": "block",
+              "hidden": true,
               "size": {
                 "px": 430
               },
@@ -173,10 +174,11 @@
               "id": "cockpit-inspector",
               "type": "block",
               "size": {
-                "px": 400
+                "px": 420
               },
-              "min": 300,
-              "max": 640,
+              "min": 310,
+              "max": 680,
+              "resizable": true,
               "content": {
                 "mod": "cockpit",
                 "props": {
