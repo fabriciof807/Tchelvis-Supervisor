@@ -1,7 +1,7 @@
 # Handoff — Cockpit (Unified Fleet Control Plane + Durable Supervisor)
 
 **Data da última atualização:** 2026-11-14  
-**Repositório:** `https://github.com/fabriciof807/cockpit` (branch `main`)  
+**Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
 **Binário instalado no container (`ai-box`):** `/home/ubuntu/.local/bin/cockpit`
 
 ---
@@ -49,8 +49,20 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ---
 
+### Atualização — LLM do Supervisor em container `llama.cpp` (`6a38eee`)
+- **`src/supervisor/container.rs`**: detecção de runtime `kiri` → `podman` → `docker` (override `[llm_container] runtime` / `COCKPIT_CONTAINER_RUNTIME`); container nomeado `cockpit-supervisor-llm` (`ghcr.io/ggml-org/llama.cpp:server`, GPU: `:server-cuda` + `--gpus all` / CDI no podman) em `127.0.0.1:11435`; `start` recria o container se o label `cockpit.ngl` difere do `-ngl` pedido; RAM via `<rt> stats` (`MemUsage`); espera `/health` 200.
+- **Modelo GGUF** (precedência): `llm_container.model_path` → `llm_container.hf_repo` (`-hf`, cache em `~/.cache/cockpit/llama.cpp` com `LLAMA_CACHE`) → blob do `ollama_model` no store do Ollama (`$OLLAMA_MODELS`, `~/.ollama/models`, `/usr/share/ollama/.ollama/models`).
+- **Modo**: `[llm_container] mode = auto|on|off` (env `COCKPIT_LLM_CONTAINER`); `auto` ativa quando há runtime no PATH → backend efetivo `llama-cpp`. `off` mantém o caminho Ollama legado intacto.
+- **Ciclo de vida explícito**: ticks nunca sobem o container; com ele parado o watcher pula a avaliação LLM (sem marcar output como avaliado). `cockpit supervisor load` sobe + espera healthy; `unload` faz `stop -t 2`; auto-stop só após `idle_unload_secs` sem sessões. `supervisor gpu on|off` recria o container se estiver rodando.
+- **Snapshot/doctor**: `llm_managed`, `llm_runtime`, `llm_container_state` (`missing|stopped|running`).
+- **Mod**: botão único `▶ Load LLM` ⇄ `⏻ Unload LLM` (`◌ Carregando…` durante o load, timeout 300 s); pílula `○ DESATIVADO` / `◌ INICIANDO…` / `● llama.cpp · X RAM`; `⚡ Poll Now` faz load antes se parado.
+- **Validado no `ai-box`** (Docker 29, modelo de teste SmolLM2-135M via `hf_repo`, HOME temporário): load 7,6 s (1,8 s com container existente), chat completions OK, unload → `Exited (0)`, recriação reaproveita o cache. **Não validado**: GGUF do `lfm3:1.7b` vindo do store do Ollama, GPU, kiri/podman.
+
+---
+
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `6a38eee` — `feat(supervisor,mod): managed llama.cpp container with explicit Load/Unload lifecycle`
 - `27ad04e` — `fix(fleet,herdr): auto-attach unattached herdr-core terminals on click`
   - Auto-attach via `herdr-core attach <target>` em `focusOrAttachTerminal` (`main.js`) com verificação de foco após `200 ms` e debounce de `1200 ms`; `mergeFleetRows` recebeu Loop 4 (`terminals()`) + `findPaneForTerminal`, `selectedAddress()` recebeu `resolveAttachedTargetAddress`, e clientes `attach` agora são filtrados em `src/herdr.rs`, `src/supervisor/hc.rs` e `isPlainShellRow`.
 - `69c6d19` — `feat(mod): make AI Usage compact bottom-right popover with provider sub-tabs`
@@ -88,6 +100,15 @@ cockpit supervisor gpu off   # num_gpu: 0 (Zero-VRAM, padrão)
 ```
 > ⚠️ O daemon `cockpit supervisor watch` só lê a config ao iniciar — reinicie-o após alternar.
 
+### LLM em container (`llama.cpp`)
+```bash
+cockpit supervisor load      # sobe/inicia cockpit-supervisor-llm e espera /health
+cockpit supervisor unload    # para o container (0 B RAM/VRAM)
+cockpit supervisor status --json | jq '{llm_managed, llm_runtime, llm_container_state, llm_status_detail}'
+COCKPIT_LLM_CONTAINER=off cockpit supervisor status --json   # volta ao Ollama legado
+```
+> ⚠️ `supervisor.toml` é parseado tudo-ou-nada: se faltar algum campo obrigatório, o arquivo inteiro é ignorado. Para definir `[llm_container] model_path`/`hf_repo`, mantenha o TOML completo.
+
 ### Rodar Testes e Build no Container (`ai-box`)
 ```bash
 cargo test --quiet
@@ -104,13 +125,12 @@ cockpit supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Próxima Sessão — Prioridade Alta: Ciclo de vida da LLM em container (`llama.cpp`)**:
-   - **Auto-detecção de runtime**: Detectar automaticamente o motor de container na ordem `kiri` → `podman` → `docker` (com override configurável em `SupervisorConfig`), gerenciando um container nomeado (ex.: `cockpit-supervisor-llm`).
-   - **Motor / Imagem (`llama.cpp`)**: Usar `llama.cpp` (`llama-server` / `LlmBackendKind::LlamaCpp`) dentro do container em vez de depender do daemon do Ollama no host, garantindo **0 B de RAM/VRAM** e estado explicitamente offline/parado ao desligar o container.
-   - **Ciclo de vida explícito e botão único alternável (`Load LLM` ⇄ `Unload LLM`)**:
-     - Quando o container estiver parado/descarregado: a pílula da barra superior exibe explicitamente a LLM como desativada (`○ LLM: ... (DESATIVADO)`), ticks automáticos em background **não** sobem o container sozinhos e o botão único da barra superior exibe **`▶ Load LLM`**.
-     - Quando o usuário clicar explicitamente em **`▶ Load LLM`** (ou `⚡ Poll Now`): inicia o container `llama.cpp`, exibe o estado ativo + consumo RAM/VRAM na pílula e alterna o próprio botão no mesmo lugar para **`⏻ Unload LLM`** (sem criar um botão extra).
-     - Quando o usuário clicar em **`⏻ Unload LLM`**: para o container (`<runtime> stop`), zera o consumo e volta a pílula para desativada com o botão **`▶ Load LLM`**.
+1. **Próxima Sessão — Validar o container `llama.cpp` no host** (binário `6a38eee`):
+   - `cockpit supervisor load` com o GGUF do `lfm3:1.7b` resolvido do store do Ollama do host (checar permissão de leitura se for `/usr/share/ollama`; senão usar `model_path`/`hf_repo`) e se o `llama-server` da imagem suporta a arquitetura LFM.
+   - Saída JSON estruturada (`response_format: json_schema`) do llama.cpp nas avaliações reais (`sim-safe` → AUTO_REPLY).
+   - Toggle GPU (`:server-cuda` + `--gpus all`) e runtime `kiri`/`podman` se instalados.
+   - Botão `▶ Load LLM` ⇄ `⏻ Unload LLM` e pílula `DESATIVADO`/`INICIANDO…`/RAM na barra superior.
+   - Considerar tornar todos os campos de `SupervisorConfig` `#[serde(default)]` (TOML parcial).
 2. Validar no host com o binário mais recente (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
    - Barra superior: botões centrais fixos enquanto a pill passa por `Idle` → `Watching (3)` → `Evaluating`; consumo de RAM/VRAM aparecendo na pill da LLM.
    - Toggle `num_gpu` na pill: carregamento na GPU real (não testado no container, sem GPU) e VRAM refletida na pill.
