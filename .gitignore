@@ -6,3 +6,6 @@
 .DS_Store
 .env
 .env.*
+
+# Landing page standalone project
+/landing-page/
