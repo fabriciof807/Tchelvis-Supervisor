@@ -4,6 +4,7 @@ use cockpit::config::{CockpitConfig, CockpitPaths};
 use cockpit::daemon::{collect_once, query_socket_once, run_daemon};
 use cockpit::doctor::run_doctor;
 use cockpit::herdr::HerdrClient;
+use cockpit::home::{self, DailyTaskStore, HomeSnapshot, TaskPriority, unix_now_secs};
 use cockpit::logging::{init_logging, read_filtered_logs};
 use cockpit::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
 use cockpit::providers::ProviderCoordinator;
@@ -141,10 +142,68 @@ enum Commands {
     },
     /// Launch the interactive Ratatui Cockpit & Durable Supervisor TUI dashboard
     Tui,
+    /// Show Projects in Development and Daily Tasks summary
+    Home {
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Manage Daily Tasks
+    Task {
+        #[command(subcommand)]
+        action: TaskCommand,
+    },
     /// Manage the Pi-Durable FSM Supervisor (tick, status, approve, ignore, mode, unload, watch)
     Supervisor {
         #[command(subcommand)]
         action: SupervisorCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List all daily tasks
+    List {
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a new daily task
+    Add {
+        /// Optional project name to associate with this task
+        #[arg(long)]
+        project: Option<String>,
+        /// Task priority (high, normal, low)
+        #[arg(long, default_value = "normal")]
+        priority: String,
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
+        /// Task title
+        #[arg(required = true)]
+        title: Vec<String>,
+    },
+    /// Toggle a daily task's completed state
+    Toggle {
+        /// Task ID (e.g. t-1)
+        id: String,
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a daily task by ID
+    Remove {
+        /// Task ID (e.g. t-1)
+        id: String,
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove all completed daily tasks
+    ClearDone {
+        /// Output full HomeSnapshot JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -493,6 +552,132 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Home { json } => {
+            let paths_clone = paths.clone();
+            let snap = tokio::task::spawn_blocking(move || home::build_home_snapshot(&paths_clone))
+                .await
+                .context("home snapshot task panicked")??;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                print_human_home(&snap);
+            }
+            Ok(())
+        }
+        Commands::Task { action } => {
+            let paths_clone = paths.clone();
+            let task_path = DailyTaskStore::default_path(&paths);
+            match action {
+                TaskCommand::List { json } => {
+                    let snap =
+                        tokio::task::spawn_blocking(move || home::build_home_snapshot(&paths_clone))
+                            .await
+                            .context("task list task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        print_human_tasks(&snap);
+                    }
+                    Ok(())
+                }
+                TaskCommand::Add {
+                    project,
+                    priority,
+                    json,
+                    title,
+                } => {
+                    let joined = title.join(" ");
+                    if joined.trim().is_empty() {
+                        bail!("Task title cannot be empty");
+                    }
+                    let prio = TaskPriority::from_str_loose(&priority);
+                    let (task, snap) = tokio::task::spawn_blocking(move || -> Result<_> {
+                        let mut store = DailyTaskStore::load_or_init(&task_path)?;
+                        let task = store.add_task(&joined, project, prio, unix_now_secs());
+                        store.save(&task_path)?;
+                        let snap = home::build_home_snapshot(&paths_clone)?;
+                        Ok((task, snap))
+                    })
+                    .await
+                    .context("task add task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        let proj = task
+                            .project
+                            .as_deref()
+                            .map(|p| format!(" [{p}]"))
+                            .unwrap_or_default();
+                        println!(
+                            "Added {} ({}){} {}",
+                            task.id,
+                            task.priority.as_str(),
+                            proj,
+                            task.title
+                        );
+                    }
+                    Ok(())
+                }
+                TaskCommand::Toggle { id, json } => {
+                    let (task, snap) = tokio::task::spawn_blocking(move || -> Result<_> {
+                        let mut store = DailyTaskStore::load_or_init(&task_path)?;
+                        let Some(task) = store.toggle_task(&id, unix_now_secs()) else {
+                            bail!("Task '{}' not found", id);
+                        };
+                        store.save(&task_path)?;
+                        let snap = home::build_home_snapshot(&paths_clone)?;
+                        Ok((task, snap))
+                    })
+                    .await
+                    .context("task toggle task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        let mark = if task.done { "x" } else { " " };
+                        println!("[{mark}] {} {}", task.id, task.title);
+                    }
+                    Ok(())
+                }
+                TaskCommand::Remove { id, json } => {
+                    let id_clone = id.clone();
+                    let snap = tokio::task::spawn_blocking(move || -> Result<_> {
+                        let mut store = DailyTaskStore::load_or_init(&task_path)?;
+                        if !store.remove_task(&id_clone) {
+                            bail!("Task '{}' not found", id_clone);
+                        }
+                        store.save(&task_path)?;
+                        home::build_home_snapshot(&paths_clone)
+                    })
+                    .await
+                    .context("task remove task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        println!("Removed task {id}");
+                    }
+                    Ok(())
+                }
+                TaskCommand::ClearDone { json } => {
+                    let (cleared, snap) = tokio::task::spawn_blocking(move || -> Result<_> {
+                        let mut store = DailyTaskStore::load_or_init(&task_path)?;
+                        let cleared = store.clear_done();
+                        if cleared > 0 {
+                            store.save(&task_path)?;
+                        }
+                        let snap = home::build_home_snapshot(&paths_clone)?;
+                        Ok((cleared, snap))
+                    })
+                    .await
+                    .context("task clear-done task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&snap)?);
+                    } else {
+                        println!("Cleared {cleared} completed task(s).");
+                    }
+                    Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -686,6 +871,70 @@ fn print_human_doctor(rep: &cockpit::doctor::DoctorReport) {
             h.status,
             id.as_str(),
             h.detail.as_deref().unwrap_or("")
+        );
+    }
+}
+
+fn print_human_home(snap: &HomeSnapshot) {
+    println!(
+        "Cockpit Home — {} projects ({} active), {} running agents ({} blocked), {} pending / {} done tasks",
+        snap.summary.total_projects,
+        snap.summary.active_projects,
+        snap.summary.running_agents,
+        snap.summary.blocked_agents,
+        snap.summary.tasks_pending,
+        snap.summary.tasks_done,
+    );
+    println!("\nProjects in Development:");
+    if snap.projects.is_empty() {
+        println!("  (none discovered)");
+    } else {
+        for p in &snap.projects {
+            let branch = p.git_branch.as_deref().unwrap_or("-");
+            let dirty = if p.git_dirty_count > 0 {
+                format!(" *{}", p.git_dirty_count)
+            } else {
+                String::new()
+            };
+            println!(
+                "  [{:<10}] {:<20} branch={}{} agents={}/{} tasks={}",
+                p.status_label,
+                truncate_col(&p.name, 20),
+                branch,
+                dirty,
+                p.active_agents,
+                p.blocked_agents,
+                p.open_tasks,
+            );
+        }
+    }
+    println!();
+    print_human_tasks(snap);
+}
+
+fn print_human_tasks(snap: &HomeSnapshot) {
+    println!(
+        "Daily Tasks ({} pending, {} done):",
+        snap.summary.tasks_pending, snap.summary.tasks_done
+    );
+    if snap.tasks.is_empty() {
+        println!("  (no tasks)");
+        return;
+    }
+    for t in &snap.tasks {
+        let mark = if t.done { "x" } else { " " };
+        let proj = t
+            .project
+            .as_deref()
+            .map(|p| format!(" [{p}]"))
+            .unwrap_or_default();
+        println!(
+            "  [{}] {:<5} ({}){:<14} {}",
+            mark,
+            t.id,
+            t.priority.as_str(),
+            proj,
+            t.title
         );
     }
 }

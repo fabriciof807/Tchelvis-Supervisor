@@ -4,6 +4,7 @@ pub mod correlate;
 pub mod daemon;
 pub mod doctor;
 pub mod herdr;
+pub mod home;
 pub mod logging;
 pub mod model;
 pub mod providers;

@@ -211,6 +211,151 @@ function parseSnapshotOutput(stdout) {
   return parsed?.snapshot ?? parsed ?? null;
 }
 
+/**
+ * Truncates long strings in JS so text inside GPUI `v_flex()` never gets clipped vertically by `.truncate()`.
+ */
+function ellipsize(str, maxLen = 72) {
+  const s = String(str ?? "");
+  return s.length > maxLen ? s.slice(0, maxLen - 1) + "…" : s;
+}
+
+function pathBasename(p) {
+  const clean = String(p ?? "").replace(/[\\/]+$/, "");
+  if (!clean) return "";
+  const parts = clean.split(/[\\/]/);
+  return parts[parts.length - 1] || clean;
+}
+
+/**
+ * Merges live Herdr `spaces()` with `homeSnap.projects` and live agent counts.
+ */
+export function buildProjectsList(
+  homeSnap,
+  liveSpaces = [],
+  allTerms = [],
+  snap = null,
+  supSnap = null
+) {
+  const mergedFleet = mergeFleetRows(agents(), allTerms, snap, supSnap);
+  const tasks = homeSnap?.tasks ?? [];
+  const homeProjects = homeSnap?.projects ?? [];
+  const byKey = new Map();
+
+  const normalizeKey = (name, p) => {
+    const base = pathBasename(p);
+    return (name || base || p || "").trim().toLowerCase();
+  };
+
+  for (const proj of homeProjects) {
+    const key = normalizeKey(proj.name, proj.path);
+    if (!key) continue;
+    byKey.set(key, {
+      name: proj.name || pathBasename(proj.path) || "Project",
+      spaceId: null,
+      isActiveSpace: false,
+      branch: proj.git_branch ?? null,
+      path: proj.path ?? "",
+      dirtyCount: proj.git_dirty_count ?? 0,
+      lastCommit: proj.last_commit_subject ?? null,
+      activeAgents: proj.active_agents ?? 0,
+      blockedAgents: proj.blocked_agents ?? 0,
+      openTasks: proj.open_tasks ?? 0,
+      status: "idle",
+    });
+  }
+
+  for (const sp of liveSpaces) {
+    const spName = sp?.name || pathBasename(sp?.cwd) || "Space";
+    const keyByName = spName.trim().toLowerCase();
+    const keyByCwd = pathBasename(sp?.cwd).trim().toLowerCase();
+    const existing =
+      byKey.get(keyByName) || (keyByCwd ? byKey.get(keyByCwd) : null);
+
+    if (existing) {
+      existing.spaceId = sp?.id ?? existing.spaceId;
+      existing.isActiveSpace = existing.isActiveSpace || Boolean(sp?.active);
+      existing.branch = sp?.branch ?? existing.branch;
+      if (!existing.path && sp?.cwd) existing.path = sp.cwd;
+    } else {
+      byKey.set(keyByName || sp?.id || spName, {
+        name: spName,
+        spaceId: sp?.id ?? null,
+        isActiveSpace: Boolean(sp?.active),
+        branch: sp?.branch ?? null,
+        path: sp?.cwd ?? "",
+        dirtyCount: 0,
+        lastCommit: null,
+        activeAgents: 0,
+        blockedAgents: 0,
+        openTasks: 0,
+        status: "idle",
+      });
+    }
+  }
+
+  const list = Array.from(byKey.values()).map((proj) => {
+    const pKey = proj.name.trim().toLowerCase();
+    const pBase = pathBasename(proj.path).trim().toLowerCase();
+
+    const matchingAgents = mergedFleet.filter((a) => {
+      const aSpace = String(a.space_name ?? "").trim().toLowerCase();
+      const aBase = pathBasename(a.cwd).trim().toLowerCase();
+      return (
+        (proj.spaceId && a.space_id === proj.spaceId) ||
+        (aSpace && aSpace === pKey) ||
+        (aBase && pBase && aBase === pBase)
+      );
+    });
+
+    const liveActive = matchingAgents.filter(
+      (a) => a.lifecycle?.state !== "finished" && a.status !== "finished"
+    ).length;
+    const liveBlocked = matchingAgents.filter(
+      (a) => a.status === "blocked" || Boolean(a.action_card)
+    ).length;
+
+    const matchingOpenTasks = tasks.filter(
+      (t) =>
+        !t.done &&
+        t.project &&
+        String(t.project).trim().toLowerCase() === pKey
+    ).length;
+
+    const activeAgents = Math.max(proj.activeAgents, liveActive);
+    const blockedAgents = Math.max(proj.blockedAgents, liveBlocked);
+    const openTasks =
+      tasks.length > 0 ? matchingOpenTasks : proj.openTasks;
+
+    const status =
+      blockedAgents > 0
+        ? "blocked"
+        : activeAgents > 0
+          ? "active"
+          : openTasks > 0
+            ? "open_tasks"
+            : "idle";
+
+    return {
+      ...proj,
+      activeAgents,
+      blockedAgents,
+      openTasks,
+      status,
+    };
+  });
+
+  const statusRank = { blocked: 0, active: 1, open_tasks: 2, idle: 3 };
+  list.sort((a, b) => {
+    if (a.isActiveSpace !== b.isActiveSpace) return a.isActiveSpace ? -1 : 1;
+    const ra = statusRank[a.status] ?? 3;
+    const rb = statusRank[b.status] ?? 3;
+    if (ra !== rb) return ra - rb;
+    return a.name.localeCompare(b.name);
+  });
+
+  return list;
+}
+
 function isPlainShellRow(name, programName, labels) {
   const agentLabel = String(labels?.["cockpit.agent"] ?? "")
     .trim()
@@ -414,25 +559,40 @@ export default class CockpitMod extends View {
     this.showLauncher = false;
     this.busy = false;
     this.pollingSupervisor = false;
+    this.fetchingHome = false;
     this.note = "";
     this.promptText = "";
     this.labelKey = "issue";
     this.labelValue = "";
     this.commandDraft = "";
     this.commandDraftKey = "";
-    this.editingField = null; // "prompt" | "label" | "command" | null
+    this.editingField = null; // "prompt" | "label" | "command" | "task" | null
     this.inspectCache = {}; // address -> InspectResponse
     this.doctorReport = null;
+    this.homeSnap = shared("cockpit.home") ?? null;
+    this.taskDraft = "";
+    this.taskPriority = "normal";
+    this.taskProject = "";
+    this.taskFilter = "pending"; // "pending" | "all" | "done"
+    this.inspectorTab = "agent"; // "agent" | "home"
     this.handle = cx.focus_handle();
 
     const role = props()?.role ?? "fleet";
     if (role === "fleet") {
       this.refreshCockpit(cx, false);
       this.fetchSupervisorStatus(cx);
+      this.fetchHomeSnapshot(cx);
       cx.timer.every(5000, (cx) => this.refreshCockpit(cx, false));
       cx.timer.every(12000, (cx) => this.tickSupervisor(cx));
+    } else if (role === "home") {
+      this.fetchHomeSnapshot(cx);
+      if (!shared("supervisor.snapshot")) {
+        this.fetchSupervisorStatus(cx);
+      }
+      cx.timer.every(8000, (cx) => this.fetchHomeSnapshot(cx));
     } else if (role === "inspector") {
       this.refreshInspector(cx);
+      this.fetchHomeSnapshot(cx);
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
       }
@@ -680,6 +840,172 @@ export default class CockpitMod extends View {
     hc(["send", address, text]);
   }
 
+  fetchHomeSnapshot(cx) {
+    if (this.fetchingHome) return;
+    this.fetchingHome = true;
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("cockpit", ["home", "--json"], {
+          timeout: 8000,
+        });
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          this.homeSnap = parsed;
+          setShared("cockpit.home", parsed);
+        }
+      } catch (_e) {
+        // Fallback smoothly to live Herdr spaces() / agents()
+      } finally {
+        this.fetchingHome = false;
+        cx.notify();
+      }
+    });
+  }
+
+  runTaskCommand(cx, args, onSuccess) {
+    if (this.busy) return;
+    this.busy = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("cockpit", ["task", ...args], { timeout: 8000 });
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          this.homeSnap = parsed;
+          setShared("cockpit.home", parsed);
+          if (onSuccess) onSuccess(parsed);
+        } else if (res.stderr) {
+          this.note = res.stderr.trim();
+        }
+      } catch (e) {
+        this.note = `Task error: ${String(e)}`;
+      } finally {
+        this.busy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  addTaskGui(cx) {
+    const title = this.taskDraft.trim();
+    if (!title || this.busy) return;
+    const args = ["add", "--priority", this.taskPriority || "normal"];
+    if (this.taskProject && this.taskProject !== "Geral") {
+      args.push("--project", this.taskProject);
+    }
+    args.push("--json", title);
+    this.taskDraft = "";
+    this.editingField = null;
+    this.runTaskCommand(cx, args, () => {
+      this.note = `Tarefa adicionada: ${ellipsize(title, 36)}`;
+    });
+  }
+
+  toggleTaskGui(cx, id) {
+    if (!id) return;
+    this.runTaskCommand(cx, ["toggle", id, "--json"]);
+  }
+
+  removeTaskGui(cx, id) {
+    if (!id) return;
+    this.runTaskCommand(cx, ["remove", id, "--json"]);
+  }
+
+  clearDoneTasksGui(cx) {
+    this.runTaskCommand(cx, ["clear-done", "--json"], () => {
+      this.note = "Tarefas concluídas removidas";
+    });
+  }
+
+  handleKeyDown(e, cx, agent = null) {
+    if (!this.editingField) return;
+    const m = e.modifiers;
+    if (e.key === "escape") {
+      this.editingField = null;
+    } else if (e.key === "enter") {
+      if (this.editingField === "task") {
+        this.addTaskGui(cx);
+      } else if (this.editingField === "command" && agent) {
+        this.approveActionCard(cx, agent.address);
+      } else if (this.editingField === "prompt" && agent) {
+        this.sendPromptGui(cx, agent.address);
+      } else if (this.editingField === "label" && agent) {
+        this.applyLabelGui(
+          cx,
+          agent.address,
+          this.labelKey,
+          this.labelValue.trim()
+        );
+      }
+    } else if (e.key === "backspace") {
+      if (this.editingField === "task") {
+        this.taskDraft = this.taskDraft.slice(0, -1);
+      } else if (this.editingField === "command") {
+        this.commandDraft = this.commandDraft.slice(0, -1);
+      } else if (this.editingField === "prompt") {
+        this.promptText = this.promptText.slice(0, -1);
+      } else {
+        this.labelValue = this.labelValue.slice(0, -1);
+      }
+    } else if (e.key_char && !m?.control && !m?.platform) {
+      if (this.editingField === "task") {
+        this.taskDraft += e.key_char;
+      } else if (this.editingField === "command") {
+        this.commandDraft += e.key_char;
+      } else if (this.editingField === "prompt") {
+        this.promptText += e.key_char;
+      } else {
+        this.labelValue += e.key_char;
+      }
+    } else {
+      return;
+    }
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  sectionTitle(t, title, subtitleOrCount = null) {
+    return h_flex()
+      .pt(10)
+      .pb(5)
+      .gap(6)
+      .items_center()
+      .justify_between()
+      .border_b(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .child(div().size(6).rounded(3).bg(t.accent))
+          .child(
+            div()
+              .text_size(11.5)
+              .font_semibold()
+              .text_color(t.foreground)
+              .child(title)
+          )
+      )
+      .when(subtitleOrCount !== null && subtitleOrCount !== undefined, (el) =>
+        el.child(
+          div()
+            .text_size(11)
+            .text_color(t.muted)
+            .child(String(subtitleOrCount))
+        )
+      );
+  }
+
+  cardBox(t) {
+    return v_flex()
+      .p(11)
+      .gap(7)
+      .rounded(8)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.surface);
+  }
+
   badge(t, text, fg, bg) {
     return div()
       .flex_none()
@@ -752,6 +1078,9 @@ export default class CockpitMod extends View {
           : "Supervisor: Idle (0 MB)");
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
+    );
+    const homeHidden = Boolean(
+      findNode(layout(), "cockpit-home")?.hidden
     );
     const w = win();
     const macNoFs = w?.platform === "macos" && !w?.fullscreen;
@@ -879,6 +1208,15 @@ export default class CockpitMod extends View {
       .child(
         this.actionBtn(
           t,
+          "ck-pill-home",
+          "🏠 Home",
+          () => run("layout.toggle", { id: "cockpit-home" }),
+          !homeHidden
+        )
+      )
+      .child(
+        this.actionBtn(
+          t,
           "ck-pill-inspector",
           inspectorHidden ? "Inspector ◁" : "Inspector ▷",
           () => run("layout.toggle", { id: "cockpit-inspector" }),
@@ -911,18 +1249,24 @@ export default class CockpitMod extends View {
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
     );
+    const homeHidden = Boolean(
+      findNode(layout(), "cockpit-home")?.hidden
+    );
 
     const filterChip = (key, label, count) => {
       const on = this.filterTab === key;
       return h_flex()
         .id(`ck-filter-${key}`)
-        .h(23)
-        .px(7)
-        .gap(4)
+        .h(25)
+        .px(8)
+        .gap(5)
         .items_center()
-        .rounded(5)
-        .bg(on ? t.selected : t.chrome)
+        .rounded(12)
+        .border(1)
+        .border_color(on ? t.accent : t.border)
+        .bg(on ? t.selected : t.surface)
         .text_size(11)
+        .font_semibold()
         .text_color(on ? t.foreground : t.muted)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -932,7 +1276,16 @@ export default class CockpitMod extends View {
         })
         .child(label)
         .when(count !== null, (el) =>
-          el.child(div().text_size(10).text_color(t.dim).child(String(count)))
+          el.child(
+            div()
+              .px(5)
+              .py(1)
+              .rounded(8)
+              .bg(on ? t.accent + "28" : t.raised)
+              .text_size(10.5)
+              .text_color(on ? t.foreground : t.muted)
+              .child(String(count))
+          )
         );
     };
 
@@ -941,13 +1294,27 @@ export default class CockpitMod extends View {
       const isBlocked = a.status === "blocked";
       const isWorking = a.status === "working";
       const isDone = a.status === "done";
+      const statusBadgeText = isBlocked
+        ? "⚠ NEEDS YOU"
+        : isWorking
+          ? "● WORKING"
+          : isDone
+            ? "✓ DONE"
+            : "○ IDLE";
       const statusColor = isBlocked
         ? t.blocked
         : isWorking
           ? t.working
           : isDone
             ? t.done
-            : t.dim;
+            : t.muted;
+      const statusBg = isBlocked
+        ? t.blocked + "24"
+        : isWorking
+          ? t.working + "22"
+          : isDone
+            ? t.done + "22"
+            : t.raised;
       const pr = a.context?.pull_request;
       const issue = a.context?.issues?.[0]?.key ?? a.labels?.["cockpit.issue"];
       const tier = a.correlation_tier;
@@ -956,13 +1323,13 @@ export default class CockpitMod extends View {
       const supLc = a.sup_lifecycle
         ? this.lifecycleColors(t, a.sup_lifecycle)
         : null;
+      const cardTitle = a.space_name ? `${a.space_name} · ${a.name}` : a.name;
 
       return v_flex()
         .id(`ck-row-${a.address}`)
         .mx(8)
-        .px(9)
-        .py(7)
-        .gap(4)
+        .p(11)
+        .gap(7)
         .rounded(8)
         .border(1)
         .border_color(
@@ -982,22 +1349,22 @@ export default class CockpitMod extends View {
             .gap(6)
             .items_center()
             .when(Boolean(a.program?.icon), (el) =>
-              el.child(programIcon(a.program, 14, t.foreground))
+              el.child(programIcon(a.program, 15, t.foreground))
             )
             .child(
               div()
                 .flex_1()
                 .min_w(0)
-                .truncate()
-                .text_size(12.5)
+                .text_size(13)
                 .font_semibold()
                 .text_color(t.foreground)
-                .child(
-                  a.space_name ? `${a.space_name} · ${a.name}` : a.name
-                )
+                .child(ellipsize(cardTitle, 30))
             )
             .child(
-              div().text_size(10.5).text_color(t.dim).child(a.address)
+              div()
+                .text_size(11)
+                .text_color(t.muted)
+                .child(a.address)
             )
             .when(isWorking, (el) =>
               el.child(
@@ -1007,9 +1374,7 @@ export default class CockpitMod extends View {
                   .spin(900)
               )
             )
-            .when(!isWorking, (el) =>
-              el.child(div().size(7).rounded(4).bg(statusColor))
-            )
+            .child(this.badge(t, statusBadgeText, statusColor, statusBg))
         )
         .when(
           Boolean(a.sup_lifecycle || hasAlert || a.audit_badge),
@@ -1044,12 +1409,12 @@ export default class CockpitMod extends View {
         .when(isBlocked, (el) =>
           el.child(
             h_flex()
-              .gap(5)
+              .gap(6)
               .items_center()
               .child(
                 this.badge(
                   t,
-                  `NEEDS YOU · ${(a.kind ?? "question").toUpperCase()}`,
+                  (a.kind ?? "question").toUpperCase(),
                   t.blocked,
                   t.blocked + "24"
                 )
@@ -1059,10 +1424,9 @@ export default class CockpitMod extends View {
                   div()
                     .flex_1()
                     .min_w(0)
-                    .truncate()
-                    .text_size(11)
+                    .text_size(12)
                     .text_color(t.foreground)
-                    .child(a.message)
+                    .child(ellipsize(a.message, 52))
                 )
               )
           )
@@ -1070,35 +1434,41 @@ export default class CockpitMod extends View {
         .when(Boolean(a.rolling_summary), (el) =>
           el.child(
             div()
-              .text_size(11)
+              .text_size(12)
               .text_color(t.muted)
-              .child(a.rolling_summary)
+              .child(ellipsize(a.rolling_summary, 96))
           )
         )
         .when(a.blocked_children?.length > 0, (el) =>
           el.child(
             div()
-              .text_size(10.5)
+              .text_size(11)
               .text_color(t.blocked)
               .child(
-                `↳ Subagent blocked: ${a.blocked_children.join(", ")}`
+                ellipsize(
+                  `↳ Subagent blocked: ${a.blocked_children.join(", ")}`,
+                  64
+                )
               )
           )
         )
         .child(
           h_flex()
-            .gap(5)
+            .gap(6)
             .items_center()
             .text_size(11)
             .text_color(t.muted)
             .when(Boolean(a.branch), (el) =>
               el.child(
-                div().flex_1().min_w(0).truncate().child(`⎇ ${a.branch}`)
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .child(`⎇ ${ellipsize(a.branch, 32)}`)
               )
             )
             .when(!a.branch, (el) =>
               el.child(
-                div().flex_1().text_color(t.dim).child("Local / No branch")
+                div().flex_1().text_color(t.muted).child("Local / No branch")
               )
             )
             .when(Boolean(issue), (el) =>
@@ -1115,7 +1485,7 @@ export default class CockpitMod extends View {
               )
             )
             .when(!pr && tier === "local_only", (el) =>
-              el.child(this.badge(t, "Local", t.dim, t.raised))
+              el.child(this.badge(t, "Local", t.muted, t.raised))
             )
         );
     };
@@ -1137,20 +1507,29 @@ export default class CockpitMod extends View {
       .child(
         // Header + GUI actions bar
         h_flex()
-          .h(34)
+          .h(38)
           .px(10)
-          .gap(6)
+          .gap(5)
           .items_center()
           .border_b(1)
           .border_color(t.border)
           .child(
             div()
-              .text_size(12)
+              .text_size(13)
               .font_semibold()
               .text_color(t.foreground)
               .child("COCKPIT FLEET")
           )
           .child(div().flex_1())
+          .child(
+            this.actionBtn(
+              t,
+              "ck-btn-home",
+              "🏠 Home",
+              () => run("layout.toggle", { id: "cockpit-home" }),
+              !homeHidden
+            )
+          )
           .child(
             this.actionBtn(
               t,
@@ -1181,14 +1560,14 @@ export default class CockpitMod extends View {
       .when(this.showLauncher, (el) =>
         el.child(
           v_flex()
-            .p(8)
+            .p(10)
             .gap(6)
             .bg(t.raised)
             .border_b(1)
             .border_color(t.border)
             .child(
               div()
-                .text_size(11)
+                .text_size(11.5)
                 .text_color(t.muted)
                 .child("Launch in active space:")
             )
@@ -1221,9 +1600,9 @@ export default class CockpitMod extends View {
       .child(
         // Filter strip
         h_flex()
-          .h(29)
+          .h(34)
           .px(8)
-          .gap(4)
+          .gap(5)
           .items_center()
           .border_b(1)
           .border_color(t.border)
@@ -1238,32 +1617,91 @@ export default class CockpitMod extends View {
           .flex_1()
           .min_h(0)
           .overflow_y_scrollbar()
-          .py(6)
-          .gap(6)
+          .py(8)
+          .gap(7)
           .when(merged.length === 0, (el) =>
             el.child(
-              v_flex()
-                .p(14)
-                .gap(8)
-                .items_center()
-                .text_size(12)
-                .text_color(t.muted)
-                .child("No coding agents running yet.")
+              this.cardBox(t)
+                .mx(8)
                 .child(
-                  this.actionBtn(
-                    t,
-                    "ck-empty-claude",
-                    "Start Claude Code",
-                    () => {
-                      const sp = spaces().find((s) => s.active);
-                      run("tab.new", {
-                        space: sp?.id,
-                        name: "claude",
-                        argv: ["claude"],
-                      });
-                    },
-                    true
-                  )
+                  div()
+                    .text_size(13)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child("Nenhum agente ativo no momento")
+                )
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.muted)
+                    .child(
+                      "Shells comuns (zsh, bash, fish) ficam ocultos automaticamente para manter o foco nos seus agentes de código."
+                    )
+                )
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .flex_wrap()
+                    .pt(2)
+                    .child(
+                      this.actionBtn(
+                        t,
+                        "ck-empty-home",
+                        "🏠 Home Overview",
+                        () => run("layout.toggle", { id: "cockpit-home" }),
+                        true
+                      )
+                    )
+                    .child(
+                      this.actionBtn(
+                        t,
+                        "ck-empty-claude",
+                        "Claude Code",
+                        () => {
+                          const sp = spaces().find((s) => s.active);
+                          run("tab.new", {
+                            space: sp?.id,
+                            name: "claude",
+                            argv: ["claude"],
+                          });
+                        }
+                      )
+                    )
+                    .child(
+                      this.actionBtn(
+                        t,
+                        "ck-empty-opencode",
+                        "OpenCode",
+                        () => {
+                          const sp = spaces().find((s) => s.active);
+                          run("tab.new", {
+                            space: sp?.id,
+                            name: "opencode",
+                            argv: ["opencode"],
+                          });
+                        }
+                      )
+                    )
+                    .child(
+                      this.actionBtn(t, "ck-empty-pi", "Pi", () => {
+                        const sp = spaces().find((s) => s.active);
+                        run("tab.new", {
+                          space: sp?.id,
+                          name: "pi",
+                          argv: ["pi"],
+                        });
+                      })
+                    )
+                    .child(
+                      this.actionBtn(t, "ck-empty-codex", "Codex", () => {
+                        const sp = spaces().find((s) => s.active);
+                        run("tab.new", {
+                          space: sp?.id,
+                          name: "codex",
+                          argv: ["codex", "--no-daemon"],
+                        });
+                      })
+                    )
                 )
             )
           )
@@ -1296,6 +1734,735 @@ export default class CockpitMod extends View {
           )
           .children(showFinished.map(renderAgentCard))
       );
+  }
+
+  renderHomeBody(cx) {
+    const t = theme();
+    const homeSnap = this.homeSnap ?? shared("cockpit.home") ?? null;
+    const snap = shared("cockpit.snapshot");
+    const supSnap = shared("supervisor.snapshot");
+    const liveSpaces = spaces();
+    const allTerms = terminals();
+    const liveAgents = agents();
+    const mergedFleet = mergeFleetRows(liveAgents, allTerms, snap, supSnap);
+
+    const projects = buildProjectsList(
+      homeSnap,
+      liveSpaces,
+      allTerms,
+      snap,
+      supSnap
+    );
+
+    const tasks = homeSnap?.tasks ?? [];
+    const totalTasksCount = tasks.length;
+    const doneTasksCount = tasks.filter((tk) => tk.done).length;
+    const pendingTasksCount = totalTasksCount - doneTasksCount;
+    const pct =
+      totalTasksCount > 0
+        ? Math.round((doneTasksCount / totalTasksCount) * 100)
+        : 0;
+
+    const activeProjectsCount = projects.filter(
+      (p) => p.activeAgents > 0 || p.blockedAgents > 0 || p.isActiveSpace
+    ).length;
+    const workingAgentsCount = mergedFleet.filter(
+      (a) => a.status === "working"
+    ).length;
+    const blockedAgents = mergedFleet.filter(
+      (a) => a.status === "blocked" || Boolean(a.action_card)
+    );
+    const blockedAgentsCount = blockedAgents.length;
+    const supModeLabel = supSnap?.mode_label ?? "Semi-Auto";
+
+    const activeSpace = liveSpaces.find((s) => s.active);
+    const projectChoices = [
+      "Geral",
+      ...Array.from(new Set(projects.map((p) => p.name).filter(Boolean))),
+    ];
+    const currentProjectTag =
+      this.taskProject || activeSpace?.name || "Geral";
+
+    const filteredTasks = tasks.filter((tk) => {
+      if (this.taskFilter === "pending") return !tk.done;
+      if (this.taskFilter === "done") return Boolean(tk.done);
+      return true;
+    });
+
+    const kpiCard = (label, value, sub, accentColor = t.foreground) =>
+      v_flex()
+        .flex_1()
+        .min_w(0)
+        .p(11)
+        .gap(4)
+        .rounded(8)
+        .border(1)
+        .border_color(t.border)
+        .bg(t.surface)
+        .child(
+          div()
+            .text_size(11)
+            .font_semibold()
+            .text_color(t.muted)
+            .child(label)
+        )
+        .child(
+          div()
+            .text_size(14)
+            .font_semibold()
+            .text_color(accentColor)
+            .child(ellipsize(value, 26))
+        )
+        .child(
+          div()
+            .text_size(11)
+            .text_color(t.muted)
+            .child(ellipsize(sub, 34))
+        );
+
+    const priorityMeta = (prio) => {
+      if (prio === "high") {
+        return { label: "ALTA", fg: t.blocked, bg: t.blocked + "24" };
+      }
+      if (prio === "low") {
+        return { label: "BAIXA", fg: t.muted, bg: t.raised };
+      }
+      return { label: "NORMAL", fg: t.accent, bg: t.accent + "22" };
+    };
+
+    const projectStatusMeta = (st) => {
+      switch (st) {
+        case "blocked":
+          return { text: "⚠ BLOQUEADO", fg: t.blocked, bg: t.blocked + "24" };
+        case "active":
+          return { text: "● EM DEV", fg: t.working, bg: t.working + "22" };
+        case "open_tasks":
+          return { text: "📋 COM TAREFAS", fg: t.accent, bg: t.accent + "22" };
+        default:
+          return { text: "○ IDLE", fg: t.muted, bg: t.raised };
+      }
+    };
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .overflow_y_scrollbar()
+      .p(12)
+      .gap(10)
+      // 1. KPI Summary Strip (2x2 grid)
+      .child(
+        v_flex()
+          .gap(7)
+          .child(
+            h_flex()
+              .gap(7)
+              .child(
+                kpiCard(
+                  "PROJETOS",
+                  `${projects.length} (${activeProjectsCount} ativos)`,
+                  "Spaces & repositórios",
+                  t.foreground
+                )
+              )
+              .child(
+                kpiCard(
+                  "AGENTES",
+                  `${workingAgentsCount} rodando`,
+                  blockedAgentsCount > 0
+                    ? `${blockedAgentsCount} bloqueados`
+                    : `${mergedFleet.length} na frota`,
+                  blockedAgentsCount > 0 ? t.blocked : t.working
+                )
+              )
+          )
+          .child(
+            h_flex()
+              .gap(7)
+              .child(
+                kpiCard(
+                  "TAREFAS DO DIA",
+                  `${doneTasksCount}/${totalTasksCount} (${pct}%)`,
+                  `${pendingTasksCount} pendentes`,
+                  pendingTasksCount > 0 ? t.accent : t.done
+                )
+              )
+              .child(
+                kpiCard(
+                  "SUPERVISOR",
+                  ellipsize(supModeLabel, 18),
+                  "lfm3:1.7b · CPU",
+                  t.foreground
+                )
+              )
+          )
+      )
+      // 2. Section: TAREFAS DO DIA
+      .child(
+        this.sectionTitle(
+          t,
+          "📋 TAREFAS DO DIA",
+          `${pendingTasksCount} pendentes`
+        )
+      )
+      .child(
+        this.cardBox(t)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .id("ck-task-input")
+                  .flex_1()
+                  .min_w(0)
+                  .px(9)
+                  .py(6)
+                  .rounded(6)
+                  .border(1)
+                  .border_color(
+                    this.editingField === "task" ? t.accent : t.border
+                  )
+                  .bg(t.background)
+                  .text_size(12)
+                  .text_color(this.taskDraft ? t.foreground : t.muted)
+                  .cursor_text()
+                  .on_click((_e, cx) => {
+                    this.editingField = "task";
+                    this.handle.focus();
+                    cx.notify();
+                  })
+                  .child(
+                    this.taskDraft
+                      ? ellipsize(this.taskDraft, 56) +
+                          (this.editingField === "task" ? "▏" : "")
+                      : (this.editingField === "task" ? "▏" : "") +
+                          "Adicionar tarefa do dia (ex: Corrigir bug no login)…"
+                  )
+              )
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-task-add",
+                  "+ Adicionar ↵",
+                  (_e, cx) => this.addTaskGui(cx),
+                  Boolean(this.taskDraft.trim())
+                )
+              )
+          )
+          // Priority & Project tag bar
+          .child(
+            h_flex()
+              .gap(5)
+              .flex_wrap()
+              .items_center()
+              .child(
+                div()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child("Prioridade:")
+              )
+              .children(
+                [
+                  ["high", "Alta"],
+                  ["normal", "Normal"],
+                  ["low", "Baixa"],
+                ].map(([key, label]) => {
+                  const on = this.taskPriority === key;
+                  return h_flex()
+                    .id(`ck-task-prio-${key}`)
+                    .h(22)
+                    .px(7)
+                    .items_center()
+                    .rounded(10)
+                    .border(1)
+                    .border_color(on ? t.accent : t.border)
+                    .bg(on ? t.selected : t.raised)
+                    .text_size(11)
+                    .text_color(on ? t.foreground : t.muted)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      this.taskPriority = key;
+                      cx.notify();
+                    })
+                    .child(label);
+                })
+              )
+              .child(div().flex_1())
+              .child(
+                h_flex()
+                  .id("ck-task-project-cycle")
+                  .h(22)
+                  .px(8)
+                  .gap(4)
+                  .items_center()
+                  .rounded(10)
+                  .border(1)
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .text_size(11)
+                  .text_color(t.accent)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_click((_e, cx) => {
+                    const idx = projectChoices.indexOf(currentProjectTag);
+                    const next =
+                      projectChoices[(idx + 1) % projectChoices.length] ??
+                      "Geral";
+                    this.taskProject = next;
+                    cx.notify();
+                  })
+                  .child(`📁 ${ellipsize(currentProjectTag, 18)}`)
+              )
+          )
+          // Filter strip
+          .child(
+            h_flex()
+              .gap(5)
+              .flex_wrap()
+              .items_center()
+              .children(
+                [
+                  ["pending", `Pendentes (${pendingTasksCount})`],
+                  ["all", `Todas (${totalTasksCount})`],
+                  ["done", `Concluídas (${doneTasksCount})`],
+                ].map(([key, label]) => {
+                  const on = this.taskFilter === key;
+                  return h_flex()
+                    .id(`ck-task-filter-${key}`)
+                    .h(22)
+                    .px(7)
+                    .items_center()
+                    .rounded(10)
+                    .border(1)
+                    .border_color(on ? t.accent : t.border)
+                    .bg(on ? t.selected : t.chrome)
+                    .text_size(11)
+                    .text_color(on ? t.foreground : t.muted)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      this.taskFilter = key;
+                      cx.notify();
+                    })
+                    .child(label);
+                })
+              )
+              .child(div().flex_1())
+              .when(doneTasksCount > 0, (el) =>
+                el.child(
+                  this.actionBtn(t, "ck-task-clear-done", "Limpar concluídas", (_e, cx) =>
+                    this.clearDoneTasksGui(cx)
+                  )
+                )
+              )
+          )
+          // Task rows
+          .when(filteredTasks.length === 0, (el) =>
+            el.child(
+              div()
+                .py(6)
+                .text_size(12)
+                .text_color(t.muted)
+                .child(
+                  this.taskFilter === "done"
+                    ? "Nenhuma tarefa concluída ainda."
+                    : "Nenhuma tarefa pendente. Adicione acima o que vai atacar hoje!"
+                )
+            )
+          )
+          .children(
+            filteredTasks.map((tk) => {
+              const pm = priorityMeta(tk.priority);
+              const projObj = tk.project
+                ? projects.find(
+                    (p) =>
+                      p.name.toLowerCase() ===
+                      String(tk.project).trim().toLowerCase()
+                  )
+                : null;
+              return h_flex()
+                .id(`ck-task-row-${tk.id}`)
+                .p(8)
+                .gap(7)
+                .items_center()
+                .rounded(6)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.raised)
+                .child(
+                  div()
+                    .id(`ck-task-toggle-${tk.id}`)
+                    .px(5)
+                    .py(2)
+                    .rounded(4)
+                    .bg(tk.done ? t.done + "24" : t.surface)
+                    .border(1)
+                    .border_color(tk.done ? t.done : t.border)
+                    .text_size(11.5)
+                    .font_semibold()
+                    .text_color(tk.done ? t.done : t.muted)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => this.toggleTaskGui(cx, tk.id))
+                    .child(tk.done ? "[✓]" : "[ ]")
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .text_size(12.5)
+                    .text_color(tk.done ? t.dim : t.foreground)
+                    .child(
+                      (tk.done ? "✓ " : "") + ellipsize(tk.title, 60)
+                    )
+                )
+                .child(this.badge(t, pm.label, pm.fg, pm.bg))
+                .when(Boolean(tk.project), (el) =>
+                  el.child(
+                    div()
+                      .id(`ck-task-proj-${tk.id}`)
+                      .px(6)
+                      .py(1)
+                      .rounded(4)
+                      .bg(t.surface)
+                      .border(1)
+                      .border_color(t.border)
+                      .text_size(10.5)
+                      .text_color(t.accent)
+                      .cursor_pointer()
+                      .on_click(() => {
+                        if (projObj?.spaceId) {
+                          run("space.focus", { space: projObj.spaceId });
+                        }
+                      })
+                      .child(ellipsize(tk.project, 16))
+                  )
+                )
+                .child(
+                  div()
+                    .id(`ck-task-del-${tk.id}`)
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .text_size(12)
+                    .text_color(t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.blocked))
+                    .on_click((_e, cx) => this.removeTaskGui(cx, tk.id))
+                    .child("×")
+                );
+            })
+          )
+      )
+      // 3. Section: PROJETOS EM DESENVOLVIMENTO
+      .child(
+        this.sectionTitle(
+          t,
+          "🚀 PROJETOS EM DESENVOLVIMENTO",
+          `${projects.length} projetos`
+        )
+      )
+      .when(projects.length === 0, (el) =>
+        el.child(
+          this.cardBox(t).child(
+            div()
+              .text_size(12)
+              .text_color(t.muted)
+              .child("Nenhum Space ou projeto git detectado ainda.")
+          )
+        )
+      )
+      .children(
+        projects.map((proj, idx) => {
+          const sm = projectStatusMeta(proj.status);
+          return this.cardBox(t)
+            .id(`ck-home-proj-${idx}`)
+            .border_color(
+              proj.status === "blocked"
+                ? t.blocked
+                : proj.isActiveSpace
+                  ? t.accent
+                  : t.border
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .flex_wrap()
+                .child(
+                  div()
+                    .text_size(13)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(ellipsize(proj.name, 26))
+                )
+                .when(proj.isActiveSpace, (el) =>
+                  el.child(this.badge(t, "ATIVO", t.accent, t.accent + "24"))
+                )
+                .child(this.badge(t, sm.text, sm.fg, sm.bg))
+                .when(Boolean(proj.branch), (el) =>
+                  el.child(
+                    this.badge(
+                      t,
+                      `⎇ ${ellipsize(proj.branch, 22)}`,
+                      t.muted,
+                      t.raised
+                    )
+                  )
+                )
+            )
+            .when(Boolean(proj.lastCommit || proj.path), (el) =>
+              el.child(
+                div()
+                  .text_size(11.5)
+                  .text_color(t.muted)
+                  .child(ellipsize(proj.lastCommit || proj.path, 68))
+              )
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .flex_wrap()
+                .child(
+                  this.badge(
+                    t,
+                    `${proj.activeAgents} agentes`,
+                    proj.activeAgents > 0 ? t.working : t.muted,
+                    t.raised
+                  )
+                )
+                .child(
+                  this.badge(
+                    t,
+                    `${proj.openTasks} tarefas`,
+                    proj.openTasks > 0 ? t.accent : t.muted,
+                    t.raised
+                  )
+                )
+                .when(proj.dirtyCount > 0, (el) =>
+                  el.child(
+                    this.badge(
+                      t,
+                      `${proj.dirtyCount} mod.`,
+                      t.blocked,
+                      t.blocked + "22"
+                    )
+                  )
+                )
+                .child(div().flex_1())
+                .when(Boolean(proj.spaceId), (el) =>
+                  el.child(
+                    this.actionBtn(t, `ck-proj-open-${idx}`, "Abrir Space", () =>
+                      run("space.focus", { space: proj.spaceId })
+                    )
+                  )
+                )
+                .child(
+                  this.actionBtn(
+                    t,
+                    `ck-proj-task-${idx}`,
+                    "+ Tarefa",
+                    (_e, cx) => {
+                      this.taskProject = proj.name;
+                      this.editingField = "task";
+                      this.handle.focus();
+                      cx.notify();
+                    }
+                  )
+                )
+                .child(
+                  this.actionBtn(
+                    t,
+                    `ck-proj-agent-${idx}`,
+                    "+ Agente",
+                    () => {
+                      const targetSpace =
+                        proj.spaceId ?? activeSpace?.id ?? undefined;
+                      run("tab.new", {
+                        space: targetSpace,
+                        name: "claude",
+                        argv: ["claude"],
+                      });
+                    },
+                    true
+                  )
+                )
+            );
+        })
+      )
+      // 4. Section: ATENÇÃO IMEDIATA & FROTA
+      .when(blockedAgents.length > 0, (el) =>
+        el
+          .child(
+            this.sectionTitle(
+              t,
+              "⚡ ATENÇÃO IMEDIATA & FROTA",
+              `${blockedAgents.length} aguardando`
+            )
+          )
+          .children(
+            blockedAgents.map((a) =>
+              this.cardBox(t)
+                .id(`ck-home-alert-${a.address}`)
+                .border_color(t.blocked)
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .justify_between()
+                    .child(
+                      div()
+                        .text_size(13)
+                        .font_semibold()
+                        .text_color(t.foreground)
+                        .child(
+                          ellipsize(
+                            a.space_name
+                              ? `${a.space_name} · ${a.name} (${a.address})`
+                              : `${a.name} (${a.address})`,
+                            38
+                          )
+                        )
+                    )
+                    .child(
+                      this.badge(
+                        t,
+                        "⚠ NEEDS YOU",
+                        t.blocked,
+                        t.blocked + "24"
+                      )
+                    )
+                )
+                .when(
+                  Boolean(
+                    a.action_card?.reason_for_operator ||
+                      a.message ||
+                      a.rolling_summary
+                  ),
+                  (el2) =>
+                    el2.child(
+                      div()
+                        .text_size(12)
+                        .text_color(t.muted)
+                        .child(
+                          ellipsize(
+                            a.action_card?.reason_for_operator ||
+                              a.message ||
+                              a.rolling_summary,
+                            96
+                          )
+                        )
+                    )
+                )
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .justify_end()
+                    .child(
+                      this.actionBtn(
+                        t,
+                        `ck-home-inspect-${a.address}`,
+                        "Abrir no Inspector ▷",
+                        (_e, cx) => {
+                          setShared("cockpit.selected", a.address);
+                          this.inspectorTab = "agent";
+                          if (
+                            findNode(layout(), "cockpit-inspector")?.hidden
+                          ) {
+                            run("layout.toggle", { id: "cockpit-inspector" });
+                          }
+                          cx.notify();
+                        },
+                        true
+                      )
+                    )
+                )
+            )
+          )
+      );
+  }
+
+  renderHome(cx) {
+    const t = theme();
+    const inspectorHidden = Boolean(
+      findNode(layout(), "cockpit-inspector")?.hidden
+    );
+
+    return v_flex()
+      .id("ck-home-root")
+      .size_full()
+      .track_focus(this.handle)
+      .bg(t.chrome)
+      .text_color(t.foreground)
+      .rounded(10)
+      .border(1)
+      .border_color(t.border)
+      .overflow_hidden()
+      .on_key_down((e, cx) => this.handleKeyDown(e, cx, null))
+      .child(
+        // Top Header Bar
+        h_flex()
+          .h(38)
+          .px(12)
+          .gap(6)
+          .items_center()
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .text_size(13)
+              .font_semibold()
+              .text_color(t.foreground)
+              .child(ellipsize("🏠 COCKPIT HOME · RESUMO DO DIA", 34))
+          )
+          .child(
+            this.actionBtn(t, "ck-home-refresh", "↻ Atualizar", (_e, cx) => {
+              this.fetchHomeSnapshot(cx);
+              this.refreshCockpit(cx, true);
+            })
+          )
+          .child(
+            this.actionBtn(
+              t,
+              "ck-home-inspector",
+              inspectorHidden ? "Inspector ◁" : "Inspector ▷",
+              () => run("layout.toggle", { id: "cockpit-inspector" }),
+              !inspectorHidden
+            )
+          )
+          .child(
+            this.actionBtn(t, "ck-home-close", "×", () =>
+              run("layout.hide", { id: "cockpit-home" })
+            )
+          )
+      )
+      .when(Boolean(this.note), (el) =>
+        el.child(
+          h_flex()
+            .px(12)
+            .py(6)
+            .bg(t.raised)
+            .border_b(1)
+            .border_color(t.border)
+            .text_size(11.5)
+            .text_color(t.accent)
+            .justify_between()
+            .child(ellipsize(this.note, 56))
+            .child(
+              div()
+                .id("ck-home-clear-note")
+                .cursor_pointer()
+                .text_color(t.muted)
+                .on_click((_e, cx) => {
+                  this.note = "";
+                  cx.notify();
+                })
+                .child("dismiss")
+            )
+        )
+      )
+      .child(this.renderHomeBody(cx));
   }
 
   renderInspector(cx) {
@@ -1381,23 +2548,10 @@ export default class CockpitMod extends View {
       .map((line) => (line.length > 96 ? `${line.slice(0, 95)}…` : line))
       .join("\n");
 
-    const sectionTitle = (title) =>
-      div()
-        .pt(8)
-        .pb(3)
-        .text_size(10.5)
-        .font_semibold()
-        .text_color(t.dim)
-        .child(title);
+    const sectionTitle = (title, subtitle = null) =>
+      this.sectionTitle(t, title, subtitle);
 
-    const cardBox = () =>
-      v_flex()
-        .p(10)
-        .gap(6)
-        .rounded(8)
-        .border(1)
-        .border_color(t.border)
-        .bg(t.surface);
+    const cardBox = () => this.cardBox(t);
 
     const pr = detailed?.context?.pull_request;
     const issues = detailed?.context?.issues ?? [];
@@ -1415,46 +2569,7 @@ export default class CockpitMod extends View {
       .border(1)
       .border_color(t.border)
       .overflow_hidden()
-      .on_key_down((e, cx) => {
-        if (!this.editingField) return;
-        const m = e.modifiers;
-        if (e.key === "escape") {
-          this.editingField = null;
-        } else if (e.key === "enter") {
-          if (this.editingField === "command" && agent) {
-            this.approveActionCard(cx, agent.address);
-          } else if (this.editingField === "prompt" && agent) {
-            this.sendPromptGui(cx, agent.address);
-          } else if (this.editingField === "label" && agent) {
-            this.applyLabelGui(
-              cx,
-              agent.address,
-              this.labelKey,
-              this.labelValue.trim()
-            );
-          }
-        } else if (e.key === "backspace") {
-          if (this.editingField === "command") {
-            this.commandDraft = this.commandDraft.slice(0, -1);
-          } else if (this.editingField === "prompt") {
-            this.promptText = this.promptText.slice(0, -1);
-          } else {
-            this.labelValue = this.labelValue.slice(0, -1);
-          }
-        } else if (e.key_char && !m?.control && !m?.platform) {
-          if (this.editingField === "command") {
-            this.commandDraft += e.key_char;
-          } else if (this.editingField === "prompt") {
-            this.promptText += e.key_char;
-          } else {
-            this.labelValue += e.key_char;
-          }
-        } else {
-          return;
-        }
-        cx.stop_propagation();
-        cx.notify();
-      })
+      .on_key_down((e, cx) => this.handleKeyDown(e, cx, agent))
       .child(
         // Top bar
         h_flex()
@@ -1465,21 +2580,56 @@ export default class CockpitMod extends View {
           .border_b(1)
           .border_color(t.border)
           .child(
-            div()
-              .flex_1()
-              .truncate()
-              .text_size(12.5)
-              .font_semibold()
+            // [ 🏠 Home | 🔍 Inspector ] view toggle
+            h_flex()
+              .gap(3)
+              .items_center()
               .child(
-                agent
-                  ? `COCKPIT · ${agent.name} (${agent.address})`
-                  : "COCKPIT INSPECTOR"
+                this.actionBtn(
+                  t,
+                  "ck-ins-tab-home",
+                  "🏠 Home",
+                  (_e, cx) => {
+                    this.inspectorTab = "home";
+                    this.fetchHomeSnapshot(cx);
+                    cx.notify();
+                  },
+                  this.inspectorTab === "home"
+                )
+              )
+              .child(
+                this.actionBtn(
+                  t,
+                  "ck-ins-tab-agent",
+                  "🔍 Inspector",
+                  (_e, cx) => {
+                    this.inspectorTab = "agent";
+                    cx.notify();
+                  },
+                  this.inspectorTab === "agent"
+                )
               )
           )
           .child(
-            this.actionBtn(t, "ck-ins-refresh", "Refresh", (_e, cx) => {
+            div()
+              .flex_1()
+              .min_w(0)
+              .text_size(12.5)
+              .font_semibold()
+              .text_color(t.foreground)
+              .child(
+                this.inspectorTab === "home"
+                  ? ""
+                  : agent
+                    ? ellipsize(`${agent.name} (${agent.address})`, 24)
+                    : ""
+              )
+          )
+          .child(
+            this.actionBtn(t, "ck-ins-refresh", "↻", (_e, cx) => {
               this.refreshCockpit(cx, true);
               this.refreshInspector(cx);
+              this.fetchHomeSnapshot(cx);
             })
           )
           .child(
@@ -1501,15 +2651,15 @@ export default class CockpitMod extends View {
             .bg(t.raised)
             .border_b(1)
             .border_color(t.border)
-            .text_size(11)
+            .text_size(11.5)
             .text_color(t.accent)
             .justify_between()
-            .child(this.note)
+            .child(ellipsize(this.note, 56))
             .child(
               div()
                 .id("ck-clear-note")
                 .cursor_pointer()
-                .text_color(t.dim)
+                .text_color(t.muted)
                 .on_click((_e, cx) => {
                   this.note = "";
                   cx.notify();
@@ -1518,23 +2668,27 @@ export default class CockpitMod extends View {
             )
         )
       )
-      .child(
-        v_flex()
-          .flex_1()
-          .min_h(0)
-          .overflow_y_scrollbar()
-          .p(12)
-          .gap(8)
-          .when(!agent, (el) =>
-            el.child(
-              cardBox().child(
-                div()
-                  .text_size(12)
-                  .text_color(t.muted)
-                  .child("Select an agent or open a terminal to inspect its context.")
+      .when(this.inspectorTab === "home", (el) =>
+        el.child(this.renderHomeBody(cx))
+      )
+      .when(this.inspectorTab !== "home", (el) =>
+        el.child(
+          v_flex()
+            .flex_1()
+            .min_h(0)
+            .overflow_y_scrollbar()
+            .p(12)
+            .gap(8)
+            .when(!agent, (el2) =>
+              el2.child(
+                cardBox().child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.muted)
+                    .child("Select an agent or open a terminal to inspect its context.")
+                )
               )
             )
-          )
           .when(Boolean(agent), (el) =>
             el
               // 0. Supervisor Operator Action Card (top of inspector when pending)
@@ -1901,10 +3055,9 @@ export default class CockpitMod extends View {
                   )
                   .child(
                     div()
-                      .truncate()
-                      .text_size(11)
-                      .text_color(t.dim)
-                      .child(agent.cwd ?? "")
+                      .text_size(11.5)
+                      .text_color(t.muted)
+                      .child(ellipsize(agent.cwd ?? "", 58))
                   )
                   .child(
                     h_flex()
@@ -2027,10 +3180,11 @@ export default class CockpitMod extends View {
                           .child(
                             div()
                               .flex_1()
-                              .truncate()
-                              .text_size(12)
+                              .min_w(0)
+                              .text_size(13)
                               .font_semibold()
-                              .child(`#${pr.number} · ${pr.title}`)
+                              .text_color(t.foreground)
+                              .child(ellipsize(`#${pr.number} · ${pr.title}`, 44))
                           )
                           .child(
                             this.actionBtn(
@@ -2084,13 +3238,13 @@ export default class CockpitMod extends View {
                             .child(
                               div()
                                 .flex_1()
-                                .truncate()
+                                .min_w(0)
                                 .text_color(
                                   chk.status === "FAILURE"
                                     ? t.blocked
                                     : t.muted
                                 )
-                                .child(`• ${chk.name} (${chk.status})`)
+                                .child(ellipsize(`• ${chk.name} (${chk.status})`, 46))
                             )
                             .when(Boolean(chk.details_url), (el2) =>
                               el2.child(
@@ -2137,9 +3291,11 @@ export default class CockpitMod extends View {
                         .child(
                           div()
                             .flex_1()
-                            .truncate()
+                            .min_w(0)
+                            .text_size(12)
+                            .text_color(t.foreground)
                             .child(
-                              `${iss.key} · ${iss.title} [${iss.status}]`
+                              ellipsize(`${iss.key} · ${iss.title} [${iss.status}]`, 46)
                             )
                         )
                         .when(Boolean(iss.url), (e) =>
@@ -2161,9 +3317,11 @@ export default class CockpitMod extends View {
                         .child(
                           div()
                             .flex_1()
-                            .truncate()
+                            .min_w(0)
+                            .text_size(12)
+                            .text_color(t.foreground)
                             .child(
-                              `Slack #${th.channel_id} (${th.reply_count ?? 0} replies)`
+                              ellipsize(`Slack #${th.channel_id} (${th.reply_count ?? 0} replies)`, 44)
                             )
                         )
                         .child(
@@ -2212,10 +3370,9 @@ export default class CockpitMod extends View {
                         )
                         .child(
                           div()
-                            .truncate()
-                            .text_size(10.5)
+                            .text_size(11.5)
                             .text_color(t.muted)
-                            .child(rb.path)
+                            .child(ellipsize(rb.path, 58))
                         )
                     )
                   )
@@ -2258,7 +3415,7 @@ export default class CockpitMod extends View {
                       h_flex()
                         .justify_between()
                         .items_center()
-                        .text_size(11)
+                        .text_size(11.5)
                         .child(div().text_color(t.muted).child(prov))
                         .child(
                           div()
@@ -2266,7 +3423,7 @@ export default class CockpitMod extends View {
                               ph?.state === "active"
                                 ? t.done
                                 : ph?.state === "inactive"
-                                  ? t.dim
+                                  ? t.muted
                                   : t.blocked
                             )
                             .child((ph?.state ?? "unknown").toUpperCase())
@@ -2275,6 +3432,7 @@ export default class CockpitMod extends View {
                   )
               )
           )
+        )
       );
   }
 
@@ -2293,6 +3451,9 @@ export default class CockpitMod extends View {
       : "CPU-only (num_gpu: 0) · 0 MB";
     const inspectorHidden = Boolean(
       findNode(layout(), "cockpit-inspector")?.hidden
+    );
+    const homeHidden = Boolean(
+      findNode(layout(), "cockpit-home")?.hidden
     );
     const mac = win()?.platform === "macos";
     const b = keys().find(
@@ -2380,6 +3541,15 @@ export default class CockpitMod extends View {
       .child(div().flex_1())
       .child(
         div()
+          .id("ck-status-home")
+          .cursor_pointer()
+          .text_color(homeHidden ? t.muted : t.accent)
+          .hover((s) => s.text_color(t.foreground))
+          .on_click(() => run("layout.toggle", { id: "cockpit-home" }))
+          .child("🏠 Home")
+      )
+      .child(
+        div()
           .id("ck-status-inspector")
           .cursor_pointer()
           .text_color(inspectorHidden ? t.muted : t.accent)
@@ -2401,6 +3571,7 @@ export default class CockpitMod extends View {
   render(cx) {
     const role = props()?.role ?? "fleet";
     if (role === "pill") return this.renderPill(cx);
+    if (role === "home") return this.renderHome(cx);
     if (role === "inspector") return this.renderInspector(cx);
     if (role === "status") return this.renderStatus();
     return this.renderFleet(cx);

@@ -39,12 +39,12 @@
           "id": "sidebar",
       "type": "column",
       "size": {
-        "px": 272
+        "px": 296
       },
-      "min": 44,
+      "min": 220,
       "max": 480,
       "background": "chrome",
-      "resizable": false,
+      "resizable": true,
       "children": [
         {
           "id": "brand",
@@ -155,12 +155,27 @@
               }
             },
             {
+              "id": "cockpit-home",
+              "type": "block",
+              "size": {
+                "px": 430
+              },
+              "min": 320,
+              "max": 760,
+              "content": {
+                "mod": "cockpit",
+                "props": {
+                  "role": "home"
+                }
+              }
+            },
+            {
               "id": "cockpit-inspector",
               "type": "block",
               "size": {
-                "px": 376
+                "px": 400
               },
-              "min": 280,
+              "min": 300,
               "max": 640,
               "content": {
                 "mod": "cockpit",

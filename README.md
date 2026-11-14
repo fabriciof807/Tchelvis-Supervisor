@@ -112,15 +112,16 @@ After running `cockpit setup --set-default-layout`, start the background collect
 cockpit daemon
 ```
 
-Select the **`cockpit`** layout in Herdr Desktop to use the 4-zone interface alongside your terminal panes:
-- **Top-Bar Pill (`cockpit-pill`, 36px)** above `spaces`: Displays `Supervisor: Watching (N)` / `Idle (0 MB)`, interactive mode switcher (`Semi-Auto (Whitelist)`, `Alert Only (Read-Only)`, `Paused`), `⚡ Poll Now`, `⏏ Unload LLM`, `Inspector ▷`, and `Switch Layout`.
-- **Left Sidebar (`cockpit-fleet`)**: Attention-first Fleet Queue (`Needs You` / `Active` / `Done`), `+ Agent` quick-launcher, and filter tabs.
-- **Right Panel (`cockpit-inspector`)**:
+Select the **`cockpit`** layout in Herdr Desktop to use the multi-zone interface alongside your terminal panes:
+- **Top-Bar Pill (`cockpit-pill`, 36px)** above `spaces`: Displays `Supervisor: Watching (N)` / `Idle (0 MB)`, interactive mode switcher (`Semi-Auto (Whitelist)`, `Alert Only (Read-Only)`, `Paused`), `⚡ Poll Now`, `⏏ Unload LLM`, `🏠 Home`, `Inspector ▷`, and `Switch Layout`.
+- **Left Sidebar (`cockpit-fleet`, 296px resizable)**: Attention-first Fleet Queue (`Needs You` / `Active` / `Done`), `🏠 Home` toggle, `+ Agent` quick-launcher, and filter tabs.
+- **Home Preview Panel (`cockpit-home`, 430px)**: Daily command center with KPI summary cards (Projects, Agents, Daily Tasks, Supervisor), interactive **Daily Tasks (`📋 TAREFAS DO DIA`)** with priority and project tags, **Projects in Development (`🚀 PROJETOS EM DESENVOLVIMENTO`)** merging live Herdr Spaces with git status, and **Immediate Attention (`⚡ ATENÇÃO IMEDIATA & FROTA`)** jump-to-inspector cards. Also accessible from the `[ 🏠 Home | 🔍 Inspector ]` toggle in the Inspector header.
+- **Right Panel (`cockpit-inspector`, 400px)**:
   - **Action Cards**: Approve, edit the command payload, or ignore blocked/dangerous actions.
   - **Durable Supervisor & Auto-Reply Audit Log**: Live supervisor state, rolling summary, and recorded auto-replies.
   - **Output Preview (Last 25 Lines)**: Sanitized preview of the agent's latest terminal output with TUI borders and stale supervisor lines stripped.
   - **Controls & Correlation**: Focus, Peek, Pin, Interrupt, Split Shell, Send Message, `cockpit.*` labels, PR/CI/Ticket/Slack/Runbook cards, and Doctor Health summary.
-- **Bottom Bar (`cockpit-status`)**: Active supervisor mode, CPU-only (`num_gpu: 0`) / VRAM badge, workspace branch, fleet summary, and provider health badges.
+- **Bottom Bar (`cockpit-status`)**: Active supervisor mode, CPU-only (`num_gpu: 0`) / VRAM badge, workspace branch, fleet summary, provider health badges, and quick `🏠 Home` / `Inspector` toggles.
 
 ### 2. Interactive TUI (`cockpit tui`)
 
@@ -161,6 +162,14 @@ cockpit label t1 issue=ENG-142 pr=88
 
 # Start the UDS background collector daemon for Herdr Desktop
 cockpit daemon
+
+# Home Overview & Daily Tasks CLI commands
+cockpit home [--json]
+cockpit task list [--json]
+cockpit task add [--project <name>] [--priority <high|normal|low>] [--json] <title...>
+cockpit task toggle <id> [--json]
+cockpit task remove <id> [--json]
+cockpit task clear-done [--json]
 
 # Durable Supervisor CLI commands
 cockpit supervisor status --json
