@@ -10,7 +10,7 @@ _Last updated: 2026-11-14_
 
 ```
 M0 Container validation & config hardening
- ├─► M1 Model selection (TUI + Herdr mod)
+ ├─► M1 Model selection (Herdr mod) ──► M1b Fallback model
  └─► M5a Rename to `tchelvis` + release pipeline ──► M5b Packages: AUR · Homebrew (Linux)
 M2 Icon system (replace emojis)
  └─► M3 Compact layout & simpler tools
@@ -27,7 +27,8 @@ with the UI track.
 | # | Milestone | Depends on | Status |
 | :-- | :-- | :-- | :-- |
 | M0 | Container validation & config hardening | — | **Next** |
-| M1 | Model selection in TUI and Herdr mod | M0 | Planned |
+| M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | Designed |
+| M1b | Fallback model when the chosen one stops working | M1 | Planned |
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |
 | M4 | Inspector multi-terminal view | M3 | Planned |
@@ -46,15 +47,24 @@ Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host
 
 **Done when:** load/unload works on the host with the default model, and a partial TOML is honored.
 
-### M1 — Model selection (TUI + Herdr mod)
-Let the user pick which model the container serves without editing TOML.
-- Persisted model override, like the GPU toggle (`~/.local/state/cockpit/`): GGUF path, HF repo, or an
-  Ollama-store model. Add a CLI command (e.g. `cockpit supervisor model list|set`).
-- `list` combines locally available GGUFs (Ollama store, HF cache) with a short curated set of small
-  instruction models known to handle the JSON schema.
-- TUI: a model picker. Mod: a picker from the LLM pill. Switching recreates a running container.
+### M1 — Model selection (Herdr mod)
+Let the user point the container at a GGUF model already on the machine, without downloading anything
+or editing TOML by hand. Design: [M1 spec](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md).
+- Scan the Ollama store, the HF / llama.cpp / LM Studio caches, and the user's folders. Filter by
+  parameter count (default ≤ 4B) and hide embedding and projector models.
+- CLI: `cockpit supervisor model list|set|filter|reset`. The mod opens a picker card in the right
+  drawer from the LLM pill or the Inspector's LLM card.
+- The choice is written into `supervisor.toml` (`[llm_container] model_id`, plus `ollama_model`), so
+  there is a single source of truth. Switching recreates a running container.
+- Phase 2 (later): paste a Hugging Face repo or link to download and serve it.
 
-**Done when:** the user can switch models from the TUI and the mod, and the choice survives restarts.
+**Done when:** the user can switch models from the mod, and the choice survives restarts.
+
+### M1b — Fallback model
+Let the user choose a second model that is used automatically when the chosen one stops working.
+"Stops working" has to be defined first: a failed load, a failed health check, or repeated
+evaluation/JSON errors. M1 reserves the `[llm_container] fallback_model_id` key.
+Design: [M1 spec](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md) (non-goals).
 
 ### M2 — Icon system (replace emojis)
 - One icon helper in the mod, built on the existing `svg()` primitive: a single source of icon paths,
