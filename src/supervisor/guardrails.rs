@@ -246,6 +246,36 @@ fn shell_tool_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(bash|shell|command|run)\b").expect("valid shell tool regex"))
 }
 
+fn status_msg_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^approve\s+(?P<tool>[\w-]+)\s*:\s*(?P<arg>.+)$")
+            .expect("valid status msg regex")
+    })
+}
+
+/// A named tool request: a Read tool on one non-sensitive file (same as `cat`), or a shell tool
+/// running one allowlisted read-only command. Write/Edit/other tools are never fast-pathed.
+fn approve_tool_request(tool: &str, target: &str, payload: &str) -> Option<(String, String)> {
+    let [_, _, _, metachar, allow, sensitive] = fast_path_regexes();
+    let tool = tool.to_ascii_lowercase();
+    let target = target.trim();
+    if read_tool_regex().is_match(&tool) {
+        let single = !target.is_empty() && !target.contains(char::is_whitespace);
+        if single && !metachar.is_match(target) && !sensitive.is_match(target) {
+            return Some((payload.to_string(), format!("Read {target}")));
+        }
+        return None;
+    }
+    if !shell_tool_regex().is_match(&tool) {
+        return None;
+    }
+    if metachar.is_match(target) || !allow.is_match(target) || sensitive.is_match(target) {
+        return None;
+    }
+    Some((payload.to_string(), target.to_string()))
+}
+
 fn command_prefix_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -262,10 +292,22 @@ fn command_prefix_regex() -> &'static Regex {
 /// prompt area holds nothing destructive, and the hc kind is not `question`. Otherwise `None`
 /// and the normal LLM flow decides. See docs/superpowers/specs/2026-11-15-readonly-fast-path-design.md.
 pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, String)> {
+    readonly_fast_path_with_msg(output, kind, None)
+}
+
+/// Like [`readonly_fast_path`], but when hc's status message names the request
+/// (`approve Bash: <cmd>`, `approve Read: <file>` — Claude Code's OSC 7501 `msg`), the command is
+/// taken from it instead of the screen; the screen only decides the key (`1` on a `1. Yes` menu,
+/// `y` on a yes/no prompt) and that a prompt is actually showing.
+pub fn readonly_fast_path_with_msg(
+    output: &str,
+    kind: Option<&str>,
+    msg: Option<&str>,
+) -> Option<(String, String)> {
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
         return None;
     }
-    if detect_destructive(output, "").is_some() {
+    if detect_destructive(output, msg.unwrap_or("")).is_some() {
         return None;
     }
     let [menu_yes, menu_item, chrome, metachar, allow, sensitive] = fast_path_regexes();
@@ -288,25 +330,14 @@ pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, S
         return None;
     };
 
+    // The request as hc reports it, e.g. `approve Bash: git diff --stat`.
+    if let Some(caps) = msg.and_then(|m| status_msg_regex().captures(m.trim())) {
+        return approve_tool_request(&caps["tool"], &caps["arg"], payload);
+    }
+
     // Command inline in the prompt line, e.g. `Allow bash tool: ls -la src/ ? [y/N]`.
     if let Some(caps) = inline_prompt_regex().captures(lines[prompt_idx]) {
-        let lead = caps["lead"].to_ascii_lowercase();
-        let target = caps["cmd"].trim().to_string();
-        if read_tool_regex().is_match(&lead) {
-            // A Read tool on one file: the same as `cat <file>`.
-            let single = !target.is_empty() && !target.contains(char::is_whitespace);
-            if single && !metachar.is_match(&target) && !sensitive.is_match(&target) {
-                return Some((payload.to_string(), format!("Read {target}")));
-            }
-            return None;
-        }
-        if !shell_tool_regex().is_match(&lead) {
-            return None; // Write/Edit/other tools are never fast-pathed.
-        }
-        if metachar.is_match(&target) || !allow.is_match(&target) || sensitive.is_match(&target) {
-            return None;
-        }
-        return Some((payload.to_string(), target));
+        return approve_tool_request(&caps["lead"], &caps["cmd"], payload);
     }
 
     let raw = lines[..prompt_idx]
@@ -816,5 +847,57 @@ mod tests {
         assert_eq!(fast("Allow Read tool: src/a.rs src/b.rs ? [y/N]"), None);
         assert_eq!(fast("Allow Write tool: notes.md ? [y/N]"), None);
         assert_eq!(fast("Allow Edit tool: src/config.rs ? [y/N]"), None);
+    }
+
+    // Real Claude Code v2.1.325 permission screen (test 8, `hc read`, home path anonymized). The
+    // command sits far above the menu; hc status carries it as `msg: "approve Bash: <cmd>"`.
+    const CLAUDE_TOUCH: &str = include_str!("fixtures/claude_permission_bash_touch.txt");
+
+    #[test]
+    fn fast_path_real_claude_touch_is_not_approved() {
+        let msg = "approve Bash: touch /home/user/.claude/jobs/job1/tmp/real-claude/marcador.txt";
+        assert_eq!(
+            readonly_fast_path_with_msg(CLAUDE_TOUCH, Some("permission"), Some(msg)),
+            None
+        );
+    }
+
+    #[test]
+    fn fast_path_reads_the_command_from_hc_status_msg_on_a_claude_menu() {
+        // Built from the real format (no real capture: Claude does not prompt for reads by default).
+        let screen = CLAUDE_TOUCH.replace(
+            "touch /home/user/.claude/jobs/job1/tmp/real-claude/marcador.txt",
+            "git diff --stat",
+        );
+        let got = readonly_fast_path_with_msg(
+            &screen,
+            Some("permission"),
+            Some("approve Bash: git diff --stat"),
+        );
+        assert_eq!(got, Some(("1".into(), "git diff --stat".into())));
+        let got = readonly_fast_path_with_msg(
+            &screen,
+            Some("permission"),
+            Some("approve Read: README.md"),
+        );
+        assert_eq!(got, Some(("1".into(), "Read README.md".into())));
+    }
+
+    #[test]
+    fn fast_path_status_msg_refusals() {
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow\n  4. No";
+        let f = |m: &str| readonly_fast_path_with_msg(menu, Some("permission"), Some(m));
+        assert_eq!(f("approve Bash: cat .env"), None);
+        assert_eq!(f("approve Bash: ls | sh"), None);
+        assert_eq!(f("approve Write: notes.md"), None);
+        assert_eq!(f("approve Edit: src/main.rs"), None);
+        assert_eq!(f("approve Read: ~/.ssh/id_rsa"), None);
+        // No visible prompt to answer: nothing is typed even if the msg looks safe.
+        assert_eq!(
+            readonly_fast_path_with_msg("working...", Some("permission"), Some("approve Bash: ls")),
+            None
+        );
+        // Claude's folder-trust dialog has no "1. Yes" and no msg: never answered.
+        assert_eq!(readonly_fast_path_with_msg("Do you trust the files in this folder?\n❯ 1. No, exit\n  2. Yes, I trust this folder", None, None), None);
     }
 }

@@ -4,6 +4,8 @@
 
 **Update (test 7):** the command may also be inline in the prompt line (`Allow bash tool: <cmd> ? [y/N]`); a `Read` tool on one non-sensitive file counts as `cat`. Write/Edit/other tools are never fast-pathed.
 
+**Update (test 8, real Claude Code):** only Claude prompts for permission in the user's setup (opencode autoaccept, pi no gate, agy auto). Its request is read from the hc status `msg` (`approve Bash: <cmd>` / `approve Read: <file>`), not the screen — on the real screen the command sits ~8 lines above the `1. Yes` menu. The screen only picks the key (`1` / `y`) and proves a prompt is showing. Options 2/3 (always allow, auto mode) are never chosen.
+
 ## Intent
 Test 5: Semi-Auto approved only 1 of 4 trivial read-only requests (`ls`, `cat`, `git status`) —
 the 1.7B model alerts too often and takes 40–245 s. Approve the trivial ones with a fixed rule,

@@ -1,7 +1,7 @@
 use super::config::SupervisorConfig;
 use super::guardrails::{
-    enforce_blocked_policy, has_error_or_loop_signature, readonly_fast_path, sanitize_auto_reply,
-    validate_evaluation,
+    enforce_blocked_policy, has_error_or_loop_signature, readonly_fast_path_with_msg,
+    sanitize_auto_reply, validate_evaluation,
 };
 use super::hc::{HcBackend, HcSession};
 use super::ollama::{CognitiveBackend, CognitiveEvaluation, SupervisorDecision};
@@ -187,7 +187,11 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             // Read-only fast path: trivial read-only requests are approved by a fixed rule,
             // without the LLM and outside the per-tick evaluation cap.
             if session.is_blocked() && current_hash != state.last_evaluated_hash {
-                if let Some((payload, cmd)) = readonly_fast_path(&output, session.kind.as_deref()) {
+                if let Some((payload, cmd)) = readonly_fast_path_with_msg(
+                    &output,
+                    session.kind.as_deref(),
+                    session.msg.as_deref(),
+                ) {
                     state.last_hc_status = session.status.clone();
                     let raw = CognitiveEvaluation {
                         updated_summary: format!(
@@ -553,6 +557,7 @@ mod tests {
             status: Some("blocked".to_string()),
             turn: Some(1),
             kind: None,
+            msg: None,
         }
     }
 
@@ -1031,5 +1036,25 @@ mod tests {
         let o = engine.tick(1000).unwrap();
         assert_eq!(o.auto_replied_agents, vec!["a", "b"]);
         assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn readonly_fast_path_uses_hc_status_msg_on_a_claude_menu() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut session = test_session("t14c");
+        session.kind = Some("permission".to_string());
+        session.msg = Some("approve Bash: git diff --stat".to_string());
+        let screen = " Bash command\n\n git diff --stat\n Show changes\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and always allow access\n   3. Yes, and switch to auto mode\n   4. No\n\n Esc to cancel · Tab to amend";
+        let hc = MockHc::new(vec![session], vec![screen]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t14c"]);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t14c".to_string(), "1".to_string(), true)]
+        );
     }
 }

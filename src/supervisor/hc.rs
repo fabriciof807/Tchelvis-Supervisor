@@ -29,6 +29,10 @@ pub struct HcSession {
     /// `cockpit.kind` label.
     #[serde(default)]
     pub kind: Option<String>,
+    /// The pending request as the agent reports it in the OSC 7501 status `msg`
+    /// (Claude Code: `approve Bash: <cmd>`). Absent when the agent sends none.
+    #[serde(default)]
+    pub msg: Option<String>,
 }
 
 impl HcSession {
@@ -636,6 +640,15 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             .map(|k| k.trim().to_ascii_lowercase())
             .filter(|k| !k.is_empty());
 
+        let msg = term
+            .status
+            .as_ref()
+            .and_then(|v| v.get("msg"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(ToString::to_string);
+
         sessions.push(HcSession {
             agent_id: term.address,
             session_name,
@@ -645,6 +658,7 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             status: status_state,
             turn: term.turn,
             kind,
+            msg,
         });
     }
 
@@ -771,6 +785,23 @@ mod tests {
         }"#;
         let sessions = parse_hc_ls_json(sample, None).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hc_ls_json_reads_status_msg() {
+        // Claude Code reports the pending request in OSC 7501 `msg` (seen on the host, test 8).
+        let sample = r#"{"terminals": [
+            {"address": "t14c", "state": "live", "reported": true,
+             "status": {"state": "blocked", "kind": "permission", "app": "claude-code",
+                        "msg": "approve Bash: touch /tmp/x"},
+             "labels": {"cockpit.msg": "Permission required"},
+             "foreground": {"name": "claude", "argv": ["claude"]}}
+        ]}"#;
+        let sessions = parse_hc_ls_json(sample, None).unwrap();
+        assert_eq!(
+            sessions[0].msg.as_deref(),
+            Some("approve Bash: touch /tmp/x")
+        );
     }
 
     #[test]
