@@ -73,6 +73,10 @@ pub struct DesktopModSnapshot {
     pub llm_runtime: String,
     #[serde(default)]
     pub llm_container_state: String,
+    #[serde(default)]
+    pub gpu_backend: String,
+    #[serde(default)]
+    pub gpu_detail: String,
     pub agents: Vec<AgentCardView>,
 }
 
@@ -97,6 +101,11 @@ pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
     };
     snap.num_gpu = engine.config.effective_num_gpu();
     snap.allow_gpu = snap.num_gpu != 0;
+    if snap.llm_managed {
+        let (gpu_bk, gpu_det) = super::container::resolve_gpu_backend(&engine.config.llm_container);
+        snap.gpu_backend = gpu_bk.as_str().to_string();
+        snap.gpu_detail = gpu_det;
+    }
     snap
 }
 
@@ -118,6 +127,8 @@ pub fn enrich_snapshot_with_llm_health(
     snap.llm_managed = health.llm_managed;
     snap.llm_runtime = health.llm_runtime;
     snap.llm_container_state = health.llm_container_state;
+    snap.gpu_backend = health.gpu_backend;
+    snap.gpu_detail = health.gpu_detail;
     if health.llm_managed {
         snap.model_loaded = health.model_loaded;
     } else {
@@ -179,6 +190,8 @@ pub fn build_desktop_mod_snapshot_from_parts(
         llm_managed: false,
         llm_runtime: String::new(),
         llm_container_state: String::new(),
+        gpu_backend: String::new(),
+        gpu_detail: String::new(),
         agents,
     }
 }

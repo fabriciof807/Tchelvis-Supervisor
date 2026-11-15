@@ -289,6 +289,21 @@ enum SupervisorCommands {
         #[command(subcommand)]
         action: ModelCommand,
     },
+    /// Benchmark CPU vs GPU speed on the supervisor's evaluation request
+    Bench {
+        /// Number of measured runs per mode (default 3)
+        #[arg(long)]
+        runs: Option<u32>,
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+        /// Print the last benchmark result without running
+        #[arg(long)]
+        last: bool,
+        /// Print the current benchmark progress JSON (or `{}`)
+        #[arg(long)]
+        progress: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -731,6 +746,40 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
             },
+            SupervisorCommands::Bench {
+                runs,
+                json,
+                last,
+                progress,
+            } => {
+                if progress {
+                    println!("{}", tchelvis::supervisor::bench::load_bench_progress());
+                    return Ok(());
+                }
+                if last {
+                    let res = tchelvis::supervisor::bench::load_last_bench()?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&res)?);
+                    } else {
+                        println!("{}", tchelvis::supervisor::bench::format_bench_table(&res));
+                    }
+                    return Ok(());
+                }
+                let runs = runs.unwrap_or(3).max(1);
+                let res = tokio::task::spawn_blocking(move || {
+                    tchelvis::supervisor::bench::run_bench(runs, |p| {
+                        eprintln!("[bench] {} {} ({}/{})", p.phase, p.mode, p.run, p.runs);
+                    })
+                })
+                .await
+                .context("supervisor bench task panicked")??;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&res)?);
+                } else {
+                    println!("{}", tchelvis::supervisor::bench::format_bench_table(&res));
+                }
+                Ok(())
+            }
         },
         Commands::Home { json } => {
             let paths_clone = paths.clone();

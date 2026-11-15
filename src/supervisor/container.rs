@@ -33,6 +33,39 @@ impl ContainerRuntime {
     }
 }
 
+/// GPU backend for the managed `llama.cpp` container.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GpuBackend {
+    Cuda,
+    Vulkan,
+    Rocm,
+    None,
+}
+
+impl GpuBackend {
+    /// Parses a GPU backend name (`"cuda"`, `"vulkan"`, `"rocm"`, `"none"`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cuda" => Some(Self::Cuda),
+            "vulkan" => Some(Self::Vulkan),
+            "rocm" => Some(Self::Rocm),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase identifier for labels, snapshots, and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cuda => "cuda",
+            Self::Vulkan => "vulkan",
+            Self::Rocm => "rocm",
+            Self::None => "none",
+        }
+    }
+}
+
 /// Configuration for the managed `llama.cpp` (`llama-server`) container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -47,6 +80,12 @@ pub struct LlmContainerConfig {
     pub image: String,
     /// GPU (CUDA) container image.
     pub image_gpu: String,
+    /// GPU backend override: `"auto"` | `"cuda"` | `"vulkan"` | `"rocm"` | `"none"`.
+    pub gpu_backend: String,
+    /// GPU (Vulkan) container image.
+    pub image_vulkan: String,
+    /// GPU (ROCm) container image.
+    pub image_rocm: String,
     /// Host loopback port mapped to container port `8080`.
     pub port: u16,
     /// Context window size (`-c`).
@@ -75,6 +114,9 @@ impl Default for LlmContainerConfig {
             name: "tchelvis-supervisor-llm".to_string(),
             image: "ghcr.io/ggml-org/llama.cpp:server".to_string(),
             image_gpu: "ghcr.io/ggml-org/llama.cpp:server-cuda".to_string(),
+            gpu_backend: "auto".to_string(),
+            image_vulkan: "ghcr.io/ggml-org/llama.cpp:server-vulkan".to_string(),
+            image_rocm: "ghcr.io/ggml-org/llama.cpp:server-rocm".to_string(),
             port: 11435,
             ctx_size: 4096,
             model_path: None,
@@ -202,6 +244,77 @@ pub fn write_runtime_pref(path: &Path, rt: ContainerRuntime) -> std::io::Result<
     fs::rename(&tmp, path)
 }
 
+/// Lists `/dev/dri/renderD*` device nodes sorted lexicographically.
+pub fn list_dri_render_nodes() -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir("/dev/dri") else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("renderD"))
+                .unwrap_or(false)
+        })
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// Pure GPU backend auto-detection:
+/// 1. `/dev/nvidia0` exists or `nvidia-smi` is on PATH -> `Cuda`
+/// 2. Any `/dev/dri/renderD*` node -> `Vulkan`
+/// 3. Otherwise -> `None`
+pub fn detect_gpu_backend(
+    exists: impl Fn(&Path) -> bool,
+    on_path: impl Fn(&str) -> bool,
+    render_nodes: &[PathBuf],
+) -> GpuBackend {
+    if exists(Path::new("/dev/nvidia0")) || on_path("nvidia-smi") {
+        GpuBackend::Cuda
+    } else if !render_nodes.is_empty() {
+        GpuBackend::Vulkan
+    } else {
+        GpuBackend::None
+    }
+}
+
+/// Resolves the effective GPU backend and a human-readable detail string from `cfg`.
+/// Forced values (anything other than `"auto"` / empty) are honored as-is.
+pub fn resolve_gpu_backend(cfg: &LlmContainerConfig) -> (GpuBackend, String) {
+    let raw = cfg.gpu_backend.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+        let nodes = list_dri_render_nodes();
+        let nvidia_dev = Path::new("/dev/nvidia0");
+        let backend = detect_gpu_backend(|p| p.exists(), binary_on_path, &nodes);
+        let detail = match backend {
+            GpuBackend::Cuda => {
+                if nvidia_dev.exists() {
+                    "cuda · /dev/nvidia0".to_string()
+                } else {
+                    "cuda · nvidia-smi".to_string()
+                }
+            }
+            GpuBackend::Vulkan => {
+                let first = nodes
+                    .first()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "/dev/dri".to_string());
+                format!("vulkan · {first}")
+            }
+            GpuBackend::Rocm => "rocm".to_string(),
+            GpuBackend::None => "none".to_string(),
+        };
+        (backend, detail)
+    } else if let Some(forced) = GpuBackend::parse(raw) {
+        (forced, format!("{} · forced", forced.as_str()))
+    } else {
+        (GpuBackend::None, format!("none · invalid ({raw})"))
+    }
+}
+
 /// Attempts `start` + `wait_health` across `candidates` in order, cleaning up failed containers
 /// and persisting the first runtime that succeeds.
 pub fn start_with_fallback<C, F, H>(
@@ -209,6 +322,7 @@ pub fn start_with_fallback<C, F, H>(
     ngl: u32,
     model: &ModelSource,
     model_id: &str,
+    gpu: GpuBackend,
     pref_path: Option<&Path>,
     mut make_mgr: F,
     mut wait_health: H,
@@ -224,7 +338,10 @@ where
     let mut errors = Vec::new();
     for &rt in candidates {
         let mgr = make_mgr(rt);
-        match mgr.start(ngl, model, model_id).and_then(|()| wait_health()) {
+        match mgr
+            .start(ngl, model, model_id, gpu)
+            .and_then(|()| wait_health())
+        {
             Ok(()) => {
                 if let Some(p) = pref_path {
                     let _ = write_runtime_pref(p, rt);
@@ -537,7 +654,9 @@ pub fn build_run_args(
     model: &ModelSource,
     hf_cache_dir: &Path,
     model_id: &str,
+    gpu: GpuBackend,
 ) -> Vec<String> {
+    let effective_gpu = if ngl > 0 { gpu } else { GpuBackend::None };
     let mut args = vec![
         "run".to_string(),
         "-d".to_string(),
@@ -547,20 +666,50 @@ pub fn build_run_args(
         format!("tchelvis.ngl={ngl}"),
         "--label".to_string(),
         format!("tchelvis.model_id={model_id}"),
+        "--label".to_string(),
+        format!("tchelvis.gpu={}", effective_gpu.as_str()),
         "-p".to_string(),
         format!("127.0.0.1:{}:8080", cfg.port),
     ];
 
     if ngl > 0 {
-        match runtime {
-            ContainerRuntime::Docker | ContainerRuntime::Kiri => {
-                args.push("--gpus".to_string());
-                args.push("all".to_string());
-            }
-            ContainerRuntime::Podman => {
+        match effective_gpu {
+            GpuBackend::Cuda => match runtime {
+                ContainerRuntime::Docker | ContainerRuntime::Kiri => {
+                    args.push("--gpus".to_string());
+                    args.push("all".to_string());
+                }
+                ContainerRuntime::Podman => {
+                    args.push("--device".to_string());
+                    args.push("nvidia.com/gpu=all".to_string());
+                }
+            },
+            GpuBackend::Vulkan => {
                 args.push("--device".to_string());
-                args.push("nvidia.com/gpu=all".to_string());
+                args.push("/dev/dri".to_string());
+                args.push("--group-add".to_string());
+                match runtime {
+                    ContainerRuntime::Docker | ContainerRuntime::Kiri => {
+                        args.push("video".to_string());
+                    }
+                    ContainerRuntime::Podman => {
+                        args.push("keep-groups".to_string());
+                    }
+                }
             }
+            GpuBackend::Rocm => {
+                args.extend([
+                    "--device".to_string(),
+                    "/dev/kfd".to_string(),
+                    "--device".to_string(),
+                    "/dev/dri".to_string(),
+                    "--group-add".to_string(),
+                    "video".to_string(),
+                    "--security-opt".to_string(),
+                    "seccomp=unconfined".to_string(),
+                ]);
+            }
+            GpuBackend::None => {}
         }
     }
 
@@ -592,7 +741,12 @@ pub fn build_run_args(
     }
 
     let image = if ngl > 0 {
-        cfg.image_gpu.clone()
+        match effective_gpu {
+            GpuBackend::Cuda => cfg.image_gpu.clone(),
+            GpuBackend::Vulkan => cfg.image_vulkan.clone(),
+            GpuBackend::Rocm => cfg.image_rocm.clone(),
+            GpuBackend::None => cfg.image.clone(),
+        }
     } else {
         cfg.image.clone()
     };
@@ -796,8 +950,39 @@ impl<C: ContainerCli> LlmContainer<C> {
         }
     }
 
-    /// Starts (or recreates when `ngl` or `model_id` changed) the `llama.cpp` container.
-    pub fn start(&self, ngl: u32, model: &ModelSource, model_id: &str) -> Result<()> {
+    /// Reads the `tchelvis.gpu` label from an existing container.
+    pub fn container_gpu(&self) -> Option<String> {
+        let args = vec![
+            "inspect".to_string(),
+            "-f".to_string(),
+            "{{index .Config.Labels \"tchelvis.gpu\"}}".to_string(),
+            self.config.name.clone(),
+        ];
+        let out = self.cli.run(self.runtime.bin(), &args).ok()?;
+        if out.status_code != 0 {
+            return None;
+        }
+        let val = out.stdout.trim();
+        if val.is_empty() || val == "<no value>" {
+            None
+        } else {
+            Some(val.to_string())
+        }
+    }
+
+    /// Starts (or recreates when `ngl`, `model_id`, or `gpu` changed) the `llama.cpp` container.
+    pub fn start(
+        &self,
+        ngl: u32,
+        model: &ModelSource,
+        model_id: &str,
+        gpu: GpuBackend,
+    ) -> Result<()> {
+        if ngl > 0 && gpu == GpuBackend::None {
+            bail!("No GPU detected (gpu_backend=auto)");
+        }
+        let effective_gpu = if ngl > 0 { gpu } else { GpuBackend::None };
+
         if matches!(model, ModelSource::HfRepo(_)) {
             // Pre-create the cache so the runtime does not create the bind mount as root.
             fs::create_dir_all(&self.hf_cache_dir)
@@ -812,12 +997,14 @@ impl<C: ContainerCli> LlmContainer<C> {
                     model,
                     &self.hf_cache_dir,
                     model_id,
+                    effective_gpu,
                 );
                 self.run_checked(&run_args)?;
             }
             ContainerState::Stopped => {
                 let matches = self.container_ngl() == Some(ngl)
-                    && self.container_model_id().as_deref() == Some(model_id);
+                    && self.container_model_id().as_deref() == Some(model_id)
+                    && self.container_gpu().as_deref() == Some(effective_gpu.as_str());
                 if matches {
                     self.run_checked(&["start".to_string(), self.config.name.clone()])?;
                 } else {
@@ -832,13 +1019,15 @@ impl<C: ContainerCli> LlmContainer<C> {
                         model,
                         &self.hf_cache_dir,
                         model_id,
+                        effective_gpu,
                     );
                     self.run_checked(&run_args)?;
                 }
             }
             ContainerState::Running => {
                 let matches = self.container_ngl() == Some(ngl)
-                    && self.container_model_id().as_deref() == Some(model_id);
+                    && self.container_model_id().as_deref() == Some(model_id)
+                    && self.container_gpu().as_deref() == Some(effective_gpu.as_str());
                 if !matches {
                     self.run_checked(&[
                         "rm".to_string(),
@@ -852,6 +1041,7 @@ impl<C: ContainerCli> LlmContainer<C> {
                         model,
                         &self.hf_cache_dir,
                         model_id,
+                        effective_gpu,
                     );
                     self.run_checked(&run_args)?;
                 }
@@ -1016,6 +1206,7 @@ mod tests {
             &file_model,
             &cache,
             "file:/data/models/lfm3.gguf",
+            GpuBackend::None,
         );
         assert!(!args.contains(&"--gpus".to_string()));
         assert!(!args.contains(&"--device".to_string()));
@@ -1034,6 +1225,7 @@ mod tests {
             &hf_model,
             &cache,
             "hf:LiquidAI/LFM2-1.2B-GGUF:Q4_K_M",
+            GpuBackend::Cuda,
         );
         assert!(args.windows(2).any(|w| w == ["--gpus", "all"]));
         assert!(args.contains(&"ghcr.io/ggml-org/llama.cpp:server-cuda".to_string()));
@@ -1052,6 +1244,7 @@ mod tests {
             &file_model,
             &cache,
             "file:/data/models/lfm3.gguf",
+            GpuBackend::Cuda,
         );
         assert!(args
             .windows(2)
@@ -1129,22 +1322,23 @@ mod tests {
             ok_out("container_id\n"),     // run
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model, mid).unwrap();
+        mgr.start(0, &model, mid, GpuBackend::None).unwrap();
         let calls = mgr.cli.calls();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].1[0], "run");
 
-        // Stopped with matching ngl and model_id -> start
+        // Stopped with matching ngl, model_id, and gpu -> start
         let cli = FakeCli::new(vec![
             ok_out("false\n"),              // state() -> Stopped
             ok_out("0\n"),                  // container_ngl() -> 0
             ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id()
+            ok_out("none\n"),               // container_gpu()
             ok_out(""),                     // start
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model, mid).unwrap();
+        mgr.start(0, &model, mid, GpuBackend::None).unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls[3].1, vec!["start", "tchelvis-supervisor-llm"]);
+        assert_eq!(calls[4].1, vec!["start", "tchelvis-supervisor-llm"]);
 
         // Stopped with different ngl -> rm -f + run
         let cli = FakeCli::new(vec![
@@ -1154,20 +1348,21 @@ mod tests {
             ok_out("cid\n"),   // run
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(99, &model, mid).unwrap();
+        mgr.start(99, &model, mid, GpuBackend::Cuda).unwrap();
         let calls = mgr.cli.calls();
         assert_eq!(calls[2].1, vec!["rm", "-f", "tchelvis-supervisor-llm"]);
         assert_eq!(calls[3].1[0], "run");
 
-        // Running with same ngl and model_id -> no-op
+        // Running with same ngl, model_id, and gpu -> no-op
         let cli = FakeCli::new(vec![
             ok_out("true\n"),               // state() -> Running
             ok_out("0\n"),                  // container_ngl() -> 0
             ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id()
+            ok_out("none\n"),               // container_gpu()
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model, mid).unwrap();
-        assert_eq!(mgr.cli.calls().len(), 3);
+        mgr.start(0, &model, mid, GpuBackend::None).unwrap();
+        assert_eq!(mgr.cli.calls().len(), 4);
 
         // Stop when Running -> stop -t 2
         let cli = FakeCli::new(vec![ok_out("true\n"), ok_out("")]);
@@ -1280,6 +1475,7 @@ mod tests {
             &file_model,
             &cache,
             "ollama:lfm3:1.7b",
+            GpuBackend::None,
         );
         assert!(args.contains(&"tchelvis.model_id=ollama:lfm3:1.7b".to_string()));
     }
@@ -1295,7 +1491,8 @@ mod tests {
             ok_out("cid\n"),              // run
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model, "hf:org/new:Q4_K_M").unwrap();
+        mgr.start(0, &model, "hf:org/new:Q4_K_M", GpuBackend::None)
+            .unwrap();
         let calls = mgr.cli.calls();
         assert_eq!(calls[3].1, vec!["rm", "-f", "tchelvis-supervisor-llm"]);
         assert_eq!(calls[4].1[0], "run");
@@ -1308,11 +1505,13 @@ mod tests {
             ok_out("true\n"),               // state() -> Running
             ok_out("0\n"),                  // container_ngl() -> 0
             ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id() -> same
+            ok_out("none\n"),               // container_gpu() -> same
         ]);
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
-        mgr.start(0, &model, "hf:org/tiny:Q4_K_M").unwrap();
+        mgr.start(0, &model, "hf:org/tiny:Q4_K_M", GpuBackend::None)
+            .unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls.len(), 3);
+        assert_eq!(calls.len(), 4);
         assert!(!calls.iter().any(|c| c.1[0] == "rm" || c.1[0] == "run"));
     }
 
@@ -1327,6 +1526,7 @@ mod tests {
             &model,
             Path::new("/tmp"),
             "hf:org/tiny:Q4_K_M",
+            GpuBackend::None,
         );
         assert!(args.windows(2).any(|w| w == ["-np", "1"]));
     }
@@ -1345,6 +1545,7 @@ mod tests {
             &model,
             Path::new("/tmp"),
             "hf:org/tiny:Q4_K_M",
+            GpuBackend::None,
         );
         assert!(!args.windows(2).any(|w| w == ["-np", "1"]));
         assert!(args.windows(2).any(|w| w == ["--parallel", "2"]));
@@ -1390,6 +1591,7 @@ mod tests {
             0,
             &model,
             "hf:org/tiny:Q4_K_M",
+            GpuBackend::None,
             Some(&pref_path),
             |rt| {
                 let cli = match rt {
@@ -1427,6 +1629,7 @@ mod tests {
             0,
             &model,
             "hf:org/tiny:Q4_K_M",
+            GpuBackend::None,
             None,
             |rt| {
                 let msg = match rt {
@@ -1450,5 +1653,180 @@ mod tests {
         assert!(text.contains("podman broke"));
         assert!(text.contains("docker:"));
         assert!(text.contains("docker daemon down"));
+    }
+
+    #[test]
+    fn detect_nvidia_device_or_smi() {
+        assert_eq!(
+            detect_gpu_backend(
+                |p| p == Path::new("/dev/nvidia0"),
+                |_| false,
+                &[PathBuf::from("/dev/dri/renderD128")],
+            ),
+            GpuBackend::Cuda
+        );
+        assert_eq!(
+            detect_gpu_backend(|_| false, |b| b == "nvidia-smi", &[]),
+            GpuBackend::Cuda
+        );
+    }
+
+    #[test]
+    fn detect_render_node_is_vulkan() {
+        assert_eq!(
+            detect_gpu_backend(
+                |_| false,
+                |_| false,
+                &[PathBuf::from("/dev/dri/renderD128")],
+            ),
+            GpuBackend::Vulkan
+        );
+    }
+
+    #[test]
+    fn detect_nothing_is_none() {
+        assert_eq!(
+            detect_gpu_backend(|_| false, |_| false, &[]),
+            GpuBackend::None
+        );
+    }
+
+    #[test]
+    fn forced_backend_wins() {
+        let cfg = LlmContainerConfig {
+            gpu_backend: "rocm".to_string(),
+            ..Default::default()
+        };
+        let (backend, _detail) = resolve_gpu_backend(&cfg);
+        assert_eq!(backend, GpuBackend::Rocm);
+    }
+
+    #[test]
+    fn run_args_per_backend() {
+        let cfg = LlmContainerConfig::default();
+        let cache = PathBuf::from("/tmp/hf-cache");
+        let model = ModelSource::File(PathBuf::from("/data/models/lfm3.gguf"));
+        let mid = "file:/data/models/lfm3.gguf";
+
+        // Cuda docker
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            99,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Cuda,
+        );
+        assert!(args.windows(2).any(|w| w == ["--gpus", "all"]));
+        assert!(args.contains(&cfg.image_gpu));
+        assert!(args.contains(&"tchelvis.gpu=cuda".to_string()));
+
+        // Cuda podman
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Podman,
+            99,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Cuda,
+        );
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--device", "nvidia.com/gpu=all"]));
+        assert!(args.contains(&cfg.image_gpu));
+
+        // Vulkan docker
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            99,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Vulkan,
+        );
+        assert!(args.windows(2).any(|w| w == ["--device", "/dev/dri"]));
+        assert!(args.windows(2).any(|w| w == ["--group-add", "video"]));
+        assert!(args.contains(&cfg.image_vulkan));
+        assert!(args.contains(&"tchelvis.gpu=vulkan".to_string()));
+
+        // Vulkan podman
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Podman,
+            99,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Vulkan,
+        );
+        assert!(args.windows(2).any(|w| w == ["--device", "/dev/dri"]));
+        assert!(args.windows(2).any(|w| w == ["--group-add", "keep-groups"]));
+
+        // Rocm
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            99,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Rocm,
+        );
+        assert!(args.windows(2).any(|w| w == ["--device", "/dev/kfd"]));
+        assert!(args.windows(2).any(|w| w == ["--device", "/dev/dri"]));
+        assert!(args.windows(2).any(|w| w == ["--group-add", "video"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--security-opt", "seccomp=unconfined"]));
+        assert!(args.contains(&cfg.image_rocm));
+        assert!(args.contains(&"tchelvis.gpu=rocm".to_string()));
+
+        // ngl 0 contains no GPU flags and uses cfg.image
+        let args = build_run_args(
+            &cfg,
+            ContainerRuntime::Docker,
+            0,
+            &model,
+            &cache,
+            mid,
+            GpuBackend::Cuda,
+        );
+        assert!(!args.contains(&"--gpus".to_string()));
+        assert!(!args.contains(&"--device".to_string()));
+        assert!(args.contains(&cfg.image));
+        assert!(args.contains(&"tchelvis.gpu=none".to_string()));
+    }
+
+    #[test]
+    fn gpu_label_change_recreates() {
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let mid = "hf:org/tiny:Q4_K_M";
+        let cli = FakeCli::new(vec![
+            ok_out("false\n"),              // state() -> Stopped
+            ok_out("99\n"),                 // container_ngl() -> 99
+            ok_out("hf:org/tiny:Q4_K_M\n"), // container_model_id() -> same
+            ok_out("vulkan\n"),             // container_gpu() -> vulkan
+            ok_out(""),                     // rm -f
+            ok_out("cid\n"),                // run
+        ]);
+        let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
+        mgr.start(99, &model, mid, GpuBackend::Cuda).unwrap();
+        let calls = mgr.cli.calls();
+        assert_eq!(calls[4].1, vec!["rm", "-f", "tchelvis-supervisor-llm"]);
+        assert_eq!(calls[5].1[0], "run");
+    }
+
+    #[test]
+    fn start_gpu_none_errors() {
+        let model = ModelSource::HfRepo("org/tiny:Q4_K_M".into());
+        let cli = FakeCli::new(vec![]);
+        let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
+        let err = mgr
+            .start(99, &model, "hf:org/tiny:Q4_K_M", GpuBackend::None)
+            .unwrap_err();
+        assert_eq!(err.to_string(), "No GPU detected (gpu_backend=auto)");
     }
 }

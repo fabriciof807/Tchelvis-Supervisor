@@ -77,6 +77,10 @@ pub struct LlmHealthStatus {
     pub llm_runtime: String,
     #[serde(default)]
     pub llm_container_state: String,
+    #[serde(default)]
+    pub gpu_backend: String,
+    #[serde(default)]
+    pub gpu_detail: String,
 }
 
 /// Human-readable inference placement for a given `num_gpu` value.
@@ -161,6 +165,8 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
         llm_managed: managed,
         llm_runtime: String::new(),
         llm_container_state: String::new(),
+        gpu_backend: String::new(),
+        gpu_detail: String::new(),
     };
 
     let agent = ureq::AgentBuilder::new()
@@ -168,6 +174,9 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
         .build();
 
     if managed {
+        let (gpu_bk, gpu_det) = super::container::resolve_gpu_backend(&config.llm_container);
+        status.gpu_backend = gpu_bk.as_str().to_string();
+        status.gpu_detail = gpu_det;
         let Some(rt) = config.detected_container_runtime() else {
             status.llm_container_state = "missing".to_string();
             status.detail =

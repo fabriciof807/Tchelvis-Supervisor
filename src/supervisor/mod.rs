@@ -1,3 +1,4 @@
+pub mod bench;
 pub mod config;
 pub mod config_write;
 pub mod container;
@@ -170,11 +171,13 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
             .unwrap_or_default();
         let host = config.effective_primary_host();
         let pref_path = config::runtime_pref_path();
+        let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
         container::start_with_fallback(
             &candidates,
             config.effective_num_gpu(),
             &model,
             &model_id,
+            gpu,
             Some(&pref_path),
             |rt| {
                 container::LlmContainer::new(
@@ -242,7 +245,8 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
                     let model_id = models::effective_model(&config, &ollama_roots)
                         .map(|m| m.id)
                         .unwrap_or_default();
-                    mgr.start(config.effective_num_gpu(), &model, &model_id)?;
+                    let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
+                    mgr.start(config.effective_num_gpu(), &model, &model_id, gpu)?;
                     let host = config.effective_primary_host();
                     container::wait_healthy(&host, Duration::from_secs(90))?;
                     loaded_after = true;
@@ -340,9 +344,10 @@ fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
         .map(|e| e.display_name.as_str())
         .unwrap_or("modelo selecionado");
     let eff_id = eff.as_ref().map(|e| e.id.as_str()).unwrap_or("");
+    let (gpu, _) = container::resolve_gpu_backend(&cfg.llm_container);
 
     let start_and_wait = mgr
-        .start(cfg.effective_num_gpu(), &model, eff_id)
+        .start(cfg.effective_num_gpu(), &model, eff_id, gpu)
         .and_then(|_| {
             container::wait_healthy(&cfg.effective_primary_host(), Duration::from_secs(90))
         });

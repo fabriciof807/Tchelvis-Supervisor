@@ -183,9 +183,16 @@ pub async fn run_doctor(
         } else {
             &health.llm_runtime
         };
+        let gpu = if !health.gpu_detail.is_empty() {
+            health.gpu_detail.as_str()
+        } else if !health.gpu_backend.is_empty() {
+            health.gpu_backend.as_str()
+        } else {
+            "none"
+        };
         format!(
-            "{} · runtime={} · container={} · mode={}",
-            health.detail, rt, health.llm_container_state, sup_mode
+            "{} · runtime={} · container={} · gpu={} · mode={}",
+            health.detail, rt, health.llm_container_state, gpu, sup_mode
         )
     } else {
         format!("{} · mode={}", health.detail, sup_mode)

@@ -243,6 +243,12 @@ fn resolve_container_runtime_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn resolve_gpu_backend_from_env() -> Option<String> {
+    crate::envvars::var("GPU_BACKEND")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 impl Default for SupervisorConfig {
     fn default() -> Self {
         let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
@@ -271,6 +277,9 @@ impl Default for SupervisorConfig {
         }
         if let Some(rt) = resolve_container_runtime_from_env() {
             llm_container.runtime = rt;
+        }
+        if let Some(gb) = resolve_gpu_backend_from_env() {
+            llm_container.gpu_backend = gb;
         }
 
         Self {
@@ -398,6 +407,9 @@ impl SupervisorConfig {
         }
         if let Some(rt) = resolve_container_runtime_from_env() {
             self.llm_container.runtime = rt;
+        }
+        if let Some(gb) = resolve_gpu_backend_from_env() {
+            self.llm_container.gpu_backend = gb;
         }
     }
 
