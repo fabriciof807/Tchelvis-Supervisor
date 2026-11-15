@@ -38,6 +38,7 @@ pub struct LocalModel {
     pub quant: Option<String>,
     pub kind: ModelKind,
     pub in_use: bool,
+    pub hidden: bool,
 }
 
 /// Injectable root directories for local model scanning.
@@ -287,6 +288,7 @@ fn build_file_entry(
         quant,
         kind,
         in_use: false,
+        hidden: false,
     })
 }
 
@@ -455,6 +457,7 @@ fn parse_ollama_manifest(
         quant,
         kind: kind.unwrap_or(ModelKind::Chat),
         in_use: false,
+        hidden: false,
     })
 }
 
@@ -694,19 +697,21 @@ pub struct EffectiveModel {
 pub struct ModelListOutput {
     pub models: Vec<LocalModel>,
     pub hidden_count: usize,
+    pub user_hidden_count: usize,
     pub filter: String,
     pub selected_id: Option<String>,
     pub managed: bool,
     pub env_override_ignored: Option<String>,
 }
 
-/// Marks `in_use`, injects a synthetic `Config` row if `effective` is absent, and applies filtering.
+/// Marks `in_use` and `hidden`, injects a synthetic `Config` row if `effective` is absent, and applies filtering.
 pub fn build_model_list(
     mut scanned: Vec<LocalModel>,
     filter: MaxParams,
     effective: Option<&EffectiveModel>,
     show_all: bool,
-) -> (Vec<LocalModel>, usize) {
+    hidden: &[String],
+) -> (Vec<LocalModel>, usize, usize) {
     let mut matched = false;
     if let Some(eff) = effective {
         for m in &mut scanned {
@@ -734,37 +739,52 @@ pub fn build_model_list(
                 quant: None,
                 kind: ModelKind::Chat,
                 in_use: true,
+                hidden: false,
             });
         }
     }
 
+    let hidden_set: std::collections::HashSet<&str> = hidden.iter().map(String::as_str).collect();
+    let mut user_hidden_count = 0usize;
+    for m in &mut scanned {
+        if !m.in_use && hidden_set.contains(m.id.as_str()) {
+            m.hidden = true;
+            user_hidden_count += 1;
+        } else {
+            m.hidden = false;
+        }
+    }
+
     if show_all {
-        return (scanned, 0);
+        return (scanned, 0, user_hidden_count);
     }
 
     let limit = filter.limit();
     let mut kept = Vec::with_capacity(scanned.len());
-    let mut hidden_count = 0usize;
+    let mut filter_hidden_count = 0usize;
 
     for m in scanned {
         if m.in_use {
             kept.push(m);
             continue;
         }
+        if m.hidden {
+            continue;
+        }
         if m.kind != ModelKind::Chat {
-            hidden_count += 1;
+            filter_hidden_count += 1;
             continue;
         }
         if let (Some(max), Some(p)) = (limit, m.params) {
             if p > max {
-                hidden_count += 1;
+                filter_hidden_count += 1;
                 continue;
             }
         }
         kept.push(m);
     }
 
-    (kept, hidden_count)
+    (kept, filter_hidden_count, user_hidden_count)
 }
 
 fn file_display_name(p: &Path) -> String {
@@ -1192,6 +1212,7 @@ mod tests {
             quant: None,
             kind,
             in_use: false,
+            hidden: false,
         }
     }
 
@@ -1204,20 +1225,20 @@ mod tests {
             dummy_model("m86", Some(8_600_000_000), ModelKind::Chat),
         ];
 
-        let (b2, h2) = build_model_list(base.clone(), MaxParams::B2, None, false);
+        let (b2, h2, _) = build_model_list(base.clone(), MaxParams::B2, None, false, &[]);
         assert_eq!(b2.len(), 1);
         assert_eq!(b2[0].id, "m24");
         assert_eq!(h2, 3);
 
-        let (b4, h4) = build_model_list(base.clone(), MaxParams::B4, None, false);
+        let (b4, h4, _) = build_model_list(base.clone(), MaxParams::B4, None, false, &[]);
         assert_eq!(b4.len(), 3);
         assert_eq!(h4, 1);
 
-        let (b8, h8) = build_model_list(base.clone(), MaxParams::B8, None, false);
+        let (b8, h8, _) = build_model_list(base.clone(), MaxParams::B8, None, false, &[]);
         assert_eq!(b8.len(), 3);
         assert_eq!(h8, 1);
 
-        let (all, ha) = build_model_list(base, MaxParams::All, None, false);
+        let (all, ha, _) = build_model_list(base, MaxParams::All, None, false, &[]);
         assert_eq!(all.len(), 4);
         assert_eq!(ha, 0);
     }
@@ -1230,7 +1251,7 @@ mod tests {
             display_name: "m7b".to_string(),
             path: None,
         };
-        let (list, hidden) = build_model_list(base, MaxParams::B4, Some(&eff), false);
+        let (list, hidden, _) = build_model_list(base, MaxParams::B4, Some(&eff), false, &[]);
         assert_eq!(list.len(), 1);
         assert!(list[0].in_use);
         assert_eq!(hidden, 0);
@@ -1239,7 +1260,7 @@ mod tests {
     #[test]
     fn unknown_params_shown() {
         let base = vec![dummy_model("unk", None, ModelKind::Chat)];
-        let (list, hidden) = build_model_list(base, MaxParams::B2, None, false);
+        let (list, hidden, _) = build_model_list(base, MaxParams::B2, None, false, &[]);
         assert_eq!(list.len(), 1);
         assert_eq!(hidden, 0);
     }
@@ -1251,11 +1272,11 @@ mod tests {
             dummy_model("emb", Some(135_000_000), ModelKind::Embedding),
             dummy_model("proj", Some(500_000_000), ModelKind::Projector),
         ];
-        let (filtered, hidden) = build_model_list(base.clone(), MaxParams::B4, None, false);
+        let (filtered, hidden, _) = build_model_list(base.clone(), MaxParams::B4, None, false, &[]);
         assert_eq!(filtered.len(), 1);
         assert_eq!(hidden, 2);
 
-        let (all, hidden_all) = build_model_list(base, MaxParams::B4, None, true);
+        let (all, hidden_all, _) = build_model_list(base, MaxParams::B4, None, true, &[]);
         assert_eq!(all.len(), 3);
         assert_eq!(hidden_all, 0);
     }
@@ -1268,12 +1289,64 @@ mod tests {
             display_name: "gone:1b".to_string(),
             path: None,
         };
-        let (list, hidden) = build_model_list(base, MaxParams::B4, Some(&eff), false);
+        let (list, hidden, _) = build_model_list(base, MaxParams::B4, Some(&eff), false, &[]);
         assert_eq!(hidden, 0);
         let last = list.last().unwrap();
         assert_eq!(last.source, "Config");
         assert_eq!(last.id, "ollama:gone:1b");
         assert!(last.in_use);
+    }
+
+    #[test]
+    fn build_list_drops_user_hidden() {
+        let base = vec![
+            dummy_model("m1", Some(1_000_000_000), ModelKind::Chat),
+            dummy_model("m2", Some(1_500_000_000), ModelKind::Chat),
+        ];
+        let hidden_ids = vec!["m1".to_string()];
+        let (list, filter_hidden, user_hidden) =
+            build_model_list(base, MaxParams::B4, None, false, &hidden_ids);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "m2");
+        assert!(!list[0].hidden);
+        assert_eq!(filter_hidden, 0);
+        assert_eq!(user_hidden, 1);
+    }
+
+    #[test]
+    fn build_list_show_all_marks_hidden() {
+        let base = vec![
+            dummy_model("m1", Some(1_000_000_000), ModelKind::Chat),
+            dummy_model("m2", Some(1_500_000_000), ModelKind::Chat),
+        ];
+        let hidden_ids = vec!["m1".to_string()];
+        let (list, filter_hidden, user_hidden) =
+            build_model_list(base, MaxParams::B4, None, true, &hidden_ids);
+        assert_eq!(list.len(), 2);
+        let m1 = list.iter().find(|m| m.id == "m1").unwrap();
+        let m2 = list.iter().find(|m| m.id == "m2").unwrap();
+        assert!(m1.hidden);
+        assert!(!m2.hidden);
+        assert_eq!(filter_hidden, 0);
+        assert_eq!(user_hidden, 1);
+    }
+
+    #[test]
+    fn build_list_never_hides_in_use() {
+        let base = vec![dummy_model("m1", Some(1_000_000_000), ModelKind::Chat)];
+        let eff = EffectiveModel {
+            id: "m1".to_string(),
+            display_name: "m1".to_string(),
+            path: None,
+        };
+        let hidden_ids = vec!["m1".to_string()];
+        let (list, filter_hidden, user_hidden) =
+            build_model_list(base, MaxParams::B4, Some(&eff), false, &hidden_ids);
+        assert_eq!(list.len(), 1);
+        assert!(list[0].in_use);
+        assert!(!list[0].hidden);
+        assert_eq!(filter_hidden, 0);
+        assert_eq!(user_hidden, 0);
     }
 
     #[test]

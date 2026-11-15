@@ -332,6 +332,22 @@ enum ModelCommand {
     },
     /// Clear `llm_container.model_id` from supervisor.toml
     Reset,
+    /// Hide a model id from `model list`
+    Hide {
+        /// Model id
+        id: String,
+        /// Return all models (including hidden/filtered) in the JSON output
+        #[arg(long)]
+        all: bool,
+    },
+    /// Unhide a previously hidden model id
+    Unhide {
+        /// Model id
+        id: String,
+        /// Return all models (including hidden/filtered) in the JSON output
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 const VALID_LABEL_KEYS: [&str; 7] = [
@@ -743,6 +759,34 @@ async fn main() -> Result<()> {
                         .await
                         .context("supervisor model reset task panicked")??;
                     println!("{}", serde_json::to_string_pretty(&snap)?);
+                    Ok(())
+                }
+                ModelCommand::Hide { id, all } => {
+                    let out = tokio::task::spawn_blocking(move || {
+                        let out = tchelvis::supervisor::hide_model(&id)?;
+                        if all {
+                            tchelvis::supervisor::list_models(None, true)
+                        } else {
+                            Ok(out)
+                        }
+                    })
+                    .await
+                    .context("supervisor model hide task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                ModelCommand::Unhide { id, all } => {
+                    let out = tokio::task::spawn_blocking(move || {
+                        let out = tchelvis::supervisor::unhide_model(&id)?;
+                        if all {
+                            tchelvis::supervisor::list_models(None, true)
+                        } else {
+                            Ok(out)
+                        }
+                    })
+                    .await
+                    .context("supervisor model unhide task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&out)?);
                     Ok(())
                 }
             },
@@ -1217,6 +1261,9 @@ fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
     }
     if out.models.is_empty() {
         println!("No local GGUF models found (filter: {}).", out.filter);
+        if out.user_hidden_count > 0 {
+            println!("({} hidden by you)", out.user_hidden_count);
+        }
         return;
     }
     println!(
@@ -1239,5 +1286,8 @@ fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
     }
     if out.hidden_count > 0 {
         println!("({} hidden by filter '{}')", out.hidden_count, out.filter);
+    }
+    if out.user_hidden_count > 0 {
+        println!("({} hidden by you)", out.user_hidden_count);
     }
 }

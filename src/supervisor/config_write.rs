@@ -71,6 +71,25 @@ pub fn clear_model_selection(path: &Path) -> Result<()> {
     })
 }
 
+/// Persists `llm_container.hidden_models`, or removes the key when `ids` is empty.
+pub fn write_hidden_models(path: &Path, ids: &[String]) -> Result<()> {
+    edit_supervisor_toml(path, |doc| {
+        if ids.is_empty() {
+            if let Some(Item::Table(tbl)) = doc.get_mut("llm_container") {
+                tbl.remove("hidden_models");
+            }
+            return Ok(());
+        }
+        let tbl = ensure_llm_container_table(doc)?;
+        let mut arr = toml_edit::Array::new();
+        for id in ids {
+            arr.push(id.as_str());
+        }
+        tbl["hidden_models"] = value(arr);
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +178,33 @@ mod tests {
 
         assert!(write_model_selection(&path, "file:/m/a.gguf", None).is_err());
         assert_eq!(fs::read(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn write_hidden_models_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.toml");
+        fs::write(
+            &path,
+            "# keep\npoll_interval_secs = 25\n\n[llm_container]\nmodel_filter = \"8b\"\n",
+        )
+        .unwrap();
+
+        let ids = vec!["a".to_string(), "b".to_string()];
+        write_hidden_models(&path, &ids).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep"));
+        let parsed: SupervisorConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.poll_interval_secs, 25);
+        assert_eq!(parsed.llm_container.model_filter, "8b");
+        assert_eq!(parsed.llm_container.hidden_models, ids);
+
+        write_hidden_models(&path, &[]).unwrap();
+        let cleared_raw = fs::read_to_string(&path).unwrap();
+        assert!(!cleared_raw.contains("hidden_models"));
+        let cleared_parsed: SupervisorConfig = toml::from_str(&cleared_raw).unwrap();
+        assert!(cleared_parsed.llm_container.hidden_models.is_empty());
+        assert_eq!(cleared_parsed.llm_container.model_filter, "8b");
+        assert_eq!(cleared_parsed.poll_interval_secs, 25);
     }
 }

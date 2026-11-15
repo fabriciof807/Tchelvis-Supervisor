@@ -287,6 +287,7 @@ pub fn list_models(
         return Ok(models::ModelListOutput {
             models: Vec::new(),
             hidden_count: 0,
+            user_hidden_count: 0,
             filter: filter.as_str().to_string(),
             selected_id: cfg.llm_container.model_id,
             managed: false,
@@ -297,8 +298,13 @@ pub fn list_models(
     let roots = models::ScanRoots::from_env_and_config(&cfg.llm_container);
     let scanned = models::scan_local_models(&roots);
     let eff = models::effective_model(&cfg, &roots.ollama);
-    let (model_list, hidden_count) =
-        models::build_model_list(scanned, filter, eff.as_ref(), show_all);
+    let (model_list, hidden_count, user_hidden_count) = models::build_model_list(
+        scanned,
+        filter,
+        eff.as_ref(),
+        show_all,
+        &cfg.llm_container.hidden_models,
+    );
 
     let model_id_set = cfg
         .llm_container
@@ -319,11 +325,65 @@ pub fn list_models(
     Ok(models::ModelListOutput {
         models: model_list,
         hidden_count,
+        user_hidden_count,
         filter: filter.as_str().to_string(),
         selected_id: cfg.llm_container.model_id,
         managed: true,
         env_override_ignored: env_note,
     })
+}
+
+fn hide_model_in(
+    id: &str,
+    cfg_path: &std::path::Path,
+    cfg: &SupervisorConfig,
+    ollama_roots: &[PathBuf],
+) -> Result<()> {
+    let eff = models::effective_model(cfg, ollama_roots);
+    if eff.as_ref().map(|e| e.id.as_str()) == Some(id) {
+        anyhow::bail!("cannot hide the model in use: {id}");
+    }
+    if !cfg.llm_container.hidden_models.iter().any(|h| h == id) {
+        let mut next = cfg.llm_container.hidden_models.clone();
+        next.push(id.to_string());
+        config_write::write_hidden_models(cfg_path, &next)?;
+    }
+    Ok(())
+}
+
+fn unhide_model_in(
+    id: &str,
+    cfg_path: &std::path::Path,
+    cfg: &SupervisorConfig,
+) -> Result<()> {
+    if cfg.llm_container.hidden_models.iter().any(|h| h == id) {
+        let next: Vec<String> = cfg
+            .llm_container
+            .hidden_models
+            .iter()
+            .filter(|h| h.as_str() != id)
+            .cloned()
+            .collect();
+        config_write::write_hidden_models(cfg_path, &next)?;
+    }
+    Ok(())
+}
+
+/// Persists `id` into `[llm_container] hidden_models` and returns the updated model list.
+/// Idempotent; errors if `id` is the currently effective model.
+pub fn hide_model(id: &str) -> Result<models::ModelListOutput> {
+    let cfg = SupervisorConfig::load();
+    let roots = models::ScanRoots::from_env_and_config(&cfg.llm_container);
+    hide_model_in(id, &config::supervisor_config_path(), &cfg, &roots.ollama)?;
+    list_models(None, false)
+}
+
+/// Removes `id` from `[llm_container] hidden_models` and returns the updated model list.
+/// Idempotent.
+pub fn unhide_model(id: &str) -> Result<models::ModelListOutput> {
+    let cfg = SupervisorConfig::load();
+    unhide_model_in(id, &config::supervisor_config_path(), &cfg)?;
+    list_models(None, false)
 }
 
 fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
@@ -561,5 +621,41 @@ mod tests {
     fn respond_requires_blocked() {
         let err = validate_respond_guard("t1", RespondAction::Approve, false, "", "").unwrap_err();
         assert!(err.to_string().contains("Nenhum prompt pendente em t1"));
+    }
+
+    #[test]
+    fn hide_and_unhide_roundtrip_and_refuse_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("supervisor.toml");
+        let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.model_id = Some("file:/m/active.gguf".to_string());
+
+        let err = hide_model_in("file:/m/active.gguf", &cfg_path, &cfg, &[]).unwrap_err();
+        assert!(err.to_string().contains("cannot hide the model in use"));
+
+        hide_model_in("file:/m/other.gguf", &cfg_path, &cfg, &[]).unwrap();
+        let parsed1: SupervisorConfig =
+            toml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed1.llm_container.hidden_models,
+            vec!["file:/m/other.gguf".to_string()]
+        );
+
+        // Idempotent hide
+        hide_model_in("file:/m/other.gguf", &cfg_path, &parsed1, &[]).unwrap();
+        let parsed2: SupervisorConfig =
+            toml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert_eq!(
+            parsed2.llm_container.hidden_models,
+            vec!["file:/m/other.gguf".to_string()]
+        );
+
+        unhide_model_in("file:/m/other.gguf", &cfg_path, &parsed2).unwrap();
+        let raw3 = std::fs::read_to_string(&cfg_path).unwrap();
+        assert!(!raw3.contains("hidden_models"));
+
+        // Idempotent unhide
+        let parsed3: SupervisorConfig = toml::from_str(&raw3).unwrap();
+        unhide_model_in("file:/m/other.gguf", &cfg_path, &parsed3).unwrap();
     }
 }

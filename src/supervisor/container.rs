@@ -104,6 +104,8 @@ pub struct LlmContainerConfig {
     pub model_dirs: Vec<PathBuf>,
     /// Reserved for M1b; not read.
     pub fallback_model_id: Option<String>,
+    /// User-hidden model ids omitted from `model list` unless `--all` is passed.
+    pub hidden_models: Vec<String>,
 }
 
 impl Default for LlmContainerConfig {
@@ -126,6 +128,7 @@ impl Default for LlmContainerConfig {
             model_filter: "4b".to_string(),
             model_dirs: Vec::new(),
             fallback_model_id: None,
+            hidden_models: Vec::new(),
         }
     }
 }
