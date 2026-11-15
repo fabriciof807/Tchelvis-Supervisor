@@ -89,6 +89,13 @@ pub fn plan_delete(model: &LocalModel) -> Result<DeletePlan> {
         bail!("model path missing for {}", model.id);
     };
     let canon_path = fs::canonicalize(&raw_path).unwrap_or(raw_path);
+    // HF blobs have no extension; their snapshot symlinks must still be `.gguf`.
+    if hf_repo_dir(&canon_path).is_none() && !is_gguf(&canon_path) {
+        bail!(
+            "refusing to delete {}: not a .gguf file",
+            canon_path.display()
+        );
+    }
 
     if let Some(repo_dir) = hf_repo_dir(&canon_path) {
         let snapshots_dir = repo_dir.join("snapshots");
@@ -129,8 +136,7 @@ pub fn plan_delete(model: &LocalModel) -> Result<DeletePlan> {
             ) {
                 if let Some((base, total)) = shard_parts(fname) {
                     for idx in 1..=total.min(1000) {
-                        let sib =
-                            parent.join(format!("{base}-{idx:05}-of-{total:05}.gguf"));
+                        let sib = parent.join(format!("{base}-{idx:05}-of-{total:05}.gguf"));
                         if fs::symlink_metadata(&sib)
                             .map(|m| m.file_type().is_symlink())
                             .unwrap_or(false)
@@ -381,6 +387,18 @@ mod tests {
     }
 
     #[test]
+    fn non_gguf_file_is_refused() {
+        // Defense in depth: never delete a file that is not a model, whatever the id says
+        // (e.g. a `file:` id pointing at an Ollama blob or a config file).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sha256-abc");
+        fs::write(&file, b"blob").unwrap();
+        let model = make_file_model(&file);
+        assert!(plan_delete(&model).is_err());
+        assert!(file.exists());
+    }
+
+    #[test]
     fn flat_file_removed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("tiny.gguf");
@@ -431,7 +449,9 @@ mod tests {
     #[test]
     fn hf_single_model_prunes_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--org--repo");
         let blob = repo.join("blobs/sha256-aaa");
         let snap = repo.join("snapshots/rev1/model.gguf");
         fs::create_dir_all(blob.parent().unwrap()).unwrap();
@@ -463,7 +483,9 @@ mod tests {
     #[test]
     fn hf_shared_blob_kept() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--org--repo");
         let blob = repo.join("blobs/sha256-shared");
         let snap1 = repo.join("snapshots/rev1/model.gguf");
         let snap2 = repo.join("snapshots/rev2/model.gguf");
@@ -497,7 +519,9 @@ mod tests {
     #[test]
     fn hf_shards_all_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--org--repo");
         let b1 = repo.join("blobs/b1");
         let b2 = repo.join("blobs/b2");
         let s1 = repo.join("snapshots/rev1/big-00001-of-00002.gguf");
@@ -535,7 +559,9 @@ mod tests {
     #[test]
     fn hf_other_model_keeps_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--org--repo");
         let b1 = repo.join("blobs/b1");
         let b2 = repo.join("blobs/b2");
         let s1 = repo.join("snapshots/rev1/q4.gguf");
@@ -651,7 +677,9 @@ mod tests {
     #[test]
     fn execute_hf_prunes_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--org--repo");
         let blob = repo.join("blobs/sha256-aaa");
         let snap = repo.join("snapshots/rev1/model.gguf");
         fs::create_dir_all(blob.parent().unwrap()).unwrap();
