@@ -36,6 +36,7 @@ with the UI track.
 | M4 | Inspector multi-terminal view | M3 | Planned |
 | M5a | Rename to `tchelvis` + release pipeline | M0 | **Implemented**; awaiting first nightly and host validation |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
+| M6 | Delegator mode: wake the coordinator when a worker finishes | — | Idea (not planned) |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -118,6 +119,21 @@ Users install the TUI/CLI binary through a package manager. From there, `tchelvi
 - **AUR**: `tchelvis-bin` from release artifacts; optionally a `tchelvis` source package.
 - **Homebrew (Linux)**: a tap (`fabriciof807/homebrew-tap`) with a Linux-only formula.
 - **Docker image**: deferred (D3).
+
+### M6 — Delegator mode (idea, not planned)
+A coordinator agent opens worker agents in Herdr terminals and should not have to poll them (as the
+Orca orchestration skill does). Instead the supervisor watches and wakes the coordinator.
+- **Link:** each worker is marked as working for a coordinator (hc `parent` field or a label).
+- **"Finished"** = the worker is back at its prompt waiting for input. A worker blocked on a
+  permission prompt (`[y/N]`) keeps the normal auto-reply/alert flow and does not count.
+- **Notice:** the supervisor sends the coordinator a short deterministic message (e.g. "worker
+  t11g is back at its prompt"). No LLM, no summary.
+- **Judgement stays with the coordinator:** it reads the worker's screen and decides whether it was
+  a checkpoint or the task is done.
+- **Open case:** a coordinator can show as `working` while it only waits on its own subagents.
+  Delivery must detect "only waiting on children" (static screen + active children, cf.
+  `blocked_children` rollup) instead of trusting the status, and account for how each agent
+  handles text typed mid-turn (queued vs. mixed into its input).
 
 ## Decisions
 
