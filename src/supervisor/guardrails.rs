@@ -324,10 +324,8 @@ pub fn readonly_fast_path_with_msg(
     // printed after the prompt (timeouts, hints) are ignored.
     let (payload, prompt_idx) = if let Some(i) = lines.iter().position(|l| menu_yes.is_match(l)) {
         ("1", i)
-    } else if let Some(i) = lines.iter().rposition(|l| is_yes_no(l)) {
-        ("y", i)
     } else {
-        return None;
+        ("y", lines.iter().rposition(|l| is_yes_no(l))?)
     };
 
     // The request as hc reports it, e.g. `approve Bash: git diff --stat`.
