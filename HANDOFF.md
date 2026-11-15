@@ -116,7 +116,12 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
     - resultado em `~/.local/state/tchelvis/bench_last.json`.
   - Card "CPU vs GPU benchmark" na aba Doctor do mod.
   - Validado no `ai-box` (sem GPU): linha da CPU com números, "No GPU detected" e restauração do estado.
-- **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench).
+- **M1c ocultar/apagar modelos** (`model hide|unhide|rm`):
+  - `[llm_container] hidden_models` em `supervisor.toml` (`config_write::write_hidden_models`); `model list --json` expõe `hidden: bool` e `user_hidden_count`; `model list --all` mostra os ocultos pelo usuário.
+  - `tchelvis supervisor model rm <id> [--yes] [--json]`: planejador puro (`model_delete.rs`) trata arquivos planos (+ shards), cache HF (`models--*`, preservando blobs compartilhados e podando o diretório só quando não resta `.gguf`), e Ollama (`ollama rm` ou `DELETE /api/delete`). Recusa modelos protegidos (efetivo, `fallback_model_id`, ou `tchelvis.model_id` no container em execução) e recusa stdin não-interativo sem `--yes`.
+  - Mod: ações `Hide`/`Show` e `Delete` (duplo clique em 4 s: `Delete <size>?`) nas linhas elegíveis do card `Supervisor model`.
+  - **Validar no host:** fluxo visual de `Hide`/`Show` e `Delete` no card do Herdr Desktop.
+- **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench, M1c).
 - **Execução:** Gemini 4 Hydrogen (medium) solo via `delegate_task`; o coordenador revisa, valida e faz commit.
   - O swarm do Antigravity travou 2× (workers parados), por isso não é usado.
   - O Hydrogen às vezes encerra antes de validar; o coordenador sempre revalida.

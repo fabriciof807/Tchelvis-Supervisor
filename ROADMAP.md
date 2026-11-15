@@ -29,7 +29,7 @@ with the UI track.
 | M0 | Container validation & config hardening | — | Host validation in progress; partial TOML done (M1) |
 | M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | **Implemented**; UI to validate on host |
 | M1b | Fallback model when the chosen one stops working | M1 | Planned |
-| M1c | Hide/delete models ([design](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md)) | M1 | In progress |
+| M1c | Hide/delete models ([design](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md)) | M1 | **Implemented**; host validation pending |
 | M1d | Decision-quality benchmark per model | M1 | Planned |
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |

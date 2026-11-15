@@ -238,6 +238,33 @@ function fmtBytes(n) {
   return `${Math.round(b / 1e6)} MB`;
 }
 
+export function modelRowActions(row, selectedId) {
+  if (!row || row.in_use || (selectedId && row.id === selectedId)) {
+    return { canHide: false, canUnhide: false, canDelete: false };
+  }
+  const isHidden = Boolean(row.hidden);
+  return {
+    canHide: !isHidden,
+    canUnhide: isHidden,
+    canDelete: true,
+  };
+}
+
+export function deleteClick(pending, id, now, windowMs = 4000) {
+  if (!id) {
+    return { pending: null, confirmed: false };
+  }
+  if (
+    pending &&
+    pending.id === id &&
+    now >= pending.at &&
+    now - pending.at <= windowMs
+  ) {
+    return { pending: null, confirmed: true };
+  }
+  return { pending: { id, at: now }, confirmed: false };
+}
+
 // Compact LLM residency label from /api/ps: "1.3 GB RAM" or "1.1 GB VRAM · 0.2 GB RAM".
 // Returns "" when the snapshot carries no usage numbers (non-Ollama backend / older binary).
 function llmMemoryLabel(snap) {
@@ -1069,6 +1096,8 @@ export default class CockpitMod extends View {
     this.modelListError = String(shared("cockpit.modelListError") ?? "");
     this.modelListShowAll = Boolean(shared("cockpit.modelListShowAll"));
     this.modelSwitchingId = shared("cockpit.modelSwitchingId") ?? null;
+    this.modelDeletePending = shared("cockpit.modelDeletePending") ?? null;
+    this.modelDeletingId = shared("cockpit.modelDeletingId") ?? null;
     this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
@@ -2095,8 +2124,10 @@ export default class CockpitMod extends View {
 
     this.modelPickerOpen = true;
     this.modelListShowAll = false;
+    this.modelDeletePending = null;
     setShared("cockpit.modelPickerOpen", true);
     setShared("cockpit.modelListShowAll", false);
+    setShared("cockpit.modelDeletePending", null);
     if (inspectorHidden) {
       this.modelPickerOnlyDrawer = true;
       setShared("cockpit.modelPickerOnlyDrawer", true);
@@ -2116,9 +2147,11 @@ export default class CockpitMod extends View {
     this.modelPickerOpen = false;
     this.modelPickerOnlyDrawer = false;
     this.modelListShowAll = false;
+    this.modelDeletePending = null;
     setShared("cockpit.modelPickerOpen", false);
     setShared("cockpit.modelPickerOnlyDrawer", false);
     setShared("cockpit.modelListShowAll", false);
+    setShared("cockpit.modelDeletePending", null);
     if (onlyDrawer && !findNode(layout(), "tchelvis-inspector")?.hidden) {
       run("layout.hide", { id: "tchelvis-inspector" });
     }
@@ -2163,6 +2196,8 @@ export default class CockpitMod extends View {
       showAll !== null
         ? Boolean(showAll)
         : Boolean(shared("cockpit.modelListShowAll") ?? this.modelListShowAll);
+    this.modelDeletePending = null;
+    setShared("cockpit.modelDeletePending", null);
     const args = ["supervisor", "model", "list", "--json"];
     if (useAll) args.push("--all");
     this._runModelListCmd(cx, args);
@@ -2170,17 +2205,23 @@ export default class CockpitMod extends View {
 
   setModelFilter(cx, f) {
     const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
-    if (switching) return;
+    const deleting = shared("cockpit.modelDeletingId") ?? this.modelDeletingId;
+    if (switching || deleting) return;
     this.modelListShowAll = false;
+    this.modelDeletePending = null;
     setShared("cockpit.modelListShowAll", false);
+    setShared("cockpit.modelDeletePending", null);
     this._runModelListCmd(cx, ["supervisor", "model", "filter", f]);
   }
 
   selectModel(cx, id) {
     const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
-    if (switching || !id) return;
+    const deleting = shared("cockpit.modelDeletingId") ?? this.modelDeletingId;
+    if (switching || deleting || !id) return;
+    this.modelDeletePending = null;
     this.modelSwitchingId = id;
     this.modelListError = "";
+    setShared("cockpit.modelDeletePending", null);
     setShared("cockpit.modelSwitchingId", id);
     setShared("cockpit.modelListError", "");
     cx?.notify();
@@ -2210,6 +2251,91 @@ export default class CockpitMod extends View {
       } finally {
         this.modelSwitchingId = null;
         setShared("cockpit.modelSwitchingId", null);
+        if (ok) {
+          this.fetchModelList(cx, null);
+        } else {
+          cx.notify();
+        }
+      }
+    });
+  }
+
+  hideModel(cx, id) {
+    const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
+    const deleting = shared("cockpit.modelDeletingId") ?? this.modelDeletingId;
+    if (switching || deleting || !id) return;
+    const useAll = Boolean(
+      shared("cockpit.modelListShowAll") ?? this.modelListShowAll
+    );
+    const args = ["supervisor", "model", "hide", id];
+    if (useAll) args.push("--all");
+    this._runModelListCmd(cx, args);
+  }
+
+  unhideModel(cx, id) {
+    const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
+    const deleting = shared("cockpit.modelDeletingId") ?? this.modelDeletingId;
+    if (switching || deleting || !id) return;
+    const useAll = Boolean(
+      shared("cockpit.modelListShowAll") ?? this.modelListShowAll
+    );
+    const args = ["supervisor", "model", "unhide", id];
+    if (useAll) args.push("--all");
+    this._runModelListCmd(cx, args);
+  }
+
+  deleteModel(cx, id) {
+    const switching = shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId;
+    const deleting = shared("cockpit.modelDeletingId") ?? this.modelDeletingId;
+    if (switching || deleting || !id) return;
+    const curPending =
+      shared("cockpit.modelDeletePending") ?? this.modelDeletePending ?? null;
+    const next = deleteClick(curPending, id, Date.now());
+    this.modelDeletePending = next.pending;
+    setShared("cockpit.modelDeletePending", next.pending);
+    if (!next.confirmed) {
+      cx?.notify();
+      return;
+    }
+
+    this.modelDeletingId = id;
+    this.modelListError = "";
+    setShared("cockpit.modelDeletingId", id);
+    setShared("cockpit.modelListError", "");
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      let ok = false;
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "model", "rm", id, "--yes", "--json"],
+          { timeout: 120000 }
+        );
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          if (parsed?.deleted) {
+            ok = true;
+          } else {
+            const err = "Model was not deleted";
+            this.modelListError = err;
+            setShared("cockpit.modelListError", err);
+          }
+        } else {
+          const err =
+            res.stderr?.trim() ||
+            res.stdout?.trim() ||
+            `Command failed (${res.code})`;
+          this.modelListError = err;
+          setShared("cockpit.modelListError", err);
+        }
+      } catch (e) {
+        const err = `Error: ${String(e)}`;
+        this.modelListError = err;
+        setShared("cockpit.modelListError", err);
+      } finally {
+        this.modelDeletingId = null;
+        setShared("cockpit.modelDeletingId", null);
         if (ok) {
           this.fetchModelList(cx, null);
         } else {
@@ -4361,9 +4487,15 @@ export default class CockpitMod extends View {
     );
     const switchingId =
       shared("cockpit.modelSwitchingId") ?? this.modelSwitchingId ?? null;
+    const deletingId =
+      shared("cockpit.modelDeletingId") ?? this.modelDeletingId ?? null;
+    const pendingDelete =
+      shared("cockpit.modelDeletePending") ?? this.modelDeletePending ?? null;
 
     const models = Array.isArray(listData?.models) ? listData.models : [];
     const hiddenCount = Number(listData?.hidden_count ?? 0);
+    const userHiddenCount = Number(listData?.user_hidden_count ?? 0);
+    const selectedId = listData?.selected_id ?? null;
     const activeFilter = String(listData?.filter || "4b").toLowerCase();
     const managed = listData ? listData.managed !== false : true;
     const envWarning = listData?.env_override_ignored
@@ -4515,14 +4647,28 @@ export default class CockpitMod extends View {
             .children(
               models.map((m, idx) => {
                 const isSwitching = switchingId === m.id;
+                const isDeleting = deletingId === m.id;
                 const isNonChat = Boolean(m.kind && m.kind !== "chat");
-                const isClickable = !isNonChat && !switchingId;
+                const isHiddenRow = Boolean(m.hidden);
+                const isClickable = !isNonChat && !switchingId && !deletingId;
+                const actions = modelRowActions(m, selectedId);
+                const isPendingDelete = Boolean(
+                  pendingDelete &&
+                    pendingDelete.id === m.id &&
+                    Date.now() - pendingDelete.at <= 4000
+                );
+                const deleteLabel = isPendingDelete
+                  ? Number(m.size_bytes) > 0
+                    ? `Delete ${fmtBytes(m.size_bytes)}?`
+                    : "Delete?"
+                  : "Delete";
                 const metaParts = [
                   m.params_label || "?",
                   m.source || "",
                   Number(m.size_bytes) > 0 ? fmtBytes(m.size_bytes) : "",
                   m.quant || "",
                   isNonChat ? String(m.kind) : "",
+                  isHiddenRow ? "hidden" : "",
                 ].filter(Boolean);
 
                 let row = h_flex()
@@ -4567,7 +4713,7 @@ export default class CockpitMod extends View {
                           .flex_none()
                           .text_size(11.5)
                           .text_color(
-                            isNonChat
+                            isNonChat || isHiddenRow
                               ? t.dim
                               : m.in_use
                                 ? t.accent
@@ -4579,25 +4725,78 @@ export default class CockpitMod extends View {
                         div()
                           .text_size(11.5)
                           .font_semibold()
-                          .text_color(isNonChat ? t.dim : t.foreground)
-                          .child(ellipsize(m.display_name || m.id, 34))
+                          .text_color(
+                            isNonChat || isHiddenRow ? t.dim : t.foreground
+                          )
+                          .child(ellipsize(m.display_name || m.id, 30))
                       )
                   )
                   .child(
-                    div()
+                    h_flex()
                       .flex_none()
-                      .text_size(10.5)
-                      .text_color(
-                        isSwitching
-                          ? t.accent
-                          : isNonChat
-                            ? t.dim
-                            : t.muted
-                      )
+                      .gap(6)
+                      .items_center()
                       .child(
-                        isSwitching
-                          ? "◌ Switching…"
-                          : metaParts.join(" · ")
+                        div()
+                          .flex_none()
+                          .text_size(10.5)
+                          .text_color(
+                            isDeleting
+                              ? t.blocked
+                              : isSwitching
+                                ? t.accent
+                                : isNonChat || isHiddenRow
+                                  ? t.dim
+                                  : t.muted
+                          )
+                          .child(
+                            isDeleting
+                              ? "◌ Deleting…"
+                              : isSwitching
+                                ? "◌ Switching…"
+                                : metaParts.join(" · ")
+                          )
+                      )
+                      .when(
+                        !isSwitching && !isDeleting && actions.canHide,
+                        (el) =>
+                          el.child(
+                            this.actionBtn(
+                              t,
+                              `ck-model-hide-${idx}`,
+                              "Hide",
+                              (_e, clickCx) =>
+                                this.hideModel(clickCx ?? cx, m.id)
+                            )
+                          )
+                      )
+                      .when(
+                        !isSwitching && !isDeleting && actions.canUnhide,
+                        (el) =>
+                          el.child(
+                            this.actionBtn(
+                              t,
+                              `ck-model-show-${idx}`,
+                              "Show",
+                              (_e, clickCx) =>
+                                this.unhideModel(clickCx ?? cx, m.id)
+                            )
+                          )
+                      )
+                      .when(
+                        !isSwitching && !isDeleting && actions.canDelete,
+                        (el) =>
+                          el.child(
+                            this.actionBtn(
+                              t,
+                              `ck-model-del-${idx}`,
+                              deleteLabel,
+                              (_e, clickCx) =>
+                                this.deleteModel(clickCx ?? cx, m.id),
+                              false,
+                              isPendingDelete
+                            )
+                          )
                       )
                   );
               })
@@ -4611,7 +4810,7 @@ export default class CockpitMod extends View {
           .justify_between()
           .gap(8)
           .child(
-            hiddenCount > 0 && !showAll
+            (hiddenCount > 0 || userHiddenCount > 0) && !showAll
               ? div()
                   .id("ck-model-show-hidden")
                   .text_size(11)
@@ -4626,7 +4825,16 @@ export default class CockpitMod extends View {
                     setShared("cockpit.modelListShowAll", true);
                     this.fetchModelList(clickCx ?? cx, true);
                   })
-                  .child(`${hiddenCount} hidden by filter`)
+                  .child(
+                    [
+                      hiddenCount > 0 ? `${hiddenCount} hidden by filter` : "",
+                      userHiddenCount > 0
+                        ? `${userHiddenCount} hidden by you`
+                        : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")
+                  )
               : div()
           )
           .child(
