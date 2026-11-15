@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Tchelvis Supervisor (binary `cockpit`, to be renamed `tchelvis`) are documented here.
+All notable changes to Tchelvis Supervisor (binary `tchelvis`, previously `cockpit`) are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -12,6 +12,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Self-updater & release pipeline (M5a):**
+  - `tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]` downloads the release archive from GitHub Releases, verifies its `.sha256` checksum, atomically replaces the binary, and runs `tchelvis setup --set-default-layout`.
+  - `install.sh`: POSIX shell installer supporting `--channel stable|nightly` and `--dir`.
+  - GitHub Actions release workflow (`.github/workflows/release.yml`) building static `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl` binaries for `nightly` (pushes to `main`) and stable `v*` tags, with per-asset `.sha256` and combined `SHA256SUMS`.
+  - Dual licensing under `MIT OR Apache-2.0` (`LICENSE-MIT` and `LICENSE-APACHE`).
 - **Supervisor model selection (M1).** Pick a GGUF model already on the machine for the `llama.cpp` container, without downloading anything new.
   - **Discovery:** scans the Ollama store, the Hugging Face / llama.cpp / LM Studio caches, and folders from `[llm_container] model_dirs` or `COCKPIT_MODEL_DIRS`.
   - **Filter:** by parameter count (`≤2B / ≤4B / ≤8B / All`, default ≤4B). Embedding and projector models are hidden.
@@ -44,6 +49,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Live LLM health** (`d414a7a`): connection and model status in the top bar, Home, Doctor, and `cockpit doctor`.
 
 ### Changed
+- **Breaking — Rename `cockpit` → `tchelvis` (M5a):**
+  - Binary renamed to `tchelvis` (package version bumped to `0.2.0`).
+  - Directories moved to `~/.config/tchelvis`, `~/.local/share/tchelvis`, `~/.local/state/tchelvis`, and `~/.cache/tchelvis/llama.cpp`.
+  - Environment variable prefix changed from `COCKPIT_*` to `TCHELVIS_*` (`TCHELVIS_LLM_CONTAINER`, `TCHELVIS_CONTAINER_RUNTIME`, `TCHELVIS_LLM_BACKEND`, `TCHELVIS_LLM_HOST`, `TCHELVIS_LLM_MODEL`, `TCHELVIS_LLM_API_KEY`, `TCHELVIS_ALLOW_GPU`, `TCHELVIS_JIRA_TOKEN`, `TCHELVIS_LINEAR_TOKEN`, `TCHELVIS_SLACK_TOKEN`).
+  - Managed LLM container renamed to `tchelvis-supervisor-llm`; Herdr Desktop mod/layout renamed to `tchelvis`; systemd unit renamed to `tchelvis.service`; agent plugins renamed to `tchelvis.js`. (`cockpit.*` `hc` labels remain readable.)
+  - **No automatic migration:** uninstall `cockpit` (`cockpit uninstall --purge`), remove any old `cockpit-supervisor-llm` container, and rename `COCKPIT_*` variables in your shell rc files to `TCHELVIS_*` before installing `tchelvis`.
 - `supervisor.toml` may now contain only some keys. Missing keys fall back to defaults instead of the whole file being ignored, and parse errors are logged.
 - **Project renamed** to **Tchelvis Supervisor**. The GitHub repository moved to `fabriciof807/Tchelvis-Supervisor` and is now public; the README was rewritten in English around the container setup (`fb01886`).
 - **Default supervisor model** is now `lfm3:1.7b` (previously `qwen2.5:1.5b-instruct`). Evaluations run with `think: false` for fast CPU responses (`4c842ec`, `0c5c727`).

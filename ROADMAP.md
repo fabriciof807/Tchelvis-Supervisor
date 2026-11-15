@@ -32,7 +32,7 @@ with the UI track.
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |
 | M4 | Inspector multi-terminal view | M3 | Planned |
-| M5a | Rename to `tchelvis` + release pipeline | M0 | Planned |
+| M5a | Rename to `tchelvis` + release pipeline | M0 | **Implemented**; awaiting first nightly and host validation |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
 
 ### M0 — Container validation & config hardening
@@ -92,13 +92,12 @@ refresh cadence and load need design.
 **Done when:** the user can watch several agents' output at once without leaving the Inspector.
 
 ### M5a — Rename to `tchelvis` + release pipeline
-- **Rename (D1)**: binary/package `cockpit` → `tchelvis` across the CLI, the Herdr mod (`exec("cockpit", …)`),
-  `setup`/`uninstall`, agent hooks, layout/mod ids, and docs. Migrate existing installs: move or read
-  `~/.config/cockpit`, `~/.local/state/cockpit`, `~/.local/share/cockpit`, the `cockpit-supervisor-llm`
-  container name, and installed hooks/mod files, and remove the old binary on `setup`. Keep `cockpit.*` hc
-  labels readable during the transition.
-- **Release pipeline**: SemVer from `0.1.0`, git tags, moving `CHANGELOG.md` "Unreleased" into the release section, and GitHub Actions that build and attach
-  Linux `x86_64`/`aarch64` binaries with checksums (Linux only, D2).
+- **Rename (D1)**: binary/package `cockpit` → `tchelvis` across the CLI, the Herdr mod (`exec("tchelvis", …)`),
+  `setup`/`uninstall`, agent hooks, layout/mod ids, env prefix (`TCHELVIS_*`), and docs. No automatic
+  migration from `cockpit`: users uninstall `cockpit` (`cockpit uninstall --purge`) and clean-install `tchelvis`.
+  Keep `cockpit.*` hc labels readable.
+- **Release pipeline**: SemVer from `0.1.0` (`0.2.0` first post-rename release), git tags, moving `CHANGELOG.md` "Unreleased" into the release section, and GitHub Actions that build and attach
+  Linux `x86_64`/`aarch64` binaries with checksums (Linux only, D2), plus `install.sh` and `tchelvis update`.
 
 ### M5b — Distribution: AUR, Homebrew (Linux)
 Users install the TUI/CLI binary through a package manager. From there, `tchelvis setup` and

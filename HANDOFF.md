@@ -106,45 +106,45 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ## 3. Comandos Rápidos para a Próxima Sessão
 
-### Sincronizar binário e mod do container (`ai-box`) para o Host
+### Instalar / atualizar no Host (Release / Nightly)
 No terminal da máquina **host**:
 ```bash
-incus file pull ai-box/home/ubuntu/.local/bin/cockpit ~/.local/bin/cockpit && \
-chmod +x ~/.local/bin/cockpit && \
-pkill -f "cockpit daemon" 2>/dev/null; pkill -f "cockpit supervisor watch" 2>/dev/null; \
-~/.local/bin/cockpit setup --set-default-layout && \
-which -a cockpit && \
-~/.local/bin/cockpit supervisor status --json
+# one time (old cockpit → tchelvis, clean install)
+cockpit uninstall --purge; docker rm -f cockpit-supervisor-llm 2>/dev/null; podman rm -f cockpit-supervisor-llm 2>/dev/null; hash -r
+curl -fsSL https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/install.sh | sh -s -- --channel nightly
+# afterwards
+tchelvis update
 ```
-> ⚠️ Se `which -a cockpit` listar `~/.cargo/bin/cockpit` antes de `~/.local/bin/cockpit`, ele é um binário antigo e sombreia o novo (o mod chama `cockpit` puro). Substitua-o ou remova-o.
+> ⚠️ Se houver variáveis `COCKPIT_*` nos arquivos de shell (`~/.bashrc`, `~/.zshrc`, etc.), renomeie-as para `TCHELVIS_*` (ex.: `TCHELVIS_LLM_CONTAINER`, `TCHELVIS_ALLOW_GPU`, `TCHELVIS_LLM_API_KEY`).
+> ⚠️ Se `which -a tchelvis` listar `~/.cargo/bin/tchelvis` antes de `~/.local/bin/tchelvis`, ele é um binário antigo e sombreia o novo (o mod chama `tchelvis` puro). Substitua-o ou remova-o.
 
 ### Alternar CPU/GPU do modelo do Supervisor
 ```bash
-cockpit supervisor gpu on    # num_gpu: 99 (offload total) + warm-load
-cockpit supervisor gpu off   # num_gpu: 0 (Zero-VRAM, padrão)
+tchelvis supervisor gpu on    # num_gpu: 99 (offload total) + warm-load
+tchelvis supervisor gpu off   # num_gpu: 0 (Zero-VRAM, padrão)
 ```
-> ⚠️ O daemon `cockpit supervisor watch` só lê a config ao iniciar — reinicie-o após alternar.
+> ⚠️ O daemon `tchelvis supervisor watch` só lê a config ao iniciar — reinicie-o após alternar.
 
 ### LLM em container (`llama.cpp`)
 ```bash
-cockpit supervisor load      # sobe/inicia cockpit-supervisor-llm e espera /health
-cockpit supervisor unload    # para o container (0 B RAM/VRAM)
-cockpit supervisor status --json | jq '{llm_managed, llm_runtime, llm_container_state, llm_status_detail}'
-COCKPIT_LLM_CONTAINER=off cockpit supervisor status --json   # volta ao Ollama legado
+tchelvis supervisor load      # sobe/inicia tchelvis-supervisor-llm e espera /health
+tchelvis supervisor unload    # para o container (0 B RAM/VRAM)
+tchelvis supervisor status --json | jq '{llm_managed, llm_runtime, llm_container_state, llm_status_detail}'
+TCHELVIS_LLM_CONTAINER=off tchelvis supervisor status --json   # volta ao Ollama legado
 ```
-> ⚠️ `supervisor.toml` é parseado tudo-ou-nada: se faltar algum campo obrigatório, o arquivo inteiro é ignorado. Para definir `[llm_container] model_path`/`hf_repo`, mantenha o TOML completo.
+> `supervisor.toml` aceita só as chaves que você quiser definir (o resto usa o padrão).
 
 ### Rodar Testes e Build no Container (`ai-box`)
 ```bash
 cargo test --quiet
-node --check assets/herdr-app/mods/cockpit/main.js
-cargo build --release && cp target/release/cockpit ~/.local/bin/cockpit && cp target/release/cockpit ~/.cargo/bin/cockpit && cockpit setup --set-default-layout
+node --check assets/herdr-app/mods/tchelvis/main.js
+cargo build --release   # binário local em target/release/tchelvis; no host use `tchelvis update`
 ```
 
 ### Verificar Diagnóstico Completo (Hooks, Herdr Mod, Providers e Ollama)
 ```bash
-cockpit doctor
-cockpit supervisor status --json
+tchelvis doctor
+tchelvis supervisor status --json
 ```
 
 ---
