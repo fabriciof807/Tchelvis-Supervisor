@@ -27,6 +27,16 @@ Decision D1 says the rename `cockpit` → `tchelvis` happens **before the first 
 - **`install.sh`** for the first install, e.g. `curl -fsSL https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/install.sh | sh -s -- --channel nightly`.
 - **License:** dual **MIT OR Apache-2.0**. Today `Cargo.toml` says Apache-2.0 while `LICENSE`/README say MIT; this fixes the mismatch.
 
+## Amendment (2026-11-15, user decision): no `cockpit` → `tchelvis` migration
+The only existing install is the user's, and the user will run `cockpit uninstall --purge` and then install `tchelvis` cleanly.
+Therefore:
+- the directory migration, the TOML path rewrite, the legacy file, marker, and fence cleanup, the legacy binary removal, the
+  legacy container removal, and the `COCKPIT_*` env aliases are **dropped**. Wherever §1 says "Migration", read
+  "none, clean install";
+- `.cockpit/runbooks` is not read any more, only `.tchelvis/runbooks`;
+- §1.1 (stop and restart processes) stays, but only for `tchelvis daemon` / `tchelvis supervisor watch`. It is used by
+  `update`, so a new binary does not leave the old daemons running.
+
 ## Non-goals
 - AUR and Homebrew packages (M5b, written by hand later against these release artifacts).
 - macOS and Windows (D2: Linux only).

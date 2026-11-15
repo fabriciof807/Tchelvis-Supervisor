@@ -2,11 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rename `cockpit` to `tchelvis`, with automatic migration of existing installs, and publish static Linux builds on two channels (stable tags, nightly per push to `main`). `tchelvis update` / `install.sh` install a release and leave everything ready in one command.
+**Goal:** Rename `cockpit` to `tchelvis` (clean install, **no migration**, per the user's decision of 2026-11-15) and publish static Linux builds on two channels (stable tags, nightly per push to `main`). `tchelvis update` / `install.sh` install a release and leave everything ready in one command.
 
 **Architecture:**
-- New focused modules: `src/envvars.rs` (env aliases), `src/version.rs` (build metadata), `src/migrate.rs` (dirs, TOML paths, legacy files and binaries), `src/procs.rs` (stop/restart our daemons), `src/update.rs` (release resolution, download, verify, atomic replace).
-- `setup` orchestrates the migration.
+- New focused modules: `src/envvars.rs` (single `TCHELVIS_` env lookup), `src/version.rs` (build metadata), `src/procs.rs` (stop/restart our daemons around `update`), `src/update.rs` (release resolution, download, verify, atomic replace).
 - A GitHub Actions workflow publishes the releases. `install.sh` bootstraps installs.
 
 **Tech Stack:** Rust 2021 (`ureq`, `sha2`, `serde_json`, `toml_edit`, `libc`; new: `flate2 = "1"`, `tar = "0.4"`), POSIX `sh`, GitHub Actions + `gh` CLI.
@@ -17,7 +16,7 @@
 - **Linux only.** Release targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`.
 - **Version** `0.2.0` in `Cargo.toml`. Build metadata comes from compile-time env `TCHELVIS_CHANNEL` (`stable` | `nightly`; unset → `dev`) and `TCHELVIS_COMMIT` (short sha).
 - **Repo:** `fabriciof807/Tchelvis-Supervisor`. Asset name: `tchelvis-<version>-<target>.tar.gz` + `.sha256` (nightly `<version>` = `nightly`). Release tags: `vX.Y.Z` and `nightly`.
-- **Renamed:** binary/crate `tchelvis`; dirs `…/tchelvis`; `tchelvis.sock`, `tchelvis.log`; mod id/dir and layout id `tchelvis`; layout node ids `tchelvis-*`; container `tchelvis-supervisor-llm` with labels `tchelvis.ngl` / `tchelvis.model_id`; unit `tchelvis.service`; shell fence `# >>> tchelvis managed >>>` / `# <<< tchelvis managed <<<`; hook marker `# tchelvis-managed`; shell function `tchelvis-tag`; env prefix `TCHELVIS_` (`COCKPIT_` still read as an alias).
+- **Renamed:** binary/crate `tchelvis`; dirs `…/tchelvis`; `tchelvis.sock`, `tchelvis.log`; mod id/dir and layout id `tchelvis`; layout node ids `tchelvis-*`; container `tchelvis-supervisor-llm` with labels `tchelvis.ngl` / `tchelvis.model_id`; unit `tchelvis.service`; shell fence `# >>> tchelvis managed >>>` / `# <<< tchelvis managed <<<`; hook marker `# tchelvis-managed`; shell function `tchelvis-tag`; env prefix `TCHELVIS_` (no `COCKPIT_` alias).
 - **Kept unchanged:**
   - hc terminal labels `cockpit.*`;
   - Herdr shared-state keys `cockpit.*` used between the binary and the mod;
@@ -25,22 +24,21 @@
 - **Error copy:**
   - "No stable release yet — use `--channel nightly`";
   - "Restart Herdr Desktop to reload the mod."
-- No `sudo` anywhere. Never delete a file that is not this project's (legacy binaries are removed only after the identity check, §1).
+- No `sudo` anywhere. Never delete a file that is not this project's. **No legacy migration or cleanup code** (amendment).
 - Format only the files you touched (`rustfmt --edition 2021 <files>`); never run a repo-wide `cargo fmt`. Deterministic tests: temp dirs, fakes, no network.
 - **Delegation:** the worker does not commit. Each task ends with "leave uncommitted"; the coordinator reviews and commits per batch.
 
 ## Review Focus
-1. **An existing `cockpit` install with `cockpit daemon` running** when `install.sh` runs setup: the processes are stopped *before* the dirs move, the data survives, and the daemon comes back as `tchelvis daemon`. → Task 4 test `finds_daemon_and_watch_ignores_others`; Task 3 test `setup_migrates_full_legacy_home`.
+1. **`tchelvis daemon` is running when `tchelvis update` runs:** it is stopped before setup and restarted from the new binary afterwards. → Task 4 test `finds_daemon_and_watch_ignores_others`.
 2. **`~/.local/bin` (the binary's dir) is not writable during `update`:** clear error, installed binary unchanged. → Task 5 test `install_bytes_unwritable_dir_errors_and_keeps_original`.
 3. **A truncated download or wrong checksum:** the update aborts before replacing anything. → Task 5 test `install_bytes_rejects_bad_sha_and_keeps_original`.
-4. **`supervisor.toml` with invalid TOML during the path rewrite:** the file is left byte-for-byte unchanged, a warning is reported, and the migration continues. → Task 3 test `rewrite_skips_invalid_toml`.
-5. **Custom `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME` / `XDG_CACHE_HOME`:** legacy and new pairs follow the XDG vars. → Task 3 test `legacy_pairs_respect_xdg`.
+4. **The GitHub API is unreachable or rate-limited (HTTP 403/5xx):** clear error naming the HTTP status, nothing replaced. → Task 5 test `http_error_message_names_status` (pure formatter).
+5. **The machine's arch is not x86_64/aarch64:** a clear "unsupported architecture" error, in both `update` and `install.sh`. → Task 5 test `parse_release_missing_asset_errors`; Task 6 step 2.
 
 ## Execution batches (coordinator reviews and commits between batches)
 - **B1:** Tasks 1–2
-- **B2:** Tasks 3–4
-- **B3:** Tasks 5–6
-- **B4:** Tasks 7–8
+- **B2:** Tasks 4–6 (Task 3 dropped)
+- **B3:** Tasks 7–8
 
 ---
 
@@ -55,7 +53,7 @@
 - Produces:
   ```rust
   // envvars.rs — `suffix` is the name without prefix, e.g. "LLM_MODEL"
-  pub fn var(suffix: &str) -> Option<String>                       // TCHELVIS_<suffix>, else COCKPIT_<suffix>
+  pub fn var(suffix: &str) -> Option<String>                       // TCHELVIS_<suffix> only
   pub fn var_with(suffix: &str, get: impl Fn(&str) -> Option<String>) -> Option<String>
   // version.rs
   pub fn format_version(pkg: &str, channel: Option<&str>, commit: Option<&str>) -> String
@@ -64,13 +62,13 @@
   ```
 
 - [ ] **Step 1: Write failing tests:**
-  - `var_with_prefers_tchelvis`: getter maps `TCHELVIS_X → "new"` and `COCKPIT_X → "old"` → `Some("new")`. Only `COCKPIT_X` set → `Some("old")`. Neither → `None`.
+  - `var_with_reads_tchelvis_only`: getter maps `TCHELVIS_X → "new"` → `Some("new")`. Only `COCKPIT_X` set → `None`.
   - `format_version_cases`: `("0.2.0", Some("nightly"), Some("a1b2c3d")) == "0.2.0 (nightly a1b2c3d)"`, `("0.2.0", Some("stable"), None) == "0.2.0 (stable)"`, `("0.2.0", None, None) == "0.2.0 (dev)"`.
 - [ ] **Step 2:** Run `cargo test --quiet envvars version`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
   - Replace every `COCKPIT_*` env read with `envvars::var("…")`.
   - Clap: `#[command(version = tchelvis… long_version())]`, using `Box::leak` for the `'static` string. Use the crate path the code has at the time; Task 2 renames it.
-  - In shell/JS hook assets, read `${TCHELVIS_X:-${COCKPIT_X:-}}`.
+  - In shell/JS hook assets, rename the env vars to `TCHELVIS_*`.
   - `LICENSE-APACHE` contains the standard Apache License 2.0 text.
 - [ ] **Step 4:** Run `cargo test --quiet`. Expected: PASS.
 - [ ] **Step 5:** Leave uncommitted.
@@ -82,7 +80,7 @@
 - every `use cockpit::` in `src/main.rs` and `tests/integration_tests.rs`;
 - `src/config.rs` (dir names, `tchelvis.log`, `tchelvis.sock`), `src/supervisor/{config,container,mod}.rs` (paths, `supervisor.toml` lookup `~/.config/tchelvis/supervisor.toml` then legacy `~/.config/herdr/supervisor.toml`, container name and labels, hf cache `~/.cache/tchelvis/llama.cpp`), `src/daemon.rs`;
 - `src/assets.rs` (include paths, fence/marker constants, `tchelvis-tag`, `command -v tchelvis`), `src/setup.rs` (all install targets and names per Global Constraints), `src/doctor.rs`;
-- `src/providers/runbooks.rs` (read both `.cockpit/runbooks` and `.tchelvis/runbooks`), `src/supervisor/hc.rs` (process filters: both names);
+- `src/providers/runbooks.rs` (`.tchelvis/runbooks` instead of `.cockpit/runbooks`), `src/supervisor/hc.rs` and `main.js` (process filters use `tchelvis`);
 - `git mv assets/herdr-app/mods/cockpit assets/herdr-app/mods/tchelvis`, `git mv assets/herdr-app/layouts/cockpit.json assets/herdr-app/layouts/tchelvis.json`;
 - `mod.json` id;
 - `main.js`:
@@ -90,100 +88,43 @@
   - `exec("cockpit", …)` → `exec("tchelvis", …)`;
   - layout node ids `tchelvis-*`;
   - visible product strings `Cockpit` → `Tchelvis`, `COCKPIT FLEET` → `TCHELVIS FLEET`;
-  - process filters accept both names;
   - **keep** `shared("cockpit.*")` keys and `cockpit.*` label names.
 
-**Interfaces:**
-- Produces: legacy constants for Task 3 in `src/assets.rs`:
-  ```rust
-  pub const LEGACY_FENCE_START: &str = "# >>> cockpit managed >>>";
-  pub const LEGACY_FENCE_END: &str = "# <<< cockpit managed <<<";
-  pub const LEGACY_CLAUDE_HOOK_MARKER: &str = "# cockpit-managed";
-  pub const LEGACY_NAME: &str = "cockpit";
-  ```
-
-- [ ] **Step 1: Write failing test:** `runbooks_reads_both_dirs`: a temp repo with `.cockpit/runbooks/a.md` and `.tchelvis/runbooks/b.md` → both discovered.
+- [ ] **Step 1: Write failing test:** `runbooks_reads_tchelvis_dir`: a temp repo with `.tchelvis/runbooks/b.md` → discovered.
 - [ ] **Step 2:** Run `cargo test --quiet runbooks`. Expected: FAIL.
 - [ ] **Step 3: Implement** the rename. Update existing test expectations (paths, names) to the new values. Do not delete tests.
 - [ ] **Step 4: Verify.** Run `cargo test --quiet && cargo build --release && ./target/release/tchelvis --version`. Expected: all tests pass, and it prints `tchelvis 0.2.0 (dev)`.
 - [ ] **Step 5:** Run this audit:
   ```bash
-  grep -rn "cockpit" src assets tests | grep -vE 'cockpit\.(agent|state|kind|msg|supervisor_state|supervisor_decision|issue|pr|slack|runbook|snapshot|[a-zA-Z_]+)\b|LEGACY_|legacy|\.cockpit/runbooks|CockpitPaths|COCKPIT_'
+  grep -rn "cockpit" src assets tests | grep -vE 'cockpit\.[a-zA-Z_]+|CockpitPaths'
   ```
-  Expected: every remaining hit is justified (legacy handling, the internal type name, or a doc comment about the legacy name). List them in the return.
+  Expected: no remaining hits except `cockpit.*` label/shared keys and internal type names. List any others in the return.
 - [ ] **Step 6:** Leave uncommitted.
 
-### Task 3: Migration (`src/migrate.rs`) wired into `setup`
+### Task 3: _(dropped — no legacy migration, per the 2026-11-15 amendment)_
 
-**Files:** Create `src/migrate.rs`; modify `src/setup.rs` (call migration first; recognize legacy markers in install and uninstall), `src/lib.rs`.
+### Task 4: Stop/restart our daemons around `update` (`src/procs.rs`)
 
-**Interfaces:**
-- Consumes: the `LEGACY_*` constants (Task 2); `procs` (Task 4) is called by setup **around** `migrate_all`. Task 4 adds that wiring.
-- Produces:
-  ```rust
-  pub struct DirPair { pub old: PathBuf, pub new: PathBuf }
-  pub enum DirOutcome { Moved, AlreadyMigrated, BothExistKeptNew, NothingToDo }
-  pub struct MigrationReport { pub dirs: Vec<(DirPair, DirOutcome)>, pub rewritten_keys: Vec<String>,
-      pub removed_files: Vec<PathBuf>, pub removed_binaries: Vec<PathBuf>,
-      pub skipped_binaries: Vec<(PathBuf, String)>, pub warnings: Vec<String> }
-  pub fn legacy_dir_pairs(home: &Path, get_env: impl Fn(&str) -> Option<String>) -> Vec<DirPair> // config, data, state, cache, runtime
-  pub fn migrate_dir(pair: &DirPair) -> Result<DirOutcome>      // rename; copy+remove on EXDEV; both exist → keep new
-  pub fn rewrite_legacy_paths_in_toml(toml_path: &Path, pairs: &[DirPair]) -> Result<Vec<String>> // model_id "file:" prefix, model_path, state_file_path
-  pub fn is_our_legacy_binary(version_out: &str, help_out: &str) -> bool  // starts "cockpit 0." && help contains "Herdr"
-  pub fn migrate_all(home: &Path, dry_run: bool) -> Result<MigrationReport>
-  ```
-
-**`migrate_all` steps:**
-1. dirs;
-2. TOML paths in `~/.config/tchelvis/supervisor.toml`;
-3. Herdr files: remove `~/.config/herdr-app/mods/cockpit/` and `layouts/cockpit.json`; in `herdr-app/settings.json`, set `default_layout` to `"tchelvis"` only if it was `"cockpit"`;
-4. legacy hook/plugin files: `~/.config/opencode/plugins/cockpit.js`, `~/.pi/agent/extensions/cockpit.js`;
-5. shell rc legacy fence blocks: remove the legacy block. `setup` then writes the new block as usual;
-6. Claude `settings.json` hooks carrying the legacy marker: remove them. `setup` re-adds the new ones;
-7. legacy systemd unit: `systemctl --user disable --now cockpit.service` (best effort), then remove the unit file;
-8. legacy binaries `~/.local/bin/cockpit` and `~/.cargo/bin/cockpit`, after `is_our_legacy_binary`;
-9. legacy container: `rm -f cockpit-supervisor-llm` via the detected runtime (best effort).
-
-`dry_run` reports the plan without touching anything. `run_uninstall` also removes legacy fences, markers, and files.
-
-- [ ] **Step 1: Write failing tests** (temp HOME):
-  - `migrate_dir_renames`.
-  - `migrate_dir_already_migrated_noop`.
-  - `migrate_dir_both_exist_keeps_new`: the old dir is untouched.
-  - `legacy_pairs_respect_xdg` (Review Focus 5).
-  - `rewrite_toml_paths`: `model_id = "file:/h/.cache/cockpit/x.gguf"` → `file:/h/.cache/tchelvis/x.gguf`, `state_file_path` rewritten, comments preserved.
-  - `rewrite_skips_invalid_toml` (Review Focus 4).
-  - `herdr_default_layout_switched_only_if_cockpit`.
-  - `shell_rc_legacy_fence_removed`: `.zshrc` with user lines + a legacy block → only the user lines remain.
-  - `legacy_binary_detection`: `("cockpit 0.1.0", "…Herdr…")` → true; `("cockpit-bridge 300", "")` → false.
-  - `setup_migrates_full_legacy_home`: a fixture HOME with legacy dirs, a TOML, the Herdr mod/layout, and a `.zshrc` fence → after `run_setup`, the data is under the new dirs, the old Herdr files are gone, and `.zshrc` has exactly one `tchelvis` block and no `cockpit` block.
-- [ ] **Step 2:** Run `cargo test --quiet migrate setup`. Expected: FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4:** Run `cargo test --quiet`. Expected: PASS.
-- [ ] **Step 5:** Leave uncommitted.
-
-### Task 4: Stop/restart our daemons around setup (`src/procs.rs`)
-
-**Files:** Create `src/procs.rs`; modify `src/setup.rs` (stop before `migrate_all`, restart after a successful setup, except in `dry_run`), `src/lib.rs`.
+**Files:** Create `src/procs.rs`; modify `src/lib.rs`. Task 5 calls it: stop before running the new binary's `setup`, restart after it.
 
 **Interfaces:**
 - Produces:
   ```rust
   pub struct OurProc { pub pid: i32, pub argv: Vec<String> }
   pub fn find_our_processes(proc_root: &Path, uid: u32, exclude_pid: i32) -> Vec<OurProc>
-     // argv0 basename ∈ {cockpit, tchelvis} && (argv1 == "daemon" || (argv1 == "supervisor" && argv2 == "watch")), status Uid == uid
+     // argv0 basename == "tchelvis" && (argv1 == "daemon" || (argv1 == "supervisor" && argv2 == "watch")), status Uid == uid
   pub fn stop_processes(procs: &[OurProc], grace: Duration) -> Vec<i32>   // SIGTERM, wait ≤ grace, SIGKILL
   pub fn restart_args(argv: &[String]) -> Vec<String>                      // drop argv0, keep the rest
   pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<String>> // detached (setsid via pre_exec), logs <log_dir>/<daemon|supervisor-watch>.log;
      // if `systemctl --user is-enabled tchelvis.service` succeeds, restart the unit instead of spawning a daemon
   ```
-- Grace: 3 s. The setup summary lists restarted processes and warns that they inherit the current shell's environment.
+- Grace: 3 s. The update summary lists restarted processes and warns that they inherit the current shell's environment.
 
 - [ ] **Step 1: Write failing tests** (fake `/proc` in a tempdir: `<pid>/cmdline` NUL-separated, `<pid>/status` with a `Uid:\t1000\t…` line):
-  - `finds_daemon_and_watch_ignores_others`: `cockpit daemon` ✓, `/home/u/.local/bin/tchelvis supervisor watch` ✓, `cockpit status` ✗, `cockpit supervisor tick` ✗, uid 0 ✗, `exclude_pid` ✗, `cockpit-bridge` ✗.
-  - `restart_args_drops_argv0`: `["cockpit","supervisor","watch"]` → `["supervisor","watch"]`.
+  - `finds_daemon_and_watch_ignores_others`: `tchelvis daemon` ✓, `/home/u/.local/bin/tchelvis supervisor watch` ✓, `tchelvis status` ✗, `tchelvis supervisor tick` ✗, uid 0 ✗, `exclude_pid` ✗, `cockpit daemon` ✗.
+  - `restart_args_drops_argv0`: `["tchelvis","supervisor","watch"]` → `["supervisor","watch"]`.
 - [ ] **Step 2:** Run `cargo test --quiet procs`. Expected: FAIL.
-- [ ] **Step 3: Implement**, plus the setup wiring.
+- [ ] **Step 3: Implement.**
 - [ ] **Step 4:** Run `cargo test --quiet`. Expected: PASS.
 - [ ] **Step 5:** Leave uncommitted.
 
@@ -213,7 +154,10 @@
 - **HTTP:** `ureq`, header `User-Agent: tchelvis-updater`, endpoints `…/releases/latest` (stable) or `…/releases/tags/nightly`.
 - **Stable 404:** error "No stable release yet — use `--channel nightly`".
 - **`--check`:** print `current → available`, then `std::process::exit(0)` if an update exists, else 1.
-- **After `install_bytes`:** write the channel file. Unless `--no-setup`, spawn the **new** binary at the same path with `setup --set-default-layout` and stream its output.
+- **After `install_bytes`:** write the channel file. Unless `--no-setup`:
+  1. `procs::find_our_processes` + `stop_processes`;
+  2. spawn the **new** binary at the same path with `setup --set-default-layout`, streaming its output;
+  3. `procs::restart` what was stopped.
 - **Summary:** old → new version and channel, then "Restart Herdr Desktop to reload the mod."
 - **Failures:** before the rename, the installed binary is untouched. A setup failure prints the retry command `tchelvis setup --set-default-layout`.
 
@@ -230,6 +174,7 @@
   - `install_bytes_replaces_atomically`: the target ends up with the new content and mode `0o755`.
   - `install_bytes_rejects_bad_sha_and_keeps_original` (Review Focus 3).
   - `install_bytes_unwritable_dir_errors_and_keeps_original` (Review Focus 2): chmod the dir `0o555`; skip when running as root.
+  - `http_error_message_names_status` (Review Focus 4): a pure helper formats `HTTP 403 from <url>`.
 - [ ] **Step 2:** Run `cargo test --quiet update`. Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4:** Run `cargo test --quiet`. Expected: PASS.
@@ -290,15 +235,15 @@
   - **Install:** `curl -fsSL https://raw.githubusercontent.com/fabriciof807/Tchelvis-Supervisor/main/install.sh | sh -s -- --channel nightly` (and stable).
   - **Update:** `tchelvis update [--channel …]`.
   - Build from source stays as an alternative.
-  - Every `cockpit` command becomes `tchelvis`, and env vars become `TCHELVIS_*` (with a note that `COCKPIT_*` still works).
+  - Every `cockpit` command becomes `tchelvis`, and env vars become `TCHELVIS_*`.
   - **License:** the dual license (badge + section).
-- **`docs/agent-install.md`:** detect `tchelvis`, then `cockpit` (legacy → run `install.sh` to migrate). Procedure A = `install.sh` / `tchelvis update`. Update the file paths to the `tchelvis` names.
+- **`docs/agent-install.md`:** detect `tchelvis`. Procedure A = `install.sh` / `tchelvis update`. Update the file paths to the `tchelvis` names.
 - **`CHANGELOG.md` Unreleased:**
-  - **Changed (breaking):** binary `tchelvis`, dirs, env prefix, Herdr layout `tchelvis`, automatic migration;
+  - **Changed (breaking):** binary `tchelvis`, dirs, env prefix, Herdr layout `tchelvis`. No migration: uninstall `cockpit`, then install `tchelvis`;
   - **Added:** `tchelvis update`, `install.sh`, stable/nightly releases, dual license.
 - **`docs/RELEASING.md`:** the steps to cut stable (CHANGELOG section, version bump, `git tag vX.Y.Z`, push tag), and how nightly works.
 - **`HANDOFF.md` §3:** replace the incus sync block with `tchelvis update --channel nightly` (first time: `install.sh --channel nightly`).
 - **ROADMAP:** M5a status → implemented, awaiting the first nightly and host validation.
 
-- [ ] **Step 1:** Run `grep -n "cockpit" README.md docs/agent-install.md llms.txt`. Expected: only legacy/migration mentions remain.
+- [ ] **Step 1:** Run `grep -n "cockpit" README.md docs/agent-install.md llms.txt`. Expected: only `cockpit.*` label names and the CHANGELOG/uninstall note remain.
 - [ ] **Step 2:** Leave uncommitted.
