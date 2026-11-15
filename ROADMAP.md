@@ -130,6 +130,9 @@ Orca orchestration skill does). Instead the supervisor watches and wakes the coo
   t11g is back at its prompt"). No LLM, no summary.
 - **Judgement stays with the coordinator:** it reads the worker's screen and decides whether it was
   a checkpoint or the task is done.
+- **Prior art: T3 Code delegation.** The parent delegates, ends its turn, and the child's
+  completion wakes the parent with a short summary plus a pointer to the child's thread; the
+  parent never polls. M6 is the same contract over Herdr terminals.
 - **Open case:** a coordinator can show as `working` while it only waits on its own subagents.
   Delivery must detect "only waiting on children" (static screen + active children, cf.
   `blocked_children` rollup) instead of trusting the status, and account for how each agent
