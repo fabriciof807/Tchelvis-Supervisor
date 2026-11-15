@@ -12,6 +12,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **CPU vs GPU benchmark.**
+  - **CLI:** `tchelvis supervisor bench [--runs N] [--json] [--last]` measures the supervisor's real evaluation request on CPU and then on GPU (prompt tok/s, generation tok/s, eval time; median after a warm-up). It restores the previous container state afterwards.
+  - **Herdr mod:** a "CPU vs GPU benchmark" card in the Doctor tab, with live progress and the last saved result.
+- **GPU backend detection.** `gpu_backend = auto|cuda|vulkan|rocm`:
+  - NVIDIA uses CUDA;
+  - AMD and Intel use Vulkan (`/dev/dri`);
+  - ROCm is available by forcing it in config.
+
+  Before this, the GPU mode only worked on NVIDIA.
 - **Self-updater & release pipeline (M5a):**
   - `tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]` downloads the release archive from GitHub Releases, verifies its `.sha256` checksum, atomically replaces the binary, and runs `tchelvis setup --set-default-layout`.
   - `install.sh`: POSIX shell installer supporting `--channel stable|nightly` and `--dir`.

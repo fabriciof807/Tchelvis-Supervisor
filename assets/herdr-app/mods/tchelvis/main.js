@@ -1065,6 +1065,12 @@ export default class CockpitMod extends View {
     this.taskPriority = "normal";
     this.taskProject = "";
     this.taskFilter = "pending"; // "pending" | "all" | "done"
+    this.benchLast = null;
+    this.benchRunning = false;
+    this.benchProgress = null;
+    this.benchError = "";
+    this.benchStartedAtMs = 0;
+    this.benchPollInFlight = false;
     const initialViewMode = shared("cockpit.viewMode");
     this.inspectorTab =
       initialViewMode && initialViewMode !== "usage"
@@ -1090,9 +1096,13 @@ export default class CockpitMod extends View {
       this.fetchHomeSnapshot(cx);
       this.fetchUsageSnapshot(cx, false, false);
       this.runDoctorCheckSilent(cx);
+      this.fetchBenchLast(cx);
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
       }
+      cx.timer.every(1000, (cx) => {
+        if (this.benchRunning) this.pollBenchProgress(cx);
+      });
       cx.timer.every(6000, (cx) => this.refreshInspector(cx));
       cx.timer.every(60000, (cx) => {
         const inspectorHidden = Boolean(
@@ -1530,6 +1540,77 @@ export default class CockpitMod extends View {
         this.note = `Error: ${String(e)}`;
       } finally {
         this.busy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  fetchBenchLast(cx) {
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "bench", "--last", "--json"],
+          { timeout: 10000 }
+        );
+        if (res.code === 0 && res.stdout) {
+          this.benchLast = JSON.parse(res.stdout);
+        } else {
+          this.benchLast = null;
+        }
+        cx.notify();
+      } catch (_e) {}
+    });
+  }
+
+  pollBenchProgress(cx) {
+    if (!this.benchRunning || this.benchPollInFlight) return;
+    this.benchPollInFlight = true;
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "bench", "--progress", "--json"],
+          { timeout: 5000 }
+        );
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          if (parsed && typeof parsed === "object" && parsed.phase) {
+            this.benchProgress = parsed;
+          }
+        }
+        cx.notify();
+      } catch (_e) {
+      } finally {
+        this.benchPollInFlight = false;
+      }
+    });
+  }
+
+  runBench(cx) {
+    if (this.benchRunning) return;
+    this.benchRunning = true;
+    this.benchProgress = null;
+    this.benchError = "";
+    this.benchStartedAtMs = Date.now();
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("tchelvis", ["supervisor", "bench", "--json"], {
+          timeout: 900000,
+        });
+        if (res.code === 0 && res.stdout) {
+          this.benchLast = JSON.parse(res.stdout);
+          this.benchError = "";
+        } else {
+          const errText = (res.stderr || res.stdout || "").trim();
+          this.benchError = errText || `Benchmark exited with code ${res.code}`;
+        }
+      } catch (e) {
+        this.benchError = String(e);
+      } finally {
+        this.benchRunning = false;
+        this.benchProgress = null;
         cx.notify();
       }
     });
@@ -2176,8 +2257,9 @@ export default class CockpitMod extends View {
     setShared("cockpit.viewMode", normalizedTab);
     this.inspectorTab = normalizedTab;
     if (normalizedTab === "home") this.fetchHomeSnapshot(cx);
-    else if (normalizedTab === "doctor" && !this.doctorReport) {
-      this.runDoctorCheck(cx);
+    else if (normalizedTab === "doctor") {
+      if (!this.doctorReport) this.runDoctorCheck(cx);
+      if (!this.benchLast && !this.benchRunning) this.fetchBenchLast(cx);
     } else if (normalizedTab === "inspector") {
       this.refreshInspector(cx);
     }
@@ -3774,7 +3856,11 @@ export default class CockpitMod extends View {
       {
         name: "supervisor",
         status: supSnap ? "pass" : "unknown",
-        detail: `${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`,
+        detail: `${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}${
+          supSnap?.gpu_detail || supSnap?.gpu_backend
+            ? ` · ${supSnap.gpu_detail || supSnap.gpu_backend}`
+            : ""
+        }`,
       },
     ];
     const checks = report?.checks?.length ? report.checks : defaultChecks;
@@ -3842,7 +3928,11 @@ export default class CockpitMod extends View {
               .text_size(11.5)
               .text_color(t.muted)
               .child(
-                `tchelvis v${report?.cockpit_version ?? version} · supervisor ${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`
+                `tchelvis v${report?.cockpit_version ?? version} · supervisor ${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}${
+                  supSnap?.gpu_detail || supSnap?.gpu_backend
+                    ? ` · ${supSnap.gpu_detail || supSnap.gpu_backend}`
+                    : ""
+                }`
               )
           )
           .child(
@@ -3984,6 +4074,269 @@ export default class CockpitMod extends View {
               )
             );
         })
+      )
+      .child(this.renderBenchCard(cx, t, supSnap));
+  }
+
+  renderBenchCard(cx, t, supSnap) {
+    const res = this.benchLast;
+    const p = this.benchProgress;
+    const fmtTps = (v) =>
+      v != null && Number.isFinite(Number(v)) ? Number(v).toFixed(1) : "—";
+    const fmtSecs = (v) =>
+      v != null && Number.isFinite(Number(v)) ? Number(v).toFixed(2) : "—";
+
+    const gpuBk =
+      supSnap?.gpu_backend && supSnap.gpu_backend !== "none"
+        ? supSnap.gpu_backend
+        : "";
+    const modeLabel =
+      p?.mode === "gpu" ? (gpuBk ? `GPU (${gpuBk})` : "GPU") : "CPU";
+    let progressText = "Starting benchmark…";
+    if (p?.phase === "loading") progressText = `Loading ${modeLabel}…`;
+    else if (p?.phase === "warmup") progressText = `Warm-up ${modeLabel}…`;
+    else if (p?.phase === "measuring") {
+      progressText = `Measuring ${modeLabel} ${p.run}/${p.runs}…`;
+    } else if (p?.phase === "restoring") {
+      progressText = "Restoring container…";
+    } else if (p?.phase === "done") {
+      progressText = "Finishing…";
+    }
+
+    const elapsedSecs = this.benchRunning
+      ? p?.started_at
+        ? Math.max(0, Math.floor(Date.now() / 1000 - p.started_at))
+        : Math.max(0, Math.floor((Date.now() - this.benchStartedAtMs) / 1000))
+      : 0;
+
+    const runBtn = this.benchRunning
+      ? h_flex()
+          .id("ck-doc-bench-run")
+          .h(25)
+          .px(8)
+          .gap(5)
+          .items_center()
+          .rounded(6)
+          .border(1)
+          .border_color(t.border)
+          .bg(t.raised)
+          .text_size(11.5)
+          .text_color(t.dim)
+          .child("Running benchmark…")
+      : this.actionBtn(
+          t,
+          "ck-doc-bench-run",
+          "Run benchmark",
+          (_e, cx) => this.runBench(cx),
+          true
+        );
+
+    const renderModeRow = (id, label, modeRes) =>
+      h_flex()
+        .id(id)
+        .gap(6)
+        .py(4)
+        .items_center()
+        .border_b(1)
+        .border_color(t.border)
+        .child(
+          div()
+            .w(110)
+            .flex_none()
+            .text_size(11)
+            .font_semibold()
+            .text_color(t.foreground)
+            .child(label)
+        )
+        .when(Boolean(modeRes?.error), (el) =>
+          el.child(
+            div()
+              .flex_1()
+              .text_size(11)
+              .text_color(t.blocked)
+              .child(ellipsize(modeRes.error, 120))
+          )
+        )
+        .when(!modeRes?.error, (el) =>
+          el
+            .child(
+              div()
+                .flex_1()
+                .text_size(11)
+                .text_color(t.foreground)
+                .child(fmtTps(modeRes?.prompt_tps))
+            )
+            .child(
+              div()
+                .flex_1()
+                .text_size(11)
+                .text_color(t.foreground)
+                .child(fmtTps(modeRes?.gen_tps))
+            )
+            .child(
+              div()
+                .w(64)
+                .flex_none()
+                .text_size(11)
+                .text_color(t.foreground)
+                .child(fmtSecs(modeRes?.eval_secs))
+            )
+        );
+
+    return v_flex()
+      .id("ck-doc-bench-card")
+      .p(11)
+      .gap(8)
+      .rounded(10)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.surface)
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .justify_between()
+          .child(
+            div()
+              .text_size(12.5)
+              .font_semibold()
+              .text_color(t.foreground)
+              .child("CPU vs GPU benchmark")
+          )
+          .child(runBtn)
+      )
+      .child(
+        div()
+          .text_size(10.5)
+          .text_color(t.dim)
+          .child("Takes 1–5 min; the first GPU run may download the GPU image.")
+      )
+      .when(this.benchRunning, (el) =>
+        el.child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .justify_between()
+            .p(7)
+            .rounded(6)
+            .border(1)
+            .border_color(t.border)
+            .bg(t.background)
+            .child(
+              div()
+                .text_size(11)
+                .text_color(t.accent)
+                .child(progressText)
+            )
+            .child(
+              div()
+                .text_size(11)
+                .text_color(t.muted)
+                .child(`${elapsedSecs}s`)
+            )
+        )
+      )
+      .when(Boolean(this.benchError), (el) =>
+        el.child(
+          div()
+            .p(7)
+            .rounded(6)
+            .border(1)
+            .border_color(withAlpha(t.blocked, "66", t.border))
+            .bg(withAlpha(t.blocked, "18", t.background))
+            .text_size(11)
+            .text_color(t.blocked)
+            .child(ellipsize(this.benchError, 240))
+        )
+      )
+      .when(!res && !this.benchRunning && !this.benchError, (el) =>
+        el.child(
+          div()
+            .text_size(11.5)
+            .text_color(t.muted)
+            .child("No benchmark yet")
+        )
+      )
+      .when(Boolean(res), (el) =>
+        el.child(
+          v_flex()
+            .gap(6)
+            .child(
+              div()
+                .text_size(11)
+                .text_color(t.muted)
+                .child(
+                  `${res.model || "unknown"}${res.quant ? ` (${res.quant})` : ""} · ${formatTimestamp(res.at)}`
+                )
+            )
+            .child(
+              v_flex()
+                .gap(2)
+                .p(8)
+                .rounded(8)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.background)
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .pb(4)
+                    .border_b(1)
+                    .border_color(t.border)
+                    .child(
+                      div()
+                        .w(110)
+                        .flex_none()
+                        .text_size(10.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Mode")
+                    )
+                    .child(
+                      div()
+                        .flex_1()
+                        .text_size(10.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Prompt tok/s")
+                    )
+                    .child(
+                      div()
+                        .flex_1()
+                        .text_size(10.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Gen tok/s")
+                    )
+                    .child(
+                      div()
+                        .w(64)
+                        .flex_none()
+                        .text_size(10.5)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child("Eval (s)")
+                    )
+                )
+                .child(renderModeRow("ck-doc-bench-cpu", "CPU", res.cpu))
+                .child(
+                  renderModeRow(
+                    "ck-doc-bench-gpu",
+                    `GPU (${res.gpu?.backend || "none"})`,
+                    res.gpu
+                  )
+                )
+            )
+            .when(res.speedup_gen != null, (el2) =>
+              el2.child(
+                div()
+                  .text_size(11.5)
+                  .font_semibold()
+                  .text_color(t.done)
+                  .child(`GPU ≈ ${res.speedup_gen}× faster at generation`)
+              )
+            )
+        )
       );
   }
 
@@ -5144,6 +5497,9 @@ export default class CockpitMod extends View {
                     setShared("cockpit.modelPickerOnlyDrawer", false);
                     this.inspectorTab = "doctor";
                     if (!this.doctorReport) this.runDoctorCheck(cx);
+                    if (!this.benchLast && !this.benchRunning) {
+                      this.fetchBenchLast(cx);
+                    }
                     cx.notify();
                   }
                 )
@@ -5157,7 +5513,10 @@ export default class CockpitMod extends View {
               this.fetchHomeSnapshot(cx);
               if (usageOpen) this.fetchUsageSnapshot(cx, true, false);
               if (modelPickerOpen) this.fetchModelList(cx, null);
-              if (activeView === "doctor") this.runDoctorCheck(cx);
+              if (activeView === "doctor") {
+                this.runDoctorCheck(cx);
+                if (!this.benchRunning) this.fetchBenchLast(cx);
+              }
             })
           )
           .child(
