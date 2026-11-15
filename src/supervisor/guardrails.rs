@@ -258,15 +258,17 @@ pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, S
     let is_yes_no = |l: &str| yn_prompt_regex().is_match(l) || yes_no_question_regex().is_match(l);
 
     // A permission menu wins: its question line ("Do you want to proceed?") is not a y/n prompt.
-    let payload = if lines.iter().any(|l| menu_yes.is_match(l)) {
-        "1"
-    } else if lines.iter().any(|l| is_yes_no(l)) {
-        "y"
+    // `prompt_idx` is where the prompt starts; the command is searched *above* it, so lines
+    // printed after the prompt (timeouts, hints) are ignored.
+    let (payload, prompt_idx) = if let Some(i) = lines.iter().position(|l| menu_yes.is_match(l)) {
+        ("1", i)
+    } else if let Some(i) = lines.iter().rposition(|l| is_yes_no(l)) {
+        ("y", i)
     } else {
         return None;
     };
 
-    let raw = lines
+    let raw = lines[..prompt_idx]
         .iter()
         .rev()
         .find(|l| !is_yes_no(l) && !menu_item.is_match(l) && !chrome.is_match(l))?;
@@ -274,6 +276,13 @@ pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, S
     let mut cmd = command_prefix_regex().replace(raw, "").trim().to_string();
     if had_bash_paren {
         cmd = cmd.trim_end_matches(')').trim().to_string();
+    }
+    // A command shown wrapped in backticks or quotes: unwrap one matching pair.
+    for q in ['`', '"', '\''] {
+        if cmd.len() >= 2 && cmd.starts_with(q) && cmd.ends_with(q) {
+            cmd = cmd[1..cmd.len() - 1].trim().to_string();
+            break;
+        }
     }
 
     if metachar.is_match(&cmd) || !allow.is_match(&cmd) || sensitive.is_match(&cmd) {
@@ -716,5 +725,27 @@ mod tests {
     #[test]
     fn fast_path_never_approves_destructive_prompt_area() {
         assert_eq!(fast("git push --force\nls\nAllow? [y/N]"), None);
+    }
+
+    #[test]
+    fn fast_path_reads_the_command_above_the_prompt_not_below() {
+        // Test 7: lines printed after the prompt (timeouts, hints) made the rule give up.
+        let screen =
+            "Bash command\n  ls -la src/\nAllow? [y/N]\n(aguardando resposta, timeout 600s)";
+        assert_eq!(fast(screen), Some(("y".into(), "ls -la src/".into())));
+    }
+
+    #[test]
+    fn fast_path_accepts_a_command_wrapped_in_backticks_or_quotes() {
+        assert_eq!(
+            fast("`cat README.md`\nAllow? [y/N]").unwrap().1,
+            "cat README.md"
+        );
+        assert_eq!(
+            fast("\"git status --short\"\nAllow? [y/N]").unwrap().1,
+            "git status --short"
+        );
+        // A backtick inside the command is still a substitution and is refused.
+        assert_eq!(fast("ls `pwd`\nAllow? [y/N]"), None);
     }
 }
