@@ -26,7 +26,7 @@ pub async fn check_health(
         return ProviderHealth {
             provider: ProviderId::Jira,
             status: ProviderStatus::Inactive,
-            detail: Some(format!("No COCKPIT_JIRA_TOKEN for {base_url}")),
+            detail: Some(format!("No TCHELVIS_JIRA_TOKEN for {base_url}")),
             ..Default::default()
         };
     }
@@ -81,9 +81,7 @@ pub async fn fetch_issue(
         return None;
     }
 
-    let email = std::env::var("COCKPIT_JIRA_EMAIL")
-        .ok()
-        .or_else(|| cfg.jira.email.clone());
+    let email = crate::envvars::var("JIRA_EMAIL").or_else(|| cfg.jira.email.clone());
 
     let auth_header = match (cfg.jira.auth_mode, email.as_deref()) {
         (JiraAuthMode::Basic, Some(em)) if !em.is_empty() => {

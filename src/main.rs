@@ -1,31 +1,31 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use cockpit::config::{CockpitConfig, CockpitPaths};
-use cockpit::daemon::{collect_once, query_socket_once, run_daemon};
-use cockpit::doctor::run_doctor;
-use cockpit::herdr::HerdrClient;
-use cockpit::home::{self, unix_now_secs, DailyTaskStore, HomeSnapshot, TaskPriority};
-use cockpit::logging::{init_logging, read_filtered_logs};
-use cockpit::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
-use cockpit::providers::ProviderCoordinator;
-use cockpit::setup::{run_setup, run_uninstall, SetupOptions};
-use cockpit::store::CacheStore;
-use cockpit::supervisor::state::SupervisorMode;
-use cockpit::supervisor::{
-    approve_action, current_status, ignore_action, load_model, run_supervisor_daemon,
-    run_tick_once, run_tui, set_gpu, set_or_cycle_mode, unload_model,
-};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
+use tchelvis::config::{CockpitConfig, CockpitPaths};
+use tchelvis::daemon::{collect_once, query_socket_once, run_daemon};
+use tchelvis::doctor::run_doctor;
+use tchelvis::herdr::HerdrClient;
+use tchelvis::home::{self, unix_now_secs, DailyTaskStore, HomeSnapshot, TaskPriority};
+use tchelvis::logging::{init_logging, read_filtered_logs};
+use tchelvis::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
+use tchelvis::providers::ProviderCoordinator;
+use tchelvis::setup::{run_setup, run_uninstall, SetupOptions};
+use tchelvis::store::CacheStore;
+use tchelvis::supervisor::state::SupervisorMode;
+use tchelvis::supervisor::{
+    approve_action, current_status, ignore_action, load_model, run_supervisor_daemon,
+    run_tick_once, run_tui, set_gpu, set_or_cycle_mode, unload_model,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "cockpit",
-    version,
+    name = "tchelvis",
+    version = tchelvis::version::long_version(),
     about = "Local-first, read-only dashboard and CLI for tracking coding agents running through Herdr (hc)"
 )]
 struct Cli {
@@ -106,13 +106,13 @@ enum Commands {
         /// Roll back all Cockpit-managed changes using setup-manifest.json
         #[arg(long)]
         undo: bool,
-        /// Set `cockpit` as the default layout in herdr-app/settings.json
+        /// Set `tchelvis` as the default layout in herdr-app/settings.json
         #[arg(long)]
         set_default_layout: bool,
-        /// Write ~/.config/systemd/user/cockpit.service
+        /// Write ~/.config/systemd/user/tchelvis.service
         #[arg(long)]
         systemd: bool,
-        /// When used with --undo, also purge Cockpit directories and remove the cockpit binary
+        /// When used with --undo, also purge Cockpit directories and remove the tchelvis binary
         #[arg(long)]
         purge: bool,
     },
@@ -124,7 +124,7 @@ enum Commands {
         /// Proceed even if warnings occur
         #[arg(long)]
         force: bool,
-        /// Also delete ~/.config/cockpit, ~/.local/share/cockpit, ~/.local/state/cockpit, runtime sockets, and the cockpit binary
+        /// Also delete ~/.config/tchelvis, ~/.local/share/tchelvis, ~/.local/state/tchelvis, runtime sockets, and the tchelvis binary
         #[arg(long)]
         purge: bool,
     },
@@ -587,9 +587,9 @@ async fn main() -> Result<()> {
                 Ok(())
             }
             SupervisorCommands::Respond { terminal, action } => {
-                let parsed = cockpit::supervisor::RespondAction::parse(&action)?;
+                let parsed = tchelvis::supervisor::RespondAction::parse(&action)?;
                 let snap = tokio::task::spawn_blocking(move || {
-                    cockpit::supervisor::respond_pending_prompt(&terminal, parsed)
+                    tchelvis::supervisor::respond_pending_prompt(&terminal, parsed)
                 })
                 .await
                 .context("supervisor respond task panicked")??;
@@ -647,7 +647,7 @@ async fn main() -> Result<()> {
                 } => {
                     let parsed_filter = match max_params {
                         Some(raw) => Some(
-                            cockpit::supervisor::models::MaxParams::parse(&raw).ok_or_else(
+                            tchelvis::supervisor::models::MaxParams::parse(&raw).ok_or_else(
                                 || {
                                     anyhow::anyhow!(
                                         "Invalid --max-params '{}'; expected 2b, 4b, 8b, or all",
@@ -659,7 +659,7 @@ async fn main() -> Result<()> {
                         None => None,
                     };
                     let out = tokio::task::spawn_blocking(move || {
-                        cockpit::supervisor::list_models(parsed_filter, all)
+                        tchelvis::supervisor::list_models(parsed_filter, all)
                     })
                     .await
                     .context("supervisor model list task panicked")??;
@@ -672,14 +672,14 @@ async fn main() -> Result<()> {
                 }
                 ModelCommand::Set { id } => {
                     let snap =
-                        tokio::task::spawn_blocking(move || cockpit::supervisor::set_model(&id))
+                        tokio::task::spawn_blocking(move || tchelvis::supervisor::set_model(&id))
                             .await
                             .context("supervisor model set task panicked")??;
                     println!("{}", serde_json::to_string_pretty(&snap)?);
                     Ok(())
                 }
                 ModelCommand::Filter { max_params } => {
-                    let filter = cockpit::supervisor::models::MaxParams::parse(&max_params)
+                    let filter = tchelvis::supervisor::models::MaxParams::parse(&max_params)
                         .ok_or_else(|| {
                             anyhow::anyhow!(
                                 "Invalid filter '{}'; expected 2b, 4b, 8b, or all",
@@ -687,7 +687,7 @@ async fn main() -> Result<()> {
                             )
                         })?;
                     let out = tokio::task::spawn_blocking(move || {
-                        cockpit::supervisor::set_model_filter(filter)
+                        tchelvis::supervisor::set_model_filter(filter)
                     })
                     .await
                     .context("supervisor model filter task panicked")??;
@@ -695,7 +695,7 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 ModelCommand::Reset => {
-                    let snap = tokio::task::spawn_blocking(cockpit::supervisor::reset_model)
+                    let snap = tokio::task::spawn_blocking(tchelvis::supervisor::reset_model)
                         .await
                         .context("supervisor model reset task panicked")??;
                     println!("{}", serde_json::to_string_pretty(&snap)?);
@@ -831,14 +831,15 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Usage { json, detect } => {
-            let snap =
-                tokio::task::spawn_blocking(move || cockpit::usage::collect_usage_snapshot(detect))
-                    .await
-                    .context("usage snapshot task panicked")?;
+            let snap = tokio::task::spawn_blocking(move || {
+                tchelvis::usage::collect_usage_snapshot(detect)
+            })
+            .await
+            .context("usage snapshot task panicked")?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&snap)?);
             } else {
-                println!("{}", cockpit::usage::format_human_usage(&snap));
+                println!("{}", tchelvis::usage::format_human_usage(&snap));
             }
             Ok(())
         }
@@ -1019,7 +1020,7 @@ fn print_human_inspect(resp: &InspectResponse) {
     }
 }
 
-fn print_human_doctor(rep: &cockpit::doctor::DoctorReport) {
+fn print_human_doctor(rep: &tchelvis::doctor::DoctorReport) {
     println!(
         "Cockpit Doctor v{} — overall: {}",
         rep.cockpit_version, rep.overall_status
@@ -1128,7 +1129,7 @@ fn format_size_bytes(bytes: u64) -> String {
     }
 }
 
-fn print_model_table(out: &cockpit::supervisor::models::ModelListOutput) {
+fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
     if !out.managed {
         println!("Container mode is off or no runtime was found.");
         return;

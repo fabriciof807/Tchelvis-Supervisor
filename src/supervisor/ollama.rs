@@ -300,7 +300,7 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
             status.detail = if has_key {
                 format!("API configurada ({primary_host}) · {}", config.ollama_model)
             } else {
-                "API Key ausente (defina COCKPIT_LLM_API_KEY)".to_string()
+                "API Key ausente (defina TCHELVIS_LLM_API_KEY)".to_string()
             };
         }
     }

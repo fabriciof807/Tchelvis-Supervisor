@@ -1,6 +1,6 @@
 use crate::assets::{
     asset_sha256, CLAUDE_HOOK_MARKER, CLAUDE_HOOK_SH, FENCE_END, FENCE_START, HERDR_LAYOUT_JSON,
-    HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_COCKPIT_JS, PI_COCKPIT_JS, SHELL_FISH, SHELL_NU,
+    HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_TCHELVIS_JS, PI_TCHELVIS_JS, SHELL_FISH, SHELL_NU,
     SHELL_SH, SYSTEMD_UNIT_TEMPLATE,
 };
 use crate::config::CockpitPaths;
@@ -146,12 +146,17 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
             "claude",
         ),
         (
-            hooks_dir.join("opencode-cockpit.js"),
-            OPENCODE_COCKPIT_JS,
+            hooks_dir.join("opencode-tchelvis.js"),
+            OPENCODE_TCHELVIS_JS,
             0o644,
             "opencode",
         ),
-        (hooks_dir.join("pi-cockpit.js"), PI_COCKPIT_JS, 0o644, "pi"),
+        (
+            hooks_dir.join("pi-tchelvis.js"),
+            PI_TCHELVIS_JS,
+            0o644,
+            "pi",
+        ),
     ];
 
     for (path, content, mode, target_name) in hook_files {
@@ -243,14 +248,14 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
         }
     }
 
-    // 3. OpenCode (~/.config/opencode/plugins/cockpit.js)
+    // 3. OpenCode (~/.config/opencode/plugins/tchelvis.js)
     if targets.contains("opencode") {
         let opencode_dir = paths.home_dir.join(".config/opencode");
         if opencode_dir.exists() || opts.only.as_deref() == Some("opencode") {
-            let plugin_path = opencode_dir.join("plugins/cockpit.js");
+            let plugin_path = opencode_dir.join("plugins/tchelvis.js");
             apply_created_file(
                 &plugin_path,
-                OPENCODE_COCKPIT_JS,
+                OPENCODE_TCHELVIS_JS,
                 0o644,
                 opts.dry_run,
                 &mut manifest,
@@ -259,14 +264,14 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
         }
     }
 
-    // 4. Pi (~/.pi/agent/extensions/cockpit.js)
+    // 4. Pi (~/.pi/agent/extensions/tchelvis.js)
     if targets.contains("pi") {
         let pi_dir = paths.home_dir.join(".pi/agent");
         if pi_dir.exists() || opts.only.as_deref() == Some("pi") {
-            let ext_path = pi_dir.join("extensions/cockpit.js");
+            let ext_path = pi_dir.join("extensions/tchelvis.js");
             apply_created_file(
                 &ext_path,
-                PI_COCKPIT_JS,
+                PI_TCHELVIS_JS,
                 0o644,
                 opts.dry_run,
                 &mut manifest,
@@ -279,9 +284,9 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
     if targets.contains("herdr-mod") {
         let herdr_dir = paths.home_dir.join(".config/herdr-app");
         let had_herdr_dir = herdr_dir.exists();
-        let mod_path = herdr_dir.join("mods/cockpit/main.js");
-        let mod_json_path = herdr_dir.join("mods/cockpit/mod.json");
-        let layout_path = herdr_dir.join("layouts/cockpit.json");
+        let mod_path = herdr_dir.join("mods/tchelvis/main.js");
+        let mod_json_path = herdr_dir.join("mods/tchelvis/mod.json");
+        let layout_path = herdr_dir.join("layouts/tchelvis.json");
         apply_created_file(
             &mod_path,
             HERDR_MOD_MAIN_JS,
@@ -319,7 +324,7 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
 
     // 6. Optional systemd user service
     if targets.contains("systemd") {
-        let unit_path = paths.home_dir.join(".config/systemd/user/cockpit.service");
+        let unit_path = paths.home_dir.join(".config/systemd/user/tchelvis.service");
         apply_created_file(
             &unit_path,
             SYSTEMD_UNIT_TEMPLATE,
@@ -405,7 +410,7 @@ pub fn run_uninstall(
     }
 
     if purge {
-        // Fallback cleanup in case setup-manifest.json was already deleted by an earlier `cockpit uninstall`
+        // Fallback cleanup in case setup-manifest.json was already deleted by an earlier `tchelvis uninstall`
         for rc_rel in [
             ".bashrc",
             ".zshrc",
@@ -444,16 +449,16 @@ pub fn run_uninstall(
         for extra_file in [
             paths
                 .home_dir
-                .join(".config/herdr-app/layouts/cockpit.json"),
+                .join(".config/herdr-app/layouts/tchelvis.json"),
             paths
                 .home_dir
-                .join(".config/herdr-app/mods/cockpit/main.js"),
+                .join(".config/herdr-app/mods/tchelvis/main.js"),
             paths
                 .home_dir
-                .join(".config/herdr-app/mods/cockpit/mod.json"),
-            paths.home_dir.join(".pi/agent/extensions/cockpit.js"),
-            paths.home_dir.join(".config/opencode/plugins/cockpit.js"),
-            paths.home_dir.join(".config/systemd/user/cockpit.service"),
+                .join(".config/herdr-app/mods/tchelvis/mod.json"),
+            paths.home_dir.join(".pi/agent/extensions/tchelvis.js"),
+            paths.home_dir.join(".config/opencode/plugins/tchelvis.js"),
+            paths.home_dir.join(".config/systemd/user/tchelvis.service"),
         ] {
             if extra_file.exists() {
                 actions.push(format!("remove file {}", extra_file.display()));
@@ -463,7 +468,7 @@ pub fn run_uninstall(
             }
         }
 
-        let herdr_mod_dir = paths.home_dir.join(".config/herdr-app/mods/cockpit");
+        let herdr_mod_dir = paths.home_dir.join(".config/herdr-app/mods/tchelvis");
         if herdr_mod_dir.exists() {
             actions.push(format!("remove directory {}", herdr_mod_dir.display()));
             if !dry_run {
@@ -542,9 +547,9 @@ pub fn verify_installation(paths: &CockpitPaths) -> Result<SetupReport> {
     }
 
     for (rel_path, expected_content) in [
-        (".config/herdr-app/mods/cockpit/main.js", HERDR_MOD_MAIN_JS),
-        (".config/herdr-app/mods/cockpit/mod.json", HERDR_MOD_JSON),
-        (".config/herdr-app/layouts/cockpit.json", HERDR_LAYOUT_JSON),
+        (".config/herdr-app/mods/tchelvis/main.js", HERDR_MOD_MAIN_JS),
+        (".config/herdr-app/mods/tchelvis/mod.json", HERDR_MOD_JSON),
+        (".config/herdr-app/layouts/tchelvis.json", HERDR_LAYOUT_JSON),
     ] {
         let p = paths.home_dir.join(rel_path);
         if p.exists() {
@@ -739,7 +744,7 @@ fn apply_claude_settings_merge(
     ] {
         let arr_val = hooks_obj.entry(event_name).or_insert_with(|| json!([]));
         if let Some(arr) = arr_val.as_array_mut() {
-            // Remove existing cockpit-managed entry to remain idempotent
+            // Remove existing tchelvis-managed entry to remain idempotent
             arr.retain(|item| !item.to_string().contains(CLAUDE_HOOK_MARKER));
             arr.push(json!({
                 "matcher": "",
@@ -810,12 +815,12 @@ fn apply_herdr_default_layout(
     };
 
     if let Some(obj) = root.as_object_mut() {
-        obj.insert("default_layout".to_string(), json!("cockpit"));
+        obj.insert("default_layout".to_string(), json!("tchelvis"));
     }
 
     let formatted = serde_json::to_string_pretty(&root)? + "\n";
     let post_hash = asset_sha256(&formatted);
-    actions.push(format!("set default_layout=cockpit in {}", path.display()));
+    actions.push(format!("set default_layout=tchelvis in {}", path.display()));
     if !dry_run {
         atomic_write_file(path, &formatted, 0o644)?;
         upsert_manifest_entry(
@@ -851,12 +856,12 @@ fn apply_herdr_shared_layout(
     };
 
     if let Some(obj) = root.as_object_mut() {
-        obj.insert("layout".to_string(), json!("cockpit"));
+        obj.insert("layout".to_string(), json!("tchelvis"));
     }
 
     let formatted = serde_json::to_string_pretty(&root)? + "\n";
     let post_hash = asset_sha256(&formatted);
-    actions.push(format!("set layout=cockpit in {}", path.display()));
+    actions.push(format!("set layout=tchelvis in {}", path.display()));
     if !dry_run {
         atomic_write_file(path, &formatted, 0o644)?;
         upsert_manifest_entry(
@@ -903,7 +908,7 @@ pub fn atomic_write_file(path: &Path, content: &str, mode: u32) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp_path = path.with_extension(format!("cockpit-tmp-{}", std::process::id()));
+    let tmp_path = path.with_extension(format!("tchelvis-tmp-{}", std::process::id()));
     {
         let mut f = File::create(&tmp_path)
             .with_context(|| format!("failed creating temp file {}", tmp_path.display()))?;
@@ -931,10 +936,10 @@ mod tests {
         let home = tmp.path();
         let paths = CockpitPaths {
             home_dir: home.to_path_buf(),
-            config_dir: home.join(".config/cockpit"),
-            data_dir: home.join(".local/share/cockpit"),
-            state_dir: home.join(".local/state/cockpit"),
-            runtime_dir: home.join(".local/state/cockpit/run"),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
         };
 
         let bashrc = home.join(".bashrc");
@@ -969,11 +974,15 @@ mod tests {
             fs::read_to_string(&claude_settings).unwrap(),
             original_claude
         );
-        assert!(!home.join(".config/herdr-app/mods/cockpit/main.js").exists());
-        assert!(!home.join(".config/herdr-app/mods/cockpit/mod.json").exists());
+        assert!(!home
+            .join(".config/herdr-app/mods/tchelvis/main.js")
+            .exists());
+        assert!(!home
+            .join(".config/herdr-app/mods/tchelvis/mod.json")
+            .exists());
 
         // Run uninstall --purge even after setup-manifest.json was already deleted
-        let dummy_bin = home.join(".local/bin/cockpit");
+        let dummy_bin = home.join(".local/bin/tchelvis");
         fs::create_dir_all(dummy_bin.parent().unwrap()).unwrap();
         fs::write(&dummy_bin, "binary").unwrap();
         paths.ensure_dirs().unwrap();

@@ -137,7 +137,7 @@ pub struct SupervisorConfig {
     pub capture_lines: usize,
     /// Default maximum consecutive auto-replies before loop-breaker triggers (default: `2`).
     pub max_auto_replies: u32,
-    /// Path to persistent episodic FSM state file (`~/.local/state/cockpit/supervisor_state.json`).
+    /// Path to persistent episodic FSM state file (`~/.local/state/tchelvis/supervisor_state.json`).
     pub state_file_path: PathBuf,
     /// Whether to trigger desktop notifications via `notify-send` on Normal/Critical alerts.
     pub enable_desktop_notifications: bool,
@@ -153,7 +153,7 @@ fn parse_env_bool(val: &str) -> bool {
 }
 
 fn resolve_allow_gpu_from_env() -> Option<bool> {
-    if let Ok(v) = env::var("COCKPIT_ALLOW_GPU") {
+    if let Some(v) = crate::envvars::var("ALLOW_GPU") {
         return Some(parse_env_bool(&v));
     }
     if let Ok(v) = env::var("HERDR_ALLOW_GPU") {
@@ -162,23 +162,23 @@ fn resolve_allow_gpu_from_env() -> Option<bool> {
     None
 }
 
-/// Path of the persisted GPU-offload toggle written by `cockpit supervisor gpu <on|off>`.
+/// Path of the persisted GPU-offload toggle written by `tchelvis supervisor gpu <on|off>`.
 pub fn gpu_override_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     PathBuf::from(home)
         .join(".local")
         .join("state")
-        .join("cockpit")
+        .join("tchelvis")
         .join("supervisor_gpu")
 }
 
-/// Path of the persisted last-working container runtime (`~/.local/state/cockpit/container_runtime`).
+/// Path of the persisted last-working container runtime (`~/.local/state/tchelvis/container_runtime`).
 pub fn runtime_pref_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     PathBuf::from(home)
         .join(".local")
         .join("state")
-        .join("cockpit")
+        .join("tchelvis")
         .join("container_runtime")
 }
 
@@ -207,34 +207,28 @@ pub fn write_gpu_override(path: &std::path::Path, allow_gpu: bool) -> std::io::R
 }
 
 fn resolve_llm_backend_from_env() -> Option<LlmBackendKind> {
-    env::var("COCKPIT_LLM_BACKEND")
-        .ok()
-        .and_then(|v| LlmBackendKind::from_str_loose(&v))
+    crate::envvars::var("LLM_BACKEND").and_then(|v| LlmBackendKind::from_str_loose(&v))
 }
 
 fn resolve_llm_host_from_env() -> Option<String> {
-    env::var("COCKPIT_LLM_HOST")
-        .ok()
+    crate::envvars::var("LLM_HOST")
         .or_else(|| env::var("OLLAMA_HOST").ok())
         .map(|h| normalize_host(&h))
 }
 
 fn resolve_llm_model_from_env() -> Option<String> {
-    env::var("COCKPIT_LLM_MODEL")
-        .ok()
-        .or_else(|| env::var("OLLAMA_MODEL").ok())
+    crate::envvars::var("LLM_MODEL").or_else(|| env::var("OLLAMA_MODEL").ok())
 }
 
 fn resolve_api_key_from_env() -> Option<String> {
-    env::var("COCKPIT_LLM_API_KEY")
-        .ok()
+    crate::envvars::var("LLM_API_KEY")
         .or_else(|| env::var("OPENAI_API_KEY").ok())
         .or_else(|| env::var("OPENROUTER_API_KEY").ok())
         .filter(|k| !k.trim().is_empty())
 }
 
 fn resolve_container_mode_from_env() -> Option<String> {
-    let raw = env::var("COCKPIT_LLM_CONTAINER").ok()?;
+    let raw = crate::envvars::var("LLM_CONTAINER")?;
     match raw.trim().to_ascii_lowercase().as_str() {
         "on" | "1" | "true" => Some("on".to_string()),
         "off" | "0" | "false" => Some("off".to_string()),
@@ -244,8 +238,7 @@ fn resolve_container_mode_from_env() -> Option<String> {
 }
 
 fn resolve_container_runtime_from_env() -> Option<String> {
-    env::var("COCKPIT_CONTAINER_RUNTIME")
-        .ok()
+    crate::envvars::var("CONTAINER_RUNTIME")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -259,7 +252,7 @@ impl Default for SupervisorConfig {
                 PathBuf::from(&home)
                     .join(".local")
                     .join("state")
-                    .join("cockpit")
+                    .join("tchelvis")
                     .join("supervisor_state.json")
             });
 
@@ -303,18 +296,21 @@ impl Default for SupervisorConfig {
     }
 }
 
-/// Returns the supervisor config path under `home`: cockpit path if it exists,
-/// else legacy (`~/.config/herdr/supervisor.toml`) if it exists, else the cockpit path.
+/// Returns the supervisor config path under `home`: tchelvis path if it exists,
+/// else legacy (`~/.config/herdr/supervisor.toml`) if it exists, else the tchelvis path.
 pub fn supervisor_config_path_in(home: &Path) -> PathBuf {
-    let cockpit_cfg = home.join(".config").join("cockpit").join("supervisor.toml");
-    if cockpit_cfg.exists() {
-        return cockpit_cfg;
+    let tchelvis_cfg = home
+        .join(".config")
+        .join("tchelvis")
+        .join("supervisor.toml");
+    if tchelvis_cfg.exists() {
+        return tchelvis_cfg;
     }
     let legacy_cfg = home.join(".config").join("herdr").join("supervisor.toml");
     if legacy_cfg.exists() {
         return legacy_cfg;
     }
-    cockpit_cfg
+    tchelvis_cfg
 }
 
 /// Returns the active `supervisor.toml` path for the current user's `$HOME`.
@@ -334,7 +330,7 @@ impl SupervisorConfig {
             .join("supervisor_state.json")
     }
 
-    /// Load configuration from `~/.config/cockpit/supervisor.toml` (or legacy `~/.config/herdr/supervisor.toml`),
+    /// Load configuration from `~/.config/tchelvis/supervisor.toml` (or legacy `~/.config/herdr/supervisor.toml`),
     /// merged with environment variable overrides.
     pub fn load() -> Self {
         let config_path = supervisor_config_path();
@@ -363,7 +359,7 @@ impl SupervisorConfig {
                 }
             }
         }
-        // Persisted `cockpit supervisor gpu on|off` wins over the TOML file, but env vars win over it.
+        // Persisted `tchelvis supervisor gpu on|off` wins over the TOML file, but env vars win over it.
         if resolve_allow_gpu_from_env().is_none() {
             if let Some(allow) = read_gpu_override(&gpu_override_path()) {
                 cfg.allow_gpu = allow;
@@ -508,7 +504,7 @@ mod tests {
     #[test]
     fn test_default_model_is_lfm3() {
         // Unless overridden by env, default model should be lfm3:1.7b
-        if env::var("COCKPIT_LLM_MODEL").is_err() && env::var("OLLAMA_MODEL").is_err() {
+        if crate::envvars::var("LLM_MODEL").is_none() && env::var("OLLAMA_MODEL").is_err() {
             let cfg = SupervisorConfig::default();
             assert_eq!(cfg.ollama_model, "lfm3:1.7b");
             assert_eq!(cfg.llm_backend, LlmBackendKind::Ollama);
@@ -601,7 +597,7 @@ mod tests {
         let parsed: SupervisorConfig = toml::from_str(&raw).unwrap();
         assert_eq!(parsed.llm_container.mode, "auto");
         assert_eq!(parsed.llm_container.port, 11435);
-        assert_eq!(parsed.llm_container.name, "cockpit-supervisor-llm");
+        assert_eq!(parsed.llm_container.name, "tchelvis-supervisor-llm");
     }
 
     #[test]
@@ -638,22 +634,22 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_config_path_prefers_cockpit_then_legacy() {
+    fn supervisor_config_path_prefers_tchelvis_then_legacy() {
         let home = tempfile::tempdir().unwrap();
-        let cockpit = home.path().join(".config/cockpit/supervisor.toml");
+        let tchelvis = home.path().join(".config/tchelvis/supervisor.toml");
         let legacy = home.path().join(".config/herdr/supervisor.toml");
 
-        // Neither exists -> cockpit path
-        assert_eq!(supervisor_config_path_in(home.path()), cockpit);
+        // Neither exists -> tchelvis path
+        assert_eq!(supervisor_config_path_in(home.path()), tchelvis);
 
         // Only legacy exists -> legacy path
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         fs::write(&legacy, "poll_interval_secs = 15\n").unwrap();
         assert_eq!(supervisor_config_path_in(home.path()), legacy);
 
-        // Both exist -> cockpit path
-        fs::create_dir_all(cockpit.parent().unwrap()).unwrap();
-        fs::write(&cockpit, "poll_interval_secs = 20\n").unwrap();
-        assert_eq!(supervisor_config_path_in(home.path()), cockpit);
+        // Both exist -> tchelvis path
+        fs::create_dir_all(tchelvis.parent().unwrap()).unwrap();
+        fs::write(&tchelvis, "poll_interval_secs = 20\n").unwrap();
+        assert_eq!(supervisor_config_path_in(home.path()), tchelvis);
     }
 }

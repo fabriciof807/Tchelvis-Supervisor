@@ -129,12 +129,12 @@ impl CockpitPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home_dir.join(".local/state"));
 
-        let config_dir = config_base.join("cockpit");
-        let data_dir = data_base.join("cockpit");
-        let state_dir = state_base.join("cockpit");
+        let config_dir = config_base.join("tchelvis");
+        let data_dir = data_base.join("tchelvis");
+        let state_dir = state_base.join("tchelvis");
 
         let runtime_dir = match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(rt) if !rt.is_empty() => PathBuf::from(rt).join("cockpit"),
+            Some(rt) if !rt.is_empty() => PathBuf::from(rt).join("tchelvis"),
             _ => state_dir.join("run"),
         };
 
@@ -179,7 +179,7 @@ impl CockpitPaths {
     }
 
     pub fn log_file(&self) -> PathBuf {
-        self.state_dir.join("cockpit.log")
+        self.state_dir.join("tchelvis.log")
     }
 
     pub fn setup_manifest_file(&self) -> PathBuf {
@@ -187,16 +187,16 @@ impl CockpitPaths {
     }
 
     pub fn socket_file(&self) -> PathBuf {
-        let candidate = self.runtime_dir.join("cockpit.sock");
+        let candidate = self.runtime_dir.join("tchelvis.sock");
         if candidate.as_os_str().len() <= 100 {
             return candidate;
         }
-        let short_candidate = self.home_dir.join("cockpit.sock");
+        let short_candidate = self.home_dir.join("tchelvis.sock");
         if short_candidate.as_os_str().len() <= 100 {
             return short_candidate;
         }
         let euid = unsafe { libc::geteuid() };
-        PathBuf::from(format!("/tmp/cockpit-{euid}-{}.sock", std::process::id()))
+        PathBuf::from(format!("/tmp/tchelvis-{euid}-{}.sock", std::process::id()))
     }
 
     pub fn lock_file(&self) -> PathBuf {
@@ -255,16 +255,16 @@ impl CockpitConfig {
     }
 
     pub async fn resolve_token(&self, provider: ProviderId) -> Option<String> {
-        let env_var = match provider {
-            ProviderId::Github => "GITHUB_TOKEN",
-            ProviderId::Gitlab => "GITLAB_TOKEN",
-            ProviderId::Jira => "COCKPIT_JIRA_TOKEN",
-            ProviderId::Linear => "COCKPIT_LINEAR_TOKEN",
-            ProviderId::Slack => "COCKPIT_SLACK_TOKEN",
+        let env_val = match provider {
+            ProviderId::Github => std::env::var("GITHUB_TOKEN").ok(),
+            ProviderId::Gitlab => std::env::var("GITLAB_TOKEN").ok(),
+            ProviderId::Jira => crate::envvars::var("JIRA_TOKEN"),
+            ProviderId::Linear => crate::envvars::var("LINEAR_TOKEN"),
+            ProviderId::Slack => crate::envvars::var("SLACK_TOKEN"),
             ProviderId::Runbooks => return None,
         };
 
-        if let Ok(val) = std::env::var(env_var) {
+        if let Some(val) = env_val {
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
                 return Some(trimmed);

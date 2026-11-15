@@ -16,7 +16,7 @@ pub async fn check_health(
         return ProviderHealth {
             provider: ProviderId::Linear,
             status: ProviderStatus::Inactive,
-            detail: Some("No COCKPIT_LINEAR_TOKEN configured".into()),
+            detail: Some("No TCHELVIS_LINEAR_TOKEN configured".into()),
             ..Default::default()
         };
     }
@@ -24,7 +24,7 @@ pub async fn check_health(
     store.apply_quota_to_health(ProviderHealth {
         provider: ProviderId::Linear,
         status: ProviderStatus::Ready,
-        detail: Some("Configured via COCKPIT_LINEAR_TOKEN".into()),
+        detail: Some("Configured via TCHELVIS_LINEAR_TOKEN".into()),
         ..Default::default()
     })
 }

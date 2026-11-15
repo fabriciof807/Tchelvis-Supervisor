@@ -172,7 +172,7 @@ impl AgentDurableState {
     }
 }
 
-/// Top-level persisted supervisor store (`~/.local/state/cockpit/supervisor_state.json`).
+/// Top-level persisted supervisor store (`~/.local/state/tchelvis/supervisor_state.json`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DurableStateStore {
     pub mode: SupervisorMode,

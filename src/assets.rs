@@ -1,31 +1,31 @@
 use sha2::{Digest, Sha256};
 
-pub const HERDR_MOD_MAIN_JS: &str = include_str!("../assets/herdr-app/mods/cockpit/main.js");
-pub const HERDR_MOD_JSON: &str = include_str!("../assets/herdr-app/mods/cockpit/mod.json");
-pub const HERDR_LAYOUT_JSON: &str = include_str!("../assets/herdr-app/layouts/cockpit.json");
+pub const HERDR_MOD_MAIN_JS: &str = include_str!("../assets/herdr-app/mods/tchelvis/main.js");
+pub const HERDR_MOD_JSON: &str = include_str!("../assets/herdr-app/mods/tchelvis/mod.json");
+pub const HERDR_LAYOUT_JSON: &str = include_str!("../assets/herdr-app/layouts/tchelvis.json");
 
-pub const FENCE_START: &str = "# >>> cockpit managed >>>";
-pub const FENCE_END: &str = "# <<< cockpit managed <<<";
-pub const CLAUDE_HOOK_MARKER: &str = "# cockpit-managed";
+pub const FENCE_START: &str = "# >>> tchelvis managed >>>";
+pub const FENCE_END: &str = "# <<< tchelvis managed <<<";
+pub const CLAUDE_HOOK_MARKER: &str = "# tchelvis-managed";
 
-/// POSIX / bash / zsh opt-in helper script (`~/.config/cockpit/hooks/shell.sh`).
+/// POSIX / bash / zsh opt-in helper script (`~/.config/tchelvis/hooks/shell.sh`).
 /// Never emits OSC 7501 or `cockpit.*` labels automatically on plain shell prompts.
-pub const SHELL_SH: &str = r#"# cockpit shell helper (opt-in only; preserves plain-shell filter)
-cockpit-tag() {
+pub const SHELL_SH: &str = r#"# tchelvis shell helper (opt-in only; preserves plain-shell filter)
+tchelvis-tag() {
     PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
     if [ -z "${HC_TERMINAL_ID:-}" ]; then
-        printf "cockpit-tag: not running inside a Herdr (hc) terminal\n" >&2
+        printf "tchelvis-tag: not running inside a Herdr (hc) terminal\n" >&2
         return 1
     fi
-    if command -v cockpit >/dev/null 2>&1; then
-        cockpit label "$HC_TERMINAL_ID" "$@"
+    if command -v tchelvis >/dev/null 2>&1; then
+        tchelvis label "$HC_TERMINAL_ID" "$@"
     elif command -v hc >/dev/null 2>&1; then
         hc label "$HC_TERMINAL_ID" "$@"
     fi
 }
 
 if [ -n "${ZSH_VERSION:-}" ]; then
-    _cockpit_extract_agent() {
+    _tchelvis_extract_agent() {
         local cmd="$1"
         local word=""
         local base=""
@@ -47,11 +47,11 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         return 1
     }
 
-    _cockpit_preexec() {
+    _tchelvis_preexec() {
         [ -n "${HC_TERMINAL_ID:-}" ] || return 0
         local agent_name
-        agent_name="$(_cockpit_extract_agent "$1")" || return 0
-        _COCKPIT_ACTIVE_AGENT="$agent_name"
+        agent_name="$(_tchelvis_extract_agent "$1")" || return 0
+        _TCHELVIS_ACTIVE_AGENT="$agent_name"
         (
             PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
             if command -v hc >/dev/null 2>&1; then
@@ -63,11 +63,11 @@ if [ -n "${ZSH_VERSION:-}" ]; then
         fi
     }
 
-    _cockpit_precmd() {
+    _tchelvis_precmd() {
         [ -n "${HC_TERMINAL_ID:-}" ] || return 0
-        [ -n "${_COCKPIT_ACTIVE_AGENT:-}" ] || return 0
-        local prev_agent="$_COCKPIT_ACTIVE_AGENT"
-        unset _COCKPIT_ACTIVE_AGENT
+        [ -n "${_TCHELVIS_ACTIVE_AGENT:-}" ] || return 0
+        local prev_agent="$_TCHELVIS_ACTIVE_AGENT"
+        unset _TCHELVIS_ACTIVE_AGENT
         (
             PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
             if command -v hc >/dev/null 2>&1; then
@@ -80,46 +80,46 @@ if [ -n "${ZSH_VERSION:-}" ]; then
     }
 
     autoload -Uz add-zsh-hook
-    add-zsh-hook preexec _cockpit_preexec
-    add-zsh-hook precmd _cockpit_precmd
+    add-zsh-hook preexec _tchelvis_preexec
+    add-zsh-hook precmd _tchelvis_precmd
 fi
 "#;
 
-/// Fish shell opt-in helper (`~/.config/cockpit/hooks/shell.fish`).
-pub const SHELL_FISH: &str = r#"# cockpit fish helper (opt-in only; preserves plain-shell filter)
-function cockpit-tag
+/// Fish shell opt-in helper (`~/.config/tchelvis/hooks/shell.fish`).
+pub const SHELL_FISH: &str = r#"# tchelvis fish helper (opt-in only; preserves plain-shell filter)
+function tchelvis-tag
     if not set -q HC_TERMINAL_ID
-        echo "cockpit-tag: not running inside a Herdr (hc) terminal" >&2
+        echo "tchelvis-tag: not running inside a Herdr (hc) terminal" >&2
         return 1
     end
-    if command -sq cockpit
-        cockpit label "$HC_TERMINAL_ID" $argv
+    if command -sq tchelvis
+        tchelvis label "$HC_TERMINAL_ID" $argv
     else if command -sq hc
         hc label "$HC_TERMINAL_ID" $argv
     end
 end
 "#;
 
-/// Nushell opt-in helper (`~/.config/cockpit/hooks/shell.nu`).
-pub const SHELL_NU: &str = r#"# cockpit nushell helper (opt-in only; preserves plain-shell filter)
-def --wrapped cockpit-tag [...rest: string] {
+/// Nushell opt-in helper (`~/.config/tchelvis/hooks/shell.nu`).
+pub const SHELL_NU: &str = r#"# tchelvis nushell helper (opt-in only; preserves plain-shell filter)
+def --wrapped tchelvis-tag [...rest: string] {
     if ($env.HC_TERMINAL_ID? | is-empty) {
-        print -e "cockpit-tag: not running inside a Herdr (hc) terminal"
+        print -e "tchelvis-tag: not running inside a Herdr (hc) terminal"
         return
     }
-    if (which cockpit | is-not-empty) {
-        ^cockpit label $env.HC_TERMINAL_ID ...$rest
+    if (which tchelvis | is-not-empty) {
+        ^tchelvis label $env.HC_TERMINAL_ID ...$rest
     } else if (which hc | is-not-empty) {
         ^hc label $env.HC_TERMINAL_ID ...$rest
     }
 }
 "#;
 
-/// Claude Code hook script (`~/.config/cockpit/hooks/claude-hook.sh`, <20ms p99).
+/// Claude Code hook script (`~/.config/tchelvis/hooks/claude-hook.sh`, <20ms p99).
 /// Emits Program Status Protocol OSC 7501 (`\x1b]7501;state=<state>:app=claude[:kind=<kind>][:msg=<base64>]\x1b\\`)
 /// and stamps `cockpit.agent=claude` asynchronously in the background.
 pub const CLAUDE_HOOK_SH: &str = r#"#!/bin/sh
-# cockpit Claude Code hook (<20ms p99, non-blocking)
+# tchelvis Claude Code hook (<20ms p99, non-blocking)
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"
 input="$(cat 2>/dev/null || true)"
 
@@ -185,8 +185,8 @@ esac
 exit 0
 "#;
 
-/// OpenCode ESM plugin (`~/.config/opencode/plugins/cockpit.js`).
-pub const OPENCODE_COCKPIT_JS: &str = r#"// cockpit-osc7501 OpenCode plugin (<20ms p99)
+/// OpenCode ESM plugin (`~/.config/opencode/plugins/tchelvis.js`).
+pub const OPENCODE_TCHELVIS_JS: &str = r#"// tchelvis-osc7501 OpenCode plugin (<20ms p99)
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
@@ -232,7 +232,7 @@ function reportState(state, kind = null, message = "") {
   stampHcLabels(labels);
 }
 
-export const CockpitPlugin = async () => {
+export const TchelvisPlugin = async () => {
   stampHcLabels();
   return {
     event: async ({ event }) => {
@@ -249,13 +249,13 @@ export const CockpitPlugin = async () => {
     },
   };
 };
-export default CockpitPlugin;
+export default TchelvisPlugin;
 "#;
 
-/// Pi coding-agent extension (`~/.pi/agent/extensions/cockpit.js`).
+/// Pi coding-agent extension (`~/.pi/agent/extensions/tchelvis.js`).
 /// Note: Pi 1.5.2+ natively emits OSC 7501 via `@earendil-works/pi-tui/dist/program-status.js`.
 /// This extension stamps `cockpit.agent=pi` and `cockpit.state` labels via `hc` and emits OSC 7501 fallback.
-pub const PI_COCKPIT_JS: &str = r#"// cockpit-osc7501 Pi extension
+pub const PI_TCHELVIS_JS: &str = r#"// tchelvis-osc7501 Pi extension
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
 
@@ -297,7 +297,7 @@ function setHcState(state, kind = "", msg = "") {
   }
 }
 
-export default function cockpitPiExtension(pi) {
+export default function tchelvisPiExtension(pi) {
   setHcState("");
   if (typeof pi?.on === "function") {
     pi.on("session_start", () => setHcState(""));
@@ -311,12 +311,12 @@ export default function cockpitPiExtension(pi) {
 "#;
 
 pub const SYSTEMD_UNIT_TEMPLATE: &str = r#"[Unit]
-Description=Cockpit Herdr Coding Agent Context Daemon
+Description=Tchelvis Herdr Coding Agent Context Daemon
 After=default.target
 
 [Service]
 Type=simple
-ExecStart=%h/.cargo/bin/cockpit daemon
+ExecStart=%h/.local/bin/tchelvis daemon
 Restart=on-failure
 RestartSec=3
 
@@ -346,7 +346,7 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert_eq!(
             children[0].get("id").and_then(|v| v.as_str()),
-            Some("cockpit-pill")
+            Some("tchelvis-pill")
         );
 
         let mod_json: serde_json::Value = serde_json::from_str(HERDR_MOD_JSON).unwrap();
@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn test_embedded_mod_js_exports_contract_symbols() {
         assert!(HERDR_MOD_MAIN_JS.contains("export default class CockpitMod extends View"));
-        assert!(HERDR_MOD_MAIN_JS.contains("export const id = \"cockpit\""));
+        assert!(HERDR_MOD_MAIN_JS.contains("export const id = \"tchelvis\""));
         assert!(HERDR_MOD_MAIN_JS.contains("export const schemaVersion = 1"));
         assert!(HERDR_MOD_MAIN_JS.contains("export function partitionAgents"));
         assert!(HERDR_MOD_MAIN_JS.contains("export function buildViewModel"));

@@ -1,26 +1,26 @@
-use cockpit::assets::{HERDR_LAYOUT_JSON, HERDR_MOD_MAIN_JS};
-use cockpit::config::{CockpitConfig, CockpitPaths};
-use cockpit::correlate::{
+use std::collections::BTreeMap;
+use std::fs;
+use tchelvis::assets::{HERDR_LAYOUT_JSON, HERDR_MOD_MAIN_JS};
+use tchelvis::config::{CockpitConfig, CockpitPaths};
+use tchelvis::correlate::{
     build_initial_agent_row, extract_slack_urls, extract_ticket_keys, resolve_git_workspace,
     should_include_terminal,
 };
-use cockpit::daemon::{collect_once, query_socket_once, DaemonLock};
-use cockpit::doctor::run_doctor;
-use cockpit::herdr::{
+use tchelvis::daemon::{collect_once, query_socket_once, DaemonLock};
+use tchelvis::doctor::run_doctor;
+use tchelvis::herdr::{
     parse_hc_event_line, FleetTracker, HcForeground, HcStatus, HcTerminal, HerdrClient,
 };
-use cockpit::logging::redact_secrets;
-use cockpit::model::{
+use tchelvis::logging::redact_secrets;
+use tchelvis::model::{
     sanitize_terminal_text, AgentKind, AttentionState, BlockedKind, CockpitSnapshot,
     CorrelationTier, FleetSummaryProjection, InspectResponse, IpcOp, IpcRequest, ProviderId,
     MAX_DOC_SNAPSHOT_BYTES,
 };
-use cockpit::providers::runbooks::discover_and_match_runbooks;
-use cockpit::providers::{is_below_quota_reserve_floor, ProviderCoordinator, TokenBucket};
-use cockpit::setup::{run_setup, run_uninstall, verify_installation, SetupOptions};
-use cockpit::store::{CacheStore, CachedEntity, QuotaRecord};
-use std::collections::BTreeMap;
-use std::fs;
+use tchelvis::providers::runbooks::discover_and_match_runbooks;
+use tchelvis::providers::{is_below_quota_reserve_floor, ProviderCoordinator, TokenBucket};
+use tchelvis::setup::{run_setup, run_uninstall, verify_installation, SetupOptions};
+use tchelvis::store::{CacheStore, CachedEntity, QuotaRecord};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -214,10 +214,10 @@ async fn test_integration_uds_ipc_and_setup_doctor_rollback() {
     let home = tmp.path();
     let paths = CockpitPaths {
         home_dir: home.to_path_buf(),
-        config_dir: home.join(".config/cockpit"),
-        data_dir: home.join(".local/share/cockpit"),
-        state_dir: home.join(".local/state/cockpit"),
-        runtime_dir: home.join(".local/state/cockpit/run"),
+        config_dir: home.join(".config/tchelvis"),
+        data_dir: home.join(".local/share/tchelvis"),
+        state_dir: home.join(".local/state/tchelvis"),
+        runtime_dir: home.join(".local/state/tchelvis/run"),
     };
     paths.ensure_dirs().unwrap();
 
@@ -242,18 +242,20 @@ async fn test_integration_uds_ipc_and_setup_doctor_rollback() {
     };
     let setup_rep = run_setup(&paths, &opts).unwrap();
     assert!(setup_rep.verified_ok);
-    assert!(home.join(".config/herdr-app/mods/cockpit/mod.json").exists());
+    assert!(home
+        .join(".config/herdr-app/mods/tchelvis/mod.json")
+        .exists());
     let shared_after_setup: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(home.join(".config/herdr-app/shared.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(
         shared_after_setup.get("layout").and_then(|v| v.as_str()),
-        Some("cockpit")
+        Some("tchelvis")
     );
-    assert!(home.join(".config/opencode/plugins/cockpit.js").exists());
-    assert!(home.join(".pi/agent/extensions/cockpit.js").exists());
-    assert!(home.join(".config/systemd/user/cockpit.service").exists());
+    assert!(home.join(".config/opencode/plugins/tchelvis.js").exists());
+    assert!(home.join(".pi/agent/extensions/tchelvis.js").exists());
+    assert!(home.join(".config/systemd/user/tchelvis.service").exists());
     assert!(verify_installation(&paths).unwrap().verified_ok);
 
     // Run doctor and generate redacted bundle
@@ -284,8 +286,8 @@ async fn test_integration_uds_ipc_and_setup_doctor_rollback() {
         fs::read_to_string(home.join(".config/herdr-app/shared.json")).unwrap(),
         orig_shared
     );
-    assert!(!home.join(".config/opencode/plugins/cockpit.js").exists());
-    assert!(!home.join(".pi/agent/extensions/cockpit.js").exists());
+    assert!(!home.join(".config/opencode/plugins/tchelvis.js").exists());
+    assert!(!home.join(".pi/agent/extensions/tchelvis.js").exists());
 
     // Test Unix socket IPC server/client and DaemonLock
     let lock = DaemonLock::try_acquire(&paths.lock_file()).unwrap();
@@ -338,6 +340,6 @@ async fn test_integration_uds_ipc_and_setup_doctor_rollback() {
         "Hello World"
     );
     assert!(HERDR_MOD_MAIN_JS.contains("export function mount"));
-    assert!(HERDR_LAYOUT_JSON.contains("\"cockpit\""));
+    assert!(HERDR_LAYOUT_JSON.contains("\"tchelvis\""));
     let _ = std::mem::size_of::<InspectResponse>();
 }

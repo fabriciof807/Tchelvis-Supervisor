@@ -59,8 +59,8 @@ fn candidate_bin_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn find_binary(env_override: &str, bin_name: &str) -> Option<PathBuf> {
-    if let Ok(raw) = env::var(env_override) {
+fn find_binary(env_suffix: &str, bin_name: &str) -> Option<PathBuf> {
+    if let Some(raw) = crate::envvars::var(env_suffix) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             let p = PathBuf::from(trimmed);
@@ -79,11 +79,11 @@ fn find_binary(env_override: &str, bin_name: &str) -> Option<PathBuf> {
 }
 
 pub fn find_ai_usagebar_bin() -> Option<PathBuf> {
-    find_binary("COCKPIT_AI_USAGEBAR_BIN", "ai-usagebar")
+    find_binary("AI_USAGEBAR_BIN", "ai-usagebar")
 }
 
 pub fn find_ai_usagebar_tui_bin() -> Option<PathBuf> {
-    find_binary("COCKPIT_AI_USAGEBAR_TUI_BIN", "ai-usagebar-tui")
+    find_binary("AI_USAGEBAR_TUI_BIN", "ai-usagebar-tui")
 }
 
 struct CmdOutput {
@@ -247,7 +247,8 @@ pub fn collect_usage_snapshot(detect_first: bool) -> UsageBarSnapshot {
                         snap.primary = primary;
                         snap.overview_vendors = overview;
                         snap.entries = entries;
-                        if !out.success && snap.entries.is_empty() && !out.stderr.trim().is_empty() {
+                        if !out.success && snap.entries.is_empty() && !out.stderr.trim().is_empty()
+                        {
                             snap.error = Some(out.stderr.trim().to_string());
                         }
                     }
@@ -450,11 +451,12 @@ mod tests {
 
         let vendors = parse_vendors_document(raw).expect("valid vendors json");
         assert_eq!(vendors.len(), 2);
-        assert_eq!(vendors[0].get("id").and_then(|v| v.as_str()), Some("anthropic"));
         assert_eq!(
-            vendors[1]
-                .get("needs_credential")
-                .and_then(|v| v.as_bool()),
+            vendors[0].get("id").and_then(|v| v.as_str()),
+            Some("anthropic")
+        );
+        assert_eq!(
+            vendors[1].get("needs_credential").and_then(|v| v.as_bool()),
             Some(false)
         );
     }

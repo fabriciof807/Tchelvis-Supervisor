@@ -82,20 +82,20 @@ pub async fn run_doctor(
         checks.push(DoctorCheck {
             name: "hooks".into(),
             status: "not_installed".into(),
-            detail: "Run `cockpit setup` to install hook scripts".into(),
+            detail: "Run `tchelvis setup` to install hook scripts".into(),
         });
     }
 
     // 3. Check Herdr mod & layout schema/hash alignment
     let mod_path = paths
         .home_dir
-        .join(".config/herdr-app/mods/cockpit/main.js");
+        .join(".config/herdr-app/mods/tchelvis/main.js");
     let mod_json_path = paths
         .home_dir
-        .join(".config/herdr-app/mods/cockpit/mod.json");
+        .join(".config/herdr-app/mods/tchelvis/mod.json");
     let layout_path = paths
         .home_dir
-        .join(".config/herdr-app/layouts/cockpit.json");
+        .join(".config/herdr-app/layouts/tchelvis.json");
     let embedded_layout_valid = serde_json::from_str::<serde_json::Value>(HERDR_LAYOUT_JSON)
         .map(|v| {
             v.get("id").and_then(|n| n.as_str()) == Some("root")
@@ -132,7 +132,7 @@ pub async fn run_doctor(
             name: "herdr_mod".into(),
             status: "not_installed".into(),
             detail: format!(
-                "Embedded layout schema valid={embedded_layout_valid}; run `cockpit setup` to install to ~/.config/herdr-app/"
+                "Embedded layout schema valid={embedded_layout_valid}; run `tchelvis setup` to install to ~/.config/herdr-app/"
             ),
         });
     }

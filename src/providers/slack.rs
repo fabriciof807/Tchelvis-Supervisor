@@ -17,7 +17,7 @@ pub async fn check_health(
             provider: ProviderId::Slack,
             status: ProviderStatus::Inactive,
             detail: Some(
-                "No COCKPIT_SLACK_TOKEN configured (URL link parsing still active)".into(),
+                "No TCHELVIS_SLACK_TOKEN configured (URL link parsing still active)".into(),
             ),
             ..Default::default()
         };
@@ -37,7 +37,7 @@ pub async fn check_health(
     store.apply_quota_to_health(ProviderHealth {
         provider: ProviderId::Slack,
         status: ProviderStatus::Ready,
-        detail: Some("Configured via COCKPIT_SLACK_TOKEN".into()),
+        detail: Some("Configured via TCHELVIS_SLACK_TOKEN".into()),
         ..Default::default()
     })
 }

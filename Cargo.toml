@@ -1,10 +1,10 @@
 [package]
-name = "cockpit"
-version = "0.1.0"
+name = "tchelvis"
+version = "0.2.0"
 edition = "2021"
 authors = ["notchelvis"]
 description = "Local-first, read-only dashboard and CLI for tracking coding agents running through Herdr (hc)"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0"

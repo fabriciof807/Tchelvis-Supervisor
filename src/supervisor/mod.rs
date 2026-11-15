@@ -303,12 +303,12 @@ pub fn list_models(
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
     let eff_display = eff.as_ref().map(|e| e.display_name.as_str()).unwrap_or("");
-    let cockpit_env = std::env::var("COCKPIT_LLM_MODEL").ok();
+    let tchelvis_env = crate::envvars::var("LLM_MODEL");
     let ollama_env = std::env::var("OLLAMA_MODEL").ok();
     let env_note = models::env_override_note(
         model_id_set,
         eff_display,
-        cockpit_env.as_deref(),
+        tchelvis_env.as_deref(),
         ollama_env.as_deref(),
     );
 
@@ -412,14 +412,14 @@ pub fn reset_model() -> Result<DesktopModSnapshot> {
 }
 
 /// Runs the supervisor deterministic watcher loop, persisting `DesktopModSnapshot` JSON
-/// to `~/.local/state/cockpit/supervisor_mod_snapshot.json` on each tick.
+/// to `~/.local/state/tchelvis/supervisor_mod_snapshot.json` on each tick.
 pub fn run_supervisor_daemon() -> Result<()> {
     let mut engine = build_default_engine()?;
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     let snap_path = PathBuf::from(home)
         .join(".local")
         .join("state")
-        .join("cockpit")
+        .join("tchelvis")
         .join("supervisor_mod_snapshot.json");
     if let Some(parent) = snap_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -464,7 +464,7 @@ pub fn respond_keys(action: RespondAction) -> &'static str {
     }
 }
 
-/// Server-side guard for `cockpit supervisor respond`.
+/// Server-side guard for `tchelvis supervisor respond`.
 pub fn validate_respond_guard(
     agent_id: &str,
     action: RespondAction,

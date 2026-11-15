@@ -20,14 +20,14 @@ pub struct ParsedRunbook {
 }
 
 pub fn check_health(home_dir: &Path) -> ProviderHealth {
-    let global_dir = home_dir.join(".config/cockpit/runbooks");
+    let global_dir = home_dir.join(".config/tchelvis/runbooks");
     let detail = if global_dir.exists() {
         format!(
             "Local runbooks active (global dir {} present)",
             global_dir.display()
         )
     } else {
-        "Local runbook discovery active (RUNBOOK.md, docs/runbooks/, .cockpit/runbooks/)".into()
+        "Local runbook discovery active (RUNBOOK.md, docs/runbooks/, .tchelvis/runbooks/)".into()
     };
     ProviderHealth {
         provider: ProviderId::Runbooks,
@@ -58,7 +58,7 @@ pub fn discover_and_match_runbooks(
             candidate_files.push(root_rb);
         }
         collect_markdown_files(&root.join("docs/runbooks"), 0, 3, &mut candidate_files);
-        collect_markdown_files(&root.join(".cockpit/runbooks"), 0, 3, &mut candidate_files);
+        collect_markdown_files(&root.join(".tchelvis/runbooks"), 0, 3, &mut candidate_files);
     } else {
         let cwd_path = Path::new(cwd);
         let cwd_rb = cwd_path.join("RUNBOOK.md");
@@ -68,7 +68,7 @@ pub fn discover_and_match_runbooks(
     }
 
     collect_markdown_files(
-        &home_dir.join(".config/cockpit/runbooks"),
+        &home_dir.join(".config/tchelvis/runbooks"),
         0,
         3,
         &mut candidate_files,
@@ -337,7 +337,7 @@ fn score_runbook(
         return (40, "Workspace RUNBOOK.md".into());
     }
 
-    // Any runbook inside the current repo's docs/runbooks or .cockpit/runbooks is included with base relevance
+    // Any runbook inside the current repo's docs/runbooks or .tchelvis/runbooks is included with base relevance
     if let Some(root) = repo_root {
         if rb.path.starts_with(root) {
             return (30, "Repository runbook".into());
@@ -378,5 +378,25 @@ mod tests {
         assert!(matched[0]
             .matched_reason
             .contains("Matches failing CI check 'integration-tests'"));
+    }
+
+    #[test]
+    fn runbooks_reads_tchelvis_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rb_dir = tmp.path().join(".tchelvis/runbooks");
+        fs::create_dir_all(&rb_dir).unwrap();
+        fs::write(rb_dir.join("b.md"), "# Tchelvis Runbook\nCheck logs.\n").unwrap();
+
+        let matched = discover_and_match_runbooks(
+            Some(tmp.path().to_str().unwrap()),
+            tmp.path().to_str().unwrap(),
+            None,
+            &[],
+            &[],
+            None,
+            tmp.path(),
+        );
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].path, ".tchelvis/runbooks/b.md");
     }
 }

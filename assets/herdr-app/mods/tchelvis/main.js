@@ -1,4 +1,4 @@
-// Cockpit Herdr Desktop Mod (`gpui-kit` + `herdr` runtime)
+// Tchelvis Herdr Desktop Mod (`gpui-kit` + `herdr` runtime)
 // Version: 0.1.0 | Schema Version: 1
 
 import { View, div, svg, image } from "gpui-kit";
@@ -22,7 +22,7 @@ import {
   keys,
 } from "herdr";
 
-export const id = "cockpit";
+export const id = "tchelvis";
 export const version = "0.1.0";
 export const schemaVersion = 1;
 
@@ -118,7 +118,7 @@ export function buildViewModel(
       ),
       bannerMessage:
         snapshot && snapshot.schema_version !== schemaVersion
-          ? `Cockpit schema mismatch (found v${snapshot.schema_version}, expected v${schemaVersion}). Run 'cockpit setup'.`
+          ? `Tchelvis schema mismatch (found v${snapshot.schema_version}, expected v${schemaVersion}). Run 'tchelvis setup'.`
           : null,
       sections: { blocked: [], active: [], finished: [] },
       selectedAgent: null,
@@ -532,9 +532,9 @@ function isPlainShellRow(name, programName, labels, term = null) {
     "nushell",
     "dash",
     "tmux",
-    "cockpit",
+    "tchelvis",
     "herdr-supervisor",
-    "cockpit-supervisor",
+    "tchelvis-supervisor",
     "herdr-core",
     "hc",
   ]);
@@ -1096,7 +1096,7 @@ export default class CockpitMod extends View {
       cx.timer.every(6000, (cx) => this.refreshInspector(cx));
       cx.timer.every(60000, (cx) => {
         const inspectorHidden = Boolean(
-          findNode(layout(), "cockpit-inspector")?.hidden
+          findNode(layout(), "tchelvis-inspector")?.hidden
         );
         if (Boolean(shared("cockpit.usageOpen")) && !inspectorHidden) {
           this.fetchUsageSnapshot(cx, false, false);
@@ -1263,7 +1263,7 @@ export default class CockpitMod extends View {
     this.pollingSupervisor = true;
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["supervisor", "status", "--json"], {
+        const res = await exec("tchelvis", ["supervisor", "status", "--json"], {
           timeout: 8000,
         });
         if (res.code === 0 && res.stdout) {
@@ -1316,7 +1316,7 @@ export default class CockpitMod extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["supervisor", "tick", "--json"], {
+        const res = await exec("tchelvis", ["supervisor", "tick", "--json"], {
           timeout: 60000,
         });
         if (res.code === 0 && res.stdout) {
@@ -1346,7 +1346,7 @@ export default class CockpitMod extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", args, { timeout: timeoutMs });
+        const res = await exec("tchelvis", args, { timeout: timeoutMs });
         if (res.code === 0 && res.stdout) {
           const snap = parseSnapshotOutput(res.stdout);
           if (snap) {
@@ -1374,7 +1374,7 @@ export default class CockpitMod extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["supervisor", "load"], {
+        const res = await exec("tchelvis", ["supervisor", "load"], {
           timeout: 300000,
         });
         if (res.code === 0 && res.stdout) {
@@ -1426,7 +1426,7 @@ export default class CockpitMod extends View {
     cx.spawn(async (cx) => {
       try {
         const res = await exec(
-          "cockpit",
+          "tchelvis",
           ["supervisor", "respond", agentId, action],
           { timeout: 15000 }
         );
@@ -1460,7 +1460,7 @@ export default class CockpitMod extends View {
       try {
         const args = ["status", "--json", "--no-spawn"];
         if (forceRefresh) args.push("--refresh");
-        const res = await exec("cockpit", args, { timeout: 8000 });
+        const res = await exec("tchelvis", args, { timeout: 8000 });
         if (res.code === 0 && res.stdout) {
           const parsed = JSON.parse(res.stdout);
           setShared("cockpit.snapshot", parsed);
@@ -1481,14 +1481,14 @@ export default class CockpitMod extends View {
     this.fetchingInspect = true;
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["inspect", addr, "--json"], {
+        const res = await exec("tchelvis", ["inspect", addr, "--json"], {
           timeout: 8000,
         });
         if (res.code === 0 && res.stdout) {
           this.inspectCache[addr] = JSON.parse(res.stdout);
         }
       } catch (_e) {
-        // Ignore if terminal is plain shell or cockpit binary is absent
+        // Ignore if terminal is plain shell or tchelvis binary is absent
       } finally {
         this.fetchingInspect = false;
         cx.notify();
@@ -1499,7 +1499,7 @@ export default class CockpitMod extends View {
   runDoctorCheckSilent(cx) {
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["doctor", "--json"], {
+        const res = await exec("tchelvis", ["doctor", "--json"], {
           timeout: 10000,
         });
         if (res.code === 0 && res.stdout) {
@@ -1513,18 +1513,18 @@ export default class CockpitMod extends View {
   runDoctorCheck(cx) {
     if (this.busy) return;
     this.busy = true;
-    this.note = "Running cockpit doctor…";
+    this.note = "Running tchelvis doctor…";
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["doctor", "--json"], {
+        const res = await exec("tchelvis", ["doctor", "--json"], {
           timeout: 10000,
         });
         if (res.code === 0 && res.stdout) {
           this.doctorReport = JSON.parse(res.stdout);
           this.note = `Doctor: ${this.doctorReport.overall_status.toUpperCase()}`;
         } else {
-          this.note = "cockpit doctor failed";
+          this.note = "tchelvis doctor failed";
         }
       } catch (e) {
         this.note = `Error: ${String(e)}`;
@@ -1538,11 +1538,11 @@ export default class CockpitMod extends View {
   runSetupGui(cx) {
     if (this.busy) return;
     this.busy = true;
-    this.note = "Running cockpit setup…";
+    this.note = "Running tchelvis setup…";
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["setup"], { timeout: 10000 });
+        const res = await exec("tchelvis", ["setup"], { timeout: 10000 });
         this.note =
           res.code === 0 ? "Hooks & mod verified" : "Setup returned warning";
       } catch (e) {
@@ -1594,7 +1594,7 @@ export default class CockpitMod extends View {
     this.fetchingHome = true;
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["home", "--json"], {
+        const res = await exec("tchelvis", ["home", "--json"], {
           timeout: 8000,
         });
         if (res.code === 0 && res.stdout) {
@@ -1627,15 +1627,15 @@ export default class CockpitMod extends View {
       try {
         const args = ["usage", "--json"];
         if (detect) args.push("--detect");
-        const res = await exec("cockpit", args, { timeout: 22000 });
+        const res = await exec("tchelvis", args, { timeout: 22000 });
         if (res.code === 0 && res.stdout) {
           snap = JSON.parse(res.stdout);
         }
       } catch (_e) {
-        // Fallback directly to ai-usagebar CLI if cockpit binary lacks `usage`
+        // Fallback directly to ai-usagebar CLI if tchelvis binary lacks `usage`
       }
 
-      // Direct fallback if cockpit failed or didn't find ai-usagebar in its PATH
+      // Direct fallback if tchelvis failed or didn't find ai-usagebar in its PATH
       if (!snap || !snap.installed) {
         try {
           if (detect) {
@@ -1733,7 +1733,7 @@ export default class CockpitMod extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", ["task", ...args], { timeout: 8000 });
+        const res = await exec("tchelvis", ["task", ...args], { timeout: 8000 });
         if (res.code === 0 && res.stdout) {
           const parsed = JSON.parse(res.stdout);
           this.homeSnap = parsed;
@@ -1941,7 +1941,7 @@ export default class CockpitMod extends View {
 
   toggleUsagePopup(cx) {
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
     const usageOpen = Boolean(shared("cockpit.usageOpen") ?? this.usageOpen);
     if (usageOpen && !inspectorHidden) {
@@ -1958,7 +1958,7 @@ export default class CockpitMod extends View {
     if (inspectorHidden) {
       this.usageOnlyDrawer = true;
       setShared("cockpit.usageOnlyDrawer", true);
-      run("layout.toggle", { id: "cockpit-inspector" });
+      run("layout.toggle", { id: "tchelvis-inspector" });
     } else {
       this.usageOnlyDrawer = false;
       setShared("cockpit.usageOnlyDrawer", false);
@@ -1982,15 +1982,15 @@ export default class CockpitMod extends View {
     this.usageOnlyDrawer = false;
     setShared("cockpit.usageOpen", false);
     setShared("cockpit.usageOnlyDrawer", false);
-    if (onlyDrawer && !findNode(layout(), "cockpit-inspector")?.hidden) {
-      run("layout.hide", { id: "cockpit-inspector" });
+    if (onlyDrawer && !findNode(layout(), "tchelvis-inspector")?.hidden) {
+      run("layout.hide", { id: "tchelvis-inspector" });
     }
     cx?.notify();
   }
 
   toggleModelPicker(cx) {
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
     const pickerOpen = Boolean(
       shared("cockpit.modelPickerOpen") ?? this.modelPickerOpen
@@ -2012,7 +2012,7 @@ export default class CockpitMod extends View {
     if (inspectorHidden) {
       this.modelPickerOnlyDrawer = true;
       setShared("cockpit.modelPickerOnlyDrawer", true);
-      run("layout.toggle", { id: "cockpit-inspector" });
+      run("layout.toggle", { id: "tchelvis-inspector" });
     } else {
       this.modelPickerOnlyDrawer = false;
       setShared("cockpit.modelPickerOnlyDrawer", false);
@@ -2031,8 +2031,8 @@ export default class CockpitMod extends View {
     setShared("cockpit.modelPickerOpen", false);
     setShared("cockpit.modelPickerOnlyDrawer", false);
     setShared("cockpit.modelListShowAll", false);
-    if (onlyDrawer && !findNode(layout(), "cockpit-inspector")?.hidden) {
-      run("layout.hide", { id: "cockpit-inspector" });
+    if (onlyDrawer && !findNode(layout(), "tchelvis-inspector")?.hidden) {
+      run("layout.hide", { id: "tchelvis-inspector" });
     }
     cx?.notify();
   }
@@ -2046,7 +2046,7 @@ export default class CockpitMod extends View {
 
     cx.spawn(async (cx) => {
       try {
-        const res = await exec("cockpit", args, { timeout: 30000 });
+        const res = await exec("tchelvis", args, { timeout: 30000 });
         if (res.code === 0 && res.stdout) {
           const parsed = JSON.parse(res.stdout);
           this.modelList = parsed;
@@ -2100,7 +2100,7 @@ export default class CockpitMod extends View {
     cx.spawn(async (cx) => {
       let ok = false;
       try {
-        const res = await exec("cockpit", ["supervisor", "model", "set", id], {
+        const res = await exec("tchelvis", ["supervisor", "model", "set", id], {
           timeout: 300000,
         });
         if (res.code === 0 && res.stdout) {
@@ -2134,7 +2134,7 @@ export default class CockpitMod extends View {
   openDrawerView(cx, tab, toggleIfActive = false) {
     const normalizedTab = tab === "usage" ? "inspector" : tab;
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
     const onlyUsage = Boolean(
       shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
@@ -2161,7 +2161,7 @@ export default class CockpitMod extends View {
       setShared("cockpit.usageOnlyDrawer", false);
       setShared("cockpit.modelPickerOpen", false);
       setShared("cockpit.modelPickerOnlyDrawer", false);
-      run("layout.toggle", { id: "cockpit-inspector" });
+      run("layout.toggle", { id: "tchelvis-inspector" });
       cx?.notify();
       return;
     }
@@ -2182,7 +2182,7 @@ export default class CockpitMod extends View {
       this.refreshInspector(cx);
     }
     if (inspectorHidden) {
-      run("layout.toggle", { id: "cockpit-inspector" });
+      run("layout.toggle", { id: "tchelvis-inspector" });
     }
     cx?.notify();
   }
@@ -2295,7 +2295,7 @@ export default class CockpitMod extends View {
       llmPillColor = t.blocked;
     }
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
     const onlyUsage = Boolean(
       shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
@@ -2645,8 +2645,8 @@ export default class CockpitMod extends View {
           setShared("cockpit.viewMode", "inspector");
           setShared("cockpit.usageOnlyDrawer", false);
           this.inspectorTab = "inspector";
-          if (findNode(layout(), "cockpit-inspector")?.hidden) {
-            run("layout.toggle", { id: "cockpit-inspector" });
+          if (findNode(layout(), "tchelvis-inspector")?.hidden) {
+            run("layout.toggle", { id: "tchelvis-inspector" });
           }
           void this.focusOrAttachTerminal(cx, a, false);
           this.refreshInspector(cx);
@@ -2776,7 +2776,7 @@ export default class CockpitMod extends View {
       .border_t(1)
       .border_color(t.border)
       .child(
-        // Header Bar (only COCKPIT FLEET + count pill + [+ Agent] + [↻])
+        // Header Bar (only TCHELVIS FLEET + count pill + [+ Agent] + [↻])
         h_flex()
           .h(36)
           .px(12)
@@ -2789,7 +2789,7 @@ export default class CockpitMod extends View {
               .text_size(11.5)
               .font_semibold()
               .text_color(t.muted)
-              .child("COCKPIT FLEET")
+              .child("TCHELVIS FLEET")
           )
           .child(this.pillBadge(t, `${liveCount}`, t.accent))
           .child(div().flex_1())
@@ -3159,7 +3159,7 @@ export default class CockpitMod extends View {
         this.sectionTitle(
           t,
           "📋 TAREFAS DO DIA",
-          "cockpit task"
+          "tchelvis task"
         )
       )
       .child(
@@ -3617,8 +3617,8 @@ export default class CockpitMod extends View {
                       setShared("cockpit.usageOnlyDrawer", false);
                       this.inspectorTab = "inspector";
                       this.refreshInspector(cx);
-                      if (findNode(layout(), "cockpit-inspector")?.hidden) {
-                        run("layout.toggle", { id: "cockpit-inspector" });
+                      if (findNode(layout(), "tchelvis-inspector")?.hidden) {
+                        run("layout.toggle", { id: "tchelvis-inspector" });
                       }
                       cx.notify();
                     },
@@ -3654,7 +3654,7 @@ export default class CockpitMod extends View {
   renderHome(cx) {
     const t = theme();
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
 
     return v_flex()
@@ -3684,7 +3684,7 @@ export default class CockpitMod extends View {
               .text_size(13)
               .font_semibold()
               .text_color(t.foreground)
-              .child(ellipsize("🏠 COCKPIT HOME · RESUMO DO DIA", 34))
+              .child(ellipsize("🏠 TCHELVIS HOME · RESUMO DO DIA", 34))
           )
           .child(
             this.actionBtn(t, "ck-home-refresh", "↻ Atualizar", (_e, cx) => {
@@ -3697,13 +3697,13 @@ export default class CockpitMod extends View {
               t,
               "ck-home-inspector",
               inspectorHidden ? "Inspector ◁" : "Inspector ▷",
-              () => run("layout.toggle", { id: "cockpit-inspector" }),
+              () => run("layout.toggle", { id: "tchelvis-inspector" }),
               !inspectorHidden
             )
           )
           .child(
             this.actionBtn(t, "ck-home-close", "×", () =>
-              run("layout.hide", { id: "cockpit-home" })
+              run("layout.hide", { id: "tchelvis-home" })
             )
           )
       )
@@ -3764,7 +3764,7 @@ export default class CockpitMod extends View {
       {
         name: "herdr_mod",
         status: "pass",
-        detail: "cockpit mod & layout loaded",
+        detail: "tchelvis mod & layout loaded",
       },
       {
         name: "storage_ipc",
@@ -3842,7 +3842,7 @@ export default class CockpitMod extends View {
               .text_size(11.5)
               .text_color(t.muted)
               .child(
-                `cockpit v${report?.cockpit_version ?? version} · supervisor ${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`
+                `tchelvis v${report?.cockpit_version ?? version} · supervisor ${supSnap?.llm_model || "lfm3:1.7b"} · ${gpuModeText(supSnap)}`
               )
           )
           .child(
@@ -4131,7 +4131,7 @@ export default class CockpitMod extends View {
             .text_size(11.5)
             .text_color(t.muted)
             .child(
-              "Model selection applies to the managed LLM container (COCKPIT_LLM_CONTAINER=on)."
+              "Model selection applies to the managed LLM container (TCHELVIS_LLM_CONTAINER=on)."
             )
         )
       )
@@ -5171,7 +5171,7 @@ export default class CockpitMod extends View {
               setShared("cockpit.usageOnlyDrawer", false);
               setShared("cockpit.modelPickerOpen", false);
               setShared("cockpit.modelPickerOnlyDrawer", false);
-              run("layout.hide", { id: "cockpit-inspector" });
+              run("layout.hide", { id: "tchelvis-inspector" });
             })
           )
       )
@@ -6397,7 +6397,7 @@ export default class CockpitMod extends View {
     const workingCount = liveMerged.filter((a) => a.status === "working").length;
     const modeLabel = supSnap?.mode_label ?? "Semi-Auto (Whitelist)";
     const inspectorHidden = Boolean(
-      findNode(layout(), "cockpit-inspector")?.hidden
+      findNode(layout(), "tchelvis-inspector")?.hidden
     );
     const onlyUsage = Boolean(
       shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
@@ -6450,7 +6450,7 @@ export default class CockpitMod extends View {
             div()
               .font_semibold()
               .text_color(t.foreground)
-              .child(`Cockpit v${version}`)
+              .child(`Tchelvis v${version}`)
           )
       )
       .child(

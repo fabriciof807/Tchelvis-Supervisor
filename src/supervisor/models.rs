@@ -89,7 +89,7 @@ impl ScanRoots {
         }
         if let Some(ref h) = home {
             llama_cpp.push(h.join(".cache").join("llama.cpp"));
-            llama_cpp.push(h.join(".cache").join("cockpit").join("llama.cpp"));
+            llama_cpp.push(h.join(".cache").join("tchelvis").join("llama.cpp"));
         }
 
         let mut lm_studio = Vec::new();
@@ -99,7 +99,7 @@ impl ScanRoots {
         }
 
         let mut folders = Vec::new();
-        if let Ok(dirs_env) = env::var("COCKPIT_MODEL_DIRS") {
+        if let Some(dirs_env) = crate::envvars::var("MODEL_DIRS") {
             for part in dirs_env.split(':') {
                 let trimmed = part.trim();
                 if !trimmed.is_empty() {
@@ -689,7 +689,7 @@ pub struct EffectiveModel {
     pub path: Option<PathBuf>,
 }
 
-/// JSON output of `cockpit supervisor model list --json` and `filter`.
+/// JSON output of `tchelvis supervisor model list --json` and `filter`.
 #[derive(Serialize, Debug)]
 pub struct ModelListOutput {
     pub models: Vec<LocalModel>,
@@ -836,19 +836,19 @@ pub fn effective_model(cfg: &SupervisorConfig, ollama_roots: &[PathBuf]) -> Opti
 }
 
 /// Returns `"<VAR>=<value>"` when `model_id_set` is true and an env var overrides
-/// a different model name than `effective_display`. Checks `COCKPIT_LLM_MODEL` before `OLLAMA_MODEL`.
+/// a different model name than `effective_display`. Checks `TCHELVIS_LLM_MODEL` before `OLLAMA_MODEL`.
 pub fn env_override_note(
     model_id_set: bool,
     effective_display: &str,
-    cockpit_llm_model: Option<&str>,
+    tchelvis_llm_model: Option<&str>,
     ollama_model_env: Option<&str>,
 ) -> Option<String> {
     if !model_id_set {
         return None;
     }
     let (var_name, val) =
-        if let Some(v) = cockpit_llm_model.map(str::trim).filter(|s| !s.is_empty()) {
-            ("COCKPIT_LLM_MODEL", v)
+        if let Some(v) = tchelvis_llm_model.map(str::trim).filter(|s| !s.is_empty()) {
+            ("TCHELVIS_LLM_MODEL", v)
         } else if let Some(v) = ollama_model_env.map(str::trim).filter(|s| !s.is_empty()) {
             ("OLLAMA_MODEL", v)
         } else {
@@ -1332,7 +1332,7 @@ mod tests {
         );
         assert_eq!(
             env_override_note(true, "qwen2.5:3b", Some("other:1b"), Some("lfm3:1.7b")),
-            Some("COCKPIT_LLM_MODEL=other:1b".to_string())
+            Some("TCHELVIS_LLM_MODEL=other:1b".to_string())
         );
     }
 

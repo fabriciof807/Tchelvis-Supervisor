@@ -132,7 +132,10 @@ impl DailyTaskStore {
         let json = serde_json::to_string_pretty(self)?;
         let tmp_path = path.with_extension("json.tmp");
         fs::write(&tmp_path, json).with_context(|| {
-            format!("failed writing temporary daily tasks file {}", tmp_path.display())
+            format!(
+                "failed writing temporary daily tasks file {}",
+                tmp_path.display()
+            )
         })?;
         fs::rename(&tmp_path, path)
             .with_context(|| format!("failed saving daily tasks to {}", path.display()))?;
@@ -412,10 +415,12 @@ pub fn build_home_snapshot_with_terminals(
     }
 
     for dir in discover_git_subdirs(&paths.home_dir) {
-        project_map.entry(dir.clone()).or_insert_with(|| ProjectAccumulator {
-            path: dir,
-            ..Default::default()
-        });
+        project_map
+            .entry(dir.clone())
+            .or_insert_with(|| ProjectAccumulator {
+                path: dir,
+                ..Default::default()
+            });
     }
 
     let mut projects: Vec<ProjectSummary> = project_map
@@ -459,7 +464,11 @@ pub fn build_home_snapshot_with_terminals(
     projects.sort_by(|a, b| {
         status_rank(&a.status_label)
             .cmp(&status_rank(&b.status_label))
-            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
             .then_with(|| a.name.cmp(&b.name))
     });
 
@@ -505,10 +514,10 @@ mod tests {
     fn test_paths(tmp: &TempDir) -> CockpitPaths {
         let home_dir = tmp.path().to_path_buf();
         CockpitPaths {
-            config_dir: home_dir.join(".config/cockpit"),
-            data_dir: home_dir.join(".local/share/cockpit"),
-            state_dir: home_dir.join(".local/state/cockpit"),
-            runtime_dir: home_dir.join(".local/state/cockpit/run"),
+            config_dir: home_dir.join(".config/tchelvis"),
+            data_dir: home_dir.join(".local/share/tchelvis"),
+            state_dir: home_dir.join(".local/state/tchelvis"),
+            runtime_dir: home_dir.join(".local/state/tchelvis/run"),
             home_dir,
         }
     }
@@ -521,7 +530,10 @@ mod tests {
         assert_eq!(TaskPriority::from_str_loose("low"), TaskPriority::Low);
         assert_eq!(TaskPriority::from_str_loose("P3"), TaskPriority::Low);
         assert_eq!(TaskPriority::from_str_loose("normal"), TaskPriority::Normal);
-        assert_eq!(TaskPriority::from_str_loose("unknown"), TaskPriority::Normal);
+        assert_eq!(
+            TaskPriority::from_str_loose("unknown"),
+            TaskPriority::Normal
+        );
         assert_eq!(TaskPriority::High.as_str(), "high");
         assert_eq!(TaskPriority::Normal.as_str(), "normal");
         assert_eq!(TaskPriority::Low.as_str(), "low");
@@ -537,7 +549,12 @@ mod tests {
         assert_eq!(store.next_id, 1);
         assert!(store.tasks.is_empty());
 
-        let t1 = store.add_task("Ship home view", Some("cockpit".to_string()), TaskPriority::High, 100);
+        let t1 = store.add_task(
+            "Ship home view",
+            Some("cockpit".to_string()),
+            TaskPriority::High,
+            100,
+        );
         let t2 = store.add_task("Review PR", None, TaskPriority::Normal, 200);
         assert_eq!(t1.id, "t-1");
         assert_eq!(t2.id, "t-2");
@@ -578,10 +595,25 @@ mod tests {
         }
 
         let mut store = DailyTaskStore::default();
-        store.add_task("Fix alpha bug", Some("alpha".to_string()), TaskPriority::High, 10);
-        store.add_task("Done task", Some("gamma".to_string()), TaskPriority::Low, 20);
+        store.add_task(
+            "Fix alpha bug",
+            Some("alpha".to_string()),
+            TaskPriority::High,
+            10,
+        );
+        store.add_task(
+            "Done task",
+            Some("gamma".to_string()),
+            TaskPriority::Low,
+            20,
+        );
         store.toggle_task("t-2", 25);
-        store.add_task("Write tests", Some("beta".to_string()), TaskPriority::Normal, 30);
+        store.add_task(
+            "Write tests",
+            Some("beta".to_string()),
+            TaskPriority::Normal,
+            30,
+        );
         store.save(&DailyTaskStore::default_path(&paths)).unwrap();
 
         let terminals = vec![HcTerminal {

@@ -401,11 +401,11 @@ fn is_attach_client_invocation(program: Option<&str>, args: &[String]) -> bool {
             .any(|arg| normalize_program_token(arg) == "attach")
 }
 
-fn is_supervisor_or_cockpit_name(token: &str) -> bool {
+fn is_supervisor_or_tchelvis_name(token: &str) -> bool {
     let norm = normalize_program_token(token);
     matches!(
         norm.as_str(),
-        "herdr-supervisor" | "cockpit-supervisor" | "cockpit"
+        "herdr-supervisor" | "tchelvis-supervisor" | "tchelvis"
     )
 }
 
@@ -436,7 +436,7 @@ fn extract_status_fields(status: Option<&serde_json::Value>) -> (Option<String>,
 }
 
 /// Returns `true` if the `hc` terminal represents an active coding agent session rather than
-/// an idle plain shell or a supervisor/cockpit UI process.
+/// an idle plain shell or a supervisor/tchelvis UI process.
 pub fn is_coding_agent_terminal(
     agent: Option<&str>,
     name: Option<&str>,
@@ -448,9 +448,9 @@ pub fn is_coding_agent_terminal(
     labels: &BTreeMap<String, String>,
 ) -> bool {
     let fg_name = foreground.and_then(|f| f.name.as_deref());
-    if agent.is_some_and(is_supervisor_or_cockpit_name)
-        || name.is_some_and(is_supervisor_or_cockpit_name)
-        || fg_name.is_some_and(is_supervisor_or_cockpit_name)
+    if agent.is_some_and(is_supervisor_or_tchelvis_name)
+        || name.is_some_and(is_supervisor_or_tchelvis_name)
+        || fg_name.is_some_and(is_supervisor_or_tchelvis_name)
     {
         return false;
     }

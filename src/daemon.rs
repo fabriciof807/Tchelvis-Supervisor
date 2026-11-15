@@ -52,7 +52,7 @@ impl Drop for DaemonLock {
     }
 }
 
-/// Executes a single collection cycle (`cockpit daemon --once` or `cockpit status` fallback).
+/// Executes a single collection cycle (`tchelvis daemon --once` or `tchelvis status` fallback).
 pub async fn collect_once(
     cfg: &CockpitConfig,
     paths: &CockpitPaths,
@@ -166,7 +166,7 @@ pub async fn run_daemon(
     paths.ensure_dirs()?;
     let lock_path = paths.lock_file();
     let Some(_lock_guard) = DaemonLock::try_acquire(&lock_path)? else {
-        tracing::info!("Another cockpit daemon instance holds daemon.lock; exiting");
+        tracing::info!("Another tchelvis daemon instance holds daemon.lock; exiting");
         return Ok(());
     };
 
@@ -417,7 +417,8 @@ async fn handle_ipc_client(
             let snap = if req.include_all {
                 collect_once(&cfg, &paths, &store, &herdr, &coord, true, false).await?
             } else {
-                let stale = chrono::Utc::now().timestamp() - shared_snap.read().await.generated_at >= 2;
+                let stale =
+                    chrono::Utc::now().timestamp() - shared_snap.read().await.generated_at >= 2;
                 if stale {
                     let _ = refresh_tx.send(false).await;
                     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -501,7 +502,7 @@ pub async fn query_socket_once<T: serde::de::DeserializeOwned>(
         .await
         .context("socket read timeout")??;
     if n == 0 {
-        bail!("empty response from cockpit.sock");
+        bail!("empty response from tchelvis.sock");
     }
     Ok(serde_json::from_str(resp_line.trim())?)
 }

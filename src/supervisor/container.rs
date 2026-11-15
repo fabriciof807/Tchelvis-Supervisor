@@ -72,7 +72,7 @@ impl Default for LlmContainerConfig {
         Self {
             mode: "auto".to_string(),
             runtime: "auto".to_string(),
-            name: "cockpit-supervisor-llm".to_string(),
+            name: "tchelvis-supervisor-llm".to_string(),
             image: "ghcr.io/ggml-org/llama.cpp:server".to_string(),
             image_gpu: "ghcr.io/ggml-org/llama.cpp:server-cuda".to_string(),
             port: 11435,
@@ -377,7 +377,7 @@ pub fn default_hf_cache_dir() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
     PathBuf::from(home)
         .join(".cache")
-        .join("cockpit")
+        .join("tchelvis")
         .join("llama.cpp")
 }
 
@@ -544,9 +544,9 @@ pub fn build_run_args(
         "--name".to_string(),
         cfg.name.clone(),
         "--label".to_string(),
-        format!("cockpit.ngl={ngl}"),
+        format!("tchelvis.ngl={ngl}"),
         "--label".to_string(),
-        format!("cockpit.model_id={model_id}"),
+        format!("tchelvis.model_id={model_id}"),
         "-p".to_string(),
         format!("127.0.0.1:{}:8080", cfg.port),
     ];
@@ -761,12 +761,12 @@ impl<C: ContainerCli> LlmContainer<C> {
         Ok(parse_inspect_running(&out))
     }
 
-    /// Reads the `cockpit.ngl` label from an existing container.
+    /// Reads the `tchelvis.ngl` label from an existing container.
     pub fn container_ngl(&self) -> Option<u32> {
         let args = vec![
             "inspect".to_string(),
             "-f".to_string(),
-            "{{index .Config.Labels \"cockpit.ngl\"}}".to_string(),
+            "{{index .Config.Labels \"tchelvis.ngl\"}}".to_string(),
             self.config.name.clone(),
         ];
         let out = self.cli.run(self.runtime.bin(), &args).ok()?;
@@ -776,12 +776,12 @@ impl<C: ContainerCli> LlmContainer<C> {
         out.stdout.trim().parse::<u32>().ok()
     }
 
-    /// Reads the `cockpit.model_id` label from an existing container.
+    /// Reads the `tchelvis.model_id` label from an existing container.
     pub fn container_model_id(&self) -> Option<String> {
         let args = vec![
             "inspect".to_string(),
             "-f".to_string(),
-            "{{index .Config.Labels \"cockpit.model_id\"}}".to_string(),
+            "{{index .Config.Labels \"tchelvis.model_id\"}}".to_string(),
             self.config.name.clone(),
         ];
         let out = self.cli.run(self.runtime.bin(), &args).ok()?;
@@ -990,7 +990,10 @@ mod tests {
             ContainerState::Stopped
         );
         assert_eq!(
-            parse_inspect_running(&err_out(1, "Error: No such object: cockpit-supervisor-llm")),
+            parse_inspect_running(&err_out(
+                1,
+                "Error: No such object: tchelvis-supervisor-llm"
+            )),
             ContainerState::Missing
         );
         assert_eq!(parse_inspect_running(&ok_out("")), ContainerState::Missing);
@@ -1019,7 +1022,7 @@ mod tests {
         assert!(args.contains(&"ghcr.io/ggml-org/llama.cpp:server".to_string()));
         assert!(args.contains(&"/data/models:/models:ro".to_string()));
         assert!(args.contains(&"/models/lfm3.gguf".to_string()));
-        assert!(args.contains(&"cockpit.ngl=0".to_string()));
+        assert!(args.contains(&"tchelvis.ngl=0".to_string()));
         assert!(args.contains(&"--threads".to_string()));
 
         // Docker GPU + HfRepo
@@ -1039,7 +1042,7 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|w| w == ["-hf", "LiquidAI/LFM2-1.2B-GGUF:Q4_K_M"]));
-        assert!(args.contains(&"cockpit.ngl=99".to_string()));
+        assert!(args.contains(&"tchelvis.ngl=99".to_string()));
 
         // Podman GPU
         let args = build_run_args(
@@ -1141,7 +1144,7 @@ mod tests {
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
         mgr.start(0, &model, mid).unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls[3].1, vec!["start", "cockpit-supervisor-llm"]);
+        assert_eq!(calls[3].1, vec!["start", "tchelvis-supervisor-llm"]);
 
         // Stopped with different ngl -> rm -f + run
         let cli = FakeCli::new(vec![
@@ -1153,7 +1156,7 @@ mod tests {
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
         mgr.start(99, &model, mid).unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls[2].1, vec!["rm", "-f", "cockpit-supervisor-llm"]);
+        assert_eq!(calls[2].1, vec!["rm", "-f", "tchelvis-supervisor-llm"]);
         assert_eq!(calls[3].1[0], "run");
 
         // Running with same ngl and model_id -> no-op
@@ -1172,7 +1175,7 @@ mod tests {
         mgr.stop().unwrap();
         assert_eq!(
             mgr.cli.calls()[1].1,
-            vec!["stop", "-t", "2", "cockpit-supervisor-llm"]
+            vec!["stop", "-t", "2", "tchelvis-supervisor-llm"]
         );
 
         // Stop when Stopped -> no-op
@@ -1278,7 +1281,7 @@ mod tests {
             &cache,
             "ollama:lfm3:1.7b",
         );
-        assert!(args.contains(&"cockpit.model_id=ollama:lfm3:1.7b".to_string()));
+        assert!(args.contains(&"tchelvis.model_id=ollama:lfm3:1.7b".to_string()));
     }
 
     #[test]
@@ -1294,7 +1297,7 @@ mod tests {
         let mgr = LlmContainer::new(ContainerRuntime::Docker, LlmContainerConfig::default(), cli);
         mgr.start(0, &model, "hf:org/new:Q4_K_M").unwrap();
         let calls = mgr.cli.calls();
-        assert_eq!(calls[3].1, vec!["rm", "-f", "cockpit-supervisor-llm"]);
+        assert_eq!(calls[3].1, vec!["rm", "-f", "tchelvis-supervisor-llm"]);
         assert_eq!(calls[4].1[0], "run");
     }
 

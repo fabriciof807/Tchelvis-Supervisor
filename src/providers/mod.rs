@@ -155,7 +155,7 @@ impl ProviderCoordinator {
             map.insert(p, TokenBucket::default());
         }
         let http_client = reqwest::Client::builder()
-            .user_agent(concat!("cockpit/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!("tchelvis/", env!("CARGO_PKG_VERSION")))
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .unwrap_or_default();
