@@ -632,16 +632,6 @@ function isPlainShellRow(name, programName, labels, term = null) {
   return /\((zsh|bash|fish|sh|nu|dash|tmux)\)$/i.test(String(name ?? "").trim());
 }
 
-async function delayMs(ms) {
-  if (typeof globalThis.setTimeout === "function") {
-    return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
-  }
-  const secs = String(Math.max(0.05, ms / 1000).toFixed(2));
-  await exec("sleep", [secs], { timeout: Math.max(1000, ms + 500) }).catch(
-    () => null
-  );
-}
-
 // Attach by the core terminal address (e.g. `t11g`): it is unique and always
 // resolvable. Names are not — agent-spawned terminals have no core name, and
 // the tab/agent label (`agy`, `claude`) makes `hc attach` fail with not_found,
@@ -702,6 +692,17 @@ function findPaneForTerminal(
   }
 
   return knownPaneId ? { pane: knownPaneId } : null;
+}
+
+// Fleet card click: focus a pane only when one in the *current* pane list shows the terminal
+// (directly or through an `hc attach` tab); otherwise attach. No focus-then-guess: `agent.focus`
+// on a background terminal could "succeed" without showing anything, and a stale `pane` id from
+// the fleet row made `pane.focus` fail silently — both left the click with no visible effect.
+export function planFleetClick(allPanes, allTerminals, address, termName, knownPaneId) {
+  const paneList = Array.isArray(allPanes) ? allPanes : [];
+  const found = findPaneForTerminal(paneList, allTerminals, address, termName, knownPaneId);
+  const isLive = found?.pane && paneList.some((p) => (p.pane ?? p.id) === found.pane);
+  return isLive ? { action: "focus-pane", pane: found.pane } : { action: "attach" };
 }
 
 function resolveAttachedTargetAddress(
@@ -1268,49 +1269,19 @@ export default class CockpitMod extends View {
       return;
     }
 
-    const livePane = findPaneForTerminal(
+    const plan = planFleetClick(
       allPanes,
       allTerms,
       addr,
       termName,
       agentRow.pane ?? null
     );
-    if (livePane?.pane) {
-      run("pane.focus", { pane: livePane.pane });
-    } else {
-      run("agent.focus", { terminal: addr });
-    }
-
-    await delayMs(200);
-
-    const termsAfter = terminals() ?? [];
-    const panesAfter = panes() ?? [];
-    const paneAfter = findPaneForTerminal(
-      panesAfter,
-      termsAfter,
-      addr,
-      termName,
-      null
-    );
-    const rawFocusedTerm = focused()?.terminal ?? null;
-    const mappedFocused = rawFocusedTerm
-      ? resolveAttachedTargetAddress(
-          rawFocusedTerm,
-          termsAfter,
-          shared("cockpit.snapshot")?.agents ?? []
-        )
-      : null;
-
-    if (!paneAfter?.pane) {
-      openAttachTab({ livePane, paneAfter, rawFocusedTerm, mappedFocused });
-    } else {
-      recordDebug("focused-pane", {
-        livePane,
-        paneAfter,
-        rawFocusedTerm,
-        mappedFocused,
-      });
+    if (plan.action === "focus-pane") {
+      run("pane.focus", { pane: plan.pane });
+      recordDebug("focused-pane", { livePane: plan });
       cx?.notify?.();
+    } else {
+      openAttachTab();
     }
   }
 
