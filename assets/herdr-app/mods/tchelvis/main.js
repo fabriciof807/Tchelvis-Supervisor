@@ -59,6 +59,29 @@ function withAlpha(color, alphaHex, fallback) {
   return fallback ?? color;
 }
 
+function isRowFinished(row) {
+  return row?.lifecycle?.state === "finished" || row?.state === "finished";
+}
+
+function isRowBlocked(row) {
+  if (isRowFinished(row)) return false;
+  return (
+    row?.status === "blocked" || row?.attention_state?.state === "blocked"
+  );
+}
+
+function compareBlockedRows(a, b) {
+  const rankA =
+    BLOCKED_KIND_ORDER[a?.attention_state?.kind ?? a?.kind ?? "question"] ?? 3;
+  const rankB =
+    BLOCKED_KIND_ORDER[b?.attention_state?.kind ?? b?.kind ?? "question"] ?? 3;
+  if (rankA !== rankB) return rankA - rankB;
+  return (
+    (a?.attention_state?.since_ms ?? a?.status_ms ?? 0) -
+    (b?.attention_state?.since_ms ?? b?.status_ms ?? 0)
+  );
+}
+
 /**
  * Partitions and sorts agent summary rows into pinned Blocked, Active (Working/Done/Idle/Error),
  * and collapsible Recent Finished sections.
@@ -69,9 +92,7 @@ export function partitionAgents(agentList = []) {
   const finished = [];
 
   for (const agent of agentList) {
-    const isFinished =
-      agent?.lifecycle?.state === "finished" || agent?.state === "finished";
-    if (isFinished) {
+    if (isRowFinished(agent)) {
       finished.push(agent);
       continue;
     }
@@ -84,22 +105,130 @@ export function partitionAgents(agentList = []) {
     }
   }
 
-  blocked.sort((a, b) => {
-    const rankA =
-      BLOCKED_KIND_ORDER[a?.attention_state?.kind ?? a?.kind ?? "question"] ?? 3;
-    const rankB =
-      BLOCKED_KIND_ORDER[b?.attention_state?.kind ?? b?.kind ?? "question"] ?? 3;
-    if (rankA !== rankB) return rankA - rankB;
-    return (
-      (a?.attention_state?.since_ms ?? a?.status_ms ?? 0) -
-      (b?.attention_state?.since_ms ?? b?.status_ms ?? 0)
-    );
-  });
+  blocked.sort(compareBlockedRows);
 
   active.sort((a, b) => (b?.updated_at ?? b?.seq ?? 0) - (a?.updated_at ?? a?.seq ?? 0));
   finished.sort((a, b) => (b?.updated_at ?? b?.seq ?? 0) - (a?.updated_at ?? a?.seq ?? 0));
 
   return { blocked, active, finished };
+}
+
+function resolveRootAddress(row, byAddr) {
+  const startAddr = row?.address;
+  if (!startAddr) return null;
+  const visited = new Set([startAddr]);
+  let cur = row;
+  let rootAddr = null;
+  while (
+    cur?.parent &&
+    cur.parent !== cur.address &&
+    byAddr.has(cur.parent)
+  ) {
+    const parentAddr = cur.parent;
+    if (visited.has(parentAddr)) {
+      return null;
+    }
+    visited.add(parentAddr);
+    rootAddr = parentAddr;
+    cur = byAddr.get(parentAddr);
+  }
+  return rootAddr;
+}
+
+export function groupFleetRows(rows = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  const byAddr = new Map();
+  for (const row of list) {
+    if (row?.address && !byAddr.has(row.address)) {
+      byAddr.set(row.address, row);
+    }
+  }
+
+  const groups = [];
+  const groupByAddr = new Map();
+  const rootAddrs = list.map((row) => resolveRootAddress(row, byAddr));
+
+  for (let i = 0; i < list.length; i += 1) {
+    const row = list[i];
+    if (!rootAddrs[i]) {
+      const group = { row, children: [] };
+      groups.push(group);
+      if (row?.address && !groupByAddr.has(row.address)) {
+        groupByAddr.set(row.address, group);
+      }
+    }
+  }
+
+  for (let i = 0; i < list.length; i += 1) {
+    const row = list[i];
+    const rootAddr = rootAddrs[i];
+    if (rootAddr) {
+      const parentGroup = groupByAddr.get(rootAddr);
+      if (parentGroup) {
+        parentGroup.children.push(row);
+      } else {
+        groups.push({ row, children: [] });
+      }
+    }
+  }
+
+  return groups;
+}
+
+export function partitionFleetGroups(groups = []) {
+  const blocked = [];
+  const active = [];
+  const finished = [];
+
+  for (const group of Array.isArray(groups) ? groups : []) {
+    const parent = group?.row;
+    if (!parent) continue;
+    const rawChildren = Array.isArray(group.children) ? group.children : [];
+    const blockedChildren = [];
+    const otherChildren = [];
+    for (const child of rawChildren) {
+      if (isRowBlocked(child)) blockedChildren.push(child);
+      else otherChildren.push(child);
+    }
+    const children = [...blockedChildren, ...otherChildren];
+    const normalized = { row: parent, children };
+    const allRows = [parent, ...children];
+
+    if (allRows.some(isRowBlocked)) {
+      blocked.push(normalized);
+    } else if (allRows.every(isRowFinished)) {
+      finished.push(normalized);
+    } else {
+      active.push(normalized);
+    }
+  }
+
+  const blockedLead = (g) =>
+    isRowBlocked(g.row) ? g.row : (g.children.find(isRowBlocked) ?? g.row);
+
+  blocked.sort((a, b) => compareBlockedRows(blockedLead(a), blockedLead(b)));
+  active.sort(
+    (a, b) =>
+      (b.row?.updated_at ?? b.row?.seq ?? 0) -
+      (a.row?.updated_at ?? a.row?.seq ?? 0)
+  );
+  finished.sort(
+    (a, b) =>
+      (b.row?.updated_at ?? b.row?.seq ?? 0) -
+      (a.row?.updated_at ?? a.row?.seq ?? 0)
+  );
+
+  return { blocked, active, finished };
+}
+
+export function childConnector(index, count) {
+  return index >= count - 1 ? "└" : "├";
+}
+
+export function blockedChildrenBadge(group) {
+  const count = (group?.children ?? []).filter(isRowBlocked).length;
+  if (count === 0) return null;
+  return count === 1 ? "⚠ 1 filho" : `⚠ ${count} filhos`;
 }
 
 /**
@@ -850,6 +979,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: enriched?.correlation_tier ?? null,
       context: enriched?.context ?? null,
       blocked_children: enriched?.blocked_children ?? [],
+      parent: enriched?.parent || term?.parent || a?.parent || null,
       lifecycle: isFinished ? { state: "finished" } : { state: "live" },
       focused: Boolean(a.focused),
       pinned: Boolean(a.pinned),
@@ -926,6 +1056,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: sa?.correlation_tier ?? null,
       context: sa?.context ?? null,
       blocked_children: sa?.blocked_children ?? [],
+      parent: sa?.parent || term?.parent || null,
       lifecycle: isFinished
         ? { state: "finished" }
         : (sa?.lifecycle ?? { state: term.state ?? "live" }),
@@ -994,6 +1125,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: null,
       context: null,
       blocked_children: [],
+      parent: term?.parent || sup?.parent || null,
       lifecycle: {
         state: sup.lifecycle_state === "COMPLETED" ? "finished" : "live",
       },
@@ -1059,6 +1191,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: null,
       context: null,
       blocked_children: [],
+      parent: term?.parent || null,
       lifecycle: { state: term?.state ?? "live" },
       focused: false,
       pinned: false,
