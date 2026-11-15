@@ -352,11 +352,7 @@ fn hide_model_in(
     Ok(())
 }
 
-fn unhide_model_in(
-    id: &str,
-    cfg_path: &std::path::Path,
-    cfg: &SupervisorConfig,
-) -> Result<()> {
+fn unhide_model_in(id: &str, cfg_path: &std::path::Path, cfg: &SupervisorConfig) -> Result<()> {
     if cfg.llm_container.hidden_models.iter().any(|h| h == id) {
         let next: Vec<String> = cfg
             .llm_container
@@ -807,7 +803,9 @@ mod tests {
         let cfg_path = dir.path().join("supervisor.toml");
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("active.gguf");
+        let model_file = std::fs::canonicalize(&models_dir)
+            .unwrap()
+            .join("active.gguf");
         std::fs::write(&model_file, b"gguf").unwrap();
         let id = format!("file:{}", model_file.display());
 
@@ -828,7 +826,9 @@ mod tests {
         let cfg_path = dir.path().join("supervisor.toml");
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("keep.gguf");
+        let model_file = std::fs::canonicalize(&models_dir)
+            .unwrap()
+            .join("keep.gguf");
         std::fs::write(&model_file, b"gguf").unwrap();
         let id = format!("file:{}", model_file.display());
 
@@ -849,7 +849,9 @@ mod tests {
         let cfg_path = dir.path().join("supervisor.toml");
         let models_dir = dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
-        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("hidden.gguf");
+        let model_file = std::fs::canonicalize(&models_dir)
+            .unwrap()
+            .join("hidden.gguf");
         std::fs::write(&model_file, b"gguf").unwrap();
         let id = format!("file:{}", model_file.display());
 
@@ -860,8 +862,7 @@ mod tests {
         let fake = FakeOllama::new();
 
         let outcome =
-            delete_model_with(&id, &cfg_path, &cfg, &roots, None, &fake, &mut |_, _| true)
-                .unwrap();
+            delete_model_with(&id, &cfg_path, &cfg, &roots, None, &fake, &mut |_, _| true).unwrap();
         assert!(outcome.deleted);
         assert!(!model_file.exists());
         let raw = std::fs::read_to_string(&cfg_path).unwrap();
