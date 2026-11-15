@@ -162,6 +162,17 @@ fn shard_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?i)-(\d{5})-of-(\d{5})\.gguf$").unwrap())
 }
 
+pub(crate) fn shard_parts(file_name: &str) -> Option<(String, u32)> {
+    let caps = shard_regex().captures(file_name)?;
+    if caps.get(1)?.as_str() != "00001" {
+        return None;
+    }
+    let suffix_start = caps.get(0)?.start();
+    let base = file_name[..suffix_start].to_string();
+    let total = caps.get(2)?.as_str().parse::<u32>().ok()?;
+    Some((base, total))
+}
+
 fn is_gguf_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())

@@ -5,6 +5,7 @@ pub mod container;
 pub mod gguf;
 pub mod guardrails;
 pub mod hc;
+pub mod model_delete;
 pub mod models;
 pub mod ollama;
 pub mod state;
