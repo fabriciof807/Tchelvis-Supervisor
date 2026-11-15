@@ -105,6 +105,18 @@ pub fn enforce_blocked_policy(
     if eval.urgency == Urgency::Critical {
         eval.urgency = Urgency::Normal;
     }
+    // Blocked on a visible prompt and the model chose to do nothing: nobody would answer and
+    // nobody would be told (the same screen is not re-evaluated). Hand it to the operator.
+    if eval.decision == SupervisorDecision::NoOp && has_pending_prompt(output) {
+        eval.decision = SupervisorDecision::AlertOperator;
+        eval.urgency = Urgency::Normal;
+        eval.hc_command_payload.clear();
+        append_reason(
+            &mut eval.reason_for_operator,
+            "[Agente aguardando resposta; o supervisor não decidiu]",
+        );
+        return eval;
+    }
     if eval.decision == SupervisorDecision::AlertOperator && !has_pending_prompt(output) {
         eval.hc_command_payload.clear();
     }
@@ -130,31 +142,51 @@ fn identifier_payload_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-z]+(_[a-z]+)+$").expect("valid identifier regex"))
 }
 
+fn yes_no_question_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(continue|proceed)\?").expect("valid yes/no question regex")
+    })
+}
+
 /// Restricts what an `AUTO_REPLY` may type into a terminal to single keys: `y`, `n`, a 1–2 digit
 /// menu choice, or Enter (empty). Anything else — text copied from the screen, free-form
 /// instructions — is never typed; the evaluation becomes an operator alert without payload.
 ///
-/// On a y/n prompt, `yes`/`no` map to `y`/`n`, and the two known small-model slips — echoing the
-/// prompt hint (`[y/N]`) or a snake_case label (`continue_readonly`) — map to `y`, since the model
-/// chose to approve. Must run after `enforce_blocked_policy` (destructive commands already alerted).
-pub fn sanitize_auto_reply(output: &str, mut eval: CognitiveEvaluation) -> CognitiveEvaluation {
+/// `y`/`n` are only valid on a yes/no prompt (`[y/N]`, `(y/n)`, `Continue?`, `Proceed?`); there,
+/// `yes`/`no` map to `y`/`n`, and the two known small-model slips — echoing the prompt hint
+/// (`[y/N]`) or a snake_case label (`continue_readonly`) — map to `y`, since the model chose to
+/// approve. A prompt whose hc status kind is `question` is never auto-answered: choosing for the
+/// human is the operator's call. Must run after `enforce_blocked_policy`.
+pub fn sanitize_auto_reply(
+    output: &str,
+    kind: Option<&str>,
+    mut eval: CognitiveEvaluation,
+) -> CognitiveEvaluation {
     if eval.decision != SupervisorDecision::AutoReply {
         return eval;
     }
     let raw = eval.hc_command_payload.trim().to_string();
     let p = raw.to_lowercase();
+    let area = pending_prompt_area(output);
+    let yes_no_prompt =
+        yn_prompt_regex().is_match(&area) || yes_no_question_regex().is_match(&area);
     let is_key = |k: &str| k.is_empty() || (k.len() <= 2 && k.chars().all(|c| c.is_ascii_digit()));
-    let normalized = match p.as_str() {
-        "y" | "yes" => Some("y".to_string()),
-        "n" | "no" => Some("n".to_string()),
-        _ if yn_prompt_regex().is_match(&pending_prompt_area(output))
-            && (yn_hint_payload_regex().is_match(&p)
-                || identifier_payload_regex().is_match(&p)) =>
-        {
-            Some("y".to_string())
+    let normalized = if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
+        None
+    } else {
+        match p.as_str() {
+            "y" | "yes" if yes_no_prompt => Some("y".to_string()),
+            "n" | "no" if yes_no_prompt => Some("n".to_string()),
+            _ if yes_no_prompt
+                && (yn_hint_payload_regex().is_match(&p)
+                    || identifier_payload_regex().is_match(&p)) =>
+            {
+                Some("y".to_string())
+            }
+            k if is_key(k) => Some(k.to_string()),
+            _ => None,
         }
-        k if is_key(k) => Some(k.to_string()),
-        _ => None,
     };
     match normalized {
         Some(key) => eval.hc_command_payload = key,
@@ -167,7 +199,7 @@ pub fn sanitize_auto_reply(output: &str, mut eval: CognitiveEvaluation) -> Cogni
             let shown: String = raw.chars().take(60).collect();
             append_reason(
                 &mut eval.reason_for_operator,
-                &format!("[Resposta automática bloqueada: '{shown}' não é y/n, número ou Enter]"),
+                &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
             );
         }
     }
@@ -451,7 +483,7 @@ mod tests {
     #[test]
     fn sanitize_yn_prompt_echoed_hint_becomes_y() {
         // Test 2 / safe-ls: the model sent the literal "[y/N]" copied from the screen.
-        let out = sanitize_auto_reply("List files in src/?\nProceed? [y/N]", auto("[y/N]"));
+        let out = sanitize_auto_reply("List files in src/?\nProceed? [y/N]", None, auto("[y/N]"));
         assert_eq!(out.decision, SupervisorDecision::AutoReply);
         assert_eq!(out.hc_command_payload, "y");
     }
@@ -460,25 +492,28 @@ mod tests {
     fn sanitize_yn_prompt_maps_words_and_case() {
         let area = "Read README.md? (y/n)";
         assert_eq!(
-            sanitize_auto_reply(area, auto(" Yes ")).hc_command_payload,
+            sanitize_auto_reply(area, None, auto(" Yes ")).hc_command_payload,
             "y"
         );
-        assert_eq!(sanitize_auto_reply(area, auto("N")).hc_command_payload, "n");
         assert_eq!(
-            sanitize_auto_reply(area, auto("continue_readonly")).hc_command_payload,
+            sanitize_auto_reply(area, None, auto("N")).hc_command_payload,
+            "n"
+        );
+        assert_eq!(
+            sanitize_auto_reply(area, None, auto("continue_readonly")).hc_command_payload,
             "y"
         );
     }
 
     #[test]
     fn sanitize_free_text_becomes_alert_without_payload() {
-        let out = sanitize_auto_reply("Proceed? [y/N]", auto("sure, go ahead"));
+        let out = sanitize_auto_reply("Proceed? [y/N]", None, auto("sure, go ahead"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert_eq!(out.urgency, Urgency::Normal);
         assert!(out.hc_command_payload.is_empty());
         assert!(out.reason_for_operator.contains("sure, go ahead"));
 
-        let out = sanitize_auto_reply("Waiting for input...", auto("cargo test"));
+        let out = sanitize_auto_reply("Waiting for input...", None, auto("cargo test"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert!(out.hc_command_payload.is_empty());
     }
@@ -486,12 +521,15 @@ mod tests {
     #[test]
     fn sanitize_numbered_choice_and_enter_allowed() {
         let menu = "Which one?\n1. Keep\n2. Replace\n3. Abort\nChoose:";
-        assert_eq!(sanitize_auto_reply(menu, auto("2")).hc_command_payload, "2");
         assert_eq!(
-            sanitize_auto_reply(menu, auto("Replace")).decision,
+            sanitize_auto_reply(menu, None, auto("2")).hc_command_payload,
+            "2"
+        );
+        assert_eq!(
+            sanitize_auto_reply(menu, None, auto("Replace")).decision,
             SupervisorDecision::AlertOperator
         );
-        let enter = sanitize_auto_reply("Press Enter to continue", auto(""));
+        let enter = sanitize_auto_reply("Press Enter to continue", None, auto(""));
         assert_eq!(enter.decision, SupervisorDecision::AutoReply);
         assert_eq!(enter.hc_command_payload, "");
     }
@@ -499,6 +537,45 @@ mod tests {
     #[test]
     fn sanitize_leaves_other_decisions_untouched() {
         let alert = sample_eval(SupervisorDecision::AlertOperator, "n");
-        assert_eq!(sanitize_auto_reply("rm -rf? [y/N]", alert.clone()), alert);
+        assert_eq!(
+            sanitize_auto_reply("rm -rf? [y/N]", None, alert.clone()),
+            alert
+        );
+    }
+
+    #[test]
+    fn sanitize_y_on_numbered_question_becomes_alert() {
+        // Test 4 / pergunta: "Responda 1, 2 ou 3" got "y" typed.
+        let q = "Qual banco usar?\n1) Postgres\n2) SQLite\n3) Mongo\nResponda 1, 2 ou 3:";
+        let out = sanitize_auto_reply(q, None, auto("y"));
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert!(out.hc_command_payload.is_empty());
+    }
+
+    #[test]
+    fn sanitize_question_kind_is_never_auto_answered() {
+        let q = "Qual banco usar?\n1) Postgres\n2) SQLite\nResponda 1 ou 2:";
+        let out = sanitize_auto_reply(q, Some("question"), auto("2"));
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert!(out.hc_command_payload.is_empty());
+        // A permission menu (Claude Code style) may still be answered with a number.
+        let perm = "Allow Bash(ls)?\n1. Yes\n2. No";
+        assert_eq!(
+            sanitize_auto_reply(perm, Some("permission"), auto("1")).hc_command_payload,
+            "1"
+        );
+    }
+
+    #[test]
+    fn blocked_noop_with_pending_prompt_alerts_operator() {
+        // Test 3/4 / write-ambiguo: NO_OP on a blocked prompt meant nobody answered and nobody was told.
+        let noop = sample_eval(SupervisorDecision::NoOp, "");
+        let out = enforce_blocked_policy(true, "Edit src/config.rs\nAllow? [y/N]", noop.clone());
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert_eq!(out.urgency, Urgency::Normal);
+        assert!(out.hc_command_payload.is_empty());
+        // No pending prompt on screen (e.g. waiting on its own subagent): NO_OP stays.
+        let out = enforce_blocked_policy(true, "Running subagent...", noop);
+        assert_eq!(out.decision, SupervisorDecision::NoOp);
     }
 }

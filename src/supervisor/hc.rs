@@ -25,6 +25,10 @@ pub struct HcSession {
     pub status: Option<String>,
     /// Turn counter reported by `hc`.
     pub turn: Option<u64>,
+    /// Kind of a blocked prompt (`"permission"`, `"question"`, …) from the OSC 7501 status or the
+    /// `cockpit.kind` label.
+    #[serde(default)]
+    pub kind: Option<String>,
 }
 
 impl HcSession {
@@ -623,6 +627,15 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             _ => base_name,
         };
 
+        let kind = term
+            .status
+            .as_ref()
+            .and_then(|v| v.get("kind"))
+            .and_then(|v| v.as_str())
+            .or_else(|| term.labels.get("cockpit.kind").map(String::as_str))
+            .map(|k| k.trim().to_ascii_lowercase())
+            .filter(|k| !k.is_empty());
+
         sessions.push(HcSession {
             agent_id: term.address,
             session_name,
@@ -631,6 +644,7 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
             state: term.state,
             status: status_state,
             turn: term.turn,
+            kind,
         });
     }
 
@@ -757,6 +771,30 @@ mod tests {
         }"#;
         let sessions = parse_hc_ls_json(sample, None).unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hc_ls_json_reads_blocked_kind() {
+        let sample = r#"{"terminals": [
+            {"address": "t1", "state": "live", "reported": true,
+             "status": {"state": "blocked", "kind": "question", "app": "claude"},
+             "foreground": {"name": "claude", "argv": ["claude"]}},
+            {"address": "t2", "state": "live", "reported": true,
+             "status": {"state": "blocked", "app": "claude"},
+             "labels": {"cockpit.kind": "permission"},
+             "foreground": {"name": "claude", "argv": ["claude"]}}
+        ]}"#;
+        let sessions = parse_hc_ls_json(sample, None).unwrap();
+        let kind = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.agent_id == id)
+                .unwrap()
+                .kind
+                .clone()
+        };
+        assert_eq!(kind("t1").as_deref(), Some("question"));
+        assert_eq!(kind("t2").as_deref(), Some("permission"));
     }
 
     #[test]

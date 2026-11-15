@@ -330,6 +330,7 @@ RULES FOR DECISION ("NO_OP", "AUTO_REPLY", "ALERT_OPERATOR"):
    - NEVER use "AUTO_REPLY" if consecutive_auto_replies >= max_auto_replies.
 3. Choose "ALERT_OPERATOR" if:
    - The agent asks to delete files, run destructive git commands (git push --force, git reset --hard, rm -rf, sudo, etc.), install system packages, or change architecture. ALWAYS choose "ALERT_OPERATOR" with "urgency": "critical" and set "hc_command_payload": "n". Only do this when such a command is literally shown in the pending prompt. For any other alert leave "hc_command_payload" empty.
+   - The pending prompt is an open or multiple-choice question (e.g. "which database: 1, 2 or 3?") rather than a permission/confirmation. Never choose for the human.
    - The agent is stuck in a loop repeating the same error.
    - The agent has completed its main task and awaits final human review.
 

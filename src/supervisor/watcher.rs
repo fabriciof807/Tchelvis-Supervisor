@@ -242,7 +242,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             self.model_loaded = true;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
-            eval = sanitize_auto_reply(&output, eval);
+            eval = sanitize_auto_reply(&output, session.kind.as_deref(), eval);
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             let state = self
@@ -515,6 +515,7 @@ mod tests {
             state: "live".to_string(),
             status: Some("blocked".to_string()),
             turn: Some(1),
+            kind: None,
         }
     }
 
