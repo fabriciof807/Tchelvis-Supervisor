@@ -2,6 +2,8 @@
 
 **Date:** 2026-11-15 · **Status:** approved by the user · **Size:** small change
 
+**Update (test 7):** the command may also be inline in the prompt line (`Allow bash tool: <cmd> ? [y/N]`); a `Read` tool on one non-sensitive file counts as `cat`. Write/Edit/other tools are never fast-pathed.
+
 ## Intent
 Test 5: Semi-Auto approved only 1 of 4 trivial read-only requests (`ls`, `cat`, `git status`) —
 the 1.7B model alerts too often and takes 40–245 s. Approve the trivial ones with a fixed rule,

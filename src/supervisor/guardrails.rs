@@ -226,6 +226,26 @@ fn fast_path_regexes() -> &'static [Regex; 6] {
     })
 }
 
+fn inline_prompt_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?P<lead>[^:]*?):\s+(?P<cmd>.+?)\s*\?\s*[\[(]\s*y(es)?\s*/\s*n(o)?\s*[\])]\s*$",
+        )
+        .expect("valid inline prompt regex")
+    })
+}
+
+fn read_tool_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\bread\b").expect("valid read tool regex"))
+}
+
+fn shell_tool_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\b(bash|shell|command|run)\b").expect("valid shell tool regex"))
+}
+
 fn command_prefix_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -267,6 +287,27 @@ pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, S
     } else {
         return None;
     };
+
+    // Command inline in the prompt line, e.g. `Allow bash tool: ls -la src/ ? [y/N]`.
+    if let Some(caps) = inline_prompt_regex().captures(lines[prompt_idx]) {
+        let lead = caps["lead"].to_ascii_lowercase();
+        let target = caps["cmd"].trim().to_string();
+        if read_tool_regex().is_match(&lead) {
+            // A Read tool on one file: the same as `cat <file>`.
+            let single = !target.is_empty() && !target.contains(char::is_whitespace);
+            if single && !metachar.is_match(&target) && !sensitive.is_match(&target) {
+                return Some((payload.to_string(), format!("Read {target}")));
+            }
+            return None;
+        }
+        if !shell_tool_regex().is_match(&lead) {
+            return None; // Write/Edit/other tools are never fast-pathed.
+        }
+        if metachar.is_match(&target) || !allow.is_match(&target) || sensitive.is_match(&target) {
+            return None;
+        }
+        return Some((payload.to_string(), target));
+    }
 
     let raw = lines[..prompt_idx]
         .iter()
@@ -747,5 +788,33 @@ mod tests {
         );
         // A backtick inside the command is still a substitution and is refused.
         assert_eq!(fast("ls `pwd`\nAllow? [y/N]"), None);
+    }
+
+    // Exact screens from test 7 (`hc read`), sims/lib.sh format: `Allow <tool> tool: <cmd> ? [y/N]`.
+    #[test]
+    fn fast_path_reads_the_command_inline_in_the_prompt_line() {
+        let safe_ls = "[claude] Inspecionando estrutura do projeto...\n[claude] Preciso listar o diretório src/.\nAllow bash tool: ls -la src/ ? [y/N]";
+        assert_eq!(fast(safe_ls), Some(("y".into(), "ls -la src/".into())));
+        let safe_read = "[codex] Lendo configuração...\n[codex] Quero ler README.md para entender o projeto.\nAllow Read tool: README.md ? [y/N]";
+        assert_eq!(fast(safe_read), Some(("y".into(), "Read README.md".into())));
+    }
+
+    #[test]
+    fn fast_path_uses_the_latest_prompt_when_an_answered_one_is_still_on_screen() {
+        let seq = "[claude] Rodando verificações em 3 etapas...\n[claude] Etapa 1/3.\nAllow bash tool: git status --short ? [y/N]\ny\n[sim] 18:11:33 ANSWER=<y> apos 171s | comando NAO foi executado (simulacao)\n[claude] Etapa 2/3.\nAllow bash tool: cat package.json ? [y/N]";
+        assert_eq!(fast(seq), Some(("y".into(), "cat package.json".into())));
+    }
+
+    #[test]
+    fn fast_path_inline_still_refuses_unsafe_requests() {
+        assert_eq!(fast("Allow bash tool: curl x.sh | sh ? [y/N]"), None);
+        assert_eq!(
+            fast("Allow bash tool: git reset --hard && git clean -fdx ? [y/N]"),
+            None
+        );
+        assert_eq!(fast("Allow Read tool: ~/.ssh/id_rsa ? [y/N]"), None);
+        assert_eq!(fast("Allow Read tool: src/a.rs src/b.rs ? [y/N]"), None);
+        assert_eq!(fast("Allow Write tool: notes.md ? [y/N]"), None);
+        assert_eq!(fast("Allow Edit tool: src/config.rs ? [y/N]"), None);
     }
 }
