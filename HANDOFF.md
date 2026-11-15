@@ -1,8 +1,8 @@
 # Handoff — Cockpit (Unified Fleet Control Plane + Durable Supervisor)
 
-**Data da última atualização:** 2026-11-14  
+**Data da última atualização:** 2026-11-15  
 **Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
-**Binário instalado no container (`ai-box`):** `/home/ubuntu/.local/bin/cockpit`
+**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`; nightly atual = `ee71994`). Nenhum stable publicado ainda (`v0.2.0` só após validar o nightly no host, com OK do usuário).
 
 ---
 
@@ -85,8 +85,53 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 
 ---
 
+### Atualização — 2026-11-15: rename `tchelvis`, distribuição (M5a) e benchmark CPU vs GPU
+- **Rename** (`028bd5f`): o binário e o crate viraram `tchelvis` 0.2.0, junto com dirs `~/.config|.local/share|.local/state|.cache/tchelvis`, mod e layout do Herdr `tchelvis` (nós `tchelvis-*`), container `tchelvis-supervisor-llm` (labels `tchelvis.*`), hooks e systemd.
+  - Variáveis: só `TCHELVIS_*`; as `COCKPIT_*` não são mais lidas.
+  - **Mantidos:** labels hc `cockpit.*` e chaves de shared-state `cockpit.*` (protocolo interno).
+  - **Sem migração** (decisão do usuário): instalação limpa.
+- **Licença:** dupla MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`).
+- **Distribuição** (`425bc0b`, `2534d5f`):
+  - `.github/workflows/release.yml`:
+    - testes;
+    - build musl estático `x86_64`/`aarch64` (runner `ubuntu-24.04-arm`);
+    - publish: tag `v*` → stable (notas do CHANGELOG); push na `main` → pré-release `nightly` recriada com `commit <sha>`.
+  - `tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]`:
+    - baixa, confere o `sha256` e troca o binário atomicamente;
+    - roda `setup`, para e reinicia `tchelvis daemon` / `supervisor watch`;
+    - lembra o canal em `~/.local/state/tchelvis/update_channel`.
+  - `install.sh` (POSIX). `docs/RELEASING.md` explica como cortar um stable.
+  - Validado: workflow verde, instalação limpa e update `2534d5f → ee71994` testados de ponta a ponta no `ai-box`.
+  - Nota: a API do GitHub tem cache de 60 s, então `update` logo após um push pode dizer "Already up to date"; esperar 1 min.
+  - A conta do GitHub ficou bloqueada por cobrança uma vez (resolvido pelo usuário).
+- **GPU + benchmark** (`d99e3fb`, `ee71994`):
+  - `[llm_container] gpu_backend = auto|cuda|vulkan|rocm` (`TCHELVIS_GPU_BACKEND`):
+    - auto: `/dev/nvidia0` ou `nvidia-smi` → CUDA (`server-cuda`), `/dev/dri/renderD*` → Vulkan (`server-vulkan`), senão none;
+    - ROCm (`server-rocm`) só se forçado.
+    - O host do usuário tem GPU **AMD** → Vulkan.
+  - `tchelvis supervisor bench [--runs N] [--json] [--last] [--progress]`:
+    - mede CPU e depois GPU com o pedido real do supervisor (timings do llama-server, mediana de 3 após aquecimento);
+    - restaura o estado anterior do container;
+    - lock contra execução dupla;
+    - resultado em `~/.local/state/tchelvis/bench_last.json`.
+  - Card "CPU vs GPU benchmark" na aba Doctor do mod.
+  - Validado no `ai-box` (sem GPU): linha da CPU com números, "No GPU detected" e restauração do estado.
+- **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench).
+- **Execução:** Gemini 4 Hydrogen (medium) solo via `delegate_task`; o coordenador revisa, valida e faz commit.
+  - O swarm do Antigravity travou 2× (workers parados), por isso não é usado.
+  - O Hydrogen às vezes encerra antes de validar; o coordenador sempre revalida.
+
+---
+
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `ee71994` — `feat(mod): CPU vs GPU benchmark card in the Doctor tab`
+- `d99e3fb` — `feat(supervisor): GPU backend detection (CUDA/Vulkan/ROCm) and supervisor bench CPU vs GPU`
+- `2534d5f` — `ci,docs: release workflow (stable tags + nightly per push) and tchelvis install/update docs (M5a B3)`
+- `425bc0b` — `feat(update): tchelvis update, install.sh and daemon restart (M5a B2)`
+- `028bd5f` — `feat!: rename cockpit to tchelvis; version metadata; dual MIT/Apache-2.0 license (M5a B1)`
+- `e432539` / `50db329` — correções do teste no host (agy, avaliação LLM limitada, Pending prompt, fallback de runtime, attach de sessões em background)
+- `6d1f86b` / `1e045db` — M1 seleção de modelo (backend + card no mod)
 - `6a38eee` — `feat(supervisor,mod): managed llama.cpp container with explicit Load/Unload lifecycle`
 - `27ad04e` — `fix(fleet,herdr): auto-attach unattached herdr-core terminals on click`
   - Auto-attach via `herdr-core attach <target>` em `focusOrAttachTerminal` (`main.js`) com verificação de foco após `200 ms` e debounce de `1200 ms`; `mergeFleetRows` recebeu Loop 4 (`terminals()`) + `findPaneForTerminal`, `selectedAddress()` recebeu `resolveAttachedTargetAddress`, e clientes `attach` agora são filtrados em `src/herdr.rs`, `src/supervisor/hc.rs` e `isPlainShellRow`.
@@ -150,17 +195,23 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Próxima Sessão — Validar o container `llama.cpp` no host** (binário `6a38eee`):
-   - `cockpit supervisor load` com o GGUF do `lfm3:1.7b` resolvido do store do Ollama do host (checar permissão de leitura se for `/usr/share/ollama`; senão usar `model_path`/`hf_repo`) e se o `llama-server` da imagem suporta a arquitetura LFM.
-   - Saída JSON estruturada (`response_format: json_schema`) do llama.cpp nas avaliações reais (`sim-safe` → AUTO_REPLY).
-   - Toggle GPU (`:server-cuda` + `--gpus all`) e runtime `kiri`/`podman` se instalados.
-   - Botão `▶ Load LLM` ⇄ `⏻ Unload LLM` e pílula `DESATIVADO`/`INICIANDO…`/RAM na barra superior.
-   - Considerar tornar todos os campos de `SupervisorConfig` `#[serde(default)]` (TOML parcial).
-2. **Backlog / ordem das próximas entregas**: ver [`ROADMAP.md`](ROADMAP.md) (M0 → M1 seleção de modelo; M2 ícones → M3 layout compacto/ferramentas simples → M4 Inspector multi-terminal; M5a renomear binário para `tchelvis` + pipeline de release → M5b AUR/Homebrew Linux) e decisões D1–D4 (Linux only; sem imagem Docker do CLI por enquanto).
-3. Validar no host com o binário mais recente (prompt do teste multi-agente `sim-build` / `sim-safe` / `sim-danger` está na conversa anterior e pode ser reenviado):
-   - Barra superior: botões centrais fixos enquanto a pill passa por `Idle` → `Watching (3)` → `Evaluating`; consumo de RAM/VRAM aparecendo na pill da LLM.
-   - Toggle `num_gpu` na pill: carregamento na GPU real (não testado no container, sem GPU) e VRAM refletida na pill.
-   - `sim-safe` → `AUTO_REPLY` (~5s); `sim-danger` → Action Card `Critical`; agente apenas `WORKING`/aguardando subagente → **nenhum** Action Card (regressão do falso `Critical` com `HooksError`).
-   - Clique em cards de agentes em background abrindo o Inspector (`Approve`, `Ignore`, `Attach Tab`, `Kill`) e limpeza para `0 agents` / `Supervisor: Idle`.
-4. Possível melhoria: o botão GPU do mod reiniciar automaticamente o `supervisor watch` (hoje precisa reinício manual para o daemon usar o novo `num_gpu`).
-5. Evoluir a `landing-page/` ou adicionar novos fluxos de automação conforme os testes reais.
+1. **Próxima sessão: validar no host** (nightly `ee71994`):
+   - Se ainda tiver `cockpit`: roteiro de instalação limpa do §3. Senão, `tchelvis update`. Depois reiniciar o Herdr Desktop e escolher o layout `tchelvis`; renomear eventuais `COCKPIT_*` no `.zshrc`.
+   - **Benchmark no Doctor** (Run benchmark): a linha `GPU (vulkan)` deve ter números na AMD. A 1ª vez baixa a imagem `server-vulkan` (GBs). Se falhar, anotar o erro da linha GPU (permissão de `/dev/dri`/grupo `video`, driver Vulkan na imagem).
+   - **Correções do teste anterior:**
+     - clique em sessão agy viva abre a aba de attach; se não abrir, anotar a linha `attach: …` do Inspector;
+     - card **Pending prompt** (Approve/Deny/Open);
+     - avaliação do lfm3 termina, ou mostra `⚠ LLM evaluation failed`;
+     - fallback podman → docker.
+   - **M1:** seletor de modelo pela pílula LLM ou pelo card LLM do Inspector.
+2. **Se o nightly estiver bom:** cortar o primeiro stable `v0.2.0` (`docs/RELEASING.md`), **com OK do usuário** (push de tag).
+3. **Próximas entregas (ver `ROADMAP.md`):**
+   - M1b modelo fallback;
+   - M2 ícones no lugar de emojis (o mapeamento do agy ainda usa "✨"/"✧");
+   - M3 layout compacto / ferramentas simples (começa com auditoria D4);
+   - M4 Inspector com vários terminais;
+   - M5b AUR / Homebrew (Linux).
+4. **Pendências pequenas:**
+   - dois avisos de estilo do clippy em `models.rs`;
+   - possível aviso no `update` sobre o cache de 60 s da API;
+   - o botão GPU reiniciar o `supervisor watch` automaticamente.
