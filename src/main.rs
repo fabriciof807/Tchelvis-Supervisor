@@ -128,6 +128,21 @@ enum Commands {
         #[arg(long)]
         purge: bool,
     },
+    /// Update tchelvis from GitHub Releases
+    Update {
+        /// Release channel (stable or nightly)
+        #[arg(long)]
+        channel: Option<String>,
+        /// Check for updates without installing (exits 0 if available, 1 if up to date)
+        #[arg(long)]
+        check: bool,
+        /// Skip running `tchelvis setup --set-default-layout` after replacing the binary
+        #[arg(long)]
+        no_setup: bool,
+        /// Reinstall even if already on the latest version/commit
+        #[arg(long)]
+        force: bool,
+    },
     /// View redacted structured JSONL logs
     Logs {
         /// Filter by terminal/agent ID
@@ -521,6 +536,20 @@ async fn main() -> Result<()> {
                 println!("  - {line}");
             }
             Ok(())
+        }
+        Commands::Update {
+            channel,
+            check,
+            no_setup,
+            force,
+        } => {
+            let parsed_channel = match channel {
+                Some(ref raw) => Some(tchelvis::update::Channel::parse(raw).ok_or_else(|| {
+                    anyhow::anyhow!("unknown channel '{raw}' (expected stable or nightly)")
+                })?),
+                None => None,
+            };
+            tchelvis::update::run_update(parsed_channel, check, no_setup, force)
         }
         Commands::Logs {
             agent,
