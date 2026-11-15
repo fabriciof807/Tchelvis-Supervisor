@@ -29,6 +29,8 @@ with the UI track.
 | M0 | Container validation & config hardening | — | Host validation in progress; partial TOML done (M1) |
 | M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | **Implemented**; UI to validate on host |
 | M1b | Fallback model when the chosen one stops working | M1 | Planned |
+| M1c | Hide/delete models ([design](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md)) | M1 | In progress |
+| M1d | Decision-quality benchmark per model | M1 | Planned |
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |
 | M4 | Inspector multi-terminal view | M3 | Planned |
@@ -65,6 +67,17 @@ Let the user choose a second model that is used automatically when the chosen on
 "Stops working" has to be defined first: a failed load, a failed health check, or repeated
 evaluation/JSON errors. M1 reserves the `[llm_container] fallback_model_id` key.
 Design: [M1 spec](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md) (non-goals).
+
+### M1c — Hide and delete models
+Hide a model from the list or delete it from disk (with confirmation), from the CLI and the mod
+card. Design: [spec](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md).
+
+### M1d — Decision-quality benchmark
+`supervisor bench` measures speed only. Add a fixed set of real terminal screens (permission
+prompt, destructive command, agent working, question) with the expected decision, score each
+model on it, and add a per-model "reasoning on/off" switch. Reasoning models are viable on GPU
+(~3–5 s at 88 tok/s) but slow on CPU. Lets the user pick a supervisor model by accuracy, not by
+category.
 
 ### M2 — Icon system (replace emojis)
 - One icon helper in the mod, built on the existing `svg()` primitive: a single source of icon paths,
