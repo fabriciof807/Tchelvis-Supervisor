@@ -605,6 +605,14 @@ async function delayMs(ms) {
   );
 }
 
+// Attach by the core terminal address (e.g. `t11g`): it is unique and always
+// resolvable. Names are not — agent-spawned terminals have no core name, and
+// the tab/agent label (`agy`, `claude`) makes `hc attach` fail with not_found,
+// closing the tab before anything is shown.
+export function attachTabArgv(address) {
+  return ["hc", "attach", address];
+}
+
 function resolveCoreTermName(term, fallbackName, address) {
   const direct = String(term?.name ?? "").trim();
   if (direct && direct !== address) return direct;
@@ -775,7 +783,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       address: a.address,
       pane: a.pane ?? pane?.pane ?? null,
       term_name: termName,
-      attach_target: termName || a.address,
+      attach_target: a.address,
       space_name: a.space_name ?? "",
       tab_name: a.tab_name ?? a.title ?? a.address,
       name: displayName,
@@ -858,7 +866,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       address: sa.address,
       pane: pane?.pane ?? null,
       term_name: termName,
-      attach_target: termName || sa.address,
+      attach_target: sa.address,
       space_name: "",
       tab_name: rawName,
       name: displayName,
@@ -932,7 +940,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       address: sup.agent_id,
       pane: pane?.pane ?? null,
       term_name: termName,
-      attach_target: termName || sup.agent_id,
+      attach_target: sup.agent_id,
       space_name: "",
       tab_name: rawName,
       name: displayName,
@@ -997,7 +1005,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       address: addr,
       pane: pane?.pane ?? null,
       term_name: termName,
-      attach_target: termName || addr,
+      attach_target: addr,
       space_name: "",
       tab_name: rawName,
       name: displayName,
@@ -1154,7 +1162,6 @@ export default class CockpitMod extends View {
     const termName =
       agentRow.term_name ??
       resolveCoreTermName(term, agentRow.tab_name ?? agentRow.name, addr);
-    const attachTarget = agentRow.attach_target || termName || addr;
 
     const recordDebug = (
       action,
@@ -1211,7 +1218,7 @@ export default class CockpitMod extends View {
       run("tab.new", {
         space: sp?.id,
         name: termName || addr,
-        argv: ["herdr-core", "attach", attachTarget],
+        argv: attachTabArgv(addr),
       });
       recordDebug("attach-tab", debugCtx);
       cx?.notify?.();

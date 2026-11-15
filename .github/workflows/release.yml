@@ -23,6 +23,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Run tests
         run: cargo test --locked --quiet
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Mod tests
+        run: |
+          node --check assets/herdr-app/mods/tchelvis/main.js
+          node --import ./tests/mod/stub-hooks.mjs --test tests/mod/
 
   build:
     needs: test
