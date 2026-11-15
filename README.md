@@ -241,6 +241,7 @@ ollama_timeout_secs = 45
 poll_interval_secs = 12
 idle_unload_secs = 180
 inactivity_trigger_secs = 20
+max_evals_per_tick = 1        # LLM evaluations per tick; blocked terminals go first
 capture_lines = 25
 max_auto_replies = 2
 state_file_path = "/home/<you>/.local/state/tchelvis/supervisor_state.json"

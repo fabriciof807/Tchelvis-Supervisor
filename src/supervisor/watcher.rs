@@ -132,7 +132,22 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             self.model_loaded = false;
         }
 
-        for session in &sessions {
+        // Blocked sessions first (longest-waiting first), then the rest; at most
+        // `max_evals_per_tick` LLM evaluations per tick so a new prompt never waits a full round.
+        let mut ordered: Vec<&crate::supervisor::hc::HcSession> = sessions.iter().collect();
+        ordered.sort_by_key(|s| {
+            let since = self
+                .store
+                .agents
+                .get(&s.agent_id)
+                .map(|a| a.last_change_timestamp)
+                .unwrap_or(now);
+            (!s.is_blocked(), since)
+        });
+        let eval_cap = self.config.max_evals_per_tick.max(1);
+        let mut evals_started = 0usize;
+
+        for session in ordered {
             let output = match self
                 .hc
                 .capture_output(&session.agent_id, self.config.capture_lines)
@@ -174,13 +189,13 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
             let status_transition =
                 session.status != state.last_hc_status && session.has_notable_hc_status();
-            state.last_hc_status = session.status.clone();
 
             // Already evaluated this exact output and waiting on operator
             if current_hash == state.last_evaluated_hash
                 && state.pending_operator_action.is_some()
                 && !status_transition
             {
+                state.last_hc_status = session.status.clone();
                 continue;
             }
 
@@ -195,8 +210,15 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                     || state.pending_operator_action.is_none());
 
             if !inactivity_trigger && !signature_trigger && !status_trigger {
+                state.last_hc_status = session.status.clone();
                 continue;
             }
+            if evals_started >= eval_cap {
+                // Deferred to a later tick; keep the status transition pending.
+                continue;
+            }
+            evals_started += 1;
+            state.last_hc_status = session.status.clone();
 
             let state_snapshot = state.clone();
             self.runtime_status = SupervisorRuntimeStatus::Evaluating(session.agent_id.clone());
@@ -866,5 +888,61 @@ mod tests {
         assert_eq!(o2.evaluated_agents, vec!["t1"]);
         assert_eq!(engine.store.agents["t1"].last_eval_error, None);
         assert_eq!(engine.store.agents["t1"].last_eval_error_at, None);
+    }
+
+    fn noop_eval() -> CognitiveEvaluation {
+        CognitiveEvaluation {
+            decision: SupervisorDecision::NoOp,
+            ..alert_eval(Urgency::Low, "")
+        }
+    }
+
+    #[test]
+    fn blocked_sessions_are_evaluated_before_working_ones() {
+        // Test 2: 9 blocked terminals waited behind working agents in `hc ls` order.
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir); // max_evals_per_tick defaults to 1
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![working_session("w1"), test_session("b1")],
+            vec!["thread 'main' panicked at x\nAllow? [y/N]"],
+        );
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+        assert_eq!(engine.tick(1000).unwrap().evaluated_agents, vec!["b1"]);
+        assert_eq!(engine.tick(1012).unwrap().evaluated_agents, vec!["w1"]);
+    }
+
+    #[test]
+    fn eval_cap_defers_without_losing_the_blocked_transition() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("b1"), test_session("b2"), test_session("b3")],
+            vec!["Read README.md? (y/n)"],
+        );
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+        assert_eq!(engine.tick(1000).unwrap().evaluated_agents, vec!["b1"]);
+        assert_eq!(engine.tick(1012).unwrap().evaluated_agents, vec!["b2"]);
+        assert_eq!(engine.tick(1024).unwrap().evaluated_agents, vec!["b3"]);
+        assert!(engine.tick(1036).unwrap().evaluated_agents.is_empty());
+    }
+
+    #[test]
+    fn eval_cap_is_configurable() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(&dir);
+        cfg.max_evals_per_tick = 2;
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("b1"), test_session("b2"), test_session("b3")],
+            vec!["Read README.md? (y/n)"],
+        );
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+        assert_eq!(
+            engine.tick(1000).unwrap().evaluated_agents,
+            vec!["b1", "b2"]
+        );
+        assert_eq!(engine.tick(1012).unwrap().evaluated_agents, vec!["b3"]);
     }
 }

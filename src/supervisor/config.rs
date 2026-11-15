@@ -133,6 +133,9 @@ pub struct SupervisorConfig {
     pub idle_unload_secs: u64,
     /// Seconds of unchanged output before triggering inactivity LLM evaluation (default: `20`).
     pub inactivity_trigger_secs: u64,
+    /// Maximum LLM evaluations per watcher tick (default: `1`). Blocked sessions go first, so a
+    /// prompt waits at most one evaluation behind other work instead of a whole round.
+    pub max_evals_per_tick: usize,
     /// Number of terminal lines to capture per agent (default: `25`).
     pub capture_lines: usize,
     /// Default maximum consecutive auto-replies before loop-breaker triggers (default: `2`).
@@ -295,6 +298,7 @@ impl Default for SupervisorConfig {
             poll_interval_secs: 12,
             idle_unload_secs: 180,
             inactivity_trigger_secs: 20,
+            max_evals_per_tick: 1,
             capture_lines: 25,
             max_auto_replies: 2,
             state_file_path: default_state_path,
