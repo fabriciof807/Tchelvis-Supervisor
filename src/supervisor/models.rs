@@ -798,7 +798,46 @@ pub fn build_model_list(
     (kept, filter_hidden_count, user_hidden_count)
 }
 
+/// For a blob in an HF hub layout (`models--org--repo/blobs/<hash>`), the name of the snapshot
+/// symlink that points to it (shard suffix stripped), e.g. `LFM3-1.7B-Q4_K_M`.
+fn hf_snapshot_name_for_blob(blob: &Path) -> Option<String> {
+    let blobs = blob.parent()?;
+    if blobs.file_name()? != "blobs" {
+        return None;
+    }
+    let repo = blobs.parent()?;
+    if !repo.file_name()?.to_string_lossy().starts_with("models--") {
+        return None;
+    }
+    let target = fs::canonicalize(blob).ok()?;
+    for rev in read_dir_entries(&repo.join("snapshots")) {
+        let mut stack = vec![rev.path()];
+        while let Some(dir) = stack.pop() {
+            for entry in read_dir_entries(&dir) {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                if ft.is_dir() {
+                    stack.push(path);
+                } else if ft.is_symlink()
+                    && is_gguf_file(&path)
+                    && fs::canonicalize(&path).ok().as_deref() == Some(target.as_path())
+                {
+                    let name = path.file_name()?.to_string_lossy().into_owned();
+                    return Some(match shard_parts(&name) {
+                        Some((base, _)) => base,
+                        None => path.file_stem()?.to_string_lossy().into_owned(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn file_display_name(p: &Path) -> String {
+    if let Some(name) = hf_snapshot_name_for_blob(p) {
+        return name;
+    }
     p.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .filter(|s| !s.is_empty())
@@ -1367,6 +1406,27 @@ mod tests {
         assert_eq!(MaxParams::parse("all"), Some(MaxParams::All));
         assert_eq!(MaxParams::parse("5b"), None);
         assert_eq!(MaxParams::B4.limit(), Some(4_500_000_000));
+    }
+
+    #[test]
+    fn effective_model_hf_blob_shows_snapshot_name_not_hash() {
+        // Host: the LLM pill showed "3793e1e6e…" (the HF blob hash) for a model chosen from the HF cache.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(dir.path())
+            .unwrap()
+            .join("models--LiquidAI--LFM3-1.7B-GGUF");
+        let blob =
+            repo.join("blobs/3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4");
+        let snap = repo.join("snapshots/rev1/LFM3-1.7B-Q4_K_M.gguf");
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::create_dir_all(snap.parent().unwrap()).unwrap();
+        fs::write(&blob, b"GGUF").unwrap();
+        symlink(&blob, &snap).unwrap();
+
+        let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.model_id = Some(format!("file:{}", blob.display()));
+        let eff = effective_model(&cfg, &[]).unwrap();
+        assert_eq!(eff.display_name, "LFM3-1.7B-Q4_K_M");
     }
 
     #[test]

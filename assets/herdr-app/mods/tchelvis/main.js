@@ -303,6 +303,16 @@ function ellipsize(str, maxLen = 72) {
   return s.length > maxLen ? s.slice(0, maxLen - 1) + "…" : s;
 }
 
+// Top-bar LLM pill: keep the model name short so the backend/RAM label after it stays visible.
+// Shortens in the middle so both the family and the quant ("…-Q4_K_M") survive.
+export function pillModelName(name, maxLen = 28) {
+  const s = String(name ?? "");
+  if (s.length <= maxLen) return s;
+  const tail = Math.floor((maxLen - 1) / 2);
+  const head = maxLen - 1 - tail;
+  return s.slice(0, head) + "…" + s.slice(s.length - tail);
+}
+
 function pathBasename(p) {
   const clean = String(p ?? "").replace(/[\\/]+$/, "");
   if (!clean) return "";
@@ -2476,7 +2486,7 @@ export default class CockpitMod extends View {
       (liveMerged.length > 0 || Boolean(shared("supervisor.forceEvaluating")));
     const activeMode = supSnap?.mode ?? "SemiAuto";
     const isPaused = activeMode === "Paused";
-    const llmModel = supSnap?.llm_model || "lfm3:1.7b";
+    const llmModel = pillModelName(supSnap?.llm_model || "lfm3:1.7b");
     const llmBackend = supSnap?.llm_backend || "ollama";
     const llmConnected = supSnap ? Boolean(supSnap.llm_connected) : false;
     const modelInstalled = supSnap ? Boolean(supSnap.model_installed) : false;
