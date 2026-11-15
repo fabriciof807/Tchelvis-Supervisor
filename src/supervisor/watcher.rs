@@ -1,5 +1,7 @@
 use super::config::SupervisorConfig;
-use super::guardrails::{enforce_blocked_policy, has_error_or_loop_signature, validate_evaluation};
+use super::guardrails::{
+    enforce_blocked_policy, has_error_or_loop_signature, sanitize_auto_reply, validate_evaluation,
+};
 use super::hc::HcBackend;
 use super::ollama::{CognitiveBackend, SupervisorDecision};
 use super::state::{
@@ -218,15 +220,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             self.model_loaded = true;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
-            if eval.decision == SupervisorDecision::AutoReply {
-                let lower_output = output.to_lowercase();
-                if (lower_output.contains("(y/n)") || lower_output.contains("[y/n]"))
-                    && eval.hc_command_payload.len() > 3
-                    && eval.hc_command_payload.contains('_')
-                {
-                    eval.hc_command_payload = "y".to_string();
-                }
-            }
+            eval = sanitize_auto_reply(&output, eval);
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             let state = self
@@ -574,29 +568,47 @@ mod tests {
         let o1 = engine.tick(1000).unwrap();
         assert!(o1.evaluated_agents.is_empty());
 
-        // > 20 seconds unchanged triggers inactivity evaluation
+        // > 20 seconds unchanged triggers inactivity evaluation. Free text ("cargo test") is never
+        // typed by AUTO_REPLY: it becomes an operator alert without payload.
         let o2 = engine.tick(1021).unwrap();
         assert_eq!(o2.evaluated_agents, vec!["worker-01"]);
-        assert_eq!(o2.auto_replied_agents, vec!["worker-01"]);
+        assert!(o2.auto_replied_agents.is_empty());
+        assert_eq!(o2.alerted_agents, vec!["worker-01"]);
         assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
-        assert_eq!(
-            engine.hc.sent_inputs.lock().unwrap().as_slice(),
-            &[("worker-01".to_string(), "cargo test".to_string(), true)]
-        );
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
         let labels = engine.hc.labels.lock().unwrap();
-        assert_eq!(labels.len(), 2);
-        assert!(labels[1].1.contains(&(
-            "cockpit.supervisor_state".to_string(),
-            "WAITING_CONFIRMATION".to_string()
-        )));
-        assert!(labels[1].1.contains(&(
+        assert!(labels.last().unwrap().1.contains(&(
             "supervisor.state".to_string(),
             "WAITING_CONFIRMATION".to_string()
         )));
 
         let agent = engine.store.agents.get("worker-01").unwrap();
-        assert_eq!(agent.consecutive_auto_replies, 1);
-        assert_eq!(agent.auto_reply_log.len(), 1);
+        assert_eq!(agent.consecutive_auto_replies, 0);
+        let card = agent.pending_operator_action.as_ref().unwrap();
+        assert!(card.hc_command_payload.is_empty());
+    }
+
+    #[test]
+    fn test_blocked_yn_prompt_echoed_hint_sends_y() {
+        // Test 2 / safe-ls: lfm3 answered AUTO_REPLY with the literal "[y/N]".
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t11m")],
+            vec!["Bash command\n  ls -la src/\nAllow? [y/N]"],
+        );
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            decision: SupervisorDecision::AutoReply,
+            ..alert_eval(Urgency::Low, "[y/N]")
+        });
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t11m"]);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t11m".to_string(), "y".to_string(), true)]
+        );
     }
 
     #[test]

@@ -111,6 +111,69 @@ pub fn enforce_blocked_policy(
     eval
 }
 
+fn yn_prompt_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)[\[(]\s*y(es)?\s*/\s*n(o)?\s*[\])]").expect("valid y/n prompt regex")
+    })
+}
+
+fn yn_hint_payload_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^[\[(]?\s*y(es)?\s*/\s*n(o)?\s*[\])]?$").expect("valid y/n hint regex")
+    })
+}
+
+fn identifier_payload_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[a-z]+(_[a-z]+)+$").expect("valid identifier regex"))
+}
+
+/// Restricts what an `AUTO_REPLY` may type into a terminal to single keys: `y`, `n`, a 1–2 digit
+/// menu choice, or Enter (empty). Anything else — text copied from the screen, free-form
+/// instructions — is never typed; the evaluation becomes an operator alert without payload.
+///
+/// On a y/n prompt, `yes`/`no` map to `y`/`n`, and the two known small-model slips — echoing the
+/// prompt hint (`[y/N]`) or a snake_case label (`continue_readonly`) — map to `y`, since the model
+/// chose to approve. Must run after `enforce_blocked_policy` (destructive commands already alerted).
+pub fn sanitize_auto_reply(output: &str, mut eval: CognitiveEvaluation) -> CognitiveEvaluation {
+    if eval.decision != SupervisorDecision::AutoReply {
+        return eval;
+    }
+    let raw = eval.hc_command_payload.trim().to_string();
+    let p = raw.to_lowercase();
+    let is_key = |k: &str| k.is_empty() || (k.len() <= 2 && k.chars().all(|c| c.is_ascii_digit()));
+    let normalized = match p.as_str() {
+        "y" | "yes" => Some("y".to_string()),
+        "n" | "no" => Some("n".to_string()),
+        _ if yn_prompt_regex().is_match(&pending_prompt_area(output))
+            && (yn_hint_payload_regex().is_match(&p)
+                || identifier_payload_regex().is_match(&p)) =>
+        {
+            Some("y".to_string())
+        }
+        k if is_key(k) => Some(k.to_string()),
+        _ => None,
+    };
+    match normalized {
+        Some(key) => eval.hc_command_payload = key,
+        None => {
+            eval.decision = SupervisorDecision::AlertOperator;
+            if eval.urgency == Urgency::Low {
+                eval.urgency = Urgency::Normal;
+            }
+            eval.hc_command_payload.clear();
+            let shown: String = raw.chars().take(60).collect();
+            append_reason(
+                &mut eval.reason_for_operator,
+                &format!("[Resposta automática bloqueada: '{shown}' não é y/n, número ou Enter]"),
+            );
+        }
+    }
+    eval
+}
+
 fn error_signature_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -377,5 +440,65 @@ mod tests {
         let out = enforce_blocked_policy(true, "Task finished.\nAll done", alert);
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert!(out.hc_command_payload.is_empty());
+    }
+
+    fn auto(payload: &str) -> CognitiveEvaluation {
+        let mut e = sample_eval(SupervisorDecision::AutoReply, payload);
+        e.urgency = Urgency::Low;
+        e
+    }
+
+    #[test]
+    fn sanitize_yn_prompt_echoed_hint_becomes_y() {
+        // Test 2 / safe-ls: the model sent the literal "[y/N]" copied from the screen.
+        let out = sanitize_auto_reply("List files in src/?\nProceed? [y/N]", auto("[y/N]"));
+        assert_eq!(out.decision, SupervisorDecision::AutoReply);
+        assert_eq!(out.hc_command_payload, "y");
+    }
+
+    #[test]
+    fn sanitize_yn_prompt_maps_words_and_case() {
+        let area = "Read README.md? (y/n)";
+        assert_eq!(
+            sanitize_auto_reply(area, auto(" Yes ")).hc_command_payload,
+            "y"
+        );
+        assert_eq!(sanitize_auto_reply(area, auto("N")).hc_command_payload, "n");
+        assert_eq!(
+            sanitize_auto_reply(area, auto("continue_readonly")).hc_command_payload,
+            "y"
+        );
+    }
+
+    #[test]
+    fn sanitize_free_text_becomes_alert_without_payload() {
+        let out = sanitize_auto_reply("Proceed? [y/N]", auto("sure, go ahead"));
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert_eq!(out.urgency, Urgency::Normal);
+        assert!(out.hc_command_payload.is_empty());
+        assert!(out.reason_for_operator.contains("sure, go ahead"));
+
+        let out = sanitize_auto_reply("Waiting for input...", auto("cargo test"));
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert!(out.hc_command_payload.is_empty());
+    }
+
+    #[test]
+    fn sanitize_numbered_choice_and_enter_allowed() {
+        let menu = "Which one?\n1. Keep\n2. Replace\n3. Abort\nChoose:";
+        assert_eq!(sanitize_auto_reply(menu, auto("2")).hc_command_payload, "2");
+        assert_eq!(
+            sanitize_auto_reply(menu, auto("Replace")).decision,
+            SupervisorDecision::AlertOperator
+        );
+        let enter = sanitize_auto_reply("Press Enter to continue", auto(""));
+        assert_eq!(enter.decision, SupervisorDecision::AutoReply);
+        assert_eq!(enter.hc_command_payload, "");
+    }
+
+    #[test]
+    fn sanitize_leaves_other_decisions_untouched() {
+        let alert = sample_eval(SupervisorDecision::AlertOperator, "n");
+        assert_eq!(sanitize_auto_reply("rm -rf? [y/N]", alert.clone()), alert);
     }
 }
