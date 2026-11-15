@@ -348,6 +348,17 @@ enum ModelCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Delete a local model from disk or Ollama (requires confirmation)
+    Rm {
+        /// Model id
+        id: String,
+        /// Skip interactive confirmation prompt
+        #[arg(long)]
+        yes: bool,
+        /// Output DeleteOutcome JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 const VALID_LABEL_KEYS: [&str; 7] = [
@@ -787,6 +798,58 @@ async fn main() -> Result<()> {
                     .await
                     .context("supervisor model unhide task panicked")??;
                     println!("{}", serde_json::to_string_pretty(&out)?);
+                    Ok(())
+                }
+                ModelCommand::Rm { id, yes, json } => {
+                    use std::io::{IsTerminal, Write};
+                    if !yes && !std::io::stdin().is_terminal() {
+                        bail!("refusing to delete without --yes (stdin is not a terminal)");
+                    }
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        tchelvis::supervisor::delete_model(&id, &mut |model, plan| {
+                            if yes {
+                                return true;
+                            }
+                            eprintln!("Source: {}", model.source);
+                            match plan {
+                                tchelvis::supervisor::model_delete::DeletePlan::Files {
+                                    remove,
+                                    prune_dir,
+                                    bytes,
+                                } => {
+                                    for p in remove {
+                                        eprintln!("  Path: {}", p.display());
+                                    }
+                                    if let Some(dir) = prune_dir {
+                                        eprintln!("  Prune dir: {}", dir.display());
+                                    }
+                                    eprintln!("Total size: {}", format_bytes(*bytes));
+                                }
+                                tchelvis::supervisor::model_delete::DeletePlan::Ollama { name } => {
+                                    eprintln!("  Ollama model: {name}");
+                                    eprintln!("  Path: {}", model.path.display());
+                                    eprintln!("Total size: {}", format_bytes(model.size_bytes));
+                                    eprintln!("This also removes it from Ollama for every app.");
+                                }
+                            }
+                            eprint!("Delete? [y/N]: ");
+                            let _ = std::io::stderr().flush();
+                            let mut input = String::new();
+                            if std::io::stdin().read_line(&mut input).is_err() {
+                                return false;
+                            }
+                            matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                        })
+                    })
+                    .await
+                    .context("supervisor model rm task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&outcome)?);
+                    } else if outcome.deleted {
+                        println!("Deleted {}", outcome.id);
+                    } else {
+                        println!("Aborted; {} was not deleted.", outcome.id);
+                    }
                     Ok(())
                 }
             },
@@ -1234,6 +1297,22 @@ fn truncate_col(s: &str, max_chars: usize) -> String {
         let mut t: String = s.chars().take(max_chars.saturating_sub(1)).collect();
         t.push('…');
         t
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
     }
 }
 

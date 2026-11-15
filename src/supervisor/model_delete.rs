@@ -237,6 +237,104 @@ pub fn plan_delete(model: &LocalModel) -> Result<DeletePlan> {
     })
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+pub struct DeleteOutcome {
+    pub id: String,
+    pub plan: DeletePlan,
+    pub deleted: bool,
+}
+
+pub trait OllamaRemover {
+    fn remove(&self, name: &str) -> Result<()>;
+}
+
+pub struct SystemOllamaRemover {
+    pub host: String,
+}
+
+impl OllamaRemover for SystemOllamaRemover {
+    fn remove(&self, name: &str) -> Result<()> {
+        if super::container::binary_on_path("ollama") {
+            let out = std::process::Command::new("ollama")
+                .args(["rm", name])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .with_context(|| format!("failed to execute `ollama rm {name}`"))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() { stderr } else { stdout };
+                bail!("`ollama rm {name}` failed ({}): {detail}", out.status);
+            }
+            return Ok(());
+        }
+
+        let url = format!("{}/api/delete", self.host.trim_end_matches('/'));
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        match agent
+            .delete(&url)
+            .send_json(serde_json::json!({ "model": name }))
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                bail!("Ollama DELETE {url} failed ({code}): {body}");
+            }
+            Err(ureq::Error::Transport(err)) => {
+                bail!("Ollama DELETE {url} failed: {err}");
+            }
+        }
+    }
+}
+
+fn has_any_gguf_under_dir(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if ft.is_symlink() || ft.is_file() {
+            if is_gguf(&path) {
+                return true;
+            }
+        } else if ft.is_dir() && has_any_gguf_under_dir(&path) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn execute_plan(plan: &DeletePlan, ollama: &dyn OllamaRemover) -> Result<()> {
+    match plan {
+        DeletePlan::Ollama { name } => ollama.remove(name),
+        DeletePlan::Files {
+            remove, prune_dir, ..
+        } => {
+            for path in remove {
+                fs::remove_file(path)
+                    .with_context(|| format!("failed to remove {}", path.display()))?;
+            }
+            if let Some(repo) = prune_dir {
+                let is_hf_repo = repo
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("models--"))
+                    .unwrap_or(false);
+                if is_hf_repo && !has_any_gguf_under_dir(&repo.join("snapshots")) {
+                    fs::remove_dir_all(repo)
+                        .with_context(|| format!("failed to prune {}", repo.display()))?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 pub fn protected_reason(
     id: &str,
     effective: Option<&str>,
@@ -511,5 +609,77 @@ mod tests {
             protected_reason("m4", Some("m1"), Some("m2"), Some("m3")),
             None
         );
+    }
+
+    struct FakeOllama {
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeOllama {
+        fn new() -> Self {
+            Self {
+                removed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.removed.lock().unwrap().clone()
+        }
+    }
+
+    impl OllamaRemover for FakeOllama {
+        fn remove(&self, name: &str) -> Result<()> {
+            self.removed.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn execute_flat_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tiny.gguf");
+        fs::write(&file, vec![1u8; 64]).unwrap();
+        let model = make_file_model(&file);
+        let plan = plan_delete(&model).unwrap();
+        let fake = FakeOllama::new();
+
+        execute_plan(&plan, &fake).unwrap();
+        assert!(!file.exists());
+        assert!(fake.calls().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn execute_hf_prunes_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fs::canonicalize(dir.path()).unwrap().join("models--org--repo");
+        let blob = repo.join("blobs/sha256-aaa");
+        let snap = repo.join("snapshots/rev1/model.gguf");
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::create_dir_all(snap.parent().unwrap()).unwrap();
+        fs::write(&blob, vec![9u8; 64]).unwrap();
+        symlink(&blob, &snap).unwrap();
+
+        let model = make_file_model(&blob);
+        let plan = plan_delete(&model).unwrap();
+        let fake = FakeOllama::new();
+
+        execute_plan(&plan, &fake).unwrap();
+        assert!(!repo.exists());
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn execute_ollama_calls_remover() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = dir.path().join("sha256-123");
+        fs::write(&blob, b"keep-me").unwrap();
+        let plan = DeletePlan::Ollama {
+            name: "lfm3:1.7b".to_string(),
+        };
+        let fake = FakeOllama::new();
+
+        execute_plan(&plan, &fake).unwrap();
+        assert_eq!(fake.calls(), vec!["lfm3:1.7b".to_string()]);
+        assert!(blob.exists());
     }
 }

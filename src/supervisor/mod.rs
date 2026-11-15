@@ -387,6 +387,95 @@ pub fn unhide_model(id: &str) -> Result<models::ModelListOutput> {
     list_models(None, false)
 }
 
+pub use model_delete::DeleteOutcome;
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn delete_model_with(
+    id: &str,
+    cfg_path: &std::path::Path,
+    cfg: &SupervisorConfig,
+    roots: &models::ScanRoots,
+    running_id: Option<&str>,
+    ollama: &dyn model_delete::OllamaRemover,
+    confirm: &mut dyn FnMut(&models::LocalModel, &model_delete::DeletePlan) -> bool,
+) -> Result<DeleteOutcome> {
+    let scanned = models::scan_local_models(roots);
+    let eff = models::effective_model(cfg, &roots.ollama);
+    let filter =
+        models::MaxParams::parse(&cfg.llm_container.model_filter).unwrap_or(models::MaxParams::B4);
+    let (all_models, _, _) = models::build_model_list(
+        scanned,
+        filter,
+        eff.as_ref(),
+        true,
+        &cfg.llm_container.hidden_models,
+    );
+
+    let Some(model) = all_models.iter().find(|m| m.id == id) else {
+        anyhow::bail!("model not found: {id}");
+    };
+
+    if let Some(reason) = model_delete::protected_reason(
+        id,
+        eff.as_ref().map(|e| e.id.as_str()),
+        cfg.llm_container.fallback_model_id.as_deref(),
+        running_id,
+    ) {
+        anyhow::bail!("cannot delete {id}: {reason}");
+    }
+
+    let plan = model_delete::plan_delete(model)?;
+    if !confirm(model, &plan) {
+        return Ok(DeleteOutcome {
+            id: id.to_string(),
+            plan,
+            deleted: false,
+        });
+    }
+
+    model_delete::execute_plan(&plan, ollama)?;
+    unhide_model_in(id, cfg_path, cfg)?;
+
+    Ok(DeleteOutcome {
+        id: id.to_string(),
+        plan,
+        deleted: true,
+    })
+}
+
+/// Deletes a model from disk or Ollama after checking protection and calling `confirm`.
+pub fn delete_model(
+    id: &str,
+    confirm: &mut dyn FnMut(&models::LocalModel, &model_delete::DeletePlan) -> bool,
+) -> Result<DeleteOutcome> {
+    let cfg = SupervisorConfig::load();
+    let roots = models::ScanRoots::from_env_and_config(&cfg.llm_container);
+    let running_id = cfg.detected_container_runtime().and_then(|rt| {
+        let mgr = container::LlmContainer::new(
+            rt,
+            cfg.llm_container.clone(),
+            container::SystemContainerCli,
+        );
+        if matches!(mgr.state(), Ok(container::ContainerState::Running)) {
+            mgr.container_model_id()
+        } else {
+            None
+        }
+    });
+    let ollama = model_delete::SystemOllamaRemover {
+        host: cfg.ollama_host.clone(),
+    };
+    delete_model_with(
+        id,
+        &config::supervisor_config_path(),
+        &cfg,
+        &roots,
+        running_id.as_deref(),
+        &ollama,
+        confirm,
+    )
+}
+
 fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
     let Some(rt) = cfg.detected_container_runtime() else {
         return Ok(());
@@ -658,5 +747,125 @@ mod tests {
         // Idempotent unhide
         let parsed3: SupervisorConfig = toml::from_str(&raw3).unwrap();
         unhide_model_in("file:/m/other.gguf", &cfg_path, &parsed3).unwrap();
+    }
+
+    struct FakeOllama {
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeOllama {
+        fn new() -> Self {
+            Self {
+                removed: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl model_delete::OllamaRemover for FakeOllama {
+        fn remove(&self, name: &str) -> Result<()> {
+            self.removed.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+    }
+
+    fn test_roots(folder: PathBuf) -> models::ScanRoots {
+        models::ScanRoots {
+            ollama: vec![],
+            hf_hub: vec![],
+            llama_cpp: vec![],
+            lm_studio: vec![],
+            folders: vec![folder],
+        }
+    }
+
+    #[test]
+    fn rm_unknown_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("supervisor.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let cfg = SupervisorConfig::default();
+        let roots = test_roots(models_dir);
+        let fake = FakeOllama::new();
+
+        let err = delete_model_with(
+            "file:/does/not/exist.gguf",
+            &cfg_path,
+            &cfg,
+            &roots,
+            None,
+            &fake,
+            &mut |_, _| true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("model not found"));
+    }
+
+    #[test]
+    fn rm_protected_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("supervisor.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("active.gguf");
+        std::fs::write(&model_file, b"gguf").unwrap();
+        let id = format!("file:{}", model_file.display());
+
+        let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.model_id = Some(id.clone());
+        let roots = test_roots(models_dir);
+        let fake = FakeOllama::new();
+
+        let err = delete_model_with(&id, &cfg_path, &cfg, &roots, None, &fake, &mut |_, _| true)
+            .unwrap_err();
+        assert!(err.to_string().contains("in use by the supervisor"));
+        assert!(model_file.exists());
+    }
+
+    #[test]
+    fn rm_declined_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("supervisor.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("keep.gguf");
+        std::fs::write(&model_file, b"gguf").unwrap();
+        let id = format!("file:{}", model_file.display());
+
+        let cfg = SupervisorConfig::default();
+        let roots = test_roots(models_dir);
+        let fake = FakeOllama::new();
+
+        let outcome =
+            delete_model_with(&id, &cfg_path, &cfg, &roots, None, &fake, &mut |_, _| false)
+                .unwrap();
+        assert!(!outcome.deleted);
+        assert!(model_file.exists());
+    }
+
+    #[test]
+    fn rm_removes_hidden_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("supervisor.toml");
+        let models_dir = dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model_file = std::fs::canonicalize(&models_dir).unwrap().join("hidden.gguf");
+        std::fs::write(&model_file, b"gguf").unwrap();
+        let id = format!("file:{}", model_file.display());
+
+        config_write::write_hidden_models(&cfg_path, std::slice::from_ref(&id)).unwrap();
+        let mut cfg = SupervisorConfig::default();
+        cfg.llm_container.hidden_models = vec![id.clone()];
+        let roots = test_roots(models_dir);
+        let fake = FakeOllama::new();
+
+        let outcome =
+            delete_model_with(&id, &cfg_path, &cfg, &roots, None, &fake, &mut |_, _| true)
+                .unwrap();
+        assert!(outcome.deleted);
+        assert!(!model_file.exists());
+        let raw = std::fs::read_to_string(&cfg_path).unwrap();
+        let parsed: SupervisorConfig = toml::from_str(&raw).unwrap();
+        assert!(parsed.llm_container.hidden_models.is_empty());
     }
 }
