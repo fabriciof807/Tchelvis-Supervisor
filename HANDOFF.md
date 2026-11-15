@@ -2,7 +2,7 @@
 
 **Data da última atualização:** 2026-11-15  
 **Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
-**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`; nightly atual = `ee71994`). Nenhum stable publicado ainda (`v0.2.0` só após validar o nightly no host, com OK do usuário).
+**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`; nightly atual = `164a947`). Nenhum stable publicado ainda (`v0.2.0` só após validar o nightly no host, com OK do usuário).
 
 ---
 
@@ -122,15 +122,44 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
   - Mod: ações `Hide`/`Show` e `Delete` (duplo clique em 4 s: `Delete <size>?`) nas linhas elegíveis do card `Supervisor model`.
   - **Validar no host:** fluxo visual de `Hide`/`Show` e `Delete` no card do Herdr Desktop.
 - **Fleet child tree** (`main.js`): terminais filhos aninhados sob o pai (`├`/`└`, badge `⚠ N filho(s)` no pai, grupo sobe para "Needs" se algum filho estiver blocked); **validar no host** (clicar num filho seleciona o filho; filho blocked puxa o grupo para cima).
-- **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench, M1c).
+- **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench, M1c, fleet child tree, read-only fast path).
 - **Execução:** Gemini 4 Hydrogen (medium) solo via `delegate_task`; o coordenador revisa, valida e faz commit.
   - O swarm do Antigravity travou 2× (workers parados), por isso não é usado.
   - O Hydrogen às vezes encerra antes de validar; o coordenador sempre revalida.
 
 ---
 
+### Atualização — 2026-11-15 (tarde): attach, supervisor endurecido pelos testes 2–8, Fleet em árvore
+- **Attach na Fleet** (`67fe16f`, `114c4ce`): a aba de attach usa o **endereço** (`hc attach t11g`), nunca o nome (terminais criados por agentes não têm nome no core → `not_found`). O clique no card só foca um pane que esteja na lista atual; senão abre o attach direto (`planFleetClick`). **Validado no host.**
+- **CI** (`9a09014`): o passo `Mod tests` (Node 24) exige os arquivos (`tests/mod/*.test.mjs`), não a pasta. Entre `67fe16f` e `9a09014` nenhum nightly saiu — sempre conferir o run após o push.
+- **Testes do mod em Node**: `node --import ./tests/mod/stub-hooks.mjs --test tests/mod/*.test.mjs` (stubs de `herdr`/`gpui-*`); funções puras exportadas de `main.js`.
+- **Pílula LLM** (`855f266`): modelos do cache HF mostram o nome do snapshot, não o hash do blob; nome encurtado no meio (28 chars).
+- **Supervisor — política de resposta** (`guardrails.rs`), resultado de 8 rodadas de teste no host (relatórios em `.work/teste-supervisor-*` no host):
+  - `sanitize_auto_reply`: AUTO_REPLY só digita `y`/`n` (só em prompt sim/não), número de menu ou Enter; texto livre vira alerta. Prompt com `kind=question` nunca é auto-respondido (`HcSession.kind`).
+  - `enforce_blocked_policy`: bloqueado + `NO_OP` com prompt visível vira alerta `Normal`.
+  - Fila (`watcher.rs`): bloqueados primeiro (mais antigo primeiro), `max_evals_per_tick` (padrão 1).
+  - **Regra fixa de leitura** (`readonly_fast_path_with_msg`, spec `2026-11-15-readonly-fast-path-design.md`): antes e sem a LLM aprova `ls/cat/head/tail/wc/pwd/rg/grep/git status|diff|log|show` e `Read` de um arquivo, sem metacaracteres nem caminhos sensíveis; comando vem do `status.msg` do hc (`approve Bash: …`, Claude Code), da linha do prompt (`Allow bash tool: … ? [y/N]`) ou da linha acima; tecla `1` (menu "1. Yes") ou `y`. Opções 2/3 do Claude (always allow / auto mode) nunca. `WatcherEngine::apply_decision` é compartilhado pela regra e pela LLM.
+  - **Teste 8** (nightly `c8a0222`): todos os cenários corretos; seguros em 7–18 s sem LLM; etapa destrutiva da `sequencia` alcançada e alertada; nenhum destrutivo recebeu `y` em 8 rodadas.
+  - Telas reais: só o **Claude** pede permissão nas configurações do usuário (opencode `autoaccept`, pi sem barreira, agy `auto`); o Claude não pede para leitura. Tela real em `src/supervisor/fixtures/claude_permission_bash_touch.txt` (caminho anonimizado).
+- **M1c** (Hydrogen, revisado): ocultar/apagar modelos; acrescentada recusa de arquivo não-`.gguf` fora do layout HF (`b178f1b`).
+- **Fleet em árvore** (Hydrogen, `403a1df`, `4a613db`): spec `2026-11-15-fleet-child-tree-design.md`.
+- **ROADMAP:** M1c, M1d (benchmark de qualidade de decisão), M6 (modo delegador: supervisor acorda o coordenador quando um worker volta ao prompt; referência: contrato de delegação do T3 Code).
+
+---
+
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `164a947` / `a650bd6` — fast path lê o pedido do `status.msg` do hc (menu real do Claude Code)
+- `c8a0222` / `390dfcc` — fast path: comando na linha do prompt; acima do prompt; comandos entre crases
+- `74719db` / `4a613db` / `403a1df` — Fleet em árvore (+ `cargo fmt`)
+- `aa72533` — `feat(supervisor): read-only fast path approves trivial commands without the LLM`
+- `2d405d0` — nunca auto-responder perguntas; `y`/`n` só em prompt sim/não; bloqueado + `NO_OP` alerta
+- `114c4ce` — clique no card da Fleet anexa se não houver pane vivo
+- `9a09014` — CI: arquivos de teste do mod explícitos (Node 24)
+- `855f266` — pílula LLM: nome do snapshot HF em vez do hash
+- `b178f1b` / `3c92619` … `37b2799` — M1c ocultar/apagar modelos
+- `ef1bbae` / `4e8a0c1` — fila com bloqueados primeiro; AUTO_REPLY só teclas simples
+- `67fe16f` — attach pelo endereço
 - `ee71994` — `feat(mod): CPU vs GPU benchmark card in the Doctor tab`
 - `d99e3fb` — `feat(supervisor): GPU backend detection (CUDA/Vulkan/ROCm) and supervisor bench CPU vs GPU`
 - `2534d5f` — `ci,docs: release workflow (stable tags + nightly per push) and tchelvis install/update docs (M5a B3)`
@@ -201,23 +230,16 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Próxima sessão: validar no host** (nightly `ee71994`):
-   - Se ainda tiver `cockpit`: roteiro de instalação limpa do §3. Senão, `tchelvis update`. Depois reiniciar o Herdr Desktop e escolher o layout `tchelvis`; renomear eventuais `COCKPIT_*` no `.zshrc`.
-   - **Benchmark no Doctor** (Run benchmark): a linha `GPU (vulkan)` deve ter números na AMD. A 1ª vez baixa a imagem `server-vulkan` (GBs). Se falhar, anotar o erro da linha GPU (permissão de `/dev/dri`/grupo `video`, driver Vulkan na imagem).
-   - **Correções do teste anterior:**
-     - clique em sessão agy viva abre a aba de attach; se não abrir, anotar a linha `attach: …` do Inspector;
-     - card **Pending prompt** (Approve/Deny/Open);
-     - avaliação do lfm3 termina, ou mostra `⚠ LLM evaluation failed`;
-     - fallback podman → docker.
-   - **M1:** seletor de modelo pela pílula LLM ou pelo card LLM do Inspector.
-2. **Se o nightly estiver bom:** cortar o primeiro stable `v0.2.0` (`docs/RELEASING.md`), **com OK do usuário** (push de tag).
-3. **Próximas entregas (ver `ROADMAP.md`):**
-   - M1b modelo fallback;
-   - M2 ícones no lugar de emojis (o mapeamento do agy ainda usa "✨"/"✧");
-   - M3 layout compacto / ferramentas simples (começa com auditoria D4);
-   - M4 Inspector com vários terminais;
-   - M5b AUR / Homebrew (Linux).
-4. **Pendências pequenas:**
-   - dois avisos de estilo do clippy em `models.rs`;
-   - possível aviso no `update` sobre o cache de 60 s da API;
-   - o botão GPU reiniciar o `supervisor watch` automaticamente.
+1. **Validar no host** (nightly `164a947`, reiniciar o Herdr Desktop para recarregar o mod):
+   - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N filho(s)` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
+   - Card de modelos: Ocultar/Mostrar e Apagar (segundo clique `Delete <size>?`); `ollama rm` real nunca foi testado.
+   - Claude real: quando o supervisor mandar `1` num menu de permissão de leitura, conferir que o Enter extra do `hc send` não tem efeito colateral.
+   - Benchmark CPU vs GPU já validado (AMD/Vulkan: GPU ≈ 3,7× na geração).
+2. **Pendências do supervisor:**
+   - Visibilidade: terminais avaliados (decisão + horário) no `supervisor status`, sem sobrescrever o label do hc (achado 3 dos testes).
+   - Registrar latência/decisão por avaliação no log (`tchelvis logs` não mostra os ticks disparados pelo app).
+   - A LLM ainda recebe a tela inteira e pode confundir um prompt antigo com o atual quando o pedido não passa pela regra fixa.
+   - Justificativas cortadas em 200 caracteres pelo schema (cosmético).
+3. **Se o nightly estiver bom:** cortar o primeiro stable `v0.2.0` (`docs/RELEASING.md`), **com OK do usuário** (push de tag).
+4. **Próximas entregas (ver `ROADMAP.md`):** M1b modelo fallback; M1d benchmark de qualidade de decisão; M2 ícones; M3 layout compacto; M4 Inspector multi-terminal; M5b AUR/Homebrew; M6 modo delegador (ideia).
+5. **Pendências pequenas:** avisos antigos do clippy (`models.rs`, `hc.rs`, `container.rs`, testes do `watcher.rs`); aviso no `update` sobre o cache de 60 s da API; botão GPU reiniciar o `supervisor watch`.
