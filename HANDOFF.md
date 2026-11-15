@@ -121,6 +121,7 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
   - `tchelvis supervisor model rm <id> [--yes] [--json]`: planejador puro (`model_delete.rs`) trata arquivos planos (+ shards), cache HF (`models--*`, preservando blobs compartilhados e podando o diretório só quando não resta `.gguf`), e Ollama (`ollama rm` ou `DELETE /api/delete`). Recusa modelos protegidos (efetivo, `fallback_model_id`, ou `tchelvis.model_id` no container em execução) e recusa stdin não-interativo sem `--yes`.
   - Mod: ações `Hide`/`Show` e `Delete` (duplo clique em 4 s: `Delete <size>?`) nas linhas elegíveis do card `Supervisor model`.
   - **Validar no host:** fluxo visual de `Hide`/`Show` e `Delete` no card do Herdr Desktop.
+- **Fleet child tree** (`main.js`): terminais filhos aninhados sob o pai (`├`/`└`, badge `⚠ N filho(s)` no pai, grupo sobe para "Needs" se algum filho estiver blocked); **validar no host** (clicar num filho seleciona o filho; filho blocked puxa o grupo para cima).
 - **Planos e specs** em `docs/superpowers/{specs,plans}/` (M1, host-test fixes, M5a, bench, M1c).
 - **Execução:** Gemini 4 Hydrogen (medium) solo via `delegate_task`; o coordenador revisa, valida e faz commit.
   - O swarm do Antigravity travou 2× (workers parados), por isso não é usado.

@@ -2873,12 +2873,22 @@ export default class CockpitMod extends View {
     const live = agents();
     const allTerms = terminals();
     const merged = mergeFleetRows(live, allTerms, snap, supSnap);
-    const parts = partitionAgents(merged);
-    const liveCount = parts.blocked.length + parts.active.length;
+    const parts = partitionFleetGroups(groupFleetRows(merged));
+    const countRows = (groups) =>
+      groups.reduce((sum, g) => sum + 1 + (g.children?.length ?? 0), 0);
+    const blockedCount = countRows(parts.blocked);
+    const activeCount = countRows(parts.active);
+    const finishedCount = countRows(parts.finished);
+    const liveCount = blockedCount + activeCount;
 
+    const flattenGroupAddrs = (groups) =>
+      groups.flatMap((g) => [
+        g.row.address,
+        ...(g.children ?? []).map((c) => c.address),
+      ]);
     const orderedAddrs = [
-      ...parts.blocked.map((a) => a.address),
-      ...parts.active.map((a) => a.address),
+      ...flattenGroupAddrs(parts.blocked),
+      ...flattenGroupAddrs(parts.active),
     ];
     if (orderedAddrs.length) setAgentOrder(orderedAddrs);
 
@@ -2900,7 +2910,7 @@ export default class CockpitMod extends View {
         .justify_center()
         .px(4);
 
-    const renderAgentCard = (a) => {
+    const renderAgentCard = (a, { blockedBadge = null, isChild = false } = {}) => {
       const isSelected = a.address === selAddr;
       const isFinished =
         a.lifecycle?.state === "finished" || a.state === "finished";
@@ -2948,16 +2958,20 @@ export default class CockpitMod extends View {
           ? withAlpha(t.blocked, "88", t.blocked)
           : t.border;
 
-      return v_flex()
+      const cardBase = v_flex()
         .id(`ck-row-${a.address}`)
-        .mx(10)
         .p(10)
         .gap(5)
         .rounded(8)
         .border(1)
         .border_color(cardBorder)
         .bg(isSelected ? t.selected : t.surface)
-        .cursor_pointer()
+        .cursor_pointer();
+      const sizedCard = isChild
+        ? cardBase.flex_1().min_w(0)
+        : cardBase.mx(10);
+
+      return sizedCard
         .hover((s) => s.bg(t.hover))
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
@@ -3034,7 +3048,16 @@ export default class CockpitMod extends View {
               .child(ellipsize(summaryLine, 52))
           )
         )
-        .when(a.blocked_children?.length > 0, (el) =>
+        .when(Boolean(blockedBadge), (el) =>
+          el.child(
+            div()
+              .text_size(11)
+              .font_semibold()
+              .text_color(t.blocked)
+              .child(blockedBadge)
+          )
+        )
+        .when(!blockedBadge && a.blocked_children?.length > 0, (el) =>
           el.child(
             div()
               .text_size(11)
@@ -3087,6 +3110,34 @@ export default class CockpitMod extends View {
             .when(!issue && !pr, (el) =>
               el.child(this.pillBadge(t, tierLabel, tierColor))
             )
+        );
+    };
+
+    const renderGroup = (group) => {
+      const badge = blockedChildrenBadge(group);
+      const parentCard = renderAgentCard(group.row, { blockedBadge: badge });
+      const children = group.children ?? [];
+      if (children.length === 0) return parentCard;
+      return v_flex()
+        .gap(5)
+        .child(parentCard)
+        .children(
+          children.map((child, idx) =>
+            h_flex()
+              .pl(16)
+              .pr(10)
+              .gap(4)
+              .items_center()
+              .child(
+                div()
+                  .w(12)
+                  .flex_none()
+                  .text_size(12)
+                  .text_color(t.muted)
+                  .child(childConnector(idx, children.length))
+              )
+              .child(renderAgentCard(child, { isChild: true }))
+          )
         );
     };
 
@@ -3182,9 +3233,9 @@ export default class CockpitMod extends View {
           .mt(8)
           .mb(6)
           .child(filterSeg("all", `Todos (${liveCount})`))
-          .child(filterSeg("blocked", `Needs (${parts.blocked.length})`))
-          .child(filterSeg("active", `Work (${parts.active.length})`))
-          .child(filterSeg("finished", `Done (${parts.finished.length})`))
+          .child(filterSeg("blocked", `Needs (${blockedCount})`))
+          .child(filterSeg("active", `Work (${activeCount})`))
+          .child(filterSeg("finished", `Done (${finishedCount})`))
       )
       .child(
         // Fleet list
@@ -3234,8 +3285,8 @@ export default class CockpitMod extends View {
                 )
             )
           )
-          .children(showBlocked.map(renderAgentCard))
-          .children(showActive.map(renderAgentCard))
+          .children(showBlocked.map(renderGroup))
+          .children(showActive.map(renderGroup))
           .when(
             this.filterTab === "all" && parts.finished.length > 0,
             (el) =>
@@ -3257,7 +3308,7 @@ export default class CockpitMod extends View {
                     this.showFinished = !this.showFinished;
                     cx.notify();
                   })
-                  .child(`Recent Finished (${parts.finished.length})`)
+                  .child(`Recent Finished (${finishedCount})`)
                   .child(this.showFinished ? "▾" : "▸")
               )
           )
@@ -3274,7 +3325,7 @@ export default class CockpitMod extends View {
                     div()
                       .text_size(11)
                       .text_color(t.dim)
-                      .child(`Finished (${parts.finished.length})`)
+                      .child(`Finished (${finishedCount})`)
                   )
                   .child(
                     this.actionBtn(
@@ -3282,7 +3333,7 @@ export default class CockpitMod extends View {
                       "ck-clear-finished",
                       "Clear Done",
                       (_e, cx) => {
-                        const addrs = parts.finished.map((a) => a.address);
+                        const addrs = flattenGroupAddrs(parts.finished);
                         if (addrs.length > 0) {
                           hc(["rm", ...addrs]);
                           this.refreshCockpit(cx, true);
@@ -3292,7 +3343,7 @@ export default class CockpitMod extends View {
                   )
               )
           )
-          .children(showFinished.map(renderAgentCard))
+          .children(showFinished.map(renderGroup))
       )
       .child(
         // Pinned Bottom Quick-Launcher Strip
