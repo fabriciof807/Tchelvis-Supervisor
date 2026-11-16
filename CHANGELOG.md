@@ -5,13 +5,24 @@ All notable changes to Tchelvis Supervisor (binary `tchelvis`, previously `cockp
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-> No version has been tagged or published yet. The first tagged release is planned for roadmap
-> milestone M5a (rename to `tchelvis` + release pipeline). Until then, `0.1.0` is the version of the
-> initial import, and everything after it is listed under **Unreleased**.
-
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
+First tagged release, and the first published as `tchelvis` binaries (`x86_64` and `aarch64` musl).
+
 ### Added
+- **Read-only fast path for permission prompts.** Trivial read-only requests are approved by a fixed rule, without the LLM:
+  - `ls`, `cat`, `head`, `tail`, `wc`, `pwd`, `rg`, `grep`, `git status|diff|log|show`, and `Read` of a single file;
+  - no shell metacharacters and no sensitive paths;
+  - the request is read from `hc`'s status message (the real Claude Code menu), the prompt line, or the line above it;
+  - the key is `1` on Claude's "1. Yes" menu, or `y` on `[y/N]` prompts. Claude's "always allow" and "auto mode" options are never chosen.
+- **Durable auto-reply audit log.** Every auto-reply that was sent is appended to `auto_replies.jsonl` next to the state file, with its source (`fixed_rule` or `llm`). It survives closed terminals.
+- **Hide and delete supervisor models (M1c).**
+  - **CLI:** `tchelvis supervisor model hide|unhide|rm`, and `model list --all` to show hidden models.
+  - **`model rm`** handles plain files and shards, Hugging Face cache entries (shared blobs are preserved), and Ollama models. It refuses protected models (effective, fallback, or loaded) and asks for `--yes` when stdin is not interactive.
+  - **Herdr mod:** Hide/Show and Delete actions in the Supervisor model card. Delete asks for a second click.
+- **Fleet child tree.** Child terminals are nested under their parent (`├`/`└`). The parent shows a `⚠ N` badge, and a blocked child pulls its group into "Needs".
 - **CPU vs GPU benchmark.**
   - **CLI:** `tchelvis supervisor bench [--runs N] [--json] [--last]` measures the supervisor's real evaluation request on CPU and then on GPU (prompt tok/s, generation tok/s, eval time; median after a warm-up). It restores the previous container state afterwards.
   - **Herdr mod:** a "CPU vs GPU benchmark" card in the Doctor tab, with live progress and the last saved result.
@@ -78,6 +89,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Herdr mod design** (`56f11ae`, `58213b9`): aligned with the landing-page design, with multi-theme GPUI support and better readability.
 
 ### Fixed
+- **Supervisor auto-reply policy**, hardened over ten rounds of host testing:
+  - The LLM never approves a permission request; only the read-only fast path may. An LLM reply on a permission menu becomes an operator alert.
+  - Auto-replies type only single keys: `y`/`n` (only on yes/no prompts), a menu number, or Enter. Free text becomes an alert.
+  - Questions (`kind=question`) are never auto-answered. A blocked agent with a visible prompt and an LLM `NO_OP` raises an alert.
+  - Blocked agents are evaluated first (oldest first), with at most `max_evals_per_tick` evaluations per tick (default 1).
+  - A failed `hc send` is logged, shown as the card's error, and labelled `AUTO_REPLY_FAILED`; it no longer counts as a reply.
+  - When a guardrail turns an LLM reply into an alert, the card says `[Sugestão da LLM não enviada]`. Stray CJK characters from small models are removed from card text.
+- **Fleet attach:** the attach tab uses the terminal address, not its name (terminals created by agents have no name). A click focuses a pane only if it is in the current list; otherwise it attaches.
+- **LLM pill:** Hugging Face cache models show the snapshot name instead of the blob hash.
 - **Host test fixes** (`50db329` and the following commit):
   - **Antigravity (`agy`) detection:** agy sessions are recognized as agents instead of plain shells.
   - **Supervisor LLM evaluations:** they now finish:
@@ -130,5 +150,6 @@ Initial import (`1d2563c`).
   - State persisted in `~/.local/state/cockpit/supervisor_state.json`.
 - CLI commands `status`, `watch`, `inspect`, `label`, `daemon`, `supervisor …`, `setup`, `doctor`, and `uninstall [--purge]`.
 
-[Unreleased]: https://github.com/fabriciof807/Tchelvis-Supervisor/compare/1d2563c...main
+[Unreleased]: https://github.com/fabriciof807/Tchelvis-Supervisor/compare/v0.2.0...main
+[0.2.0]: https://github.com/fabriciof807/Tchelvis-Supervisor/compare/1d2563c...v0.2.0
 [0.1.0]: https://github.com/fabriciof807/Tchelvis-Supervisor/tree/1d2563c
