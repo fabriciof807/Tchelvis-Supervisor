@@ -1,8 +1,8 @@
 # Handoff — Cockpit (Unified Fleet Control Plane + Durable Supervisor)
 
-**Data da última atualização:** 2026-11-15  
+**Data da última atualização:** 2026-11-16  
 **Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
-**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`; nightly atual = `164a947`). Nenhum stable publicado ainda (`v0.2.0` só após validar o nightly no host, com OK do usuário).
+**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`). Primeiro stable publicado: **`v0.2.0`** (`a6a81d1`, 2026-11-16); nightly atual = `a6a81d1`.
 
 ---
 
@@ -145,10 +145,22 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 - **Fleet em árvore** (Hydrogen, `403a1df`, `4a613db`): spec `2026-11-15-fleet-child-tree-design.md`.
 - **ROADMAP:** M1c, M1d (benchmark de qualidade de decisão), M6 (modo delegador: supervisor acorda o coordenador quando um worker volta ao prompt; referência: contrato de delegação do T3 Code).
 
+### Atualização — 2026-11-16: teste 10, `v0.2.0`
+- **`45d276a`** (resultado do teste 9): a LLM nunca aprova pedido de permissão (`sanitize_auto_reply` recebe o `status.msg` do hc; só a regra fixa de leitura aprova); toda auto-resposta enviada vai para `~/.local/state/tchelvis/auto_replies.jsonl` com `source` (`fixed_rule|llm`); `hc send` com falha vira erro no card e rótulo `AUTO_REPLY_FAILED` (teste unitário `failed_hc_send_records_error_and_sets_auto_reply_failed_label`, não dá para provocar por fora).
+- **Teste 10** (nightly `45d276a`, relatório do host): **passou**. 27 auto-respostas, todas `fixed_rule`, nenhuma da LLM; destrutivos (`rm -rf`, `curl | sudo sh`, `git push --force` com injeção, `git reset --hard`) e escrita (`Edit`, `touch` no Claude real) viraram alerta; Claude real recebeu `1` só no `cat` e continuou em `manual mode`; o jsonl sobreviveu ao `hc kill`/`hc rm` dos 38 terminais.
+  - Decisão mantida: a regra fixa continua aprovando leituras triviais também no menu do Claude (spec `2026-11-15-readonly-fast-path-design.md`).
+- **`e394340`**: quando uma proteção transforma a resposta sugerida pela LLM em alerta, o card começa com `[Sugestão da LLM não enviada]` (antes dizia "AUTO_REPLY aplicada porque…"); caracteres CJK soltos pelo modelo pequeno (`git 清`) são removidos do texto (`tidy_operator_reason` em `guardrails.rs`).
+- **`v0.2.0`** (`a6a81d1`, `chore(release): v0.2.0`): CHANGELOG completado (regra fixa, jsonl, M1c, Fleet em árvore, política de auto-resposta, attach por endereço) e movido para `## [0.2.0]`; tag enviada; release estável com binários `x86_64`/`aarch64`, `.sha256`, `SHA256SUMS` e notas. `install.sh --channel stable` validado no `ai-box` (`tchelvis 0.2.0 (stable a6a81d1)`). No host: `tchelvis update --channel stable`.
+- Abertos do teste 10: latência do 1º lote ~30 s (teste 9: 10–13 s; lotes seguintes 12–20 s), não investigada; `supervisor status` não mostra o histórico de terminais fechados (só o jsonl).
+
 ---
 
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `a6a81d1` — `chore(release): v0.2.0` (tag `v0.2.0`)
+- `e394340` — card de alerta não parece resposta enviada; remove ruído CJK
+- `45d276a` — LLM nunca aprova permissão; `auto_replies.jsonl`; `AUTO_REPLY_FAILED`
+- `d974d9b` — handoff da sessão de 2026-11-15
 - `164a947` / `a650bd6` — fast path lê o pedido do `status.msg` do hc (menu real do Claude Code)
 - `c8a0222` / `390dfcc` — fast path: comando na linha do prompt; acima do prompt; comandos entre crases
 - `74719db` / `4a613db` / `403a1df` — Fleet em árvore (+ `cargo fmt`)
@@ -230,16 +242,18 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Validar no host** (nightly `164a947`, reiniciar o Herdr Desktop para recarregar o mod):
-   - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N filho(s)` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
+1. **Próxima sessão: M1b — modelo fallback** (decisão do usuário, 2026-11-16). Ver `ROADMAP.md` § M1b.
+   - Começar pelo brainstorming/spec: definir "parou de funcionar" (load falhou, health check falhou, erros repetidos de avaliação/JSON), quando volta ao modelo principal, e como o mod mostra que o fallback está ativo.
+   - Já existe: chave `[llm_container] fallback_model_id` (`src/supervisor/container.rs:106`), usada hoje só para proteger o modelo no `model rm` (`src/supervisor/mod.rs:417`); `last_eval_error` por agente; spec M1 (`docs/superpowers/specs/2026-11-14-m1-model-selection-design.md`, non-goals).
+   - Fluxo de sempre: spec → plano → Hydrogen em worktree → revisão → push com OK.
+2. **Validar no host** (com `v0.2.0`, reiniciar o Herdr Desktop):
+   - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
    - Card de modelos: Ocultar/Mostrar e Apagar (segundo clique `Delete <size>?`); `ollama rm` real nunca foi testado.
-   - Claude real: quando o supervisor mandar `1` num menu de permissão de leitura, conferir que o Enter extra do `hc send` não tem efeito colateral.
-   - Benchmark CPU vs GPU já validado (AMD/Vulkan: GPU ≈ 3,7× na geração).
-2. **Pendências do supervisor:**
-   - Visibilidade: terminais avaliados (decisão + horário) no `supervisor status`, sem sobrescrever o label do hc (achado 3 dos testes).
-   - Registrar latência/decisão por avaliação no log (`tchelvis logs` não mostra os ticks disparados pelo app).
-   - A LLM ainda recebe a tela inteira e pode confundir um prompt antigo com o atual quando o pedido não passa pela regra fixa.
+   - Texto novo do card de alerta (`[Sugestão da LLM não enviada]`).
+3. **Pendências do supervisor:**
+   - Latência do primeiro lote (~30 s no teste 10): registrar latência/decisão por avaliação no log (`tchelvis logs` não mostra os ticks disparados pelo app) e investigar.
+   - Visibilidade: terminais avaliados (decisão + horário) no `supervisor status`, inclusive os já fechados (hoje só no `auto_replies.jsonl`).
+   - A LLM ainda recebe a tela inteira e pode confundir um prompt antigo com o atual.
    - Justificativas cortadas em 200 caracteres pelo schema (cosmético).
-3. **Se o nightly estiver bom:** cortar o primeiro stable `v0.2.0` (`docs/RELEASING.md`), **com OK do usuário** (push de tag).
-4. **Próximas entregas (ver `ROADMAP.md`):** M1b modelo fallback; M1d benchmark de qualidade de decisão; M2 ícones; M3 layout compacto; M4 Inspector multi-terminal; M5b AUR/Homebrew; M6 modo delegador (ideia).
-5. **Pendências pequenas:** avisos antigos do clippy (`models.rs`, `hc.rs`, `container.rs`, testes do `watcher.rs`); aviso no `update` sobre o cache de 60 s da API; botão GPU reiniciar o `supervisor watch`.
+4. **Depois (ver `ROADMAP.md`):** M1d benchmark de qualidade de decisão; M2 ícones; M3 layout compacto; M4 Inspector multi-terminal; M5b AUR/Homebrew; M6 modo delegador (ideia).
+5. **Pendências pequenas:** avisos antigos do clippy (`guardrails.rs:26`, `models.rs`, `hc.rs`, `container.rs`, testes do `watcher.rs`); aviso no `update` sobre o cache de 60 s da API; botão GPU reiniciar o `supervisor watch`.

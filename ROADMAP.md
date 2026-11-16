@@ -4,7 +4,7 @@ Direction, milestone order, and dependencies. Behavior details and acceptance cr
 milestone belong in its own spec/plan when the milestone starts. Session-level status lives in
 [`HANDOFF.md`](HANDOFF.md).
 
-_Last updated: 2026-11-14_
+_Last updated: 2026-11-16_
 
 ## Dependency graph
 
@@ -28,13 +28,13 @@ with the UI track.
 | :-- | :-- | :-- | :-- |
 | M0 | Container validation & config hardening | — | Host validation in progress; partial TOML done (M1) |
 | M1 | Model selection in the Herdr mod ([design](docs/superpowers/specs/2026-11-14-m1-model-selection-design.md)) | M0 | **Implemented**; UI to validate on host |
-| M1b | Fallback model when the chosen one stops working | M1 | Planned |
+| M1b | Fallback model when the chosen one stops working | M1 | **Next** (starts 2026-11-17 session) |
 | M1c | Hide/delete models ([design](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md)) | M1 | **Implemented**; host validation pending |
 | M1d | Decision-quality benchmark per model | M1 | Planned |
 | M2 | Icon system replacing emojis | — | Planned |
 | M3 | Compact layout & simpler tools | M2 | Planned |
 | M4 | Inspector multi-terminal view | M3 | Planned |
-| M5a | Rename to `tchelvis` + release pipeline | M0 | **Implemented**; awaiting first nightly and host validation |
+| M5a | Rename to `tchelvis` + release pipeline | M0 | **Done** — `v0.2.0` published 2026-11-16 |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
 | M6 | Delegator mode: wake the coordinator when a worker finishes | — | Idea (not planned) |
 
