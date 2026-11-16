@@ -37,6 +37,7 @@ with the UI track.
 | M5a | Rename to `tchelvis` + release pipeline | M0 | **Done** — `v0.2.0` published 2026-11-16 |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
 | M6 | Delegator mode: wake the coordinator when a worker finishes | — | Idea (not planned) |
+| M7 | Kanban board mod: daily tasks grouped by project tag | Daily-tasks tags | Idea (not planned) |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -119,6 +120,11 @@ Users install the TUI/CLI binary through a package manager. From there, `tchelvi
 - **AUR**: `tchelvis-bin` from release artifacts; optionally a `tchelvis` source package.
 - **Homebrew (Linux)**: a tap (`fabriciof807/homebrew-tap`) with a Linux-only formula.
 - **Docker image**: deferred (D3).
+
+### M7 — Kanban board mod (idea, not planned)
+A separate mod that reads the daily tasks (`tchelvis task list --json`) and shows them as a board,
+one column per project tag (plus Geral). Tasks stay general; the tag is the only grouping key
+(decision 2026-11-16, see `docs/superpowers/specs/2026-11-16-daily-tasks-input-design.md`).
 
 ### M6 — Delegator mode (idea, not planned)
 A coordinator agent opens worker agents in Herdr terminals and should not have to poll them (as the
