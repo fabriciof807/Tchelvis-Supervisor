@@ -93,6 +93,25 @@ pub struct AutoReplyAuditEntry {
     pub summary: String,
 }
 
+/// Source of an executed `AUTO_REPLY` recorded in the durable JSONL audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReplySource {
+    FixedRule,
+    Llm,
+}
+
+/// Durable append-only JSONL audit record written to `auto_replies.jsonl`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableAutoReplyEntry {
+    pub timestamp: u64,
+    pub agent_id: String,
+    pub session_name: String,
+    pub payload: String,
+    pub source: AutoReplySource,
+    pub summary: String,
+}
+
 /// Details of an active Operator Alert Banner / Action Card.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingOperatorAction {
@@ -266,6 +285,43 @@ impl DurableStateStore {
     pub fn path(&self) -> &Path {
         &self.file_path
     }
+
+    pub fn auto_replies_log_path(&self) -> Option<PathBuf> {
+        if self.file_path.as_os_str().is_empty() {
+            return None;
+        }
+        Some(match self.file_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join("auto_replies.jsonl"),
+            _ => PathBuf::from("auto_replies.jsonl"),
+        })
+    }
+
+    /// Appends one JSON line to `auto_replies.jsonl` in the state file's directory.
+    /// No-op when `file_path` is empty.
+    pub fn append_auto_reply_log(&self, entry: &DurableAutoReplyEntry) -> Result<()> {
+        let Some(log_path) = self.auto_replies_log_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = log_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("Failed to create audit log directory {:?}", parent)
+                })?;
+            }
+        }
+        let mut line =
+            serde_json::to_string(entry).context("Failed to serialize DurableAutoReplyEntry")?;
+        line.push('\n');
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("Failed to open audit log {:?}", log_path))?;
+        use std::io::Write;
+        file.write_all(line.as_bytes())
+            .with_context(|| format!("Failed to write audit log {:?}", log_path))?;
+        Ok(())
+    }
 }
 
 /// Computes the hex-encoded SHA-256 hash of a string.
@@ -318,5 +374,51 @@ mod tests {
         assert_eq!(a.session_name, "refactor-auth");
         assert_eq!(a.lifecycle_state, LifecycleState::Working);
         assert_eq!(a.max_auto_replies, 2);
+    }
+
+    #[test]
+    fn test_auto_replies_jsonl_appends_and_survives_empty_path() {
+        let empty_store = DurableStateStore::default();
+        assert!(empty_store.auto_replies_log_path().is_none());
+        let sample = DurableAutoReplyEntry {
+            timestamp: 1000,
+            agent_id: "t1".to_string(),
+            session_name: "auth".to_string(),
+            payload: "y".to_string(),
+            source: AutoReplySource::FixedRule,
+            summary: "read-only".to_string(),
+        };
+        empty_store.append_auto_reply_log(&sample).unwrap();
+
+        let dir = tempdir().unwrap();
+        let store =
+            DurableStateStore::load_or_init(dir.path().join("supervisor_state.json")).unwrap();
+        store.append_auto_reply_log(&sample).unwrap();
+        store
+            .append_auto_reply_log(&DurableAutoReplyEntry {
+                timestamp: 1010,
+                agent_id: "t2".to_string(),
+                session_name: "tests".to_string(),
+                payload: "y".to_string(),
+                source: AutoReplySource::Llm,
+                summary: "continue".to_string(),
+            })
+            .unwrap();
+
+        let log_path = dir.path().join("auto_replies.jsonl");
+        let raw = fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["timestamp"], 1000);
+        assert_eq!(first["agent_id"], "t1");
+        assert_eq!(first["session_name"], "auth");
+        assert_eq!(first["payload"], "y");
+        assert_eq!(first["source"], "fixed_rule");
+        assert_eq!(first["summary"], "read-only");
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["source"], "llm");
+        assert_eq!(second["agent_id"], "t2");
     }
 }

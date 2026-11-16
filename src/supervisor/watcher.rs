@@ -6,8 +6,8 @@ use super::guardrails::{
 use super::hc::{HcBackend, HcSession};
 use super::ollama::{CognitiveBackend, CognitiveEvaluation, SupervisorDecision};
 use super::state::{
-    compute_sha256, AgentDurableState, AutoReplyAuditEntry, DurableStateStore, LifecycleState,
-    PendingOperatorAction, SupervisorMode, Urgency,
+    compute_sha256, AgentDurableState, AutoReplyAuditEntry, AutoReplySource, DurableAutoReplyEntry,
+    DurableStateStore, LifecycleState, PendingOperatorAction, SupervisorMode, Urgency,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -204,7 +204,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                         reason_for_operator: String::new(),
                     };
                     let eval = validate_evaluation(state, self.store.mode, raw);
-                    self.apply_decision(session, &current_hash, eval, now, &mut outcome);
+                    self.apply_decision(
+                        session,
+                        &current_hash,
+                        eval,
+                        AutoReplySource::FixedRule,
+                        now,
+                        &mut outcome,
+                    );
                     continue;
                 }
             }
@@ -268,14 +275,26 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             self.model_loaded = true;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
-            eval = sanitize_auto_reply(&output, session.kind.as_deref(), eval);
+            eval = sanitize_auto_reply(
+                &output,
+                session.kind.as_deref(),
+                session.msg.as_deref(),
+                eval,
+            );
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             if let Some(state) = self.store.agents.get_mut(&session.agent_id) {
                 state.last_eval_error = None;
                 state.last_eval_error_at = None;
             }
-            self.apply_decision(session, &current_hash, eval, now, &mut outcome);
+            self.apply_decision(
+                session,
+                &current_hash,
+                eval,
+                AutoReplySource::Llm,
+                now,
+                &mut outcome,
+            );
         }
 
         self.runtime_status = SupervisorRuntimeStatus::Watching(sessions.len());
@@ -292,70 +311,110 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         session: &HcSession,
         current_hash: &str,
         eval: CognitiveEvaluation,
+        source: AutoReplySource,
         now: u64,
         outcome: &mut TickOutcome,
     ) {
-        let state = self
-            .store
-            .agents
-            .get_mut(&session.agent_id)
-            .expect("agent state must exist");
-        state.rolling_summary = eval.updated_summary.clone();
-        state.lifecycle_state = eval.detected_state;
-        state.last_evaluated_hash = current_hash.to_string();
+        let mut decision_label = eval.decision.as_str();
+        let mut audit_entry: Option<DurableAutoReplyEntry> = None;
 
-        match eval.decision {
-            SupervisorDecision::NoOp => {}
-            SupervisorDecision::AutoReply => {
-                if self
-                    .hc
-                    .send_input(&session.agent_id, &eval.hc_command_payload, true)
-                    .is_ok()
-                {
-                    let _ = self.hc.set_labels(
-                        &session.agent_id,
-                        &[
-                            ("cockpit.state", "working"),
-                            ("cockpit.kind", ""),
-                            ("cockpit.msg", ""),
-                        ],
-                    );
-                    state.consecutive_auto_replies += 1;
-                    state.last_auto_action = Some(eval.hc_command_payload.clone());
-                    state.pending_operator_action = None;
-                    state.auto_reply_log.push(AutoReplyAuditEntry {
-                        timestamp: now,
-                        payload: eval.hc_command_payload.clone(),
-                        summary: eval.updated_summary.clone(),
+        let lifecycle_state_str = {
+            let state = self
+                .store
+                .agents
+                .get_mut(&session.agent_id)
+                .expect("agent state must exist");
+            state.rolling_summary = eval.updated_summary.clone();
+            state.lifecycle_state = eval.detected_state;
+            state.last_evaluated_hash = current_hash.to_string();
+
+            match eval.decision {
+                SupervisorDecision::NoOp => {}
+                SupervisorDecision::AutoReply => {
+                    match self
+                        .hc
+                        .send_input(&session.agent_id, &eval.hc_command_payload, true)
+                    {
+                        Ok(()) => {
+                            let _ = self.hc.set_labels(
+                                &session.agent_id,
+                                &[
+                                    ("cockpit.state", "working"),
+                                    ("cockpit.kind", ""),
+                                    ("cockpit.msg", ""),
+                                ],
+                            );
+                            state.consecutive_auto_replies += 1;
+                            state.last_auto_action = Some(eval.hc_command_payload.clone());
+                            state.pending_operator_action = None;
+                            state.last_eval_error = None;
+                            state.last_eval_error_at = None;
+                            state.auto_reply_log.push(AutoReplyAuditEntry {
+                                timestamp: now,
+                                payload: eval.hc_command_payload.clone(),
+                                summary: eval.updated_summary.clone(),
+                            });
+                            audit_entry = Some(DurableAutoReplyEntry {
+                                timestamp: now,
+                                agent_id: session.agent_id.clone(),
+                                session_name: session.session_name.clone(),
+                                payload: eval.hc_command_payload.clone(),
+                                source,
+                                summary: eval.updated_summary.clone(),
+                            });
+                            outcome.auto_replied_agents.push(session.agent_id.clone());
+                        }
+                        Err(e) => {
+                            let err_msg: String = format!("{e:#}").chars().take(300).collect();
+                            tracing::warn!(
+                                agent_id = %session.agent_id,
+                                error = %err_msg,
+                                "hc send_input failed"
+                            );
+                            state.last_eval_error = Some(format!("hc send falhou: {err_msg}"));
+                            state.last_eval_error_at = Some(now);
+                            decision_label = "AUTO_REPLY_FAILED";
+                        }
+                    }
+                }
+                SupervisorDecision::AlertOperator => {
+                    state.pending_operator_action = Some(PendingOperatorAction {
+                        urgency: eval.urgency,
+                        detected_state: eval.detected_state,
+                        reason_for_operator: eval.reason_for_operator.clone(),
+                        updated_summary: eval.updated_summary.clone(),
+                        hc_command_payload: eval.hc_command_payload.clone(),
+                        triggered_at: now,
                     });
-                    outcome.auto_replied_agents.push(session.agent_id.clone());
+                    outcome.alerted_agents.push(session.agent_id.clone());
+                    if self.config.enable_desktop_notifications
+                        && matches!(eval.urgency, Urgency::Normal | Urgency::Critical)
+                    {
+                        send_desktop_notification(&session.agent_id, &eval.reason_for_operator);
+                    }
                 }
             }
-            SupervisorDecision::AlertOperator => {
-                state.pending_operator_action = Some(PendingOperatorAction {
-                    urgency: eval.urgency,
-                    detected_state: eval.detected_state,
-                    reason_for_operator: eval.reason_for_operator.clone(),
-                    updated_summary: eval.updated_summary.clone(),
-                    hc_command_payload: eval.hc_command_payload.clone(),
-                    triggered_at: now,
-                });
-                outcome.alerted_agents.push(session.agent_id.clone());
-                if self.config.enable_desktop_notifications
-                    && matches!(eval.urgency, Urgency::Normal | Urgency::Critical)
-                {
-                    send_desktop_notification(&session.agent_id, &eval.reason_for_operator);
-                }
+
+            state.lifecycle_state.as_str()
+        };
+
+        if let Some(entry) = audit_entry {
+            if let Err(e) = self.store.append_auto_reply_log(&entry) {
+                tracing::warn!(
+                    agent_id = %session.agent_id,
+                    error = %format!("{e:#}"),
+                    "Failed to append auto-reply audit log"
+                );
             }
         }
 
         let _ = self.hc.set_labels(
             &session.agent_id,
             &[
-                ("cockpit.supervisor_state", state.lifecycle_state.as_str()),
-                ("cockpit.supervisor_decision", eval.decision.as_str()),
-                ("supervisor.state", state.lifecycle_state.as_str()),
-                ("supervisor.decision", eval.decision.as_str()),
+                ("cockpit.supervisor_state", lifecycle_state_str),
+                ("cockpit.supervisor_decision", decision_label),
+                ("supervisor.state", lifecycle_state_str),
+                ("supervisor.decision", decision_label),
             ],
         );
     }
@@ -450,6 +509,7 @@ mod tests {
         sessions: Mutex<Vec<HcSession>>,
         outputs: Mutex<VecDeque<String>>,
         sent_inputs: Mutex<Vec<(String, String, bool)>>,
+        fail_send_input: Mutex<Option<String>>,
         labels: Mutex<Vec<(String, Vec<(String, String)>)>>,
     }
 
@@ -459,6 +519,7 @@ mod tests {
                 sessions: Mutex::new(sessions),
                 outputs: Mutex::new(outputs.into_iter().map(String::from).collect()),
                 sent_inputs: Mutex::new(Vec::new()),
+                fail_send_input: Mutex::new(None),
                 labels: Mutex::new(Vec::new()),
             }
         }
@@ -479,6 +540,9 @@ mod tests {
         }
 
         fn send_input(&self, agent_id: &str, payload: &str, force: bool) -> Result<()> {
+            if let Some(err) = self.fail_send_input.lock().unwrap().as_ref() {
+                anyhow::bail!("{err}");
+            }
             self.sent_inputs.lock().unwrap().push((
                 agent_id.to_string(),
                 payload.to_string(),
@@ -1056,5 +1120,170 @@ mod tests {
             engine.hc.sent_inputs.lock().unwrap().as_slice(),
             &[("t14c".to_string(), "1".to_string(), true)]
         );
+    }
+
+    #[test]
+    fn llm_cannot_auto_reply_to_claude_permission_menu() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut session = test_session("t11g");
+        session.kind = Some("permission".to_string());
+        session.msg = Some("approve Bash: ls -la src && find . -name '*.rs'".to_string());
+        let screen = " Bash command\n\n  ls -la src && find . -name '*.rs'\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n   3. No";
+        let hc = MockHc::new(vec![session], vec![screen]);
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: "y".to_string(),
+            ..alert_eval(Urgency::Low, "y")
+        });
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.evaluated_agents, vec!["t11g"]);
+        assert!(o.auto_replied_agents.is_empty());
+        assert_eq!(o.alerted_agents, vec!["t11g"]);
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
+        assert!(!dir.path().join("auto_replies.jsonl").exists());
+
+        let card = engine.store.agents["t11g"]
+            .pending_operator_action
+            .as_ref()
+            .unwrap();
+        assert!(card.hc_command_payload.is_empty());
+        assert_eq!(card.urgency, Urgency::Normal);
+    }
+
+    #[test]
+    fn auto_replies_jsonl_records_both_paths_and_survives_agent_pruning() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+
+        // Tick 1: fast path replies to t1
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        let cognitive = MockCognitive::new(CognitiveEvaluation {
+            updated_summary: "Continuando execução.".to_string(),
+            detected_state: LifecycleState::WaitingConfirmation,
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: "y".to_string(),
+            reason_for_operator: String::new(),
+        });
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+        let o1 = engine.tick(1000).unwrap();
+        assert_eq!(o1.auto_replied_agents, vec!["t1"]);
+
+        // Tick 2: LLM path replies to t2
+        *engine.hc.sessions.lock().unwrap() = vec![test_session("t2")];
+        *engine.hc.outputs.lock().unwrap() = VecDeque::from(vec!["Continue? [y/N]".to_string()]);
+        let o2 = engine.tick(1010).unwrap();
+        assert_eq!(o2.auto_replied_agents, vec!["t2"]);
+
+        // Tick 3: all terminals closed -> agents pruned from state store
+        *engine.hc.sessions.lock().unwrap() = vec![];
+        engine.tick(1020).unwrap();
+        assert!(engine.store.agents.is_empty());
+
+        let log_path = dir.path().join("auto_replies.jsonl");
+        let raw = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<serde_json::Value> = raw
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["timestamp"], 1000);
+        assert_eq!(lines[0]["agent_id"], "t1");
+        assert_eq!(lines[0]["session_name"], "refactor-auth");
+        assert_eq!(lines[0]["payload"], "y");
+        assert_eq!(lines[0]["source"], "fixed_rule");
+        assert!(lines[0]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("ls -la src/"));
+
+        assert_eq!(lines[1]["timestamp"], 1010);
+        assert_eq!(lines[1]["agent_id"], "t2");
+        assert_eq!(lines[1]["session_name"], "refactor-auth");
+        assert_eq!(lines[1]["payload"], "y");
+        assert_eq!(lines[1]["source"], "llm");
+        assert_eq!(lines[1]["summary"], "Continuando execução.");
+    }
+
+    #[test]
+    fn failed_hc_send_records_error_and_sets_auto_reply_failed_label() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        *hc.fail_send_input.lock().unwrap() = Some("tmux pane not found".to_string());
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+
+        let o = engine.tick(1000).unwrap();
+        assert!(o.auto_replied_agents.is_empty());
+        assert!(!dir.path().join("auto_replies.jsonl").exists());
+
+        let agent = &engine.store.agents["t1"];
+        assert_eq!(agent.consecutive_auto_replies, 0);
+        assert!(agent.auto_reply_log.is_empty());
+        assert!(agent.last_auto_action.is_none());
+        assert_eq!(
+            agent.last_eval_error.as_deref(),
+            Some("hc send falhou: tmux pane not found")
+        );
+        assert_eq!(agent.last_eval_error_at, Some(1000));
+
+        let labels = engine.hc.labels.lock().unwrap();
+        let last_labels = &labels.last().unwrap().1;
+        assert!(last_labels.contains(&(
+            "cockpit.supervisor_decision".to_string(),
+            "AUTO_REPLY_FAILED".to_string()
+        )));
+        assert!(last_labels.contains(&(
+            "supervisor.decision".to_string(),
+            "AUTO_REPLY_FAILED".to_string()
+        )));
+        assert!(!labels.iter().any(|(_, pairs)| pairs
+            .iter()
+            .any(|(k, v)| k == "cockpit.state" && v == "working")));
+        drop(labels);
+
+        // Error messages longer than 300 chars are truncated in last_eval_error.
+        *engine.hc.fail_send_input.lock().unwrap() = Some("x".repeat(400));
+        *engine.hc.outputs.lock().unwrap() =
+            VecDeque::from(vec!["Bash command\n  pwd\nAllow? [y/N]".to_string()]);
+        engine.tick(1005).unwrap();
+        let err = engine.store.agents["t1"]
+            .last_eval_error
+            .as_deref()
+            .unwrap();
+        assert_eq!(
+            err.strip_prefix("hc send falhou: ")
+                .unwrap()
+                .chars()
+                .count(),
+            300
+        );
+    }
+
+    #[test]
+    fn audit_log_write_failure_does_not_stop_reply() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        // Make auto_replies.jsonl a directory so opening it for append fails.
+        std::fs::create_dir_all(dir.path().join("auto_replies.jsonl")).unwrap();
+
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t1"]);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t1".to_string(), "y".to_string(), true)]
+        );
+        assert_eq!(engine.store.agents["t1"].consecutive_auto_replies, 1);
     }
 }

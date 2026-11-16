@@ -149,18 +149,30 @@ fn yes_no_question_regex() -> &'static Regex {
     })
 }
 
+fn reject_auto_reply(mut eval: CognitiveEvaluation, note: &str) -> CognitiveEvaluation {
+    eval.decision = SupervisorDecision::AlertOperator;
+    if eval.urgency == Urgency::Low {
+        eval.urgency = Urgency::Normal;
+    }
+    eval.hc_command_payload.clear();
+    append_reason(&mut eval.reason_for_operator, note);
+    eval
+}
+
 /// Restricts what an `AUTO_REPLY` may type into a terminal to single keys: `y`, `n`, a 1–2 digit
 /// menu choice, or Enter (empty). Anything else — text copied from the screen, free-form
 /// instructions — is never typed; the evaluation becomes an operator alert without payload.
 ///
-/// `y`/`n` are only valid on a yes/no prompt (`[y/N]`, `(y/n)`, `Continue?`, `Proceed?`); there,
-/// `yes`/`no` map to `y`/`n`, and the two known small-model slips — echoing the prompt hint
-/// (`[y/N]`) or a snake_case label (`continue_readonly`) — map to `y`, since the model chose to
-/// approve. A prompt whose hc status kind is `question` is never auto-answered: choosing for the
-/// human is the operator's call. Must run after `enforce_blocked_policy`.
+/// An LLM `AUTO_REPLY` on a permission request (`kind == "permission"`, a menu with `1. Yes`, or
+/// an hc status `msg` naming a tool) is never sent; only the deterministic read-only fast path may
+/// approve those. On any numbered menu, `y`/`yes`/`n`/`no` and empty Enter are rejected; only digit
+/// keys may be used. Plain yes/no prompts (`[y/N]`, `(y/n)`, `Continue?`, `Proceed?`) that are
+/// not permission requests or numbered menus keep `y`/`n` normalization. A prompt whose hc status
+/// kind is `question` is never auto-answered. Must run after `enforce_blocked_policy`.
 pub fn sanitize_auto_reply(
     output: &str,
     kind: Option<&str>,
+    msg: Option<&str>,
     mut eval: CognitiveEvaluation,
 ) -> CognitiveEvaluation {
     if eval.decision != SupervisorDecision::AutoReply {
@@ -169,41 +181,59 @@ pub fn sanitize_auto_reply(
     let raw = eval.hc_command_payload.trim().to_string();
     let p = raw.to_lowercase();
     let area = pending_prompt_area(output);
-    let yes_no_prompt =
-        yn_prompt_regex().is_match(&area) || yes_no_question_regex().is_match(&area);
-    let is_key = |k: &str| k.is_empty() || (k.len() <= 2 && k.chars().all(|c| c.is_ascii_digit()));
-    let normalized = if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
-        None
-    } else {
-        match p.as_str() {
-            "y" | "yes" if yes_no_prompt => Some("y".to_string()),
-            "n" | "no" if yes_no_prompt => Some("n".to_string()),
-            _ if yes_no_prompt
-                && (yn_hint_payload_regex().is_match(&p)
-                    || identifier_payload_regex().is_match(&p)) =>
-            {
-                Some("y".to_string())
-            }
-            k if is_key(k) => Some(k.to_string()),
-            _ => None,
+    let [menu_yes, menu_item, ..] = fast_path_regexes();
+    let area_lines: Vec<&str> = area.lines().map(str::trim).collect();
+
+    if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
+        let shown: String = raw.chars().take(60).collect();
+        return reject_auto_reply(
+            eval,
+            &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
+        );
+    }
+
+    let is_permission_request = kind.is_some_and(|k| k.eq_ignore_ascii_case("permission"))
+        || area_lines.iter().any(|l| menu_yes.is_match(l))
+        || msg.is_some_and(|m| status_msg_regex().is_match(m.trim()));
+    if is_permission_request {
+        return reject_auto_reply(
+            eval,
+            "[Resposta automática bloqueada: pedido de permissão fora da lista de leitura]",
+        );
+    }
+
+    let has_menu_item = area_lines.iter().any(|l| menu_item.is_match(l));
+    let yes_no_prompt = !has_menu_item
+        && (yn_prompt_regex().is_match(&area) || yes_no_question_regex().is_match(&area));
+    let is_digit_key =
+        |k: &str| !k.is_empty() && k.len() <= 2 && k.chars().all(|c| c.is_ascii_digit());
+    let is_key = |k: &str| (!has_menu_item && k.is_empty()) || is_digit_key(k);
+
+    let normalized = match p.as_str() {
+        "y" | "yes" if yes_no_prompt => Some("y".to_string()),
+        "n" | "no" if yes_no_prompt => Some("n".to_string()),
+        _ if yes_no_prompt
+            && (yn_hint_payload_regex().is_match(&p)
+                || identifier_payload_regex().is_match(&p)) =>
+        {
+            Some("y".to_string())
         }
+        k if is_key(k) => Some(k.to_string()),
+        _ => None,
     };
     match normalized {
-        Some(key) => eval.hc_command_payload = key,
+        Some(key) => {
+            eval.hc_command_payload = key;
+            eval
+        }
         None => {
-            eval.decision = SupervisorDecision::AlertOperator;
-            if eval.urgency == Urgency::Low {
-                eval.urgency = Urgency::Normal;
-            }
-            eval.hc_command_payload.clear();
             let shown: String = raw.chars().take(60).collect();
-            append_reason(
-                &mut eval.reason_for_operator,
+            reject_auto_reply(
+                eval,
                 &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
-            );
+            )
         }
     }
-    eval
 }
 
 fn fast_path_regexes() -> &'static [Regex; 6] {
@@ -638,7 +668,12 @@ mod tests {
     #[test]
     fn sanitize_yn_prompt_echoed_hint_becomes_y() {
         // Test 2 / safe-ls: the model sent the literal "[y/N]" copied from the screen.
-        let out = sanitize_auto_reply("List files in src/?\nProceed? [y/N]", None, auto("[y/N]"));
+        let out = sanitize_auto_reply(
+            "List files in src/?\nProceed? [y/N]",
+            None,
+            None,
+            auto("[y/N]"),
+        );
         assert_eq!(out.decision, SupervisorDecision::AutoReply);
         assert_eq!(out.hc_command_payload, "y");
     }
@@ -647,28 +682,28 @@ mod tests {
     fn sanitize_yn_prompt_maps_words_and_case() {
         let area = "Read README.md? (y/n)";
         assert_eq!(
-            sanitize_auto_reply(area, None, auto(" Yes ")).hc_command_payload,
+            sanitize_auto_reply(area, None, None, auto(" Yes ")).hc_command_payload,
             "y"
         );
         assert_eq!(
-            sanitize_auto_reply(area, None, auto("N")).hc_command_payload,
+            sanitize_auto_reply(area, None, None, auto("N")).hc_command_payload,
             "n"
         );
         assert_eq!(
-            sanitize_auto_reply(area, None, auto("continue_readonly")).hc_command_payload,
+            sanitize_auto_reply(area, None, None, auto("continue_readonly")).hc_command_payload,
             "y"
         );
     }
 
     #[test]
     fn sanitize_free_text_becomes_alert_without_payload() {
-        let out = sanitize_auto_reply("Proceed? [y/N]", None, auto("sure, go ahead"));
+        let out = sanitize_auto_reply("Proceed? [y/N]", None, None, auto("sure, go ahead"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert_eq!(out.urgency, Urgency::Normal);
         assert!(out.hc_command_payload.is_empty());
         assert!(out.reason_for_operator.contains("sure, go ahead"));
 
-        let out = sanitize_auto_reply("Waiting for input...", None, auto("cargo test"));
+        let out = sanitize_auto_reply("Waiting for input...", None, None, auto("cargo test"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert!(out.hc_command_payload.is_empty());
     }
@@ -677,14 +712,14 @@ mod tests {
     fn sanitize_numbered_choice_and_enter_allowed() {
         let menu = "Which one?\n1. Keep\n2. Replace\n3. Abort\nChoose:";
         assert_eq!(
-            sanitize_auto_reply(menu, None, auto("2")).hc_command_payload,
+            sanitize_auto_reply(menu, None, None, auto("2")).hc_command_payload,
             "2"
         );
         assert_eq!(
-            sanitize_auto_reply(menu, None, auto("Replace")).decision,
+            sanitize_auto_reply(menu, None, None, auto("Replace")).decision,
             SupervisorDecision::AlertOperator
         );
-        let enter = sanitize_auto_reply("Press Enter to continue", None, auto(""));
+        let enter = sanitize_auto_reply("Press Enter to continue", None, None, auto(""));
         assert_eq!(enter.decision, SupervisorDecision::AutoReply);
         assert_eq!(enter.hc_command_payload, "");
     }
@@ -693,7 +728,7 @@ mod tests {
     fn sanitize_leaves_other_decisions_untouched() {
         let alert = sample_eval(SupervisorDecision::AlertOperator, "n");
         assert_eq!(
-            sanitize_auto_reply("rm -rf? [y/N]", None, alert.clone()),
+            sanitize_auto_reply("rm -rf? [y/N]", None, None, alert.clone()),
             alert
         );
     }
@@ -702,7 +737,7 @@ mod tests {
     fn sanitize_y_on_numbered_question_becomes_alert() {
         // Test 4 / pergunta: "Responda 1, 2 ou 3" got "y" typed.
         let q = "Qual banco usar?\n1) Postgres\n2) SQLite\n3) Mongo\nResponda 1, 2 ou 3:";
-        let out = sanitize_auto_reply(q, None, auto("y"));
+        let out = sanitize_auto_reply(q, None, None, auto("y"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert!(out.hc_command_payload.is_empty());
     }
@@ -710,15 +745,20 @@ mod tests {
     #[test]
     fn sanitize_question_kind_is_never_auto_answered() {
         let q = "Qual banco usar?\n1) Postgres\n2) SQLite\nResponda 1 ou 2:";
-        let out = sanitize_auto_reply(q, Some("question"), auto("2"));
+        let out = sanitize_auto_reply(q, Some("question"), None, auto("2"));
         assert_eq!(out.decision, SupervisorDecision::AlertOperator);
         assert!(out.hc_command_payload.is_empty());
-        // A permission menu (Claude Code style) may still be answered with a number.
-        let perm = "Allow Bash(ls)?\n1. Yes\n2. No";
+        // A non-permission numbered menu without "question" kind may still be answered with a number,
+        // while a permission menu is blocked on the LLM path.
+        let choice = "Which mode?\n1. Fast\n2. Thorough";
         assert_eq!(
-            sanitize_auto_reply(perm, Some("permission"), auto("1")).hc_command_payload,
+            sanitize_auto_reply(choice, None, None, auto("1")).hc_command_payload,
             "1"
         );
+        let perm = "Allow Bash(ls)?\n1. Yes\n2. No";
+        let perm_out = sanitize_auto_reply(perm, Some("permission"), None, auto("1"));
+        assert_eq!(perm_out.decision, SupervisorDecision::AlertOperator);
+        assert!(perm_out.hc_command_payload.is_empty());
     }
 
     #[test]
@@ -897,5 +937,75 @@ mod tests {
         );
         // Claude's folder-trust dialog has no "1. Yes" and no msg: never answered.
         assert_eq!(readonly_fast_path_with_msg("Do you trust the files in this folder?\n❯ 1. No, exit\n  2. Yes, I trust this folder", None, None), None);
+    }
+
+    #[test]
+    fn sanitize_blocks_llm_auto_reply_on_claude_permission_menu() {
+        let menu = "Bash command\n\n  ls -la src && find . -name '*.rs'\n\nDo you want to proceed?\n❯ 1. Yes\n  2. Yes, and don't ask again for ls/find in /home/user/project\n  3. No";
+
+        // Fast path rejects `&&`, and LLM proposing `y` or `1` must become ALERT_OPERATOR.
+        assert_eq!(readonly_fast_path_with_msg(menu, None, None), None);
+
+        for payload in ["y", "1"] {
+            let out = sanitize_auto_reply(menu, None, None, auto(payload));
+            assert_eq!(
+                out.decision,
+                SupervisorDecision::AlertOperator,
+                "payload {payload}"
+            );
+            assert_eq!(out.urgency, Urgency::Normal);
+            assert!(out.hc_command_payload.is_empty());
+            assert!(out
+                .reason_for_operator
+                .contains("pedido de permissão fora da lista de leitura"));
+        }
+
+        // Critical urgency is preserved when blocking a permission-menu auto-reply.
+        let mut critical = auto("1");
+        critical.urgency = Urgency::Critical;
+        let out = sanitize_auto_reply(menu, None, None, critical);
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert_eq!(out.urgency, Urgency::Critical);
+        assert!(out.hc_command_payload.is_empty());
+
+        // Real Claude touch fixture with kind + msg is also blocked on the LLM path.
+        let msg = "approve Bash: touch /home/user/.claude/jobs/job1/tmp/real-claude/marcador.txt";
+        let out = sanitize_auto_reply(CLAUDE_TOUCH, Some("permission"), Some(msg), auto("1"));
+        assert_eq!(out.decision, SupervisorDecision::AlertOperator);
+        assert!(out.hc_command_payload.is_empty());
+    }
+
+    #[test]
+    fn sanitize_blocks_llm_auto_reply_on_permission_kind_or_status_msg() {
+        let yn = "Continue? [y/N]";
+        let by_kind = sanitize_auto_reply(yn, Some("permission"), None, auto("y"));
+        assert_eq!(by_kind.decision, SupervisorDecision::AlertOperator);
+        assert!(by_kind.hc_command_payload.is_empty());
+
+        let by_msg = sanitize_auto_reply(yn, None, Some("approve Bash: cargo build"), auto("y"));
+        assert_eq!(by_msg.decision, SupervisorDecision::AlertOperator);
+        assert!(by_msg.hc_command_payload.is_empty());
+
+        // Plain yes/no prompt with no permission signal keeps today's behaviour.
+        let plain = sanitize_auto_reply(yn, None, None, auto("y"));
+        assert_eq!(plain.decision, SupervisorDecision::AutoReply);
+        assert_eq!(plain.hc_command_payload, "y");
+    }
+
+    #[test]
+    fn sanitize_rejects_yn_and_enter_on_numbered_menu() {
+        let menu = "Do you want to proceed?\n1. Continue\n2. Abort";
+        for bad in ["y", "yes", "n", "no", ""] {
+            let out = sanitize_auto_reply(menu, None, None, auto(bad));
+            assert_eq!(
+                out.decision,
+                SupervisorDecision::AlertOperator,
+                "payload '{bad}' should be rejected on numbered menu"
+            );
+            assert!(out.hc_command_payload.is_empty());
+        }
+        let digit = sanitize_auto_reply(menu, None, None, auto("1"));
+        assert_eq!(digit.decision, SupervisorDecision::AutoReply);
+        assert_eq!(digit.hc_command_payload, "1");
     }
 }
