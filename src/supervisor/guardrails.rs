@@ -149,6 +149,38 @@ fn yes_no_question_regex() -> &'static Regex {
     })
 }
 
+fn cjk_noise_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"\s*[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}]+").expect("valid CJK regex")
+    })
+}
+
+/// Removes CJK runs that small models leak into Portuguese/English text (`git 清 reset`).
+fn strip_cjk_noise(text: &str) -> String {
+    cjk_noise_regex().replace_all(text, "").into_owned()
+}
+
+/// Cleans the operator-facing text after all guardrails ran. The LLM writes its reason to justify
+/// the decision it chose; when that was `AUTO_REPLY` and a guardrail turned it into an alert, the
+/// card must not read as if the reply had been sent.
+pub fn tidy_operator_reason(
+    llm_decision: SupervisorDecision,
+    mut eval: CognitiveEvaluation,
+) -> CognitiveEvaluation {
+    eval.reason_for_operator = strip_cjk_noise(&eval.reason_for_operator);
+    eval.updated_summary = strip_cjk_noise(&eval.updated_summary);
+    if llm_decision == SupervisorDecision::AutoReply
+        && eval.decision == SupervisorDecision::AlertOperator
+    {
+        eval.reason_for_operator = format!(
+            "[Sugestão da LLM não enviada] {}",
+            eval.reason_for_operator.trim_start()
+        );
+    }
+    eval
+}
+
 fn reject_auto_reply(mut eval: CognitiveEvaluation, note: &str) -> CognitiveEvaluation {
     eval.decision = SupervisorDecision::AlertOperator;
     if eval.urgency == Urgency::Low {
@@ -1007,5 +1039,43 @@ mod tests {
         let digit = sanitize_auto_reply(menu, None, None, auto("1"));
         assert_eq!(digit.decision, SupervisorDecision::AutoReply);
         assert_eq!(digit.hc_command_payload, "1");
+    }
+
+    #[test]
+    fn rejected_llm_reply_is_labelled_as_not_sent() {
+        let mut eval = sample_eval(SupervisorDecision::AlertOperator, "n");
+        eval.reason_for_operator =
+            "AUTO_REPLY aplicada porque o comando é seguro. [Limite de auto-resposta atingido]"
+                .to_string();
+        let out = tidy_operator_reason(SupervisorDecision::AutoReply, eval);
+        assert_eq!(
+            out.reason_for_operator,
+            "[Sugestão da LLM não enviada] AUTO_REPLY aplicada porque o comando é seguro. \
+             [Limite de auto-resposta atingido]"
+        );
+    }
+
+    #[test]
+    fn reason_is_untouched_when_llm_did_not_ask_for_a_reply() {
+        let alert = sample_eval(SupervisorDecision::AlertOperator, "");
+        let out = tidy_operator_reason(SupervisorDecision::AlertOperator, alert.clone());
+        assert_eq!(out.reason_for_operator, alert.reason_for_operator);
+
+        let reply = sample_eval(SupervisorDecision::AutoReply, "y");
+        let out = tidy_operator_reason(SupervisorDecision::AutoReply, reply.clone());
+        assert_eq!(out.reason_for_operator, reply.reason_for_operator);
+    }
+
+    #[test]
+    fn cjk_noise_from_small_models_is_removed_from_operator_text() {
+        let mut eval = sample_eval(SupervisorDecision::AlertOperator, "");
+        eval.reason_for_operator = "Etapa 3 pede git 清 reset; ação não executada.".to_string();
+        eval.updated_summary = "Rodando git 清理 clean".to_string();
+        let out = tidy_operator_reason(SupervisorDecision::AlertOperator, eval);
+        assert_eq!(
+            out.reason_for_operator,
+            "Etapa 3 pede git reset; ação não executada."
+        );
+        assert_eq!(out.updated_summary, "Rodando git clean");
     }
 }

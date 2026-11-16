@@ -1,7 +1,7 @@
 use super::config::SupervisorConfig;
 use super::guardrails::{
     enforce_blocked_policy, has_error_or_loop_signature, readonly_fast_path_with_msg,
-    sanitize_auto_reply, validate_evaluation,
+    sanitize_auto_reply, tidy_operator_reason, validate_evaluation,
 };
 use super::hc::{HcBackend, HcSession};
 use super::ollama::{CognitiveBackend, CognitiveEvaluation, SupervisorDecision};
@@ -273,6 +273,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 }
             };
             self.model_loaded = true;
+            let llm_decision = raw_eval.decision;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
             eval = sanitize_auto_reply(
@@ -281,6 +282,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 session.msg.as_deref(),
                 eval,
             );
+            eval = tidy_operator_reason(llm_decision, eval);
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             if let Some(state) = self.store.agents.get_mut(&session.agent_id) {
