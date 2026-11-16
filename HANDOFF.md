@@ -1,6 +1,6 @@
 # Handoff — Cockpit (Unified Fleet Control Plane + Durable Supervisor)
 
-**Data da última atualização:** 2026-11-16  
+**Data da última atualização:** 2026-11-16 (sessão 2)  
 **Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
 **Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`). Primeiro stable publicado: **`v0.2.0`** (`a6a81d1`, 2026-11-16); nightly atual = `a6a81d1`.
 
@@ -153,10 +153,29 @@ O **Cockpit** unifica o **Fleet Attention Queue & 4-Tier Context Correlator**, o
 - **`v0.2.0`** (`a6a81d1`, `chore(release): v0.2.0`): CHANGELOG completado (regra fixa, jsonl, M1c, Fleet em árvore, política de auto-resposta, attach por endereço) e movido para `## [0.2.0]`; tag enviada; release estável com binários `x86_64`/`aarch64`, `.sha256`, `SHA256SUMS` e notas. `install.sh --channel stable` validado no `ai-box` (`tchelvis 0.2.0 (stable a6a81d1)`). No host: `tchelvis update --channel stable`.
 - Abertos do teste 10: latência do 1º lote ~30 s (teste 9: 10–13 s; lotes seguintes 12–20 s), não investigada; `supervisor status` não mostra o histórico de terminais fechados (só o jsonl).
 
+### Atualização — 2026-11-16 (sessão 2): specs do M1b e das Tarefas do dia
+Só documentação; nenhum código mudou. As duas specs **aguardam aprovação do usuário**.
+- **M1b — modelo fallback, fase 1 via API** (`docs/superpowers/specs/2026-11-16-m1b-fallback-model-design.md`, `a5ff2c8` + `1e43a81`). Decisões do usuário:
+  - Gatilhos: **load falhou** ou **health check falhou** (2 ticks seguidos). Erros repetidos de avaliação/JSON ficam para depois.
+  - Volta ao principal **só quando o usuário pedir**: botão `Voltar ao principal` no card e `tchelvis supervisor fallback off`. Se o principal falhar de novo, continua no fallback.
+  - Pill: `● LLM: <modelo> (Fallback)` em tom de aviso. Card **Supervisor model** com duas seções explícitas: `PRINCIPAL (local)` e `FALLBACK (API)` (abordagem A; `Trocar` lista o `/v1/models` do endpoint).
+  - Chave: arquivo `~/.config/tchelvis/fallback_api_key` (0600), gravado por `tchelvis supervisor fallback key` via stdin; ordem `TCHELVIS_FALLBACK_API_KEY` → arquivo → `TCHELVIS_LLM_API_KEY` → chave do provedor **casada pelo host** (`OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY` para OpenCode Go `https://opencode.ai/zen/go/v1`). A mesma tabela substitui a cadeia cega do backend principal `openai-compatible`.
+  - O que encerra o fallback: Unload LLM (para tudo), zero-idle, `Voltar ao principal`/Load LLM com sucesso. Paused mantém mas não avalia.
+  - Calls meus registrados na spec: flag persistido `primary_intended` (hoje `tick` zera `model_loaded` quando o container cai, então não serve de gatilho); falha em troca de modelo/GPU também ativa; estado em `~/.local/state/tchelvis/supervisor_fallback.json` com lock, lido a cada tick (daemon e ticks do app concorrem); só modo container.
+  - Fase 2 (fora): fallback local em container (`fallback_model_id`).
+- **Tarefas do dia — texto longo e escolha de etiqueta** (`docs/superpowers/specs/2026-11-16-daily-tasks-input-design.md`, `34a95b1`, spec curta). Decisões do usuário:
+  - Tarefas são todas gerais; projeto é **só etiqueta visual** (sem filtro). Etiquetas = projetos da Home + **Geral**.
+  - Abordagem C: campo inline que cresce e quebra linha (Shift+Enter nova linha, Enter salva) **e** botão `✎` que abre `$EDITOR` via `tchelvis task add --edit`.
+  - Título e etiqueta inteiros na lista (sem `ellipsize`); menu de etiqueta ao clicar em `📁`; corrigir bug da pílula (mostra o Space ativo, `main.js:3427`, mas salva sem projeto, `main.js:1989`).
+- **ROADMAP:** novo **M7 — mod de board kanban** (ideia) que lê as tarefas e agrupa por etiqueta.
+
 ---
 
 ## 2. Histórico de Commits Recentes (`main`)
 
+- `34a95b1` — spec curta Tarefas do dia (texto longo, `✎` editor, menu de etiqueta); M7 kanban no roadmap
+- `1e43a81` / `a5ff2c8` — spec M1b fallback (fase 1 API; chaves casadas pelo host incl. DeepSeek e OpenCode Go)
+- `60c7ab8` — handoff: teste 10 passou, `v0.2.0`
 - `a6a81d1` — `chore(release): v0.2.0` (tag `v0.2.0`)
 - `e394340` — card de alerta não parece resposta enviada; remove ruído CJK
 - `45d276a` — LLM nunca aprova permissão; `auto_replies.jsonl`; `AUTO_REPLY_FAILED`
@@ -242,10 +261,10 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Próxima sessão: M1b — modelo fallback** (decisão do usuário, 2026-11-16). Ver `ROADMAP.md` § M1b.
-   - Começar pelo brainstorming/spec: definir "parou de funcionar" (load falhou, health check falhou, erros repetidos de avaliação/JSON), quando volta ao modelo principal, e como o mod mostra que o fallback está ativo.
-   - Já existe: chave `[llm_container] fallback_model_id` (`src/supervisor/container.rs:106`), usada hoje só para proteger o modelo no `model rm` (`src/supervisor/mod.rs:417`); `last_eval_error` por agente; spec M1 (`docs/superpowers/specs/2026-11-14-m1-model-selection-design.md`, non-goals).
-   - Fluxo de sempre: spec → plano → Hydrogen em worktree → revisão → push com OK.
+1. **Próxima sessão: aprovar as duas specs e implementar.**
+   - O usuário ainda precisa aprovar: `docs/superpowers/specs/2026-11-16-m1b-fallback-model-design.md` e `docs/superpowers/specs/2026-11-16-daily-tasks-input-design.md`.
+   - Depois: `superpowers:writing-plans` para cada uma → Hydrogen em worktrees separadas → revisão → push com OK. Os dois mexem em cards diferentes do `main.js`; integrar um de cada vez.
+   - M1b: confirmar o endpoint/variável da OpenCode Go em `opencode.ai/docs/go` antes de implementar (veio de docs da Docker/LiteLLM); modelos da OpenCode Go em formato Anthropic não funcionam na fase 1.
 2. **Validar no host** (com `v0.2.0`, reiniciar o Herdr Desktop):
    - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
    - Card de modelos: Ocultar/Mostrar e Apagar (segundo clique `Delete <size>?`); `ollama rm` real nunca foi testado.
