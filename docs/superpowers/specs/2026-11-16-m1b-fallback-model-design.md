@@ -81,10 +81,26 @@ model = "openai/gpt-4.1-mini"
   out of shell history). Reason: ticks started by the Herdr Desktop app do not reliably inherit the
   user's shell environment (same reason the GPU toggle has its own file), so an env-only key would
   make the mod and the CLI disagree.
-- Key resolution order: `TCHELVIS_FALLBACK_API_KEY` env → key file. *(My call: the existing
-  `TCHELVIS_LLM_API_KEY`/`OPENAI_API_KEY`/`OPENROUTER_API_KEY` chain is **not** used for the
-  fallback, so a key exported for something else never silently enables sending terminal output
-  to a remote API.)* Keys are never written to the TOML, snapshot, mod, or logs.
+- Key resolution order: `TCHELVIS_FALLBACK_API_KEY` env → key file → `TCHELVIS_LLM_API_KEY` →
+  the **provider key that matches the fallback host** (user request: also read DeepSeek and
+  OpenCode Go keys besides the existing three):
+
+  | Host contains | Env var |
+  | :-- | :-- |
+  | `openai.com` | `OPENAI_API_KEY` |
+  | `openrouter.ai` | `OPENROUTER_API_KEY` |
+  | `deepseek.com` | `DEEPSEEK_API_KEY` |
+  | `opencode.ai` (OpenCode Go, `https://opencode.ai/zen/go/v1`) | `OPENCODE_API_KEY` |
+
+  *(My call: a provider key is only sent to its own provider's host — never an OpenAI key to
+  DeepSeek, etc. Sending terminal output still requires the user to set `host` + `model`
+  explicitly, so an exported key alone never enables the fallback.)* The same host-matched table
+  replaces today's blind chain in `resolve_api_key_from_env` for the primary
+  `openai-compatible` backend, so the two paths agree. Keys are never written to the TOML,
+  snapshot, mod, or logs.
+- OpenCode Go serves some models only in Anthropic format (e.g. MiniMax); phase 1 speaks only
+  `/v1/chat/completions`, so such a model fails like any other evaluation error. *(Known limitation;
+  the builder may filter them out of `fallback models` if the listing marks them.)*
 - Writes go through `config_write.rs` (`toml_edit`, atomic rename), like model selection.
 
 ### Runtime state (shared between daemon and CLI)
