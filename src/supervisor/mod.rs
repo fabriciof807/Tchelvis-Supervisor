@@ -165,38 +165,46 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
 pub fn load_model() -> Result<DesktopModSnapshot> {
     let config = SupervisorConfig::load();
     if config.container_mode_active() {
-        let candidates = config.runtime_candidates();
-        if candidates.is_empty() {
-            anyhow::bail!("Nenhum runtime de container encontrado (kiri/podman/docker)");
-        }
-        let ollama_roots = container::default_ollama_roots();
-        let model = container::resolve_model_source(
-            &config.llm_container,
-            &config.ollama_model,
-            &ollama_roots,
-        )?;
-        let model_id = models::effective_model(&config, &ollama_roots)
-            .map(|m| m.id)
-            .unwrap_or_default();
-        let host = config.effective_primary_host();
-        let pref_path = config::runtime_pref_path();
-        let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
-        container::start_with_fallback(
-            &candidates,
-            config.effective_num_gpu(),
-            &model,
-            &model_id,
-            gpu,
-            Some(&pref_path),
-            |rt| {
-                container::LlmContainer::new(
-                    rt,
-                    config.llm_container.clone(),
-                    container::SystemContainerCli,
-                )
-            },
-            || container::wait_healthy(&host, Duration::from_secs(90)),
-        )?;
+        let start_res = (|| -> Result<()> {
+            let candidates = config.runtime_candidates();
+            if candidates.is_empty() {
+                anyhow::bail!("Nenhum runtime de container encontrado (kiri/podman/docker)");
+            }
+            let ollama_roots = container::default_ollama_roots();
+            let model = container::resolve_model_source(
+                &config.llm_container,
+                &config.ollama_model,
+                &ollama_roots,
+            )?;
+            let model_id = models::effective_model(&config, &ollama_roots)
+                .map(|m| m.id)
+                .unwrap_or_default();
+            let host = config.effective_primary_host();
+            let pref_path = config::runtime_pref_path();
+            let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
+            container::start_with_fallback(
+                &candidates,
+                config.effective_num_gpu(),
+                &model,
+                &model_id,
+                gpu,
+                Some(&pref_path),
+                |rt| {
+                    container::LlmContainer::new(
+                        rt,
+                        config.llm_container.clone(),
+                        container::SystemContainerCli,
+                    )
+                },
+                || container::wait_healthy(&host, Duration::from_secs(90)),
+            )?;
+            Ok(())
+        })();
+        let provider = fallback::LiveFallback {
+            state_path: fallback::fallback_state_path(),
+            primary: config.clone(),
+        };
+        fallback::finish_primary_start(&provider, start_res, unix_now_secs())?;
     } else {
         let client = OllamaClient::new(config.clone());
         client.warm_model()?;
@@ -218,6 +226,10 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
 pub fn unload_model() -> Result<DesktopModSnapshot> {
     let mut engine = build_default_engine()?;
     engine.cognitive.unload_model()?;
+    if engine.config.container_mode_active() {
+        let _ = engine.fallback.update_state(&mut fallback::primary_stopped);
+        engine.refresh_fallback_state();
+    }
     engine.model_loaded = false;
     engine.store.model_loaded = false;
     let _ = engine.store.save();
@@ -244,23 +256,35 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
                 container::SystemContainerCli,
             );
             if matches!(mgr.state(), Ok(container::ContainerState::Running)) {
+                let provider = fallback::LiveFallback {
+                    state_path: fallback::fallback_state_path(),
+                    primary: config.clone(),
+                };
                 if warm {
-                    let ollama_roots = container::default_ollama_roots();
-                    let model = container::resolve_model_source(
-                        &config.llm_container,
-                        &config.ollama_model,
-                        &ollama_roots,
-                    )?;
-                    let model_id = models::effective_model(&config, &ollama_roots)
-                        .map(|m| m.id)
-                        .unwrap_or_default();
-                    let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
-                    mgr.start(config.effective_num_gpu(), &model, &model_id, gpu)?;
-                    let host = config.effective_primary_host();
-                    container::wait_healthy(&host, Duration::from_secs(90))?;
+                    let res = (|| -> Result<()> {
+                        let ollama_roots = container::default_ollama_roots();
+                        let model = container::resolve_model_source(
+                            &config.llm_container,
+                            &config.ollama_model,
+                            &ollama_roots,
+                        )?;
+                        let model_id = models::effective_model(&config, &ollama_roots)
+                            .map(|m| m.id)
+                            .unwrap_or_default();
+                        let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
+                        mgr.start(config.effective_num_gpu(), &model, &model_id, gpu)?;
+                        let host = config.effective_primary_host();
+                        container::wait_healthy(&host, Duration::from_secs(90))?;
+                        Ok(())
+                    })();
+                    fallback::finish_primary_start(&provider, res, unix_now_secs())?;
                     loaded_after = true;
                 } else {
                     let _ = mgr.stop();
+                    let _ = fallback::update_state(
+                        &fallback::fallback_state_path(),
+                        fallback::primary_stopped,
+                    );
                 }
             }
         }
@@ -489,27 +513,133 @@ fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
     if !matches!(mgr.state(), Ok(container::ContainerState::Running)) {
         return Ok(());
     }
-    let ollama_roots = container::default_ollama_roots();
-    let model =
-        container::resolve_model_source(&cfg.llm_container, &cfg.ollama_model, &ollama_roots)?;
-    let eff = models::effective_model(cfg, &ollama_roots);
-    let display = eff
-        .as_ref()
-        .map(|e| e.display_name.as_str())
-        .unwrap_or("modelo selecionado");
-    let eff_id = eff.as_ref().map(|e| e.id.as_str()).unwrap_or("");
-    let (gpu, _) = container::resolve_gpu_backend(&cfg.llm_container);
+    let res = (|| -> Result<()> {
+        let ollama_roots = container::default_ollama_roots();
+        let model =
+            container::resolve_model_source(&cfg.llm_container, &cfg.ollama_model, &ollama_roots)?;
+        let eff = models::effective_model(cfg, &ollama_roots);
+        let display = eff
+            .as_ref()
+            .map(|e| e.display_name.as_str())
+            .unwrap_or("modelo selecionado");
+        let eff_id = eff.as_ref().map(|e| e.id.as_str()).unwrap_or("");
+        let (gpu, _) = container::resolve_gpu_backend(&cfg.llm_container);
 
-    let start_and_wait = mgr
-        .start(cfg.effective_num_gpu(), &model, eff_id, gpu)
-        .and_then(|_| {
-            container::wait_healthy(&cfg.effective_primary_host(), Duration::from_secs(90))
-        });
-    if let Err(err) = start_and_wait {
-        let _ = mgr.stop();
-        anyhow::bail!("Falha ao carregar modelo {display}: {err}");
+        let start_and_wait = mgr
+            .start(cfg.effective_num_gpu(), &model, eff_id, gpu)
+            .and_then(|_| {
+                container::wait_healthy(&cfg.effective_primary_host(), Duration::from_secs(90))
+            });
+        if let Err(err) = start_and_wait {
+            let _ = mgr.stop();
+            anyhow::bail!("Falha ao carregar modelo {display}: {err}");
+        }
+        Ok(())
+    })();
+    if cfg.container_mode_active() {
+        let provider = fallback::LiveFallback {
+            state_path: fallback::fallback_state_path(),
+            primary: cfg.clone(),
+        };
+        fallback::finish_primary_start(&provider, res, unix_now_secs())
+    } else {
+        res
     }
-    Ok(())
+}
+
+/// Attempts to return to the primary local model (`load_model`). Clears fallback only on success.
+pub fn fallback_off() -> Result<DesktopModSnapshot> {
+    load_model()
+}
+
+/// Returns the fallback configuration and runtime state (never includes the API key).
+pub fn fallback_status() -> fallback::FallbackInfo {
+    let cfg = SupervisorConfig::load();
+    let key_present = fallback::resolve_fallback_key(
+        &cfg.fallback.host,
+        fallback::read_key_file(&fallback::fallback_key_path()),
+        |k| std::env::var(k).ok(),
+    )
+    .is_some();
+    let state = fallback::load_state(&fallback::fallback_state_path());
+    fallback::fallback_snapshot_info(&cfg.fallback, key_present, &state)
+}
+
+/// Returns the name of the active fallback key source (never the key value itself).
+pub fn fallback_key_source(host: &str) -> Option<&'static str> {
+    fallback::resolve_fallback_key_with_source(
+        host,
+        fallback::read_key_file(&fallback::fallback_key_path()),
+        |k| std::env::var(k).ok(),
+    )
+    .map(|(_, src)| src)
+}
+
+/// Updates `[fallback] host` and/or `model` in `supervisor.toml` and returns updated status.
+pub fn fallback_set(host: Option<&str>, model: Option<&str>) -> Result<fallback::FallbackInfo> {
+    if host.is_none() && model.is_none() {
+        anyhow::bail!("informe --host e/ou --model");
+    }
+    config_write::write_fallback(&config::supervisor_config_path(), host, model)?;
+    Ok(fallback_status())
+}
+
+/// Saves the fallback API key from `r` into `~/.config/tchelvis/fallback_api_key` (0600).
+pub fn fallback_key_from_reader(r: impl std::io::Read) -> Result<()> {
+    fallback::write_key_from_reader(&fallback::fallback_key_path(), r)
+}
+
+/// Queries `GET {host}/v1/models` on the configured fallback endpoint using the resolved key.
+pub fn fallback_models(filter: Option<&str>) -> Result<Vec<String>> {
+    let cfg = SupervisorConfig::load();
+    let host = cfg.fallback.host.trim();
+    if host.is_empty() {
+        anyhow::bail!("nenhum host de fallback configurado (use `tchelvis supervisor fallback set --host <url>`)");
+    }
+    let key = fallback::resolve_fallback_key(
+        host,
+        fallback::read_key_file(&fallback::fallback_key_path()),
+        |k| std::env::var(k).ok(),
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "nenhuma chave de API encontrada para o fallback (rode `tchelvis supervisor fallback key`)"
+        )
+    })?;
+    let url = fallback::models_url(host);
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .build();
+    let resp = match agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {key}"))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, _)) => {
+            anyhow::bail!("{}", fallback::models_http_error(status));
+        }
+        Err(ureq::Error::Transport(t)) => {
+            anyhow::bail!("{}", fallback::redact_key(&t.to_string(), &key));
+        }
+    };
+    let val = resp
+        .into_json::<serde_json::Value>()
+        .map_err(|e| anyhow::anyhow!("resposta inválida de /models: {e}"))?;
+    let ids = fallback::parse_models_list(&val);
+    Ok(fallback::filter_models(&ids, filter))
+}
+
+/// Removes `[fallback]` from `supervisor.toml` and clears any active fallback state.
+pub fn fallback_clear() -> Result<fallback::FallbackInfo> {
+    config_write::clear_fallback(&config::supervisor_config_path())?;
+    fallback::update_state(&fallback::fallback_state_path(), |s| {
+        s.active = false;
+        s.reason = None;
+        s.detail = None;
+        s.since = None;
+    })?;
+    Ok(fallback_status())
 }
 
 fn snapshot_from_config(cfg: SupervisorConfig) -> Result<DesktopModSnapshot> {

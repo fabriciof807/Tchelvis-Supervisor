@@ -433,6 +433,107 @@ pub fn fallback_snapshot_info(
     }
 }
 
+pub fn resolve_fallback_key_with_source(
+    host: &str,
+    key_file: Option<String>,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<(String, &'static str)> {
+    if let Some(k) = non_blank(get("TCHELVIS_FALLBACK_API_KEY")) {
+        return Some((k, "TCHELVIS_FALLBACK_API_KEY"));
+    }
+    if let Some(k) = non_blank(key_file) {
+        return Some((k, "~/.config/tchelvis/fallback_api_key"));
+    }
+    if let Some(k) = non_blank(get("TCHELVIS_LLM_API_KEY")) {
+        return Some((k, "TCHELVIS_LLM_API_KEY"));
+    }
+    if let Some(env_name) = provider_env_for_host(host) {
+        if let Some(k) = non_blank(get(env_name)) {
+            return Some((k, env_name));
+        }
+    }
+    None
+}
+
+pub fn write_key_from_reader(path: &Path, mut r: impl std::io::Read) -> Result<()> {
+    let mut raw = String::new();
+    r.read_to_string(&mut raw)
+        .context("Failed to read fallback API key from stdin")?;
+    write_key_file(path, &raw)
+}
+
+pub fn finish_primary_start(p: &dyn FallbackProvider, res: Result<()>, now: u64) -> Result<()> {
+    match res {
+        Ok(()) => {
+            let _ = p.update_state(&mut primary_started);
+            Ok(())
+        }
+        Err(e) => {
+            if let Some(backend) = p.backend() {
+                let model = backend.model_label();
+                let short_err: String = format!("{e:#}").chars().take(300).collect();
+                let _ = p.update_state(&mut |s| {
+                    s.primary_intended = true;
+                    activate(s, FallbackReason::LoadFailed, &short_err, now);
+                });
+                Err(e.context(format!("fallback ativo: {model}")))
+            } else {
+                let _ = p.update_state(&mut |s| {
+                    s.primary_intended = true;
+                });
+                Err(e)
+            }
+        }
+    }
+}
+
+pub fn models_url(host: &str) -> String {
+    let base = normalize_host(host);
+    if base.ends_with("/v1") {
+        format!("{base}/models")
+    } else {
+        format!("{base}/v1/models")
+    }
+}
+
+pub fn parse_models_list(v: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+pub fn filter_models(ids: &[String], filter: Option<&str>) -> Vec<String> {
+    match filter.map(str::trim).filter(|f| !f.is_empty()) {
+        None => ids.to_vec(),
+        Some(needle) => {
+            let lower = needle.to_ascii_lowercase();
+            ids.iter()
+                .filter(|id| id.to_ascii_lowercase().contains(&lower))
+                .cloned()
+                .collect()
+        }
+    }
+}
+
+pub fn models_http_error(status: u16) -> String {
+    match status {
+        401 | 403 => format!("chave recusada pelo endpoint (HTTP {status})"),
+        404 => "endpoint sem /models (HTTP 404) — confira o host".to_string(),
+        _ => format!("HTTP {status}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,5 +824,136 @@ mod tests {
         ))
         .unwrap();
         assert!(!json.contains("key\":\""));
+    }
+
+    struct Task5FakeFallback {
+        state: std::sync::Mutex<FallbackState>,
+        model: Option<String>,
+    }
+
+    impl Task5FakeFallback {
+        fn configured(model: &str) -> Self {
+            Self {
+                state: std::sync::Mutex::new(FallbackState::default()),
+                model: Some(model.to_string()),
+            }
+        }
+        fn unconfigured() -> Self {
+            Self {
+                state: std::sync::Mutex::new(FallbackState::default()),
+                model: None,
+            }
+        }
+        fn set_active(&self) {
+            let mut g = self.state.lock().unwrap();
+            g.primary_intended = true;
+            g.active = true;
+            g.reason = Some(FallbackReason::Health);
+            g.since = Some(1);
+        }
+    }
+
+    impl FallbackProvider for Task5FakeFallback {
+        fn load_state(&self) -> FallbackState {
+            self.state.lock().unwrap().clone()
+        }
+        fn update_state(&self, f: &mut dyn FnMut(&mut FallbackState)) -> Result<FallbackState> {
+            let mut g = self.state.lock().unwrap();
+            f(&mut g);
+            Ok(g.clone())
+        }
+        fn probe_primary(&self) -> (bool, String) {
+            (true, String::new())
+        }
+        fn backend(&self) -> Option<Box<dyn CognitiveBackend>> {
+            let m = self.model.clone()?;
+            struct DummyBackend(String);
+            impl CognitiveBackend for DummyBackend {
+                fn evaluate(
+                    &self,
+                    _state: &AgentDurableState,
+                    _recent_output: &str,
+                ) -> Result<CognitiveEvaluation> {
+                    unreachable!()
+                }
+                fn unload_model(&self) -> Result<()> {
+                    Ok(())
+                }
+                fn model_label(&self) -> String {
+                    self.0.clone()
+                }
+            }
+            Some(Box::new(DummyBackend(m)))
+        }
+    }
+
+    #[test]
+    fn failed_start_activates_when_configured() {
+        let p = Task5FakeFallback::configured("openai/gpt-4.1-mini");
+        let err = finish_primary_start(
+            &p,
+            Err(anyhow::anyhow!("Container llama.cpp não respondeu")),
+            7,
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("fallback ativo"));
+        let s = p.load_state();
+        assert!(s.active && s.primary_intended);
+        assert_eq!(s.reason, Some(FallbackReason::LoadFailed));
+    }
+
+    #[test]
+    fn failed_start_unconfigured_returns_original_error() {
+        let p = Task5FakeFallback::unconfigured();
+        let err = finish_primary_start(&p, Err(anyhow::anyhow!("boom")), 7).unwrap_err();
+        assert_eq!(format!("{err:#}"), "boom");
+        assert!(!p.load_state().active);
+    }
+
+    #[test]
+    fn successful_start_clears_active() {
+        let p = Task5FakeFallback::configured("m");
+        p.set_active();
+        finish_primary_start(&p, Ok(()), 8).unwrap();
+        assert!(!p.load_state().active);
+    }
+
+    #[test]
+    fn failed_return_keeps_fallback_and_updates_detail() {
+        let p = Task5FakeFallback::configured("m");
+        p.set_active();
+        let _ = finish_primary_start(&p, Err(anyhow::anyhow!("ainda quebrado")), 9);
+        let s = p.load_state();
+        assert!(s.active);
+        assert!(s.detail.unwrap().contains("ainda quebrado"));
+    }
+
+    #[test]
+    fn models_url_and_parsing() {
+        assert_eq!(
+            models_url("https://openrouter.ai/api"),
+            "https://openrouter.ai/api/v1/models"
+        );
+        assert_eq!(
+            models_url("https://opencode.ai/inference/go/openai/v1"),
+            "https://opencode.ai/inference/go/openai/v1/models"
+        );
+        let v = serde_json::json!({"data":[{"id":"b"},{"id":"a"},{"id":"a"}]});
+        assert_eq!(parse_models_list(&v), vec!["a", "b"]);
+        assert_eq!(
+            filter_models(&["GPT-4.1-mini".into(), "glm".into()], Some("gpt")),
+            vec!["GPT-4.1-mini"]
+        );
+        assert!(models_http_error(401).contains("401"));
+        assert!(models_http_error(404).contains("404"));
+    }
+
+    #[test]
+    fn key_from_reader_trims_and_rejects_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fallback_api_key");
+        write_key_from_reader(&p, std::io::Cursor::new("  sk-reader \n")).unwrap();
+        assert_eq!(read_key_file(&p).as_deref(), Some("sk-reader"));
+        assert!(write_key_from_reader(&p, std::io::Cursor::new("   \n")).is_err());
     }
 }

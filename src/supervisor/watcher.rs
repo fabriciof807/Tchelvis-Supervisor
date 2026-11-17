@@ -86,6 +86,10 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         self.last_fallback_state.clone()
     }
 
+    pub fn refresh_fallback_state(&mut self) {
+        self.last_fallback_state = self.fallback.load_state();
+    }
+
     /// Executes one deterministic poll/diff/evaluate cycle at Unix timestamp `now`.
     pub fn tick(&mut self, now: u64) -> Result<TickOutcome> {
         let sessions = self.hc.list_sessions()?;

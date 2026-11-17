@@ -77,7 +77,46 @@ pub struct DesktopModSnapshot {
     pub gpu_backend: String,
     #[serde(default)]
     pub gpu_detail: String,
+    #[serde(default)]
+    pub fallback_configured: bool,
+    #[serde(default)]
+    pub fallback_key_present: bool,
+    #[serde(default)]
+    pub fallback_active: bool,
+    #[serde(default)]
+    pub fallback_model: String,
+    #[serde(default)]
+    pub fallback_host: String,
+    #[serde(default)]
+    pub fallback_reason: Option<String>,
+    #[serde(default)]
+    pub fallback_detail: Option<String>,
+    #[serde(default)]
+    pub fallback_since: Option<u64>,
     pub agents: Vec<AgentCardView>,
+}
+
+fn apply_fallback_to_snapshot(
+    snap: &mut DesktopModSnapshot,
+    fb_cfg: &super::fallback::FallbackConfig,
+    key_present: bool,
+    fb_state: &super::fallback::FallbackState,
+) {
+    let info = super::fallback::fallback_snapshot_info(fb_cfg, key_present, fb_state);
+    snap.fallback_configured = info.configured;
+    snap.fallback_key_present = info.key_present;
+    snap.fallback_active = info.active;
+    snap.fallback_host = info.host;
+    snap.fallback_model = info.model;
+    snap.fallback_reason = info.reason.map(|r| match r {
+        super::fallback::FallbackReason::LoadFailed => "load_failed".to_string(),
+        super::fallback::FallbackReason::Health => "health".to_string(),
+    });
+    snap.fallback_detail = info.detail;
+    snap.fallback_since = info.since;
+    if snap.fallback_active && !snap.fallback_model.is_empty() {
+        snap.llm_model = snap.fallback_model.clone();
+    }
 }
 
 /// Builds a `DesktopModSnapshot` from the live `WatcherEngine`.
@@ -106,6 +145,14 @@ pub fn build_desktop_mod_snapshot<H: HcBackend, C: CognitiveBackend>(
         snap.gpu_backend = gpu_bk.as_str().to_string();
         snap.gpu_detail = gpu_det;
     }
+    let key_present = super::fallback::resolve_fallback_key(
+        &engine.config.fallback.host,
+        super::fallback::read_key_file(&super::fallback::fallback_key_path()),
+        |k| std::env::var(k).ok(),
+    )
+    .is_some();
+    let fb_state = engine.fallback_state();
+    apply_fallback_to_snapshot(&mut snap, &engine.config.fallback, key_present, &fb_state);
     snap
 }
 
@@ -135,6 +182,16 @@ pub fn enrich_snapshot_with_llm_health(
         snap.model_loaded = snap.model_loaded || health.model_loaded;
     }
     snap.llm_status_detail = health.detail;
+    if config.container_mode_active() {
+        let key_present = super::fallback::resolve_fallback_key(
+            &config.fallback.host,
+            super::fallback::read_key_file(&super::fallback::fallback_key_path()),
+            |k| std::env::var(k).ok(),
+        )
+        .is_some();
+        let fb_state = super::fallback::load_state(&super::fallback::fallback_state_path());
+        apply_fallback_to_snapshot(snap, &config.fallback, key_present, &fb_state);
+    }
 }
 
 /// Builds a `DesktopModSnapshot` from decoupled state components.
@@ -192,6 +249,14 @@ pub fn build_desktop_mod_snapshot_from_parts(
         llm_container_state: String::new(),
         gpu_backend: String::new(),
         gpu_detail: String::new(),
+        fallback_configured: false,
+        fallback_key_present: false,
+        fallback_active: false,
+        fallback_model: String::new(),
+        fallback_host: String::new(),
+        fallback_reason: None,
+        fallback_detail: None,
+        fallback_since: None,
         agents,
     }
 }
@@ -910,5 +975,34 @@ mod tests {
             rendered.contains("[Ignorar]"),
             "Missing ignore button in:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn snapshot_json_never_contains_key() {
+        let mut snap = build_desktop_mod_snapshot_from_parts(
+            &SupervisorRuntimeStatus::Watching(1),
+            false,
+            &DurableStateStore::default(),
+        );
+        let fb_cfg = crate::supervisor::fallback::FallbackConfig {
+            host: "https://openrouter.ai/api".to_string(),
+            model: "openai/gpt-4.1-mini".to_string(),
+        };
+        let fb_state = crate::supervisor::fallback::FallbackState {
+            primary_intended: true,
+            active: true,
+            reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+            detail: Some("/health sem resposta".to_string()),
+            since: Some(1234),
+            ..Default::default()
+        };
+        apply_fallback_to_snapshot(&mut snap, &fb_cfg, true, &fb_state);
+        assert!(snap.fallback_configured);
+        assert!(snap.fallback_key_present);
+        assert!(snap.fallback_active);
+        assert_eq!(snap.llm_model, "openai/gpt-4.1-mini");
+        assert_eq!(snap.fallback_reason.as_deref(), Some("health"));
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("sk-very-secret"));
     }
 }

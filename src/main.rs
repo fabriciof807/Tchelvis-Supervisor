@@ -292,6 +292,11 @@ enum SupervisorCommands {
         #[command(subcommand)]
         action: ModelCommand,
     },
+    /// Configure and control the API fallback model for container failures
+    Fallback {
+        #[command(subcommand)]
+        action: FallbackCommand,
+    },
     /// Benchmark CPU vs GPU speed on the supervisor's evaluation request
     Bench {
         /// Number of measured runs per mode (default 3)
@@ -307,6 +312,40 @@ enum SupervisorCommands {
         #[arg(long)]
         progress: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum FallbackCommand {
+    /// Show fallback configuration and runtime state
+    Status {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set fallback endpoint host and/or model name
+    Set {
+        /// OpenAI-compatible base URL (e.g. https://openrouter.ai/api)
+        #[arg(long)]
+        host: Option<String>,
+        /// Model identifier (e.g. openai/gpt-4.1-mini)
+        #[arg(long)]
+        model: Option<String>,
+    },
+    /// Save the fallback API key from stdin to ~/.config/tchelvis/fallback_api_key (0600)
+    Key,
+    /// List models from the configured fallback endpoint (/v1/models)
+    Models {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+        /// Case-insensitive substring filter
+        #[arg(long)]
+        filter: Option<String>,
+    },
+    /// Try to return to the primary local model (clears fallback only on success)
+    Off,
+    /// Remove [fallback] from supervisor.toml and deactivate fallback
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -853,6 +892,122 @@ async fn main() -> Result<()> {
                     } else {
                         println!("Aborted; {} was not deleted.", outcome.id);
                     }
+                    Ok(())
+                }
+            },
+            SupervisorCommands::Fallback { action } => match action {
+                FallbackCommand::Status { json } => {
+                    let info = tokio::task::spawn_blocking(tchelvis::supervisor::fallback_status)
+                        .await
+                        .context("supervisor fallback status task panicked")?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&info)?);
+                    } else {
+                        let source = tchelvis::supervisor::fallback_key_source(&info.host)
+                            .unwrap_or("nenhuma");
+                        println!("configured: {}", info.configured);
+                        println!("active: {}", info.active);
+                        if let Some(reason) = info.reason {
+                            let r = match reason {
+                                tchelvis::supervisor::fallback::FallbackReason::LoadFailed => {
+                                    "load_failed"
+                                }
+                                tchelvis::supervisor::fallback::FallbackReason::Health => "health",
+                            };
+                            println!("reason: {r}");
+                        }
+                        if let Some(detail) = &info.detail {
+                            println!("detail: {detail}");
+                        }
+                        println!(
+                            "host: {}",
+                            if info.host.is_empty() {
+                                "(não definido)"
+                            } else {
+                                &info.host
+                            }
+                        );
+                        println!(
+                            "model: {}",
+                            if info.model.is_empty() {
+                                "(não definido)"
+                            } else {
+                                &info.model
+                            }
+                        );
+                        println!("key_source: {source}");
+                    }
+                    Ok(())
+                }
+                FallbackCommand::Set { host, model } => {
+                    if host.is_none() && model.is_none() {
+                        bail!("informe --host e/ou --model");
+                    }
+                    let info = tokio::task::spawn_blocking(move || {
+                        tchelvis::supervisor::fallback_set(host.as_deref(), model.as_deref())
+                    })
+                    .await
+                    .context("supervisor fallback set task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
+                    Ok(())
+                }
+                FallbackCommand::Key => {
+                    use std::io::{IsTerminal, Read, Write};
+                    let mut buf = String::new();
+                    if std::io::stdin().is_terminal() {
+                        eprint!("Cole a chave da API de fallback e pressione Enter: ");
+                        let _ = std::io::stderr().flush();
+                        std::io::stdin()
+                            .read_line(&mut buf)
+                            .context("Falha ao ler chave de stdin")?;
+                    } else {
+                        std::io::stdin()
+                            .read_to_string(&mut buf)
+                            .context("Falha ao ler chave de stdin")?;
+                    }
+                    if buf.trim().is_empty() {
+                        bail!("nenhuma chave fornecida em stdin");
+                    }
+                    tokio::task::spawn_blocking(move || {
+                        tchelvis::supervisor::fallback_key_from_reader(std::io::Cursor::new(buf))
+                    })
+                    .await
+                    .context("supervisor fallback key task panicked")??;
+                    println!(
+                        "Chave salva em {} (0600)",
+                        tchelvis::supervisor::fallback::fallback_key_path().display()
+                    );
+                    Ok(())
+                }
+                FallbackCommand::Models { json, filter } => {
+                    let models = tokio::task::spawn_blocking(move || {
+                        tchelvis::supervisor::fallback_models(filter.as_deref())
+                    })
+                    .await
+                    .context("supervisor fallback models task panicked")??;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&models)?);
+                    } else if models.is_empty() {
+                        println!("(nenhum modelo encontrado)");
+                    } else {
+                        for id in models {
+                            println!("{id}");
+                        }
+                    }
+                    Ok(())
+                }
+                FallbackCommand::Off => {
+                    let snap = tokio::task::spawn_blocking(tchelvis::supervisor::fallback_off)
+                        .await
+                        .context("supervisor fallback off task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&snap)?);
+                    Ok(())
+                }
+                FallbackCommand::Clear => {
+                    let info = tokio::task::spawn_blocking(tchelvis::supervisor::fallback_clear)
+                        .await
+                        .context("supervisor fallback clear task panicked")??;
+                    println!("{}", serde_json::to_string_pretty(&info)?);
                     Ok(())
                 }
             },
