@@ -369,6 +369,11 @@ pub fn run_bench(runs: u32, mut on_progress: impl FnMut(&BenchProgress)) -> Resu
                 runs,
                 started_at,
             });
+            // The bench recreates the container on purpose: keep the fallback health trigger quiet.
+            super::fallback::mark_primary_starting(
+                &super::fallback::fallback_state_path(),
+                super::state::unix_now_secs(),
+            );
             mgr.start(ngl, &model_src, &model_id, gpu)?;
             container::wait_healthy(&host, Duration::from_secs(300))?;
 
@@ -430,11 +435,21 @@ pub fn run_bench(runs: u32, mut on_progress: impl FnMut(&BenchProgress)) -> Resu
         },
         |action| match action {
             RestoreAction::Recreate { ngl, gpu } => {
+                let fb_path = super::fallback::fallback_state_path();
+                super::fallback::mark_primary_starting(&fb_path, super::state::unix_now_secs());
                 let _ = mgr.start(ngl, &model_src, &model_id, gpu);
                 let _ = container::wait_healthy(&host, Duration::from_secs(300));
+                // Back to the user's prior running state: health probes count again from here.
+                let _ =
+                    super::fallback::update_state(&fb_path, super::fallback::primary_start_settled);
             }
             RestoreAction::Stop => {
                 let _ = mgr.stop();
+                // The container was stopped before the bench: the primary is not expected to run.
+                let _ = super::fallback::update_state(
+                    &super::fallback::fallback_state_path(),
+                    super::fallback::primary_stopped,
+                );
             }
         },
         |p| {

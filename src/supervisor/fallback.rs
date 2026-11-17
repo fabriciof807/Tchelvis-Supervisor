@@ -41,21 +41,37 @@ pub struct FallbackState {
     pub since: Option<u64>,
     pub reason: Option<FallbackReason>,
     pub detail: Option<String>,
+    /// Set while an intentional primary (re)start is in progress (load, model/GPU switch, bench).
+    /// Health probes are not counted until it settles or `START_GRACE_SECS` pass.
+    pub starting_since: Option<u64>,
 }
 
+/// How long an intentional primary restart may keep `/health` down before probes count again.
+pub const START_GRACE_SECS: u64 = 300;
+
+/// Extracts the lowercase hostname from a base URL (scheme, userinfo, port and path removed).
+fn hostname_of(host: &str) -> String {
+    let lower = host.trim().to_ascii_lowercase();
+    let rest = lower.split_once("://").map(|(_, r)| r).unwrap_or(&lower);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let without_user = authority.rsplit('@').next().unwrap_or("");
+    without_user.split(':').next().unwrap_or("").to_string()
+}
+
+/// Provider key env var for a host. Matches the hostname exactly or as a subdomain, so a
+/// provider key is never sent to a look-alike host (`openai.com.example.io`).
 pub fn provider_env_for_host(host: &str) -> Option<&'static str> {
-    let lower = host.to_ascii_lowercase();
-    if lower.contains("openai.com") {
-        Some("OPENAI_API_KEY")
-    } else if lower.contains("openrouter.ai") {
-        Some("OPENROUTER_API_KEY")
-    } else if lower.contains("deepseek.com") {
-        Some("DEEPSEEK_API_KEY")
-    } else if lower.contains("opencode.ai") {
-        Some("OPENCODE_API_KEY")
-    } else {
-        None
-    }
+    const PROVIDERS: [(&str, &str); 4] = [
+        ("openai.com", "OPENAI_API_KEY"),
+        ("openrouter.ai", "OPENROUTER_API_KEY"),
+        ("deepseek.com", "DEEPSEEK_API_KEY"),
+        ("opencode.ai", "OPENCODE_API_KEY"),
+    ];
+    let name = hostname_of(host);
+    PROVIDERS
+        .iter()
+        .find(|(domain, _)| name == *domain || name.ends_with(&format!(".{domain}")))
+        .map(|(_, env)| *env)
 }
 
 fn non_blank(val: Option<String>) -> Option<String> {
@@ -243,6 +259,7 @@ pub fn activate(state: &mut FallbackState, reason: FallbackReason, detail: &str,
         state.since = Some(now);
     }
     state.active = true;
+    state.starting_since = None;
     state.reason = Some(reason);
     state.detail = Some(detail.to_string());
     state.health_failures = 0;
@@ -251,6 +268,12 @@ pub fn activate(state: &mut FallbackState, reason: FallbackReason, detail: &str,
 pub fn apply_health_probe(state: &mut FallbackState, ctx: &ProbeCtx) -> bool {
     if state.active || !state.primary_intended || ctx.paused || ctx.sessions == 0 {
         return false;
+    }
+    if let Some(started) = state.starting_since {
+        if ctx.now.saturating_sub(started) < START_GRACE_SECS {
+            state.health_failures = 0;
+            return false;
+        }
     }
     if ctx.healthy {
         state.health_failures = 0;
@@ -264,7 +287,27 @@ pub fn apply_health_probe(state: &mut FallbackState, ctx: &ProbeCtx) -> bool {
     false
 }
 
+/// Marks an intentional primary (re)start; probes are ignored until it settles or the grace ends.
+pub fn primary_starting(state: &mut FallbackState, now: u64) {
+    state.starting_since = Some(now);
+    state.health_failures = 0;
+}
+
+/// Ends the start grace without changing whether the primary is intended or the fallback active.
+pub fn primary_start_settled(state: &mut FallbackState) {
+    state.starting_since = None;
+    state.health_failures = 0;
+}
+
+/// Best-effort `primary_starting` on the shared state file (errors are logged, never fatal).
+pub fn mark_primary_starting(path: &Path, now: u64) {
+    if let Err(err) = update_state(path, |s| primary_starting(s, now)) {
+        tracing::warn!(error = %format!("{err:#}"), "Failed to mark primary start");
+    }
+}
+
 pub fn primary_started(state: &mut FallbackState) {
+    state.starting_since = None;
     state.primary_intended = true;
     state.active = false;
     state.reason = None;
@@ -274,6 +317,7 @@ pub fn primary_started(state: &mut FallbackState) {
 }
 
 pub fn primary_stopped(state: &mut FallbackState) {
+    state.starting_since = None;
     state.primary_intended = false;
     state.active = false;
     state.reason = None;
@@ -691,6 +735,65 @@ mod tests {
             primary_intended: true,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn provider_env_matches_hostname_not_substring() {
+        assert_eq!(provider_env_for_host("https://openai.com.evil.io/v1"), None);
+        assert_eq!(provider_env_for_host("https://evil.io/?x=openai.com"), None);
+        assert_eq!(provider_env_for_host("https://notopenai.com"), None);
+        assert_eq!(
+            provider_env_for_host("https://user@api.openai.com:443/v1"),
+            Some("OPENAI_API_KEY")
+        );
+        assert_eq!(
+            provider_env_for_host("openrouter.ai/api"),
+            Some("OPENROUTER_API_KEY")
+        );
+    }
+
+    #[test]
+    fn intentional_restart_does_not_trigger_within_grace() {
+        let mut s = intended();
+        primary_starting(&mut s, 100);
+        let mut c = ctx(false);
+        c.now = 112;
+        apply_health_probe(&mut s, &c);
+        c.now = 124;
+        apply_health_probe(&mut s, &c);
+        c.now = 100 + START_GRACE_SECS - 1;
+        apply_health_probe(&mut s, &c);
+        assert!(!s.active);
+        assert_eq!(s.health_failures, 0);
+    }
+
+    #[test]
+    fn restart_that_never_settles_triggers_after_grace() {
+        let mut s = intended();
+        primary_starting(&mut s, 100);
+        let mut c = ctx(false);
+        c.now = 100 + START_GRACE_SECS;
+        apply_health_probe(&mut s, &c);
+        c.now += 12;
+        assert!(apply_health_probe(&mut s, &c));
+    }
+
+    #[test]
+    fn settle_started_stopped_and_activate_clear_starting() {
+        let mut s = intended();
+        primary_starting(&mut s, 1);
+        primary_start_settled(&mut s);
+        assert_eq!(s.starting_since, None);
+        assert!(s.primary_intended);
+        primary_starting(&mut s, 2);
+        primary_started(&mut s);
+        assert_eq!(s.starting_since, None);
+        primary_starting(&mut s, 3);
+        primary_stopped(&mut s);
+        assert_eq!(s.starting_since, None);
+        primary_starting(&mut s, 4);
+        activate(&mut s, FallbackReason::LoadFailed, "x", 5);
+        assert_eq!(s.starting_since, None);
     }
 
     #[test]

@@ -165,6 +165,7 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
 pub fn load_model() -> Result<DesktopModSnapshot> {
     let config = SupervisorConfig::load();
     if config.container_mode_active() {
+        fallback::mark_primary_starting(&fallback::fallback_state_path(), unix_now_secs());
         let start_res = (|| -> Result<()> {
             let candidates = config.runtime_candidates();
             if candidates.is_empty() {
@@ -261,6 +262,10 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
                     primary: config.clone(),
                 };
                 if warm {
+                    fallback::mark_primary_starting(
+                        &fallback::fallback_state_path(),
+                        unix_now_secs(),
+                    );
                     let res = (|| -> Result<()> {
                         let ollama_roots = container::default_ollama_roots();
                         let model = container::resolve_model_source(
@@ -512,6 +517,9 @@ fn recreate_container_if_running(cfg: &SupervisorConfig) -> Result<()> {
         container::LlmContainer::new(rt, cfg.llm_container.clone(), container::SystemContainerCli);
     if !matches!(mgr.state(), Ok(container::ContainerState::Running)) {
         return Ok(());
+    }
+    if cfg.container_mode_active() {
+        fallback::mark_primary_starting(&fallback::fallback_state_path(), unix_now_secs());
     }
     let res = (|| -> Result<()> {
         let ollama_roots = container::default_ollama_roots();
