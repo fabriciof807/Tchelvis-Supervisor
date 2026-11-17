@@ -7179,78 +7179,6 @@ export default class CockpitMod extends View {
           .border_b(1)
           .border_color(t.border)
           .bg(t.chrome)
-          .child(
-            this.segmentedTrack(t)
-              .child(
-                this.segmentBtn(
-                  t,
-                  "ck-ins-tab-home",
-                  "🏠 Home",
-                  activeView === "home",
-                  (_e, cx) => {
-                    setShared("cockpit.viewMode", "home");
-                    setShared("cockpit.usageOnlyDrawer", false);
-                    setShared("cockpit.modelPickerOnlyDrawer", false);
-                    this.inspectorTab = "home";
-                    this.fetchHomeSnapshot(cx);
-                    cx.notify();
-                  }
-                )
-              )
-              .child(
-                this.segmentBtn(
-                  t,
-                  "ck-ins-tab-inspector",
-                  "🔍 Inspector",
-                  activeView === "inspector",
-                  (_e, cx) => {
-                    setShared("cockpit.viewMode", "inspector");
-                    setShared("cockpit.usageOnlyDrawer", false);
-                    setShared("cockpit.modelPickerOnlyDrawer", false);
-                    this.inspectorTab = "inspector";
-                    this.refreshInspector(cx);
-                    cx.notify();
-                  }
-                )
-              )
-              .child(
-                this.segmentBtn(
-                  t,
-                  "ck-ins-tab-doctor",
-                  "🩺 Doctor",
-                  activeView === "doctor",
-                  (_e, cx) => {
-                    setShared("cockpit.viewMode", "doctor");
-                    setShared("cockpit.usageOnlyDrawer", false);
-                    setShared("cockpit.modelPickerOnlyDrawer", false);
-                    this.inspectorTab = "doctor";
-                    if (!this.doctorReport) this.runDoctorCheck(cx);
-                    if (!this.benchLast && !this.benchRunning) {
-                      this.fetchBenchLast(cx);
-                    }
-                    cx.notify();
-                  }
-                )
-              )
-              .child(
-                this.segmentBtn(
-                  t,
-                  "ck-ins-tab-chat",
-                  "💬 Chat",
-                  activeView === "chat",
-                  (_e, cx) => {
-                    setShared("cockpit.viewMode", "chat");
-                    setShared("cockpit.usageOnlyDrawer", false);
-                    setShared("cockpit.modelPickerOnlyDrawer", false);
-                    this.inspectorTab = "chat";
-                    if (!shared("supervisor.snapshot")) {
-                      this.fetchSupervisorStatus(cx);
-                    }
-                    cx.notify();
-                  }
-                )
-              )
-          )
           .child(div().flex_1())
           .child(
             this.actionBtn(t, "ck-ins-refresh", "↻", (_e, cx) => {
@@ -8510,31 +8438,12 @@ export default class CockpitMod extends View {
     const inspectorHidden = Boolean(
       findNode(layout(), "tchelvis-inspector")?.hidden
     );
-    const onlyUsage = Boolean(
-      shared("cockpit.usageOnlyDrawer") ?? this.usageOnlyDrawer
-    );
     const usageOpen = Boolean(shared("cockpit.usageOpen") ?? this.usageOpen);
-    const rawView =
-      shared("cockpit.viewMode") || this.inspectorTab || "inspector";
-    const rightView = rawView === "usage" ? "inspector" : rawView;
     const mac = win()?.platform === "macos";
     const b = keys().find(
       (k) => k.section === "global" && k.action === "app.palette"
     );
     const paletteHint = b ? b.keys.toUpperCase() : mac ? "⌘K" : "CTRL+SHIFT+P";
-
-    const viewLink = (id, label, tab) =>
-      div()
-        .id(id)
-        .cursor_pointer()
-        .text_color(
-          !inspectorHidden && !onlyUsage && rightView === tab
-            ? t.accent
-            : t.muted
-        )
-        .hover((s) => s.text_color(t.foreground))
-        .on_click((_e, clickCx) => this.openDrawerView(clickCx ?? cx, tab, true))
-        .child(label);
 
     return h_flex()
       .size_full()
@@ -8616,7 +8525,7 @@ export default class CockpitMod extends View {
         el.child(this.pillBadge(t, "Local-First Read-Only", t.muted))
       )
       .child(div().flex_1())
-      // Right side: Quick view links
+      // Right side: Usage and command palette hint
       .child(
         div()
           .id("ck-status-usage")
@@ -8626,14 +8535,6 @@ export default class CockpitMod extends View {
           .on_click((_e, clickCx) => this.toggleUsagePopup(clickCx ?? cx))
           .child("Uso")
       )
-      .child(div().text_color(t.dim).child("·"))
-      .child(viewLink("ck-status-home", "Home", "home"))
-      .child(div().text_color(t.dim).child("·"))
-      .child(viewLink("ck-status-inspector", "Inspector", "inspector"))
-      .child(div().text_color(t.dim).child("·"))
-      .child(viewLink("ck-status-doctor", "Doctor", "doctor"))
-      .child(div().text_color(t.dim).child("·"))
-      .child(viewLink("ck-status-chat", "Chat", "chat"))
       .child(div().text_color(t.dim).child("·"))
       .child(
         div()
