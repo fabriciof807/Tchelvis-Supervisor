@@ -985,7 +985,7 @@ async fn main() -> Result<()> {
                             task.id,
                             task.priority.as_str(),
                             proj,
-                            task.title
+                            home::table_title(&task.title)
                         );
                     }
                     Ok(())
