@@ -3,7 +3,7 @@ use super::fallback::{
     apply_health_probe, primary_stopped, FallbackProvider, FallbackState, NoFallback, ProbeCtx,
 };
 use super::guardrails::{
-    enforce_blocked_policy, has_error_or_loop_signature, readonly_fast_path_with_msg,
+    enforce_blocked_policy_with_msg, has_error_or_loop_signature, readonly_fast_path_with_msg,
     sanitize_auto_reply, tidy_operator_reason, validate_evaluation,
 };
 use super::hc::{HcBackend, HcSession};
@@ -358,7 +358,12 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             );
             let llm_decision = raw_eval.decision;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
-            eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
+            eval = enforce_blocked_policy_with_msg(
+                session.is_blocked(),
+                &output,
+                session.msg.as_deref(),
+                eval,
+            );
             eval = sanitize_auto_reply(
                 &output,
                 session.kind.as_deref(),

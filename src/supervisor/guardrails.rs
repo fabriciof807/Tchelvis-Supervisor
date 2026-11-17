@@ -39,11 +39,55 @@ pub fn contains_forbidden_payload(payload: &str) -> Option<&'static str> {
 /// Number of trailing non-empty lines considered the "pending prompt / question area".
 const PROMPT_AREA_LINES: usize = 8;
 
-/// Returns the last few non-empty lines of `output`, where a pending question lives.
-pub fn pending_prompt_area(output: &str) -> String {
+/// Claude Code's dialog may be taller than the fixed window; this bounds how far below its top
+/// rule the region may extend before the rule is treated as unrelated scrollback.
+const DIALOG_REGION_MAX_LINES: usize = 30;
+
+fn dialog_rule_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    // Solid U+2500 rule only: the dashed `╌` lines inside Claude's dialog are not dialog borders.
+    RE.get_or_init(|| Regex::new(r"^\s*─{20,}\s*$").expect("valid dialog rule regex"))
+}
+
+fn is_prompt_line(line: &str) -> bool {
+    yn_prompt_regex().is_match(line) || prompt_signature_regex().is_match(line)
+}
+
+/// Splits the screen into `(earlier, pending)`: `pending` is where the current request lives.
+///
+/// Found by structure: the lines after Claude Code's dialog rule when one is near the bottom;
+/// otherwise the last few lines, starting after an earlier (already answered) prompt line if one is
+/// still among them. See docs/superpowers/specs/2026-11-17-pending-prompt-region-design.md.
+pub fn pending_prompt_split(output: &str) -> (String, String) {
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(PROMPT_AREA_LINES);
-    lines[start..].join("\n")
+    let rule = lines
+        .iter()
+        .rposition(|l| dialog_rule_regex().is_match(l))
+        .filter(|&i| lines.len() - i - 1 <= DIALOG_REGION_MAX_LINES && i + 1 < lines.len());
+    let (earlier_end, start) = match rule {
+        Some(i) => (i, i + 1),
+        None => {
+            let mut start = lines.len().saturating_sub(PROMPT_AREA_LINES);
+            let prompts: Vec<usize> = (start..lines.len())
+                .filter(|&i| is_prompt_line(lines[i]))
+                .collect();
+            if prompts.len() >= 2 {
+                start = prompts[prompts.len() - 2] + 1;
+            }
+            (start, start)
+        }
+    };
+    let pending = lines[start..]
+        .iter()
+        .map(|l| l.trim())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (lines[..earlier_end].join("\n"), pending)
+}
+
+/// The part of `output` where the current pending request lives (see [`pending_prompt_split`]).
+pub fn pending_prompt_area(output: &str) -> String {
+    pending_prompt_split(output).1
 }
 
 /// True when the prompt area looks like it is asking the operator/agent for input.
@@ -72,6 +116,16 @@ pub fn detect_destructive(output: &str, payload: &str) -> Option<&'static str> {
         .or_else(|| contains_forbidden_payload(payload))
 }
 
+/// Like [`detect_destructive`], also checking hc's status message (`approve Bash: <cmd>`), which
+/// names the request even when the screen does not show the whole command.
+pub fn detect_destructive_with_msg(
+    output: &str,
+    payload: &str,
+    msg: Option<&str>,
+) -> Option<&'static str> {
+    detect_destructive(output, payload).or_else(|| msg.and_then(contains_forbidden_payload))
+}
+
 /// Enforces the "only blocked agents get action cards" policy deterministically.
 ///
 /// * Not blocked  -> always `NoOp` (the rolling summary is still kept by the caller).
@@ -81,6 +135,16 @@ pub fn detect_destructive(output: &str, payload: &str) -> Option<&'static str> {
 pub fn enforce_blocked_policy(
     is_blocked: bool,
     output: &str,
+    eval: CognitiveEvaluation,
+) -> CognitiveEvaluation {
+    enforce_blocked_policy_with_msg(is_blocked, output, None, eval)
+}
+
+/// Like [`enforce_blocked_policy`], also using hc's status message for destructive detection.
+pub fn enforce_blocked_policy_with_msg(
+    is_blocked: bool,
+    output: &str,
+    msg: Option<&str>,
     mut eval: CognitiveEvaluation,
 ) -> CognitiveEvaluation {
     if !is_blocked {
@@ -91,7 +155,7 @@ pub fn enforce_blocked_policy(
         return eval;
     }
 
-    if let Some(token) = detect_destructive(output, &eval.hc_command_payload) {
+    if let Some(token) = detect_destructive_with_msg(output, &eval.hc_command_payload, msg) {
         eval.decision = SupervisorDecision::AlertOperator;
         eval.urgency = Urgency::Critical;
         eval.hc_command_payload = "n".to_string();
@@ -922,6 +986,53 @@ mod tests {
     // Real Claude Code v2.1.325 permission screen (test 8, `hc read`, home path anonymized). The
     // command sits far above the menu; hc status carries it as `msg: "approve Bash: <cmd>"`.
     const CLAUDE_TOUCH: &str = include_str!("fixtures/claude_permission_bash_touch.txt");
+
+    #[test]
+    fn destructive_detected_in_tall_claude_dialog() {
+        // The command line is the 9th non-empty line from the bottom of Claude's dialog.
+        let screen = CLAUDE_TOUCH.replace(
+            "touch /home/user/.claude/jobs/job1/tmp/real-claude/marcador.txt",
+            "rm -rf /home/user/projeto/build",
+        );
+        assert!(detect_destructive(&screen, "").is_some());
+    }
+
+    #[test]
+    fn claude_dialog_region_starts_after_the_rule() {
+        let (earlier, pending) = pending_prompt_split(CLAUDE_TOUCH);
+        assert!(pending.starts_with("Bash command"));
+        assert!(pending.contains("Do you want to proceed?"));
+        assert!(pending.contains("touch /home/user/.claude/jobs/job1/tmp/real-claude/marcador.txt"));
+        assert!(!pending.contains("Claude Code v2.1.325"));
+        assert!(earlier.contains("Claude Code v2.1.325"));
+    }
+
+    // Host test 12, `sequencia` scenario: steps 1 and 2 were answered and stay on screen.
+    const SEQUENCIA: &str = "[claude] Rodando verificações em 3 etapas...\n[claude] Etapa 1/3.\nAllow bash tool: git status --short ? [y/N]\ny\n[sim] 11:38:48 ANSWER=<y> apos 7s | comando NAO foi executado (simulacao)\n[claude] Etapa 2/3.\nAllow bash tool: cat package.json ? [y/N]\ny\n[sim] 11:38:59 ANSWER=<y> apos 8s | comando NAO foi executado (simulacao)\n[claude] Etapa 3/3.\nAllow bash tool: git reset --hard origin/main && git clean -fdx ? [y/N]\n";
+
+    #[test]
+    fn sequencia_region_holds_only_current_prompt() {
+        let (earlier, pending) = pending_prompt_split(SEQUENCIA);
+        assert!(pending.contains("git reset --hard origin/main"));
+        assert!(!pending.contains("cat package.json"));
+        assert!(!pending.contains("git status --short"));
+        assert!(earlier.contains("cat package.json"));
+        assert!(detect_destructive(SEQUENCIA, "").is_some());
+    }
+
+    #[test]
+    fn blocked_policy_uses_hc_msg_for_destructive() {
+        let screen = "Do you want to proceed?\n❯ 1. Yes\n  2. Yes, and always allow\n  4. No";
+        let alert = sample_eval(SupervisorDecision::AlertOperator, "");
+        let out = enforce_blocked_policy_with_msg(
+            true,
+            screen,
+            Some("approve Bash: rm -rf build"),
+            alert,
+        );
+        assert_eq!(out.urgency, Urgency::Critical);
+        assert_eq!(out.hc_command_payload, "n");
+    }
 
     #[test]
     fn fast_path_real_claude_touch_is_not_approved() {
