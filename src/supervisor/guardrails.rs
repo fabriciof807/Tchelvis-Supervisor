@@ -60,22 +60,23 @@ fn is_prompt_line(line: &str) -> bool {
 /// still among them. See docs/superpowers/specs/2026-11-17-pending-prompt-region-design.md.
 pub fn pending_prompt_split(output: &str) -> (String, String) {
     let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
-    let rule = lines
+    // Fixed window, cut after an earlier (already answered) prompt line inside it.
+    let mut window_start = lines.len().saturating_sub(PROMPT_AREA_LINES);
+    let prompts: Vec<usize> = (window_start..lines.len())
+        .filter(|&i| is_prompt_line(lines[i]))
+        .collect();
+    if prompts.len() >= 2 {
+        window_start = prompts[prompts.len() - 2] + 1;
+    }
+    // A dialog rule only ever widens the region (a footer rule below the request must not hide it).
+    let rule_start = lines
         .iter()
         .rposition(|l| dialog_rule_regex().is_match(l))
-        .filter(|&i| lines.len() - i - 1 <= DIALOG_REGION_MAX_LINES && i + 1 < lines.len());
-    let (earlier_end, start) = match rule {
-        Some(i) => (i, i + 1),
-        None => {
-            let mut start = lines.len().saturating_sub(PROMPT_AREA_LINES);
-            let prompts: Vec<usize> = (start..lines.len())
-                .filter(|&i| is_prompt_line(lines[i]))
-                .collect();
-            if prompts.len() >= 2 {
-                start = prompts[prompts.len() - 2] + 1;
-            }
-            (start, start)
-        }
+        .filter(|&i| lines.len() - i - 1 <= DIALOG_REGION_MAX_LINES)
+        .map(|i| i + 1);
+    let (earlier_end, start) = match rule_start {
+        Some(r) if r < window_start => (r - 1, r),
+        _ => (window_start, window_start),
     };
     let pending = lines[start..]
         .iter()
@@ -1018,6 +1019,14 @@ mod tests {
         assert!(!pending.contains("git status --short"));
         assert!(earlier.contains("cat package.json"));
         assert!(detect_destructive(SEQUENCIA, "").is_some());
+    }
+
+    #[test]
+    fn rule_below_the_prompt_never_shrinks_the_region() {
+        // A footer rule under the request must not hide the command above it.
+        let rule = "─".repeat(40);
+        let screen = format!("Run: rm -rf build ? [y/N]\n{rule}\nctx 5% · main");
+        assert!(detect_destructive(&screen, "").is_some());
     }
 
     #[test]

@@ -39,10 +39,11 @@ The supervisor finds the pending request by taking the **last 8 non-empty lines*
 ## Design
 
 - `pending_prompt_area(output)`:
-  - Non-empty lines. If a line matching `^\s*─{20,}\s*$` exists and at most 30 lines follow it,
-    the region is the lines after the last one.
-  - Otherwise the last 8 lines; if two or more prompt lines (`[y/N]`-style or prompt signature)
-    are inside, the region starts after the second-to-last one.
+  - Non-empty lines. Window: the last 8 lines; if two or more prompt lines (`[y/N]`-style or
+    prompt signature) are inside, it starts after the second-to-last one.
+  - If a line matching `^\s*─{20,}\s*$` exists with at most 30 lines after it, and the line after
+    it starts earlier than the window, the region starts there. The rule only widens the region:
+    a footer rule below the request never hides it (found in self-review).
 - `detect_destructive_with_msg(output, payload, msg)`; `enforce_blocked_policy` takes the hc
   `msg` and uses it. The watcher passes `session.msg`.
 - LLM payload: `pending_prompt` (the region) and `earlier_output` (the lines before it) replace

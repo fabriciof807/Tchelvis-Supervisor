@@ -177,6 +177,14 @@ Specs aprovadas pelo usuário; planos em `docs/superpowers/plans/2026-11-17-{dai
   - OpenCode Go: base `https://opencode.ai/inference/go/openai/v1` (conferido na doc); só modelos Chat Completions funcionam na fase 1. `OPENCODE_API_KEY` é convenção nossa (a doc não cita variável).
   - Limites conhecidos: após atualizar com o container já rodando, o gatilho de health só arma depois do próximo Load (`primary_intended`); com fallback ativo o botão da pílula é `▶ Load LLM` (voltar) — Unload fica pela CLI.
 - **Teste 11** (nightly `264760b`, relatório do host, 2026-11-17): **passou**, idêntico ao teste 10 cenário a cenário. 7 auto-respostas novas, todas `fixed_rule` (6 `y` + 1 `1`), nenhuma da LLM nem em pedido perigoso; regra fixa responde em ~10-11 s; jsonl intacto após `hc kill`/`hc rm`. As "pendências" do relatório são comportamento da spec (fast path aprova `cat`/`Read` com `1`/`y`, inclusive fora do projeto, e `[y/N]` simulado com `app=claude`); `AUTO_REPLY_FAILED` só tem teste unitário. **O teste não cobriu Tarefas do dia nem M1b** — continuam por validar.
+- **Teste 12** (nightly `264760b`, 2026-11-17): regressão igual ao 11 (principal `LFM2.5-350M`, respostas `y` em 6-8 s). **M1b passou** no estado: fallback (segundo container local em `:11436`) ativa em 16/24 s após `docker stop`, `Voltar` em ~5 s, troca de modelo/GPU e bench não ativam, Unload encerra, chave fora de status/logs. Card PRINCIPAL/FALLBACK aparece no mod (tela do usuário), mas o nome se sobrepunha aos detalhes nas linhas com Hide/Delete. Não provado: avaliação real passando pelo fallback.
+
+### Atualização — 2026-11-17 (tarde): região do pedido e card de modelos
+- Spec/plano: `docs/superpowers/{specs,plans}/2026-11-17-pending-prompt-region*.md`.
+- `guardrails::pending_prompt_split` → `(earlier, pending)`: janela de 8 linhas cortada após um pedido já respondido; a linha `────` do diálogo do Claude só **alarga** a região (o comando do diálogo real fica na 9ª linha de baixo → `rm -rf` saía `normal`). `enforce_blocked_policy_with_msg` também lê o `status.msg` do hc.
+- LLM recebe `pending_prompt` + `earlier_output` (no lugar de `recent_hc_output`) e decide só pelo pedido atual.
+- Mod: linhas do card de modelos com detalhes embaixo do nome.
+- **Validar no host:** card de modelos sem sobreposição; `sequencia` e Claude real iguais ao teste 12; se possível, Claude real pedindo um `rm -rf` → alerta `critical`.
 - `cargo clippy -D warnings` falha em `main` por lints antigos (`src/usage.rs`, `config.rs`/`watcher.rs` testes, `tui.rs`, etc.); nada novo. Testes: 285 Rust, 32 mod.
 
 ---
@@ -271,7 +279,7 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Validar no host o nightly `264760b`** (Tarefas do dia e M1b): `tchelvis update --channel nightly`, conferir `tchelvis --version`, reiniciar o Herdr Desktop. M1b antes do teste: `supervisor fallback key` (stdin), `supervisor fallback set --host <url> --model <m>` e **um Load** (arma `primary_intended`). OpenCode Go: host `https://opencode.ai/inference/go/openai/v1`, modelo Chat Completions (GLM/Kimi/DeepSeek). M1b: com sessão aberta, `podman stop` no container → pílula `(Fallback)` em ~2 ticks; `Voltar ao principal` recarrega; Unload encerra ambos; trocar modelo/GPU e rodar bench **não** ativam o fallback; `status --json` sem chave. Tarefas: quebra de linha, Shift+Enter, `✎`, menu, pílula/etiqueta num Space que não é projeto.
+1. **Validar no host o próximo nightly** (região do pedido, card de modelos; Tarefas do dia ficaram com o usuário). Contexto anterior, nightly `264760b` (Tarefas do dia e M1b): `tchelvis update --channel nightly`, conferir `tchelvis --version`, reiniciar o Herdr Desktop. M1b antes do teste: `supervisor fallback key` (stdin), `supervisor fallback set --host <url> --model <m>` e **um Load** (arma `primary_intended`). OpenCode Go: host `https://opencode.ai/inference/go/openai/v1`, modelo Chat Completions (GLM/Kimi/DeepSeek). M1b: com sessão aberta, `podman stop` no container → pílula `(Fallback)` em ~2 ticks; `Voltar ao principal` recarrega; Unload encerra ambos; trocar modelo/GPU e rodar bench **não** ativam o fallback; `status --json` sem chave. Tarefas: quebra de linha, Shift+Enter, `✎`, menu, pílula/etiqueta num Space que não é projeto.
 2. **Validar no host** (com `v0.2.0`, reiniciar o Herdr Desktop):
    - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
    - Card de modelos: Ocultar/Mostrar e Apagar (segundo clique `Delete <size>?`); `ollama rm` real nunca foi testado.
