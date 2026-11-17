@@ -12,3 +12,6 @@
 
 # Coordinator/worker briefs and returns
 /.work/
+
+# Local session notes (not published)
+HANDOFF.md
