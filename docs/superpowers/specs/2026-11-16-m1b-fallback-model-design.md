@@ -90,7 +90,7 @@ model = "openai/gpt-4.1-mini"
   | `openai.com` | `OPENAI_API_KEY` |
   | `openrouter.ai` | `OPENROUTER_API_KEY` |
   | `deepseek.com` | `DEEPSEEK_API_KEY` |
-  | `opencode.ai` (OpenCode Go, `https://opencode.ai/zen/go/v1`) | `OPENCODE_API_KEY` |
+  | `opencode.ai` (OpenCode Go, `https://opencode.ai/inference/go/openai/v1`, verified 2026-11-17) | `OPENCODE_API_KEY` |
 
   *(My call: a provider key is only sent to its own provider's host — never an OpenAI key to
   DeepSeek, etc. Sending terminal output still requires the user to set `host` + `model`
