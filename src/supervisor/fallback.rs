@@ -222,6 +222,60 @@ pub fn update_state(path: &Path, f: impl FnOnce(&mut FallbackState)) -> Result<F
     Ok(state)
 }
 
+#[derive(Debug, Clone)]
+pub struct ProbeCtx {
+    pub healthy: bool,
+    pub paused: bool,
+    pub sessions: usize,
+    pub configured: bool,
+    pub now: u64,
+    pub detail: String,
+}
+
+pub fn activate(state: &mut FallbackState, reason: FallbackReason, detail: &str, now: u64) {
+    if !state.active || state.since.is_none() {
+        state.since = Some(now);
+    }
+    state.active = true;
+    state.reason = Some(reason);
+    state.detail = Some(detail.to_string());
+    state.health_failures = 0;
+}
+
+pub fn apply_health_probe(state: &mut FallbackState, ctx: &ProbeCtx) -> bool {
+    if state.active || !state.primary_intended || ctx.paused || ctx.sessions == 0 {
+        return false;
+    }
+    if ctx.healthy {
+        state.health_failures = 0;
+        return false;
+    }
+    state.health_failures = state.health_failures.saturating_add(1);
+    if state.health_failures >= 2 && ctx.configured {
+        activate(state, FallbackReason::Health, &ctx.detail, ctx.now);
+        return true;
+    }
+    false
+}
+
+pub fn primary_started(state: &mut FallbackState) {
+    state.primary_intended = true;
+    state.active = false;
+    state.reason = None;
+    state.detail = None;
+    state.since = None;
+    state.health_failures = 0;
+}
+
+pub fn primary_stopped(state: &mut FallbackState) {
+    state.primary_intended = false;
+    state.active = false;
+    state.reason = None;
+    state.detail = None;
+    state.since = None;
+    state.health_failures = 0;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,5 +415,94 @@ mod tests {
             model: "m".into()
         }
         .is_set());
+    }
+
+    fn ctx(healthy: bool) -> ProbeCtx {
+        ProbeCtx {
+            healthy,
+            paused: false,
+            sessions: 1,
+            configured: true,
+            now: 100,
+            detail: "/health sem resposta".into(),
+        }
+    }
+
+    fn intended() -> FallbackState {
+        FallbackState {
+            primary_intended: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn two_consecutive_failures_activate() {
+        let mut s = intended();
+        assert!(!apply_health_probe(&mut s, &ctx(false)));
+        assert!(apply_health_probe(&mut s, &ctx(false)));
+        assert!(s.active);
+        assert_eq!(s.reason, Some(FallbackReason::Health));
+        assert_eq!(s.since, Some(100));
+    }
+
+    #[test]
+    fn single_failure_then_success_resets() {
+        let mut s = intended();
+        apply_health_probe(&mut s, &ctx(false));
+        apply_health_probe(&mut s, &ctx(true));
+        assert!(!apply_health_probe(&mut s, &ctx(false)));
+        assert!(!s.active);
+    }
+
+    #[test]
+    fn intentional_stop_never_triggers() {
+        let mut s = FallbackState::default();
+        apply_health_probe(&mut s, &ctx(false));
+        apply_health_probe(&mut s, &ctx(false));
+        assert!(!s.active);
+        assert_eq!(s.health_failures, 0);
+    }
+
+    #[test]
+    fn paused_does_not_count() {
+        let mut s = intended();
+        let mut c = ctx(false);
+        c.paused = true;
+        apply_health_probe(&mut s, &c);
+        apply_health_probe(&mut s, &c);
+        assert!(!s.active);
+        assert_eq!(s.health_failures, 0);
+    }
+
+    #[test]
+    fn no_counting_without_sessions() {
+        let mut s = intended();
+        let mut c = ctx(false);
+        c.sessions = 0;
+        apply_health_probe(&mut s, &c);
+        apply_health_probe(&mut s, &c);
+        assert_eq!(s.health_failures, 0);
+    }
+
+    #[test]
+    fn unconfigured_counts_but_never_activates() {
+        let mut s = intended();
+        let mut c = ctx(false);
+        c.configured = false;
+        apply_health_probe(&mut s, &c);
+        apply_health_probe(&mut s, &c);
+        apply_health_probe(&mut s, &c);
+        assert!(!s.active);
+    }
+
+    #[test]
+    fn started_and_stopped_reset_state() {
+        let mut s = intended();
+        activate(&mut s, FallbackReason::LoadFailed, "x", 5);
+        primary_started(&mut s);
+        assert!(s.primary_intended && !s.active && s.reason.is_none());
+        activate(&mut s, FallbackReason::Health, "y", 6);
+        primary_stopped(&mut s);
+        assert!(!s.primary_intended && !s.active);
     }
 }
