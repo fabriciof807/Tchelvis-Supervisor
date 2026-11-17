@@ -1,4 +1,4 @@
-use super::config::{normalize_host, LlmBackendKind, SupervisorConfig};
+use super::config::{LlmBackendKind, SupervisorConfig};
 use super::container::{
     probe_llama_server_health, ContainerState, LlmContainer, SystemContainerCli,
 };
@@ -44,6 +44,8 @@ pub struct FallbackState {
     /// Set while an intentional primary (re)start is in progress (load, model/GPU switch, bench).
     /// Health probes are not counted until it settles or `START_GRACE_SECS` pass.
     pub starting_since: Option<u64>,
+    /// When the last counted health failure happened (any process); closer probes do not count.
+    pub last_failure_at: Option<u64>,
 }
 
 /// How long an intentional primary restart may keep `/health` down before probes count again.
@@ -53,7 +55,8 @@ pub const START_GRACE_SECS: u64 = 300;
 fn hostname_of(host: &str) -> String {
     let lower = host.trim().to_ascii_lowercase();
     let rest = lower.split_once("://").map(|(_, r)| r).unwrap_or(&lower);
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `\\` too: URL parsers treat it as a path separator for http(s).
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
     let without_user = authority.rsplit('@').next().unwrap_or("");
     without_user.split(':').next().unwrap_or("").to_string()
 }
@@ -122,11 +125,12 @@ pub fn write_key_file(path: &Path, key: &str) -> Result<()> {
             .with_context(|| format!("Failed to create directory {}", parent.display()))?;
     }
     let tmp = PathBuf::from(format!("{}.tmp.{}", path.display(), std::process::id()));
+    // Never follow or reuse a leftover file: remove it, then require a fresh 0600 file.
+    let _ = fs::remove_file(&tmp);
     {
         let mut f = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .mode(0o600)
             .open(&tmp)
             .with_context(|| format!("Failed to create temp key file {}", tmp.display()))?;
@@ -252,6 +256,9 @@ pub struct ProbeCtx {
     pub configured: bool,
     pub now: u64,
     pub detail: String,
+    /// Minimum seconds between two counted failures, so ticks from several processes
+    /// (watch daemon + mod) do not add up to "2 consecutive" within seconds.
+    pub min_gap_secs: u64,
 }
 
 pub fn activate(state: &mut FallbackState, reason: FallbackReason, detail: &str, now: u64) {
@@ -260,6 +267,7 @@ pub fn activate(state: &mut FallbackState, reason: FallbackReason, detail: &str,
     }
     state.active = true;
     state.starting_since = None;
+    state.last_failure_at = None;
     state.reason = Some(reason);
     state.detail = Some(detail.to_string());
     state.health_failures = 0;
@@ -277,8 +285,15 @@ pub fn apply_health_probe(state: &mut FallbackState, ctx: &ProbeCtx) -> bool {
     }
     if ctx.healthy {
         state.health_failures = 0;
+        state.last_failure_at = None;
         return false;
     }
+    if let Some(last) = state.last_failure_at {
+        if ctx.now.saturating_sub(last) < ctx.min_gap_secs {
+            return false;
+        }
+    }
+    state.last_failure_at = Some(ctx.now);
     state.health_failures = state.health_failures.saturating_add(1);
     if state.health_failures >= 2 && ctx.configured {
         activate(state, FallbackReason::Health, &ctx.detail, ctx.now);
@@ -291,12 +306,14 @@ pub fn apply_health_probe(state: &mut FallbackState, ctx: &ProbeCtx) -> bool {
 pub fn primary_starting(state: &mut FallbackState, now: u64) {
     state.starting_since = Some(now);
     state.health_failures = 0;
+    state.last_failure_at = None;
 }
 
 /// Ends the start grace without changing whether the primary is intended or the fallback active.
 pub fn primary_start_settled(state: &mut FallbackState) {
     state.starting_since = None;
     state.health_failures = 0;
+    state.last_failure_at = None;
 }
 
 /// Best-effort `primary_starting` on the shared state file (errors are logged, never fatal).
@@ -308,6 +325,7 @@ pub fn mark_primary_starting(path: &Path, now: u64) {
 
 pub fn primary_started(state: &mut FallbackState) {
     state.starting_since = None;
+    state.last_failure_at = None;
     state.primary_intended = true;
     state.active = false;
     state.reason = None;
@@ -318,6 +336,7 @@ pub fn primary_started(state: &mut FallbackState) {
 
 pub fn primary_stopped(state: &mut FallbackState) {
     state.starting_since = None;
+    state.last_failure_at = None;
     state.primary_intended = false;
     state.active = false;
     state.reason = None;
@@ -395,7 +414,11 @@ pub fn fallback_client_config(
     let mut cfg = primary.clone();
     cfg.llm_container.mode = "off".to_string();
     cfg.llm_backend = LlmBackendKind::OpenAiCompatible;
-    cfg.ollama_host = normalize_host(&fb.host);
+    let host = normalize_fallback_host(&fb.host);
+    // Explicit override: `effective_primary_host` would otherwise rewrite the Ollama default
+    // port (`localhost:11434`) to api.openai.com for the openai-compatible backend.
+    cfg.host_override = Some(host.clone());
+    cfg.ollama_host = host;
     cfg.ollama_fallback_host = None;
     cfg.ollama_model = fb.model.trim().to_string();
     cfg.api_key = Some(key);
@@ -436,7 +459,7 @@ impl FallbackProvider for LiveFallback {
         if !fb.is_set() {
             return None;
         }
-        let host = normalize_host(&fb.host);
+        let host = normalize_fallback_host(&fb.host);
         let key = resolve_fallback_key(&host, read_key_file(&fallback_key_path()), |k| {
             std::env::var(k).ok()
         })?;
@@ -524,6 +547,7 @@ pub fn finish_primary_start(p: &dyn FallbackProvider, res: Result<()>, now: u64)
             } else {
                 let _ = p.update_state(&mut |s| {
                     s.primary_intended = true;
+                    s.starting_since = None;
                 });
                 Err(e)
             }
@@ -531,8 +555,19 @@ pub fn finish_primary_start(p: &dyn FallbackProvider, res: Result<()>, now: u64)
     }
 }
 
+/// Normalizes a fallback base URL: trims, drops trailing `/`, and defaults to `https://` so a
+/// typed `openrouter.ai/api` never sends the key in cleartext. An explicit `http://` is kept.
+pub fn normalize_fallback_host(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("https://{trimmed}")
+    }
+}
+
 pub fn models_url(host: &str) -> String {
-    let base = normalize_host(host);
+    let base = normalize_fallback_host(host);
     if base.ends_with("/v1") {
         format!("{base}/models")
     } else {
@@ -727,7 +762,70 @@ mod tests {
             configured: true,
             now: 100,
             detail: "/health sem resposta".into(),
+            min_gap_secs: 9,
         }
+    }
+
+    #[test]
+    fn failures_closer_than_the_min_gap_count_once() {
+        // Two processes (watch daemon + mod tick) probing seconds apart must not add up.
+        let mut s = intended();
+        let mut c = ctx(false);
+        apply_health_probe(&mut s, &c);
+        c.now = 103;
+        assert!(!apply_health_probe(&mut s, &c));
+        assert_eq!(s.health_failures, 1);
+        c.now = 112;
+        assert!(apply_health_probe(&mut s, &c));
+    }
+
+    #[test]
+    fn localhost_ollama_port_fallback_is_not_rewritten_to_openai() {
+        let primary = SupervisorConfig::default();
+        let fb = FallbackConfig {
+            host: "localhost:11434".into(),
+            model: "qwen3:4b".into(),
+        };
+        let c = fallback_client_config(&primary, &fb, "k".into());
+        assert_eq!(c.effective_primary_host(), "https://localhost:11434");
+        let fb = FallbackConfig {
+            host: "http://localhost:11434".into(),
+            model: "qwen3:4b".into(),
+        };
+        let c = fallback_client_config(&primary, &fb, "k".into());
+        assert_eq!(c.effective_primary_host(), "http://localhost:11434");
+    }
+
+    #[test]
+    fn fallback_host_without_scheme_defaults_to_https() {
+        assert_eq!(
+            normalize_fallback_host(" openrouter.ai/api/ "),
+            "https://openrouter.ai/api"
+        );
+        assert_eq!(
+            normalize_fallback_host("http://10.0.0.5:4000"),
+            "http://10.0.0.5:4000"
+        );
+        assert_eq!(
+            models_url("openrouter.ai/api"),
+            "https://openrouter.ai/api/v1/models"
+        );
+    }
+
+    #[test]
+    fn backslash_in_host_does_not_fake_a_provider_domain() {
+        assert_eq!(
+            provider_env_for_host("https://evil.example\\.openai.com/v1"),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_start_without_fallback_ends_the_start_grace() {
+        let p = Task5FakeFallback::unconfigured();
+        let _ = p.update_state(&mut |s| primary_starting(s, 1));
+        let _ = finish_primary_start(&p, Err(anyhow::anyhow!("boom")), 7);
+        assert_eq!(p.load_state().starting_since, None);
     }
 
     fn intended() -> FallbackState {
@@ -800,10 +898,12 @@ mod tests {
     fn two_consecutive_failures_activate() {
         let mut s = intended();
         assert!(!apply_health_probe(&mut s, &ctx(false)));
-        assert!(apply_health_probe(&mut s, &ctx(false)));
+        let mut c = ctx(false);
+        c.now = 112; // next poll, 12 s later
+        assert!(apply_health_probe(&mut s, &c));
         assert!(s.active);
         assert_eq!(s.reason, Some(FallbackReason::Health));
-        assert_eq!(s.since, Some(100));
+        assert_eq!(s.since, Some(112));
     }
 
     #[test]

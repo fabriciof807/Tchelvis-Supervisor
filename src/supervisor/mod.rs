@@ -226,11 +226,13 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
 /// Explicitly stops the managed container (or unloads Ollama with `keep_alive: 0`) and returns the updated snapshot.
 pub fn unload_model() -> Result<DesktopModSnapshot> {
     let mut engine = build_default_engine()?;
-    engine.cognitive.unload_model()?;
+    // Record the intentional stop before stopping, so a concurrent tick never reads the
+    // stopping container as a failure and switches to the fallback.
     if engine.config.container_mode_active() {
         let _ = engine.fallback.update_state(&mut fallback::primary_stopped);
         engine.refresh_fallback_state();
     }
+    engine.cognitive.unload_model()?;
     engine.model_loaded = false;
     engine.store.model_loaded = false;
     let _ = engine.store.save();
@@ -285,11 +287,12 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
                     fallback::finish_primary_start(&provider, res, unix_now_secs())?;
                     loaded_after = true;
                 } else {
-                    let _ = mgr.stop();
+                    // State first (see `unload_model`), then stop.
                     let _ = fallback::update_state(
                         &fallback::fallback_state_path(),
                         fallback::primary_stopped,
                     );
+                    let _ = mgr.stop();
                 }
             }
         }
@@ -588,7 +591,8 @@ pub fn fallback_set(host: Option<&str>, model: Option<&str>) -> Result<fallback:
     if host.is_none() && model.is_none() {
         anyhow::bail!("informe --host e/ou --model");
     }
-    config_write::write_fallback(&config::supervisor_config_path(), host, model)?;
+    let host = host.map(fallback::normalize_fallback_host);
+    config_write::write_fallback(&config::supervisor_config_path(), host.as_deref(), model)?;
     Ok(fallback_status())
 }
 

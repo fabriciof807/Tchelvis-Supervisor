@@ -444,11 +444,13 @@ pub fn run_bench(runs: u32, mut on_progress: impl FnMut(&BenchProgress)) -> Resu
                     super::fallback::update_state(&fb_path, super::fallback::primary_start_settled);
             }
             RestoreAction::Stop => {
+                // The container was stopped before the bench. Only end the start grace: an
+                // intended-but-crashed primary keeps its active fallback (return is the user's
+                // call), and a user-stopped primary already has primary_intended = false.
                 let _ = mgr.stop();
-                // The container was stopped before the bench: the primary is not expected to run.
                 let _ = super::fallback::update_state(
                     &super::fallback::fallback_state_path(),
-                    super::fallback::primary_stopped,
+                    super::fallback::primary_start_settled,
                 );
             }
         },

@@ -153,6 +153,9 @@ pub struct SupervisorConfig {
     /// Optional API fallback model settings.
     #[serde(default)]
     pub fallback: FallbackConfig,
+    /// Runtime-only host that `effective_primary_host` returns as is (set for the fallback client).
+    #[serde(skip)]
+    pub host_override: Option<String>,
 }
 
 fn parse_env_bool(val: &str) -> bool {
@@ -302,6 +305,7 @@ impl Default for SupervisorConfig {
             hc: HcAdapterConfig::default(),
             llm_container,
             fallback: FallbackConfig::default(),
+            host_override: None,
         };
         cfg.api_key =
             resolve_primary_key(&cfg.effective_primary_host(), None, |k| env::var(k).ok());
@@ -462,6 +466,9 @@ impl SupervisorConfig {
     /// Otherwise, when `ollama_host` is still the Ollama default (`http://localhost:11434`),
     /// switches to each backend's standard default endpoint.
     pub fn effective_primary_host(&self) -> String {
+        if let Some(host) = &self.host_override {
+            return host.clone();
+        }
         if self.container_mode_active() {
             return format!("http://127.0.0.1:{}", self.llm_container.port);
         }

@@ -175,6 +175,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                         configured,
                         now,
                         detail: detail.clone(),
+                        min_gap_secs: (self.config.poll_interval_secs * 3 / 4).max(1),
                     },
                 );
             }) {
