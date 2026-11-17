@@ -22,6 +22,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Host-matched API keys for `openai-compatible`.** Provider environment variables are now matched against the target host (`openai.com` → `OPENAI_API_KEY`, `openrouter.ai` → `OPENROUTER_API_KEY`, `deepseek.com` → `DEEPSEEK_API_KEY`, `opencode.ai` → `OPENCODE_API_KEY`); an `OPENAI_API_KEY` is no longer sent to non-OpenAI hosts. Explicit `TCHELVIS_LLM_API_KEY` (and `TCHELVIS_FALLBACK_API_KEY` / key file for fallback) still take precedence.
 
 ### Fixed
+- **Pending prompt found by screen structure.** The supervisor now reads Claude Code's permission dialog from its top rule instead of a fixed last-8-lines window (the dialog is taller, so a destructive command shown in it was alerted as `normal` instead of `critical`), and destructive detection for Action Cards also checks hc's `status.msg`. Other agents still use the last 8 lines, cut after an earlier answered prompt.
+- **LLM sees the current request apart from earlier output.** The evaluation payload sends `pending_prompt` and `earlier_output` instead of one `recent_hc_output` block, and the model is told to decide only on the current request.
+- **Supervisor model card overlap.** Model rows put size/source details under the name; `Hide` / `Delete` no longer squeeze the name over them.
 - **Daily task tag pill vs saved tag.** When no explicit tag is chosen, the pill now defaults to the active Space only if it is a Home project (otherwise `Geral`) and falls back to `Geral` if a chosen project disappears, ensuring the saved `--project` always matches the displayed pill (`Geral` never passes `--project`).
 
 ## [0.2.0] - 2026-11-16

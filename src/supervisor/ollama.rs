@@ -324,7 +324,8 @@ pub fn probe_llm_health(config: &SupervisorConfig) -> LlmHealthStatus {
 
 /// Embedded system prompt for the Cockpit Durable Supervisor.
 pub const SYSTEM_PROMPT: &str = r#"You are the Cockpit Durable Supervisor, an autonomous triage controller monitoring software engineering agents via Herdr Core (hc).
-Your job is to analyze an agent's durable state and its last 25 lines of terminal output, then output a strict JSON decision.
+Your job is to analyze an agent's durable state and its terminal screen, then output a strict JSON decision.
+The screen comes in two parts: "pending_prompt" is the bottom of the screen, where the current request (if any) is shown; "earlier_output" is the output above it, context only. Decide ONLY on "pending_prompt". "earlier_output" may contain prompts that were already answered: never alert, reply or judge urgency because of them.
 
 RULES FOR DECISION ("NO_OP", "AUTO_REPLY", "ALERT_OPERATOR"):
 0. Only an agent that is BLOCKED on a pending prompt (a question or permission request awaiting input) may receive "AUTO_REPLY" or "ALERT_OPERATOR". If the agent is WORKING, thinking, or waiting on its own background subagent/tool, choose "NO_OP" and just update "updated_summary". Non-fatal log noise (e.g. a hook error, "aborted", a warning) is NOT a reason to alert the operator.
@@ -341,8 +342,11 @@ RULES FOR DECISION ("NO_OP", "AUTO_REPLY", "ALERT_OPERATOR"):
 
 Always write "updated_summary" and "reason_for_operator" in concise Brazilian Portuguese (pt-BR)."#;
 
-/// Builds the episodic user prompt JSON payload.
+/// Builds the episodic user prompt JSON payload. The screen is split so the model cannot mistake
+/// an answered prompt still on screen for the current one.
 pub fn build_user_prompt_payload(state: &AgentDurableState, recent_hc_output: &str) -> Value {
+    let (earlier_output, pending_prompt) =
+        crate::supervisor::guardrails::pending_prompt_split(recent_hc_output);
     json!({
         "agent_state": {
             "agent_id": state.agent_id,
@@ -351,7 +355,8 @@ pub fn build_user_prompt_payload(state: &AgentDurableState, recent_hc_output: &s
             "max_auto_replies": state.max_auto_replies,
             "rolling_summary": state.rolling_summary,
         },
-        "recent_hc_output": recent_hc_output,
+        "earlier_output": earlier_output,
+        "pending_prompt": pending_prompt,
     })
 }
 
@@ -672,7 +677,10 @@ mod tests {
     #[test]
     fn test_build_user_prompt_payload_matches_spec() {
         let state = sample_state();
-        let payload = build_user_prompt_payload(&state, "running 12 tests...\nContinue? [y/N]");
+        let payload = build_user_prompt_payload(
+            &state,
+            "Allow bash tool: ls ? [y/N]\ny\nrunning 12 tests...\nContinue? [y/N]",
+        );
 
         let agent_state = payload.get("agent_state").expect("agent_state missing");
         assert_eq!(agent_state["agent_id"], "worker-01");
@@ -683,10 +691,13 @@ mod tests {
             agent_state["rolling_summary"],
             "Executando testes unitários do módulo de autenticação."
         );
+        // The answered prompt stays out of the current request.
         assert_eq!(
-            payload["recent_hc_output"],
-            "running 12 tests...\nContinue? [y/N]"
+            payload["pending_prompt"],
+            "y\nrunning 12 tests...\nContinue? [y/N]"
         );
+        assert_eq!(payload["earlier_output"], "Allow bash tool: ls ? [y/N]");
+        assert!(payload.get("recent_hc_output").is_none());
     }
 
     #[test]
