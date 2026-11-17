@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod chat;
 pub mod config;
 pub mod config_write;
 pub mod container;
