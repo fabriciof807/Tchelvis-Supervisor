@@ -184,6 +184,8 @@ Specs aprovadas pelo usuário; planos em `docs/superpowers/plans/2026-11-17-{dai
 - `guardrails::pending_prompt_split` → `(earlier, pending)`: janela de 8 linhas cortada após um pedido já respondido; a linha `────` do diálogo do Claude só **alarga** a região (o comando do diálogo real fica na 9ª linha de baixo → `rm -rf` saía `normal`). `enforce_blocked_policy_with_msg` também lê o `status.msg` do hc.
 - LLM recebe `pending_prompt` + `earlier_output` (no lugar de `recent_hc_output`) e decide só pelo pedido atual.
 - Mod: linhas do card de modelos com detalhes embaixo do nome.
+- **Validado no host (`d3bbd26`):** card de modelos sem sobreposição (tela do usuário); Claude real pedindo `rm -rf` (opção 2 quebrada, comando na 9ª linha de baixo) → `critical` pela tela, `n` não enviado, pasta intacta. Tela real virou fixture `claude_permission_bash_rm.txt` (`54d1f90`). Texto da LLM de 350M no card veio quebrado; usuário decidiu **não** esconder o texto da LLM por enquanto.
+- `9b9f550` (local até o próximo push): seletor/card/pílula do fallback mostram o nome do modelo local quando o `llama-server` sem `--alias` lista `/models/<hash>`.
 - **Validar no host:** card de modelos sem sobreposição; `sequencia` e Claude real iguais ao teste 12; se possível, Claude real pedindo um `rm -rf` → alerta `critical`.
 - `cargo clippy -D warnings` falha em `main` por lints antigos (`src/usage.rs`, `config.rs`/`watcher.rs` testes, `tui.rs`, etc.); nada novo. Testes: 285 Rust, 32 mod.
 
