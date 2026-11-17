@@ -1477,7 +1477,10 @@ export default class CockpitMod extends View {
     this.inspectorTab =
       initialViewMode && initialViewMode !== "usage"
         ? initialViewMode
-        : "inspector"; // "home" | "inspector" | "doctor"
+        : "inspector"; // "home" | "inspector" | "doctor" | "chat"
+    this.chatMessages = [];
+    this.chatDraft = "";
+    this.chatPending = false;
     this.handle = cx.focus_handle();
 
     const role = props()?.role ?? "fleet";
@@ -2414,6 +2417,7 @@ export default class CockpitMod extends View {
 
   handleKeyDown(e, cx, agent = null) {
     if (!this.editingField) return;
+    if (this.editingField === "chat" && this.chatPending) return;
     const m = e.modifiers;
     if (e.key === "escape") {
       this.editingField = null;
@@ -2423,6 +2427,12 @@ export default class CockpitMod extends View {
           this.taskDraft += "\n";
         } else {
           this.addTaskGui(cx);
+        }
+      } else if (this.editingField === "chat") {
+        if (m?.shift) {
+          this.chatDraft += "\n";
+        } else {
+          this.sendChatMessage(cx);
         }
       } else if (this.editingField === "fallbackHost") {
         this.submitFallbackHost(cx);
@@ -2447,6 +2457,8 @@ export default class CockpitMod extends View {
     } else if (e.key === "backspace") {
       if (this.editingField === "task") {
         this.taskDraft = this.taskDraft.slice(0, -1);
+      } else if (this.editingField === "chat") {
+        this.chatDraft = this.chatDraft.slice(0, -1);
       } else if (this.editingField === "fallbackHost") {
         this.fallbackHostDraft = this.fallbackHostDraft.slice(0, -1);
       } else if (this.editingField === "modelFilter") {
@@ -2461,6 +2473,8 @@ export default class CockpitMod extends View {
     } else if (e.key_char && !m?.control && !m?.platform) {
       if (this.editingField === "task") {
         this.taskDraft += e.key_char;
+      } else if (this.editingField === "chat") {
+        this.chatDraft += e.key_char;
       } else if (this.editingField === "fallbackHost") {
         this.fallbackHostDraft += e.key_char;
       } else if (this.editingField === "modelFilter") {
@@ -2936,6 +2950,8 @@ export default class CockpitMod extends View {
       if (!this.benchLast && !this.benchRunning) this.fetchBenchLast(cx);
     } else if (normalizedTab === "inspector") {
       this.refreshInspector(cx);
+    } else if (normalizedTab === "chat") {
+      if (!shared("supervisor.snapshot")) this.fetchSupervisorStatus(cx);
     }
     if (inspectorHidden) {
       run("layout.toggle", { id: "tchelvis-inspector" });
@@ -3307,6 +3323,15 @@ export default class CockpitMod extends View {
                   "🩺 Doctor",
                   rightView === "doctor" && !inspectorHidden && !onlyUsage,
                   (_e, cx) => this.openDrawerView(cx, "doctor", true)
+                )
+              )
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-pill-view-chat",
+                  "💬 Chat",
+                  rightView === "chat" && !inspectorHidden && !onlyUsage,
+                  (_e, cx) => this.openDrawerView(cx, "chat", true)
                 )
               )
           )
@@ -5167,6 +5192,339 @@ export default class CockpitMod extends View {
       );
   }
 
+  sendChatMessage(cx) {
+    if (this.chatPending || isBlankDraft(this.chatDraft)) return;
+    const question = this.chatDraft.trim();
+    const history = chatHistoryForRequest(this.chatMessages);
+    this.chatDraft = "";
+    this.chatMessages = [
+      ...this.chatMessages,
+      { role: "user", content: question },
+    ];
+    this.chatPending = true;
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          chatRequestArgv(history, question),
+          { timeout: 130000 }
+        );
+        const parsed = parseChatResult(res.code, res.stdout);
+        if (parsed.ok) {
+          this.chatMessages = [
+            ...this.chatMessages,
+            {
+              role: "assistant",
+              content: parsed.answer,
+              model: parsed.model,
+              viaFallback: parsed.viaFallback,
+              fallbackHost: parsed.fallbackHost,
+            },
+          ];
+        } else if (parsed.code === "llm_stopped") {
+          this.chatMessages = [
+            ...this.chatMessages,
+            {
+              role: "error",
+              code: "llm_stopped",
+              content: "LLM desligada",
+            },
+          ];
+        } else {
+          this.chatMessages = [
+            ...this.chatMessages,
+            {
+              role: "error",
+              code: parsed.code,
+              content: parsed.error || "Erro desconhecido",
+            },
+          ];
+        }
+      } catch (_e) {
+        this.chatMessages = [
+          ...this.chatMessages,
+          {
+            role: "error",
+            code: "llm_error",
+            content: "Sem resposta do tchelvis",
+          },
+        ];
+      } finally {
+        this.chatPending = false;
+        cx.notify();
+      }
+    });
+  }
+
+  renderChatBody(cx, themeArg = null) {
+    const t = themeArg ?? theme();
+    const supSnap = shared("supervisor.snapshot");
+    const headerLabel = chatHeaderLabel(supSnap) || "Chat";
+    const isFallback = Boolean(supSnap?.fallback_active);
+    const messages = Array.isArray(this.chatMessages) ? this.chatMessages : [];
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .p(12)
+      .gap(10)
+      // Header bar: model / fallback indicator + Limpar
+      .child(
+        h_flex()
+          .gap(8)
+          .px(10)
+          .py(7)
+          .rounded(8)
+          .border(1)
+          .border_color(
+            isFallback ? withAlpha(t.working, "77", t.border) : t.border
+          )
+          .bg(t.surface)
+          .items_center()
+          .justify_between()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_1()
+              .min_w(0)
+              .child(
+                div()
+                  .text_size(11.5)
+                  .font_semibold()
+                  .text_color(isFallback ? t.working : t.muted)
+                  .child(headerLabel)
+              )
+          )
+          .child(
+            this.actionBtn(t, "ck-chat-clear", "Limpar", (_e, cx) => {
+              this.chatMessages = [];
+              cx.notify();
+            })
+          )
+      )
+      // Messages list (scrollable)
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .overflow_y_scrollbar()
+          .gap(8)
+          .when(messages.length === 0 && !this.chatPending, (el) =>
+            el.child(
+              this.cardBox(t)
+                .rounded(10)
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.muted)
+                    .child(
+                      "Pergunte sobre os agentes ativos ou as Tarefas do dia. Somente leitura."
+                    )
+                )
+            )
+          )
+          .children(
+            messages.map((m, idx) => {
+              if (m.role === "user") {
+                return v_flex()
+                  .id(`ck-chat-msg-${idx}`)
+                  .p(9)
+                  .gap(4)
+                  .rounded(8)
+                  .border(1)
+                  .border_color(withAlpha(t.accent, "55", t.border))
+                  .bg(t.selected)
+                  .child(
+                    div()
+                      .text_size(10)
+                      .font_semibold()
+                      .text_color(t.accent)
+                      .child("VOCÊ")
+                  )
+                  .child(
+                    div()
+                      .text_size(12)
+                      .text_color(t.foreground)
+                      .child(String(m.content ?? ""))
+                  );
+              }
+              if (m.role === "error") {
+                return v_flex()
+                  .id(`ck-chat-msg-${idx}`)
+                  .p(9)
+                  .gap(6)
+                  .rounded(8)
+                  .border(1)
+                  .border_color(withAlpha(t.blocked, "66", t.blocked))
+                  .bg(withAlpha(t.blocked, "18", t.surface))
+                  .child(
+                    div()
+                      .text_size(12)
+                      .text_color(t.blocked)
+                      .child(String(m.content ?? "Erro"))
+                  )
+                  .when(m.code === "llm_stopped", (el) =>
+                    el.child(
+                      h_flex().child(
+                        this.actionBtn(
+                          t,
+                          `ck-chat-load-llm-${idx}`,
+                          this.loadingLlm ? "◌ Carregando…" : "▶ Load LLM",
+                          (_e, cx) => this.loadSupervisorLlm(cx),
+                          true
+                        )
+                      )
+                    )
+                  );
+              }
+              const fbMark = fallbackMarker(m);
+              return v_flex()
+                .id(`ck-chat-msg-${idx}`)
+                .p(9)
+                .gap(4)
+                .rounded(8)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.surface)
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .justify_between()
+                    .child(
+                      div()
+                        .text_size(10)
+                        .font_semibold()
+                        .text_color(t.muted)
+                        .child(
+                          m.model ? `SUPERVISOR · ${m.model}` : "SUPERVISOR"
+                        )
+                    )
+                    .when(Boolean(fbMark), (el) =>
+                      el.child(
+                        div()
+                          .text_size(10.5)
+                          .font_semibold()
+                          .text_color(t.working)
+                          .child(fbMark)
+                      )
+                    )
+                )
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.foreground)
+                    .child(String(m.content ?? ""))
+                );
+            })
+          )
+          .when(Boolean(this.chatPending), (el) =>
+            el.child(
+              v_flex()
+                .id("ck-chat-pending")
+                .p(9)
+                .rounded(8)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.surface)
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.muted)
+                    .child("◌ Pensando…")
+                )
+            )
+          )
+      )
+      // Input bar styled like Daily Tasks input
+      .child(
+        h_flex()
+          .flex_none()
+          .gap(6)
+          .items_start()
+          .child(
+            div()
+              .id("ck-chat-input")
+              .flex_1()
+              .min_w(0)
+              .px(9)
+              .py(6)
+              .rounded(6)
+              .border(1)
+              .border_color(
+                this.editingField === "chat" ? t.accent : t.border
+              )
+              .bg(t.background)
+              .text_size(12)
+              .text_color(this.chatDraft ? t.foreground : t.dim)
+              .cursor_text()
+              .on_click((_e, cx) => {
+                this.editingField = "chat";
+                this.handle.focus();
+                cx.notify();
+              })
+              .child(
+                (() => {
+                  const isEditingChat = this.editingField === "chat";
+                  if (!this.chatDraft) {
+                    return div().child(
+                      (isEditingChat && !this.chatPending ? "▏" : "") +
+                        "Pergunte sobre agentes ou tarefas (Shift+Enter: nova linha)…"
+                    );
+                  }
+                  const lines = draftDisplayLines(this.chatDraft);
+                  return v_flex()
+                    .gap(2)
+                    .children(
+                      lines.map((line, idx) => {
+                        const isLast = idx === lines.length - 1;
+                        const text =
+                          line +
+                          (isLast && isEditingChat && !this.chatPending
+                            ? "▏"
+                            : "");
+                        return div().child(text || " ");
+                      })
+                    );
+                })()
+              )
+          )
+          .child(
+            h_flex()
+              .id("ck-chat-send")
+              .h(26)
+              .px(10)
+              .items_center()
+              .rounded(6)
+              .bg(
+                this.chatPending || isBlankDraft(this.chatDraft)
+                  ? t.raised
+                  : t.accent
+              )
+              .border(1)
+              .border_color(
+                this.chatPending || isBlankDraft(this.chatDraft)
+                  ? t.border
+                  : t.accent
+              )
+              .text_size(11.5)
+              .font_semibold()
+              .text_color(
+                this.chatPending || isBlankDraft(this.chatDraft)
+                  ? t.dim
+                  : t.background
+              )
+              .cursor_pointer()
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => this.sendChatMessage(cx))
+              .child(this.chatPending ? "…" : "Enviar")
+          )
+      );
+  }
+
   renderModelPicker(cx, themeArg = null, standalone = true) {
     const t = themeArg ?? theme();
     const supSnap = shared("supervisor.snapshot") ?? null;
@@ -6874,6 +7232,24 @@ export default class CockpitMod extends View {
                   }
                 )
               )
+              .child(
+                this.segmentBtn(
+                  t,
+                  "ck-ins-tab-chat",
+                  "💬 Chat",
+                  activeView === "chat",
+                  (_e, cx) => {
+                    setShared("cockpit.viewMode", "chat");
+                    setShared("cockpit.usageOnlyDrawer", false);
+                    setShared("cockpit.modelPickerOnlyDrawer", false);
+                    this.inspectorTab = "chat";
+                    if (!shared("supervisor.snapshot")) {
+                      this.fetchSupervisorStatus(cx);
+                    }
+                    cx.notify();
+                  }
+                )
+              )
           )
           .child(div().flex_1())
           .child(
@@ -6886,6 +7262,9 @@ export default class CockpitMod extends View {
               if (activeView === "doctor") {
                 this.runDoctorCheck(cx);
                 if (!this.benchRunning) this.fetchBenchLast(cx);
+              }
+              if (activeView === "chat") {
+                this.fetchSupervisorStatus(cx);
               }
             })
           )
@@ -6943,6 +7322,9 @@ export default class CockpitMod extends View {
       )
       .when(activeView === "doctor", (el) =>
         el.child(this.renderDoctorBody(cx, t))
+      )
+      .when(activeView === "chat", (el) =>
+        el.child(this.renderChatBody(cx, t))
       )
       .when(activeView === "inspector", (el) =>
         el.child(
@@ -8250,6 +8632,8 @@ export default class CockpitMod extends View {
       .child(viewLink("ck-status-inspector", "Inspector", "inspector"))
       .child(div().text_color(t.dim).child("·"))
       .child(viewLink("ck-status-doctor", "Doctor", "doctor"))
+      .child(div().text_color(t.dim).child("·"))
+      .child(viewLink("ck-status-chat", "Chat", "chat"))
       .child(div().text_color(t.dim).child("·"))
       .child(
         div()
