@@ -203,8 +203,11 @@ enum TaskCommand {
         /// Output full HomeSnapshot JSON
         #[arg(long)]
         json: bool,
+        /// Open $VISUAL / $EDITOR to compose a multi-line task title
+        #[arg(long)]
+        edit: bool,
         /// Task title
-        #[arg(required = true)]
+        #[arg(required_unless_present = "edit")]
         title: Vec<String>,
     },
     /// Toggle a daily task's completed state
@@ -921,16 +924,48 @@ async fn main() -> Result<()> {
                     project,
                     priority,
                     json,
+                    edit,
                     title,
                 } => {
-                    let joined = title.join(" ");
-                    if joined.trim().is_empty() {
-                        bail!("Task title cannot be empty");
-                    }
+                    let initial = title.join(" ");
+                    let final_title = if edit {
+                        let visual = std::env::var("VISUAL").ok();
+                        let editor_env = std::env::var("EDITOR").ok();
+                        let nvi_available = std::env::var_os("PATH").is_some_and(|paths| {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::env::split_paths(&paths).any(|dir| {
+                                let candidate = dir.join("nvi");
+                                candidate.metadata().is_ok_and(|m| {
+                                    m.is_file() && (m.permissions().mode() & 0o111 != 0)
+                                })
+                            })
+                        });
+                        let editor = home::resolve_editor(
+                            visual.as_deref(),
+                            editor_env.as_deref(),
+                            nvi_available,
+                        );
+                        let temp_dir = std::env::temp_dir();
+                        let edited = tokio::task::spawn_blocking(move || {
+                            home::edit_text_with_editor(&editor, &initial, &temp_dir)
+                        })
+                        .await
+                        .context("task add --edit task panicked")??;
+                        let Some(text) = edited else {
+                            println!("Cancelado: texto vazio");
+                            return Ok(());
+                        };
+                        text
+                    } else {
+                        if initial.trim().is_empty() {
+                            bail!("Task title cannot be empty");
+                        }
+                        initial
+                    };
                     let prio = TaskPriority::from_str_loose(&priority);
                     let (task, snap) = tokio::task::spawn_blocking(move || -> Result<_> {
                         let mut store = DailyTaskStore::load_or_init(&task_path)?;
-                        let task = store.add_task(&joined, project, prio, unix_now_secs());
+                        let task = store.add_task(&final_title, project, prio, unix_now_secs());
                         store.save(&task_path)?;
                         let snap = home::build_home_snapshot(&paths_clone)?;
                         Ok((task, snap))
@@ -1284,7 +1319,7 @@ fn print_human_tasks(snap: &HomeSnapshot) {
             t.id,
             t.priority.as_str(),
             proj,
-            t.title
+            home::table_title(&t.title)
         );
     }
 }
@@ -1368,5 +1403,47 @@ fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
     }
     if out.user_hidden_count > 0 {
         println!("({} hidden by you)", out.user_hidden_count);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn task_add_requires_title_without_edit() {
+        assert!(Cli::try_parse_from(["tchelvis", "task", "add"]).is_err());
+    }
+
+    #[test]
+    fn task_add_edit_makes_title_optional() {
+        let cli = Cli::try_parse_from(["tchelvis", "task", "add", "--edit"]).unwrap();
+        match cli.command {
+            Commands::Task {
+                action: TaskCommand::Add { edit, title, .. },
+            } => {
+                assert!(edit);
+                assert!(title.is_empty());
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_add_edit_accepts_prefill_text() {
+        let cli = Cli::try_parse_from([
+            "tchelvis", "task", "add", "--edit", "--", "rascunho", "longo",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Task {
+                action: TaskCommand::Add { edit, title, .. },
+            } => {
+                assert!(edit);
+                assert_eq!(title, vec!["rascunho", "longo"]);
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 }
