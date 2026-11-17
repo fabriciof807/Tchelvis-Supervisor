@@ -5313,36 +5313,62 @@ export default class CockpitMod extends View {
                     );
                 }
 
+                // Name and details stack in the left column; only the badge and the buttons sit on
+                // the right. Side by side, Hide + Delete squeezed the name over the details.
+                const metaColor = isDeleting
+                  ? t.blocked
+                  : isSwitching
+                    ? t.accent
+                    : isNonChat || isHiddenRow
+                      ? t.dim
+                      : t.muted;
+                const metaText = isDeleting
+                  ? "◌ Deleting…"
+                  : isSwitching
+                    ? "◌ Switching…"
+                    : ellipsize(metaParts.join(" · "), 44);
                 return row
                   .child(
-                    h_flex()
+                    v_flex()
                       .flex_1()
                       .min_w(0)
-                      .gap(6)
-                      .items_center()
+                      .overflow_hidden()
+                      .gap(2)
                       .child(
-                        div()
-                          .flex_none()
-                          .text_size(11.5)
-                          .text_color(
-                            isNonChat || isHiddenRow
-                              ? t.dim
-                              : isFailedRow
-                                ? t.blocked
-                                : m.in_use
-                                  ? t.accent
-                                  : t.muted
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .child(
+                            div()
+                              .flex_none()
+                              .text_size(11.5)
+                              .text_color(
+                                isNonChat || isHiddenRow
+                                  ? t.dim
+                                  : isFailedRow
+                                    ? t.blocked
+                                    : m.in_use
+                                      ? t.accent
+                                      : t.muted
+                              )
+                              .child(m.in_use ? "●" : "○")
                           )
-                          .child(m.in_use ? "●" : "○")
+                          .child(
+                            div()
+                              .text_size(11.5)
+                              .font_semibold()
+                              .text_color(
+                                isNonChat || isHiddenRow ? t.dim : t.foreground
+                              )
+                              .child(ellipsize(m.display_name || m.id, 30))
+                          )
                       )
                       .child(
                         div()
-                          .text_size(11.5)
-                          .font_semibold()
-                          .text_color(
-                            isNonChat || isHiddenRow ? t.dim : t.foreground
-                          )
-                          .child(ellipsize(m.display_name || m.id, 30))
+                          .pl(17)
+                          .text_size(10.5)
+                          .text_color(metaColor)
+                          .child(metaText)
                       )
                   )
                   .child(
@@ -5350,27 +5376,6 @@ export default class CockpitMod extends View {
                       .flex_none()
                       .gap(6)
                       .items_center()
-                      .child(
-                        div()
-                          .flex_none()
-                          .text_size(10.5)
-                          .text_color(
-                            isDeleting
-                              ? t.blocked
-                              : isSwitching
-                                ? t.accent
-                                : isNonChat || isHiddenRow
-                                  ? t.dim
-                                  : t.muted
-                          )
-                          .child(
-                            isDeleting
-                              ? "◌ Deleting…"
-                              : isSwitching
-                                ? "◌ Switching…"
-                                : metaParts.join(" · ")
-                          )
-                      )
                       .when(Boolean(rowBadge) && !isSwitching && !isDeleting, (el) =>
                         el.child(
                           div()
