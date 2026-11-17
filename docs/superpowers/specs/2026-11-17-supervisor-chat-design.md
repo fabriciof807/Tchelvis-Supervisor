@@ -51,7 +51,7 @@ do projeto X ainda estão abertas?", "resuma o que entrou hoje", "o que eu dever
 ### CLI — `tchelvis chat ask`
 
 - `tchelvis chat ask "<pergunta>"`: uma pergunta, resposta em texto no stdout.
-- `tchelvis chat ask --json`: lê do stdin `{"question": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}`
+- `tchelvis chat ask --json [--request '<json>']`: lê do argumento `--request` (o mod não manda stdin) ou do stdin `{"question": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}`
   e escreve `{"answer": "...", "model": "<rótulo>", "via_fallback": bool, "context_chars": N}` ou
   `{"error": "...", "code": "llm_stopped"|"llm_error"|"bad_input"}` (código de saída ≠ 0 no erro).
 - O histórico vem de quem chama (o mod); o CLI não guarda nada em disco.
