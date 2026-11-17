@@ -219,73 +219,61 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         let eval_cap = self.config.max_evals_per_tick.max(1);
         let mut evals_started = 0usize;
 
-        for session in ordered {
-            let output = match self
+        // Pass 1: the read-only fast path for every blocked session, before any LLM call, so a
+        // trivial read never waits behind another terminal's evaluation in this tick (test 10:
+        // ~30 s behind a cold model right after `supervisor load`).
+        let mut fixed_rule_handled: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        let mut pass1_outputs: std::collections::HashMap<&str, String> =
+            std::collections::HashMap::new();
+        for session in ordered.iter().filter(|s| s.is_blocked()) {
+            let Ok(output) = self
                 .hc
                 .capture_output(&session.agent_id, self.config.capture_lines)
-            {
-                Ok(out) => out,
-                Err(_) => continue,
+            else {
+                continue;
             };
-
-            let current_hash = compute_sha256(&output);
-            let state = self
-                .store
-                .agents
-                .entry(session.agent_id.clone())
-                .or_insert_with(|| {
-                    AgentDurableState::new(
-                        &session.agent_id,
-                        &session.session_name,
-                        self.config.max_auto_replies,
-                        now,
-                    )
-                });
-            state.session_name = session.session_name.clone();
-            state.last_output_preview = output.clone();
-
-            // Stale Action Cards: an agent that is no longer blocked needs no operator attention.
-            if !session.is_blocked() && state.pending_operator_action.is_some() {
-                state.pending_operator_action = None;
+            let current_hash = self.observe_output(session, &output, now);
+            if self.try_readonly_fast_path(session, &output, &current_hash, now, &mut outcome) {
+                fixed_rule_handled.insert(session.agent_id.as_str());
+            } else {
+                pass1_outputs.insert(session.agent_id.as_str(), output);
             }
+        }
 
-            let hash_changed = current_hash != state.last_output_hash;
-            if hash_changed {
-                state.last_output_hash = current_hash.clone();
-                state.last_change_timestamp = now;
+        // Pass 2: everything else. Pass 1's screen is reused until the first LLM evaluation
+        // starts; after that each screen is read again, because an evaluation can take long
+        // enough for a human to answer in the meantime.
+        for session in ordered {
+            if fixed_rule_handled.contains(session.agent_id.as_str()) {
+                continue;
             }
+            let reusable = if evals_started == 0 {
+                pass1_outputs.remove(session.agent_id.as_str())
+            } else {
+                None
+            };
+            let output = match reusable {
+                Some(out) => out,
+                None => match self
+                    .hc
+                    .capture_output(&session.agent_id, self.config.capture_lines)
+                {
+                    Ok(out) => out,
+                    Err(_) => continue,
+                },
+            };
+            let current_hash = self.observe_output(session, &output, now);
 
-            // Read-only fast path: trivial read-only requests are approved by a fixed rule,
-            // without the LLM and outside the per-tick evaluation cap.
-            if session.is_blocked() && current_hash != state.last_evaluated_hash {
-                if let Some((payload, cmd)) = readonly_fast_path_with_msg(
-                    &output,
-                    session.kind.as_deref(),
-                    session.msg.as_deref(),
-                ) {
-                    state.last_hc_status = session.status.clone();
-                    let raw = CognitiveEvaluation {
-                        updated_summary: format!(
-                            "Comando somente leitura aprovado pela regra fixa: {cmd}"
-                        ),
-                        detected_state: LifecycleState::WaitingConfirmation,
-                        decision: SupervisorDecision::AutoReply,
-                        urgency: Urgency::Low,
-                        hc_command_payload: payload,
-                        reason_for_operator: String::new(),
-                    };
-                    let eval = validate_evaluation(state, self.store.mode, raw);
-                    self.apply_decision(
-                        session,
-                        &current_hash,
-                        eval,
-                        AutoReplySource::FixedRule,
-                        now,
-                        &mut outcome,
-                    );
-                    continue;
-                }
+            // The screen may have turned into a read-only request since pass 1.
+            if self.try_readonly_fast_path(session, &output, &current_hash, now, &mut outcome) {
+                continue;
             }
+            let Some(state) = self.store.agents.get_mut(&session.agent_id) else {
+                continue;
+            };
+            // Changed in this tick, whether pass 1 or this pass recorded it.
+            let hash_changed = state.last_change_timestamp == now;
 
             if !llm_available {
                 continue;
@@ -392,6 +380,82 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         self.store.model_loaded = self.model_loaded;
         self.store.save()?;
         Ok(outcome)
+    }
+
+    /// Records a freshly captured screen in the session's durable state (creating it on first
+    /// sight) and returns the screen hash. Clears an Action Card once the agent is no longer
+    /// blocked; a changed hash restarts the inactivity clock.
+    fn observe_output(&mut self, session: &HcSession, output: &str, now: u64) -> String {
+        let current_hash = compute_sha256(output);
+        let state = self
+            .store
+            .agents
+            .entry(session.agent_id.clone())
+            .or_insert_with(|| {
+                AgentDurableState::new(
+                    &session.agent_id,
+                    &session.session_name,
+                    self.config.max_auto_replies,
+                    now,
+                )
+            });
+        state.session_name = session.session_name.clone();
+        state.last_output_preview = output.to_string();
+
+        // Stale Action Cards: an agent that is no longer blocked needs no operator attention.
+        if !session.is_blocked() && state.pending_operator_action.is_some() {
+            state.pending_operator_action = None;
+        }
+        if current_hash != state.last_output_hash {
+            state.last_output_hash = current_hash.clone();
+            state.last_change_timestamp = now;
+        }
+        current_hash
+    }
+
+    /// Read-only fast path: trivial read-only requests are approved by a fixed rule, without the
+    /// LLM and outside the per-tick evaluation cap. Returns whether a decision was applied.
+    fn try_readonly_fast_path(
+        &mut self,
+        session: &HcSession,
+        output: &str,
+        current_hash: &str,
+        now: u64,
+        outcome: &mut TickOutcome,
+    ) -> bool {
+        if !session.is_blocked() {
+            return false;
+        }
+        let Some(state) = self.store.agents.get_mut(&session.agent_id) else {
+            return false;
+        };
+        if current_hash == state.last_evaluated_hash {
+            return false;
+        }
+        let Some((payload, cmd)) =
+            readonly_fast_path_with_msg(output, session.kind.as_deref(), session.msg.as_deref())
+        else {
+            return false;
+        };
+        state.last_hc_status = session.status.clone();
+        let raw = CognitiveEvaluation {
+            updated_summary: format!("Comando somente leitura aprovado pela regra fixa: {cmd}"),
+            detected_state: LifecycleState::WaitingConfirmation,
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: payload,
+            reason_for_operator: String::new(),
+        };
+        let eval = validate_evaluation(state, self.store.mode, raw);
+        self.apply_decision(
+            session,
+            current_hash,
+            eval,
+            AutoReplySource::FixedRule,
+            now,
+            outcome,
+        );
+        true
     }
 
     /// Records an evaluation (LLM or fixed rule) for a session and performs its side effects:
@@ -601,12 +665,18 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::tempdir;
 
+    type SharedScreens = std::sync::Arc<Mutex<std::collections::HashMap<String, String>>>;
+
     struct MockHc {
         sessions: Mutex<Vec<HcSession>>,
         outputs: Mutex<VecDeque<String>>,
         sent_inputs: Mutex<Vec<(String, String, bool)>>,
         fail_send_input: Mutex<Option<String>>,
         labels: Mutex<Vec<(String, Vec<(String, String)>)>>,
+        /// Per-agent screens; when set for an agent it wins over the shared `outputs` queue.
+        outputs_by_agent: SharedScreens,
+        /// Shared call log (`send:<id>`, `eval`) to assert ordering across both mocks.
+        events: std::sync::Arc<Mutex<Vec<String>>>,
     }
 
     impl MockHc {
@@ -617,6 +687,8 @@ mod tests {
                 sent_inputs: Mutex::new(Vec::new()),
                 fail_send_input: Mutex::new(None),
                 labels: Mutex::new(Vec::new()),
+                outputs_by_agent: Default::default(),
+                events: Default::default(),
             }
         }
     }
@@ -626,7 +698,10 @@ mod tests {
             Ok(self.sessions.lock().unwrap().clone())
         }
 
-        fn capture_output(&self, _agent_id: &str, _lines: usize) -> Result<String> {
+        fn capture_output(&self, agent_id: &str, _lines: usize) -> Result<String> {
+            if let Some(out) = self.outputs_by_agent.lock().unwrap().get(agent_id) {
+                return Ok(out.clone());
+            }
             let mut outputs = self.outputs.lock().unwrap();
             if outputs.len() > 1 {
                 Ok(outputs.pop_front().unwrap())
@@ -639,6 +714,7 @@ mod tests {
             if let Some(err) = self.fail_send_input.lock().unwrap().as_ref() {
                 anyhow::bail!("{err}");
             }
+            self.events.lock().unwrap().push(format!("send:{agent_id}"));
             self.sent_inputs.lock().unwrap().push((
                 agent_id.to_string(),
                 payload.to_string(),
@@ -670,6 +746,10 @@ mod tests {
         available: Mutex<bool>,
         next_eval: Mutex<CognitiveEvaluation>,
         next_error: Mutex<Option<String>>,
+        events: std::sync::Arc<Mutex<Vec<String>>>,
+        /// Screen change applied during `evaluate` (shared map, agent, new screen), to simulate
+        /// a terminal changing while the LLM is busy.
+        on_eval_set_screen: Option<(SharedScreens, String, String)>,
     }
 
     impl MockCognitive {
@@ -680,6 +760,8 @@ mod tests {
                 available: Mutex::new(true),
                 next_eval: Mutex::new(next_eval),
                 next_error: Mutex::new(None),
+                events: Default::default(),
+                on_eval_set_screen: None,
             }
         }
     }
@@ -691,6 +773,13 @@ mod tests {
             _recent_output: &str,
         ) -> Result<CognitiveEvaluation> {
             *self.eval_calls.lock().unwrap() += 1;
+            self.events.lock().unwrap().push("eval".to_string());
+            if let Some((screens, agent, screen)) = &self.on_eval_set_screen {
+                screens
+                    .lock()
+                    .unwrap()
+                    .insert(agent.clone(), screen.clone());
+            }
             if let Some(err) = self.next_error.lock().unwrap().as_ref() {
                 anyhow::bail!("{err}");
             }
@@ -1196,6 +1285,68 @@ mod tests {
         let o = engine.tick(1000).unwrap();
         assert_eq!(o.auto_replied_agents, vec!["a", "b"]);
         assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn readonly_fast_path_replies_before_any_llm_evaluation_in_the_same_tick() {
+        // Test 10: the first batch mixed safe and dangerous prompts right after `supervisor load`.
+        // A safe `y` waited ~30 s because the fixed rule only ran when the serial loop reached
+        // that session, after a cold LLM evaluation of a session queued ahead of it.
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(vec![test_session("danger"), test_session("safe")], vec![]);
+        hc.outputs_by_agent.lock().unwrap().extend([
+            (
+                "danger".to_string(),
+                "Bash command\n  rm -rf build/\nAllow? [y/N]".to_string(),
+            ),
+            ("safe".to_string(), SAFE_LS.to_string()),
+        ]);
+        let events = std::sync::Arc::clone(&hc.events);
+        let cognitive = MockCognitive {
+            events: std::sync::Arc::clone(&events),
+            ..MockCognitive::new(noop_eval())
+        };
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["safe"]);
+        assert_eq!(o.evaluated_agents, vec!["danger"]);
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &["send:safe".to_string(), "eval".to_string()]
+        );
+    }
+
+    #[test]
+    fn screens_are_read_again_after_an_llm_evaluation_in_the_same_tick() {
+        // Pass 2 may reuse pass 1's screens only until an LLM call starts: while the model is
+        // busy a terminal can change, and a decision must follow its current screen.
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(&dir);
+        cfg.max_evals_per_tick = 2;
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let risky = "Bash command\n  rm -rf build/\nAllow? [y/N]".to_string();
+        let hc = MockHc::new(vec![test_session("a"), test_session("b")], vec![]);
+        hc.outputs_by_agent
+            .lock()
+            .unwrap()
+            .extend([("a".to_string(), risky.clone()), ("b".to_string(), risky)]);
+        let cognitive = MockCognitive {
+            on_eval_set_screen: Some((
+                std::sync::Arc::clone(&hc.outputs_by_agent),
+                "b".to_string(),
+                SAFE_LS.to_string(),
+            )),
+            ..MockCognitive::new(noop_eval())
+        };
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.evaluated_agents, vec!["a"]);
+        assert_eq!(o.auto_replied_agents, vec!["b"]);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
     }
 
     #[test]
