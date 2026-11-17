@@ -450,13 +450,38 @@ function formatShortHm(ts) {
   return `${hh}:${mm}`;
 }
 
-export function fallbackPill(supSnap) {
+export function fallbackPill(supSnap, localModels) {
   if (!supSnap?.fallback_active) return null;
-  const model = pillModelName(supSnap.fallback_model || supSnap.llm_model || "");
+  const model = pillModelName(
+    fallbackModelLabel(supSnap.fallback_model || supSnap.llm_model || "", localModels)
+  );
   return {
     text: `● LLM: ${model} (Fallback)`,
     tone: "working",
   };
+}
+
+function blobHex(name) {
+  const m = /^(?:sha256-)?([0-9a-f]{32,})$/i.exec(String(name || ""));
+  return m ? m[1].toLowerCase() : null;
+}
+
+/**
+ * Readable name for a fallback model id. A llama-server started without `--alias` reports the
+ * model's file path (`/models/<blob hash>`); the hash is matched against the local model scan.
+ * API ids (`org/model`) are returned unchanged.
+ */
+export function fallbackModelLabel(id, localModels) {
+  const raw = String(id || "").trim();
+  if (!raw.startsWith("/")) return raw;
+  const base = raw.split("/").filter(Boolean).pop() || raw;
+  const hex = blobHex(base);
+  if (!hex) return base;
+  const hit = (Array.isArray(localModels) ? localModels : []).find((m) => {
+    const file = String(m?.path || "").split("/").pop();
+    return blobHex(file) === hex;
+  });
+  return hit?.display_name || `modelo sem nome · ${hex.slice(0, 8)}`;
 }
 
 export function fallbackSection(supSnap) {
@@ -2914,7 +2939,10 @@ export default class CockpitMod extends View {
     const llmContainerState = supSnap?.llm_container_state || "missing";
     const llmContainerRunning = llmContainerState === "running";
 
-    const fbPill = fallbackPill(supSnap);
+    const fbPill = fallbackPill(
+      supSnap,
+      (shared("cockpit.modelList") ?? this.modelList)?.models
+    );
     let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
     let llmPillColor = t.muted;
     if (fbPill) {
@@ -5090,8 +5118,18 @@ export default class CockpitMod extends View {
     const fbModelsAll = Array.isArray(this.fallbackModels)
       ? this.fallbackModels
       : [];
+    const localModelsForLabels = Array.isArray(
+      (shared("cockpit.modelList") ?? this.modelList)?.models
+    )
+      ? (shared("cockpit.modelList") ?? this.modelList).models
+      : [];
+    const fbLabel = (id) => fallbackModelLabel(id, localModelsForLabels);
     const fbModelsFiltered = fbFilterQuery
-      ? fbModelsAll.filter((id) => id.toLowerCase().includes(fbFilterQuery))
+      ? fbModelsAll.filter(
+          (id) =>
+            id.toLowerCase().includes(fbFilterQuery) ||
+            fbLabel(id).toLowerCase().includes(fbFilterQuery)
+        )
       : fbModelsAll;
 
     const filterOpts = [
@@ -5626,7 +5664,7 @@ export default class CockpitMod extends View {
                             .text_color(t.foreground)
                             .child(
                               ellipsize(
-                                `${fbHostLabel || fbHostRaw} · ${fbModel}`,
+                                `${fbHostLabel || fbHostRaw} · ${fbLabel(fbModel)}`,
                                 42
                               )
                             )
@@ -5852,7 +5890,7 @@ export default class CockpitMod extends View {
                                     .text_size(11)
                                     .font_semibold()
                                     .text_color(t.foreground)
-                                    .child(ellipsize(modelId, 44))
+                                    .child(ellipsize(fbLabel(modelId), 44))
                                 )
                                 .child(
                                   div()
