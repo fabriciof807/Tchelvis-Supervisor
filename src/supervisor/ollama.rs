@@ -57,6 +57,11 @@ pub trait CognitiveBackend: Send + Sync {
     fn model_label(&self) -> String {
         String::new()
     }
+
+    /// Sends a free-text chat completion request without a JSON schema.
+    fn complete_text(&self, _messages: &[Value], _max_tokens: u32) -> Result<String> {
+        anyhow::bail!("free-text completion not supported by this backend")
+    }
 }
 
 /// Live connectivity and model availability status for the configured local/remote LLM backend.
@@ -454,6 +459,27 @@ pub fn extract_openai_chat_content(response: &Value) -> Result<&str> {
         })
 }
 
+/// Extracts and cleans free-text chat content without leaking the response body in errors.
+pub(crate) fn parse_chat_text(response: &Value) -> Result<String> {
+    let raw = response
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow::anyhow!("resposta sem conteúdo"))?;
+    let mut trimmed = raw.trim();
+    if let Some(after_open) = trimmed.strip_prefix("<think>") {
+        if let Some(end_idx) = after_open.find("</think>") {
+            trimmed = after_open[end_idx + "</think>".len()..].trim();
+        }
+    }
+    if trimmed.is_empty() {
+        anyhow::bail!("resposta vazia");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// Synchronous HTTP client for Ollama `/api/chat` and `/api/generate` endpoints.
 #[derive(Debug, Clone)]
 pub struct OllamaClient {
@@ -521,6 +547,17 @@ impl OllamaClient {
                     "content": user_payload.to_string(),
                 }
             ]
+        })
+    }
+
+    /// Builds an OpenAI-compatible free-text `/v1/chat/completions` request payload (no schema).
+    pub fn build_openai_text_chat_body(&self, messages: &[Value], max_tokens: u32) -> Value {
+        json!({
+            "model": self.config.ollama_model,
+            "stream": false,
+            "temperature": self.config.temperature,
+            "max_tokens": max_tokens,
+            "messages": messages,
         })
     }
 
@@ -659,6 +696,45 @@ impl CognitiveBackend for OllamaClient {
 
     fn model_label(&self) -> String {
         self.config.ollama_model.clone()
+    }
+
+    fn complete_text(&self, messages: &[Value], max_tokens: u32) -> Result<String> {
+        if self.config.effective_backend() == LlmBackendKind::Ollama {
+            anyhow::bail!("chat requer backend OpenAI-compatível");
+        }
+        let host = self.config.effective_primary_host();
+        let path = openai_chat_completions_path(&host);
+        let url = format!("{}{}", host.trim_end_matches('/'), path);
+        let body = self.build_openai_text_chat_body(messages, max_tokens);
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(self.config.ollama_timeout_secs))
+            .build();
+
+        let mut req = agent.post(&url).set("Content-Type", "application/json");
+        if let Some(key) = &self.config.api_key {
+            let trimmed = key.trim();
+            if !trimmed.is_empty() {
+                req = req.set("Authorization", &format!("Bearer {trimmed}"));
+            }
+        }
+
+        match req.send_json(&body) {
+            Ok(resp) => {
+                let val = resp
+                    .into_json::<Value>()
+                    .map_err(|_| anyhow::anyhow!("resposta JSON inválida do LLM"))?;
+                parse_chat_text(&val)
+            }
+            Err(ureq::Error::Status(503, _)) => {
+                anyhow::bail!("Modelo carregando…");
+            }
+            Err(ureq::Error::Status(status, _)) => {
+                anyhow::bail!("LLM retornou HTTP {status}");
+            }
+            Err(ureq::Error::Transport(t)) => {
+                anyhow::bail!("Falha ao consultar {url}: {t}");
+            }
+        }
     }
 }
 
@@ -920,5 +996,38 @@ mod tests {
         let client = OllamaClient::new(SupervisorConfig::default());
         let body = client.build_chat_request_body(&sample_state(), "Allow? (y/n)");
         assert_eq!(body["options"]["num_predict"], 384);
+    }
+
+    #[test]
+    fn openai_text_chat_body_has_no_schema_and_carries_max_tokens() {
+        let client = OllamaClient::new(SupervisorConfig::default());
+        let msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            json!({"role": "user", "content": "oi"}),
+        ];
+        let body = client.build_openai_text_chat_body(&msgs, 384);
+        let obj = body.as_object().expect("body should be an object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["max_tokens", "messages", "model", "stream", "temperature"]
+        );
+        assert_eq!(body["max_tokens"], 384);
+        assert_eq!(body["messages"], json!(msgs));
+    }
+
+    #[test]
+    fn chat_text_content_strips_think_and_rejects_empty() {
+        let ok = json!({"choices": [{"message": {"content": "<think>x</think> oi"}}]});
+        assert_eq!(parse_chat_text(&ok).unwrap(), "oi");
+
+        let empty = json!({"choices": [{"message": {"content": "  \n "}}]});
+        assert!(parse_chat_text(&empty).is_err());
+
+        let missing = json!({"secret_payload": "do_not_leak_me"});
+        let err = parse_chat_text(&missing).unwrap_err();
+        let err_str = format!("{err:#}");
+        assert!(!err_str.contains("do_not_leak_me"));
     }
 }

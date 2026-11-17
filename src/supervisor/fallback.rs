@@ -404,6 +404,12 @@ impl CognitiveBackend for RedactingBackend {
     fn model_label(&self) -> String {
         self.inner.model_label()
     }
+
+    fn complete_text(&self, messages: &[serde_json::Value], max_tokens: u32) -> Result<String> {
+        self.inner
+            .complete_text(messages, max_tokens)
+            .map_err(|err| anyhow::anyhow!("{}", redact_key(&format!("{err:#}"), &self.key)))
+    }
 }
 
 pub fn fallback_client_config(
@@ -1158,5 +1164,37 @@ mod tests {
         write_key_from_reader(&p, std::io::Cursor::new("  sk-reader \n")).unwrap();
         assert_eq!(read_key_file(&p).as_deref(), Some("sk-reader"));
         assert!(write_key_from_reader(&p, std::io::Cursor::new("   \n")).is_err());
+    }
+
+    #[test]
+    fn redacting_backend_redacts_key_in_complete_text_errors() {
+        struct FailingComplete;
+        impl CognitiveBackend for FailingComplete {
+            fn evaluate(
+                &self,
+                _state: &AgentDurableState,
+                _recent_output: &str,
+            ) -> Result<CognitiveEvaluation> {
+                unreachable!()
+            }
+            fn unload_model(&self) -> Result<()> {
+                Ok(())
+            }
+            fn complete_text(
+                &self,
+                _messages: &[serde_json::Value],
+                _max_tokens: u32,
+            ) -> Result<String> {
+                anyhow::bail!("401 for key sk-SECRET")
+            }
+        }
+        let rb = RedactingBackend {
+            inner: Box::new(FailingComplete),
+            key: "sk-SECRET".to_string(),
+        };
+        let err = rb.complete_text(&[], 384).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("sk-SECRET"));
+        assert!(msg.contains("***"));
     }
 }
