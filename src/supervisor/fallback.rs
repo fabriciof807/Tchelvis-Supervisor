@@ -1,3 +1,9 @@
+use super::config::{normalize_host, LlmBackendKind, SupervisorConfig};
+use super::container::{
+    probe_llama_server_health, ContainerState, LlmContainer, SystemContainerCli,
+};
+use super::ollama::{CognitiveBackend, CognitiveEvaluation, OllamaClient};
+use super::state::AgentDurableState;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -276,6 +282,157 @@ pub fn primary_stopped(state: &mut FallbackState) {
     state.health_failures = 0;
 }
 
+pub trait FallbackProvider: Send + Sync {
+    fn load_state(&self) -> FallbackState;
+    fn update_state(&self, f: &mut dyn FnMut(&mut FallbackState)) -> Result<FallbackState>;
+    /// (healthy, detail) for the primary: container Running AND GET {primary}/health == 200.
+    fn probe_primary(&self) -> (bool, String);
+    /// Fresh each call: re-reads `[fallback]` from supervisor.toml and resolves the key.
+    /// None when not configured. Errors returned by the backend are redacted of the key.
+    fn backend(&self) -> Option<Box<dyn CognitiveBackend>>;
+}
+
+pub struct NoFallback;
+
+impl FallbackProvider for NoFallback {
+    fn load_state(&self) -> FallbackState {
+        FallbackState::default()
+    }
+
+    fn update_state(&self, _f: &mut dyn FnMut(&mut FallbackState)) -> Result<FallbackState> {
+        Ok(FallbackState::default())
+    }
+
+    fn probe_primary(&self) -> (bool, String) {
+        (true, String::new())
+    }
+
+    fn backend(&self) -> Option<Box<dyn CognitiveBackend>> {
+        None
+    }
+}
+
+pub struct RedactingBackend {
+    pub inner: Box<dyn CognitiveBackend>,
+    pub key: String,
+}
+
+impl CognitiveBackend for RedactingBackend {
+    fn evaluate(
+        &self,
+        state: &AgentDurableState,
+        recent_output: &str,
+    ) -> Result<CognitiveEvaluation> {
+        self.inner
+            .evaluate(state, recent_output)
+            .map_err(|err| anyhow::anyhow!("{}", redact_key(&format!("{err:#}"), &self.key)))
+    }
+
+    fn unload_model(&self) -> Result<()> {
+        self.inner
+            .unload_model()
+            .map_err(|err| anyhow::anyhow!("{}", redact_key(&format!("{err:#}"), &self.key)))
+    }
+
+    fn is_available(&self) -> bool {
+        self.inner.is_available()
+    }
+
+    fn model_label(&self) -> String {
+        self.inner.model_label()
+    }
+}
+
+pub fn fallback_client_config(
+    primary: &SupervisorConfig,
+    fb: &FallbackConfig,
+    key: String,
+) -> SupervisorConfig {
+    let mut cfg = primary.clone();
+    cfg.llm_container.mode = "off".to_string();
+    cfg.llm_backend = LlmBackendKind::OpenAiCompatible;
+    cfg.ollama_host = normalize_host(&fb.host);
+    cfg.ollama_fallback_host = None;
+    cfg.ollama_model = fb.model.trim().to_string();
+    cfg.api_key = Some(key);
+    cfg
+}
+
+pub struct LiveFallback {
+    pub state_path: PathBuf,
+    pub primary: SupervisorConfig,
+}
+
+impl FallbackProvider for LiveFallback {
+    fn load_state(&self) -> FallbackState {
+        load_state(&self.state_path)
+    }
+
+    fn update_state(&self, f: &mut dyn FnMut(&mut FallbackState)) -> Result<FallbackState> {
+        update_state(&self.state_path, f)
+    }
+
+    fn probe_primary(&self) -> (bool, String) {
+        let Some(rt) = self.primary.detected_container_runtime() else {
+            return (false, "container parado".to_string());
+        };
+        let mgr = LlmContainer::new(rt, self.primary.llm_container.clone(), SystemContainerCli);
+        if !matches!(mgr.state(), Ok(ContainerState::Running)) {
+            return (false, "container parado".to_string());
+        }
+        if probe_llama_server_health(&self.primary.effective_primary_host()) {
+            (true, String::new())
+        } else {
+            (false, "/health sem resposta".to_string())
+        }
+    }
+
+    fn backend(&self) -> Option<Box<dyn CognitiveBackend>> {
+        let fb = SupervisorConfig::load().fallback;
+        if !fb.is_set() {
+            return None;
+        }
+        let host = normalize_host(&fb.host);
+        let key = resolve_fallback_key(&host, read_key_file(&fallback_key_path()), |k| {
+            std::env::var(k).ok()
+        })?;
+        let client_cfg = fallback_client_config(&self.primary, &fb, key.clone());
+        Some(Box::new(RedactingBackend {
+            inner: Box::new(OllamaClient::new(client_cfg)),
+            key,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FallbackInfo {
+    pub configured: bool,
+    pub key_present: bool,
+    pub active: bool,
+    pub host: String,
+    pub model: String,
+    pub reason: Option<FallbackReason>,
+    pub detail: Option<String>,
+    pub since: Option<u64>,
+}
+
+pub fn fallback_snapshot_info(
+    cfg: &FallbackConfig,
+    key_present: bool,
+    state: &FallbackState,
+) -> FallbackInfo {
+    FallbackInfo {
+        configured: cfg.is_set() && key_present,
+        key_present,
+        active: state.active,
+        host: cfg.host.trim().to_string(),
+        model: cfg.model.trim().to_string(),
+        reason: state.reason,
+        detail: state.detail.clone(),
+        since: state.since,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +661,67 @@ mod tests {
         activate(&mut s, FallbackReason::Health, "y", 6);
         primary_stopped(&mut s);
         assert!(!s.primary_intended && !s.active);
+    }
+
+    #[test]
+    fn fallback_client_config_talks_openai_to_the_fallback_host() {
+        let mut primary = SupervisorConfig::default();
+        primary.llm_container.mode = "on".into();
+        let fb = FallbackConfig {
+            host: "https://openrouter.ai/api".into(),
+            model: "openai/gpt-4.1-mini".into(),
+        };
+        let c = fallback_client_config(&primary, &fb, "sk".into());
+        assert!(!c.container_mode_active());
+        assert_eq!(
+            c.effective_backend(),
+            crate::supervisor::config::LlmBackendKind::OpenAiCompatible
+        );
+        assert_eq!(c.effective_primary_host(), "https://openrouter.ai/api");
+        assert_eq!(c.ollama_model, "openai/gpt-4.1-mini");
+        assert_eq!(c.ollama_fallback_host, None);
+    }
+
+    #[test]
+    fn redacting_backend_strips_key_from_errors() {
+        struct FailWithSecret;
+        impl crate::supervisor::ollama::CognitiveBackend for FailWithSecret {
+            fn evaluate(
+                &self,
+                _state: &crate::supervisor::state::AgentDurableState,
+                _recent_output: &str,
+            ) -> Result<crate::supervisor::ollama::CognitiveEvaluation> {
+                anyhow::bail!("401 for Bearer sk-secret");
+            }
+            fn unload_model(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let b = RedactingBackend {
+            inner: Box::new(FailWithSecret),
+            key: "sk-secret".into(),
+        };
+        let st = crate::supervisor::state::AgentDurableState::new("a", "n", 1, 0);
+        let err = b.evaluate(&st, "out").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("***"));
+        assert!(!msg.contains("sk-secret"));
+    }
+
+    #[test]
+    fn snapshot_info_has_no_key_and_requires_key_for_configured() {
+        let cfg = FallbackConfig {
+            host: "h".into(),
+            model: "m".into(),
+        };
+        let info = fallback_snapshot_info(&cfg, false, &FallbackState::default());
+        assert!(!info.configured);
+        let json = serde_json::to_string(&fallback_snapshot_info(
+            &cfg,
+            true,
+            &FallbackState::default(),
+        ))
+        .unwrap();
+        assert!(!json.contains("key\":\""));
     }
 }

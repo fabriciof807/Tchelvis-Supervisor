@@ -52,6 +52,11 @@ pub trait CognitiveBackend: Send + Sync {
     fn is_available(&self) -> bool {
         true
     }
+
+    /// Returns the configured model label for audit logging.
+    fn model_label(&self) -> String {
+        String::new()
+    }
 }
 
 /// Live connectivity and model availability status for the configured local/remote LLM backend.
@@ -645,6 +650,10 @@ impl CognitiveBackend for OllamaClient {
         };
         let mgr = LlmContainer::new(rt, self.config.llm_container.clone(), SystemContainerCli);
         matches!(mgr.state(), Ok(ContainerState::Running))
+    }
+
+    fn model_label(&self) -> String {
+        self.config.ollama_model.clone()
     }
 }
 
