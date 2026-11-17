@@ -442,6 +442,60 @@ export function pillModelName(name, maxLen = 28) {
   return s.slice(0, head) + "…" + s.slice(s.length - tail);
 }
 
+function formatShortHm(ts) {
+  if (ts == null) return "--:--";
+  const d = new Date(Number(ts) * 1000);
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+export function fallbackPill(supSnap) {
+  if (!supSnap?.fallback_active) return null;
+  const model = pillModelName(supSnap.fallback_model || supSnap.llm_model || "");
+  return {
+    text: `● LLM: ${model} (Fallback)`,
+    tone: "working",
+  };
+}
+
+export function fallbackSection(supSnap) {
+  if (!supSnap?.fallback_key_present) {
+    return { state: "no_key", label: "Sem chave" };
+  }
+  const hasHost = Boolean(String(supSnap.fallback_host || "").trim());
+  const hasModel = Boolean(String(supSnap.fallback_model || "").trim());
+  if (!hasHost || !hasModel) {
+    return { state: "needs_endpoint", label: "Configuração pendente" };
+  }
+  if (supSnap.fallback_active) {
+    const why =
+      supSnap.fallback_reason === "load_failed"
+        ? "load falhou"
+        : "health falhou";
+    return {
+      state: "active",
+      label: `ATIVO — ${why} ${formatShortHm(supSnap.fallback_since)}`,
+    };
+  }
+  return { state: "standby", label: "Em espera" };
+}
+
+export function primaryRowBadge(row, supSnap) {
+  if (!row?.in_use) return null;
+  return supSnap?.fallback_active ? "falhou" : "em uso";
+}
+
+function fallbackHostLabel(host) {
+  const raw = String(host || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw).host || raw;
+  } catch (_e) {
+    return raw.replace(/^https?:\/\//i, "").split("/")[0] || raw;
+  }
+}
+
 export function effectiveTaskTag(chosen, activeSpaceName, choices) {
   const list = Array.isArray(choices) ? choices : [];
   if (chosen && list.includes(chosen)) return chosen;
@@ -1267,7 +1321,7 @@ export default class CockpitMod extends View {
     this.labelValue = "";
     this.commandDraft = "";
     this.commandDraftKey = "";
-    this.editingField = null; // "prompt" | "label" | "command" | "task" | null
+    this.editingField = null; // "prompt" | "label" | "command" | "task" | "fallbackHost" | "modelFilter" | null
     this.inspectCache = {}; // address -> InspectResponse
     this.doctorReport = null;
     this.homeSnap = shared("cockpit.home") ?? null;
@@ -1287,6 +1341,15 @@ export default class CockpitMod extends View {
     this.modelSwitchingId = shared("cockpit.modelSwitchingId") ?? null;
     this.modelDeletePending = shared("cockpit.modelDeletePending") ?? null;
     this.modelDeletingId = shared("cockpit.modelDeletingId") ?? null;
+    this.fallbackReturning = false;
+    this.fallbackReturnError = "";
+    this.fallbackHostDraft = "";
+    this.fallbackModelsOpen = false;
+    this.fallbackModels = null;
+    this.fallbackModelsLoading = false;
+    this.fallbackModelsError = "";
+    this.fallbackSettingModel = "";
+    this.modelFilterText = "";
     this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
@@ -1598,6 +1661,165 @@ export default class CockpitMod extends View {
       } finally {
         this.loadingLlm = false;
         this.busy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  returnToPrimary(cx) {
+    if (this.fallbackReturning || this.loadingLlm || this.busy) return;
+    this.fallbackReturning = true;
+    this.fallbackReturnError = "";
+    this.busy = true;
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("tchelvis", ["supervisor", "fallback", "off"], {
+          timeout: 120000,
+        });
+        if (res.code === 0) {
+          if (res.stdout) {
+            const snap = parseSnapshotOutput(res.stdout);
+            if (snap) {
+              setShared("supervisor.snapshot", snap);
+              setShared("supervisor.lastError", "");
+            }
+          }
+          this.fallbackReturnError = "";
+          this.note = "Primário restaurado";
+        } else {
+          const err =
+            res.stderr?.trim() ||
+            `Falha ao voltar ao principal (${res.code})`;
+          this.fallbackReturnError = err;
+          this.note = err;
+        }
+      } catch (e) {
+        const err = `Error: ${String(e)}`;
+        this.fallbackReturnError = err;
+        this.note = err;
+      } finally {
+        this.fallbackReturning = false;
+        this.busy = false;
+        this.fetchSupervisorStatus(cx);
+        if (Boolean(shared("cockpit.modelPickerOpen") ?? this.modelPickerOpen)) {
+          this.fetchModelList(cx, null);
+        }
+        cx.notify();
+      }
+    });
+  }
+
+  submitFallbackHost(cx) {
+    const host = String(this.fallbackHostDraft || "").trim();
+    if (!host || this.busy) return;
+    this.editingField = null;
+    this.fallbackReturnError = "";
+    this.busy = true;
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "fallback", "set", "--host", host],
+          { timeout: 15000 }
+        );
+        if (res.code === 0) {
+          this.note = `Fallback host: ${host}`;
+          this.fallbackModelsOpen = true;
+          this.fetchFallbackModels(cx);
+        } else {
+          this.fallbackReturnError =
+            res.stderr?.trim() || `Falha ao definir host (${res.code})`;
+        }
+      } catch (e) {
+        this.fallbackReturnError = `Error: ${String(e)}`;
+      } finally {
+        this.busy = false;
+        this.fetchSupervisorStatus(cx);
+        cx.notify();
+      }
+    });
+  }
+
+  toggleFallbackModels(cx) {
+    if (this.fallbackModelsOpen) {
+      this.fallbackModelsOpen = false;
+      if (this.editingField === "modelFilter") {
+        this.editingField = null;
+      }
+      cx?.notify();
+      return;
+    }
+    this.fallbackModelsOpen = true;
+    this.fetchFallbackModels(cx);
+  }
+
+  fetchFallbackModels(cx) {
+    if (this.fallbackModelsLoading) return;
+    this.fallbackModelsLoading = true;
+    this.fallbackModelsError = "";
+    cx?.notify();
+
+    const filterText = String(this.modelFilterText || "").trim();
+    const args = ["supervisor", "fallback", "models", "--json"];
+    if (filterText) {
+      args.push("--filter", filterText);
+    }
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("tchelvis", args, { timeout: 20000 });
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          this.fallbackModels = Array.isArray(parsed) ? parsed : [];
+          this.fallbackModelsError = "";
+        } else {
+          this.fallbackModels = [];
+          this.fallbackModelsError =
+            res.stderr?.trim() || `Falha ao listar modelos (${res.code})`;
+        }
+      } catch (e) {
+        this.fallbackModels = [];
+        this.fallbackModelsError = `Error: ${String(e)}`;
+      } finally {
+        this.fallbackModelsLoading = false;
+        cx.notify();
+      }
+    });
+  }
+
+  selectFallbackModel(cx, modelId) {
+    if (!modelId || this.fallbackSettingModel) return;
+    this.fallbackSettingModel = modelId;
+    this.fallbackModelsError = "";
+    this.fallbackReturnError = "";
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "fallback", "set", "--model", modelId],
+          { timeout: 15000 }
+        );
+        if (res.code === 0) {
+          this.fallbackModelsOpen = false;
+          if (this.editingField === "modelFilter") {
+            this.editingField = null;
+          }
+          this.note = `Fallback model: ${modelId}`;
+        } else {
+          this.fallbackModelsError =
+            res.stderr?.trim() || `Falha ao definir modelo (${res.code})`;
+        }
+      } catch (e) {
+        this.fallbackModelsError = `Error: ${String(e)}`;
+      } finally {
+        this.fallbackSettingModel = "";
+        this.fetchSupervisorStatus(cx);
         cx.notify();
       }
     });
@@ -2089,6 +2311,14 @@ export default class CockpitMod extends View {
         } else {
           this.addTaskGui(cx);
         }
+      } else if (this.editingField === "fallbackHost") {
+        this.submitFallbackHost(cx);
+      } else if (this.editingField === "modelFilter") {
+        if (this.fallbackModelsOpen) {
+          this.fetchFallbackModels(cx);
+        } else {
+          this.editingField = null;
+        }
       } else if (this.editingField === "command" && agent) {
         this.approveActionCard(cx, agent.address);
       } else if (this.editingField === "prompt" && agent) {
@@ -2104,6 +2334,10 @@ export default class CockpitMod extends View {
     } else if (e.key === "backspace") {
       if (this.editingField === "task") {
         this.taskDraft = this.taskDraft.slice(0, -1);
+      } else if (this.editingField === "fallbackHost") {
+        this.fallbackHostDraft = this.fallbackHostDraft.slice(0, -1);
+      } else if (this.editingField === "modelFilter") {
+        this.modelFilterText = this.modelFilterText.slice(0, -1);
       } else if (this.editingField === "command") {
         this.commandDraft = this.commandDraft.slice(0, -1);
       } else if (this.editingField === "prompt") {
@@ -2114,6 +2348,10 @@ export default class CockpitMod extends View {
     } else if (e.key_char && !m?.control && !m?.platform) {
       if (this.editingField === "task") {
         this.taskDraft += e.key_char;
+      } else if (this.editingField === "fallbackHost") {
+        this.fallbackHostDraft += e.key_char;
+      } else if (this.editingField === "modelFilter") {
+        this.modelFilterText += e.key_char;
       } else if (this.editingField === "command") {
         this.commandDraft += e.key_char;
       } else if (this.editingField === "prompt") {
@@ -2319,6 +2557,7 @@ export default class CockpitMod extends View {
       setShared("cockpit.modelPickerOnlyDrawer", false);
     }
     this.fetchModelList(cx, false);
+    this.fetchSupervisorStatus(cx);
     cx?.notify();
   }
 
@@ -2330,6 +2569,13 @@ export default class CockpitMod extends View {
     this.modelPickerOnlyDrawer = false;
     this.modelListShowAll = false;
     this.modelDeletePending = null;
+    this.fallbackModelsOpen = false;
+    if (
+      this.editingField === "fallbackHost" ||
+      this.editingField === "modelFilter"
+    ) {
+      this.editingField = null;
+    }
     setShared("cockpit.modelPickerOpen", false);
     setShared("cockpit.modelPickerOnlyDrawer", false);
     setShared("cockpit.modelListShowAll", false);
@@ -2668,9 +2914,13 @@ export default class CockpitMod extends View {
     const llmContainerState = supSnap?.llm_container_state || "missing";
     const llmContainerRunning = llmContainerState === "running";
 
+    const fbPill = fallbackPill(supSnap);
     let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
     let llmPillColor = t.muted;
-    if (llmManaged) {
+    if (fbPill) {
+      llmPillText = fbPill.text;
+      llmPillColor = t[fbPill.tone] ?? t.working;
+    } else if (llmManaged) {
       if (!llmContainerRunning) {
         llmPillText = `○ LLM: ${llmModel} (DESATIVADO)`;
         llmPillColor = t.muted;
@@ -2854,7 +3104,11 @@ export default class CockpitMod extends View {
           )
           .child(
             this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
-              if (llmManaged && !llmContainerRunning) {
+              if (
+                llmManaged &&
+                !llmContainerRunning &&
+                !supSnap?.fallback_active
+              ) {
                 this.loadSupervisorLlm(cx, (loadedCx) => {
                   this.refreshCockpit(loadedCx, true);
                   this.tickSupervisor(loadedCx, true);
@@ -2867,24 +3121,38 @@ export default class CockpitMod extends View {
           )
           .child(
             (() => {
-              const showLoadBtn = llmManaged && !llmContainerRunning;
-              const unloadLabel = this.loadingLlm
-                ? "◌ Carregando…"
-                : showLoadBtn
-                  ? "▶ Load LLM"
-                  : "⏻ Unload LLM";
-              return this.actionBtn(t, "ck-pill-unload", unloadLabel, (_e, cx) => {
-                if (this.loadingLlm) return;
-                if (showLoadBtn) {
-                  this.loadSupervisorLlm(cx);
-                } else {
-                  this.runSupervisorAction(
-                    cx,
-                    ["supervisor", "unload"],
-                    llmManaged ? "Container LLM descarregado" : "Modelo Ollama descarregado"
-                  );
+              const isFallbackActive = Boolean(supSnap?.fallback_active);
+              const showLoadBtn =
+                isFallbackActive || (llmManaged && !llmContainerRunning);
+              const isReturning = Boolean(this.fallbackReturning);
+              const unloadLabel = isReturning
+                ? "◌ Voltando…"
+                : this.loadingLlm
+                  ? "◌ Carregando…"
+                  : showLoadBtn
+                    ? "▶ Load LLM"
+                    : "⏻ Unload LLM";
+              return this.actionBtn(
+                t,
+                "ck-pill-unload",
+                unloadLabel,
+                (_e, cx) => {
+                  if (this.loadingLlm || this.fallbackReturning) return;
+                  if (isFallbackActive) {
+                    this.returnToPrimary(cx);
+                  } else if (showLoadBtn) {
+                    this.loadSupervisorLlm(cx);
+                  } else {
+                    this.runSupervisorAction(
+                      cx,
+                      ["supervisor", "unload"],
+                      llmManaged
+                        ? "Container LLM descarregado"
+                        : "Modelo Ollama descarregado"
+                    );
+                  }
                 }
-              });
+              );
             })()
           )
       )
@@ -4785,6 +5053,7 @@ export default class CockpitMod extends View {
 
   renderModelPicker(cx, themeArg = null, standalone = true) {
     const t = themeArg ?? theme();
+    const supSnap = shared("supervisor.snapshot") ?? null;
     const listData = shared("cockpit.modelList") ?? this.modelList ?? null;
     const isLoading = Boolean(
       shared("cockpit.modelListLoading") ?? this.modelListLoading
@@ -4811,6 +5080,19 @@ export default class CockpitMod extends View {
     const envWarning = listData?.env_override_ignored
       ? String(listData.env_override_ignored)
       : "";
+
+    const fb = fallbackSection(supSnap);
+    const fbHostRaw = String(supSnap?.fallback_host || "").trim();
+    const fbHostLabel = fallbackHostLabel(fbHostRaw);
+    const fbModel = String(supSnap?.fallback_model || "").trim();
+    const isReturning = Boolean(this.fallbackReturning);
+    const fbFilterQuery = String(this.modelFilterText || "").trim().toLowerCase();
+    const fbModelsAll = Array.isArray(this.fallbackModels)
+      ? this.fallbackModels
+      : [];
+    const fbModelsFiltered = fbFilterQuery
+      ? fbModelsAll.filter((id) => id.toLowerCase().includes(fbFilterQuery))
+      : fbModelsAll;
 
     const filterOpts = [
       ["2b", "≤2B"],
@@ -4887,6 +5169,22 @@ export default class CockpitMod extends View {
               )
           )
       )
+      .when(managed, (el) =>
+        el.child(
+          h_flex()
+            .pt(2)
+            .gap(6)
+            .items_center()
+            .child(
+              div()
+                .text_size(10)
+                .font_semibold()
+                .text_color(t.muted)
+                .child("PRINCIPAL (local)")
+            )
+            .child(div().flex_1().h(1).bg(t.border))
+        )
+      )
       .when(Boolean(envWarning), (el) =>
         el.child(
           h_flex()
@@ -4962,6 +5260,8 @@ export default class CockpitMod extends View {
                 const isHiddenRow = Boolean(m.hidden);
                 const isClickable = !isNonChat && !switchingId && !deletingId;
                 const actions = modelRowActions(m, selectedId);
+                const rowBadge = primaryRowBadge(m, supSnap);
+                const isFailedRow = rowBadge === "falhou";
                 const isPendingDelete = Boolean(
                   pendingDelete &&
                     pendingDelete.id === m.id &&
@@ -4991,9 +5291,11 @@ export default class CockpitMod extends View {
                   .rounded(6)
                   .border(1)
                   .border_color(
-                    m.in_use
-                      ? withAlpha(t.accent, "66", t.accent)
-                      : t.border
+                    isFailedRow
+                      ? withAlpha(t.blocked, "66", t.blocked)
+                      : m.in_use
+                        ? withAlpha(t.accent, "66", t.accent)
+                        : t.border
                   )
                   .bg(m.in_use ? t.selected : t.surface);
 
@@ -5025,9 +5327,11 @@ export default class CockpitMod extends View {
                           .text_color(
                             isNonChat || isHiddenRow
                               ? t.dim
-                              : m.in_use
-                                ? t.accent
-                                : t.muted
+                              : isFailedRow
+                                ? t.blocked
+                                : m.in_use
+                                  ? t.accent
+                                  : t.muted
                           )
                           .child(m.in_use ? "●" : "○")
                       )
@@ -5066,6 +5370,26 @@ export default class CockpitMod extends View {
                                 ? "◌ Switching…"
                                 : metaParts.join(" · ")
                           )
+                      )
+                      .when(Boolean(rowBadge) && !isSwitching && !isDeleting, (el) =>
+                        el.child(
+                          div()
+                            .px(5)
+                            .py(1)
+                            .rounded(4)
+                            .border(1)
+                            .border_color(
+                              withAlpha(
+                                isFailedRow ? t.blocked : t.accent,
+                                "66",
+                                t.border
+                              )
+                            )
+                            .text_size(10)
+                            .font_semibold()
+                            .text_color(isFailedRow ? t.blocked : t.accent)
+                            .child(rowBadge)
+                        )
                       )
                       .when(
                         !isSwitching && !isDeleting && actions.canHide,
@@ -5157,6 +5481,396 @@ export default class CockpitMod extends View {
               }
             )
           )
+      )
+      .when(managed, (el) =>
+        el.child(
+          v_flex()
+            .pt(4)
+            .gap(6)
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .child(
+                  div()
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(t.muted)
+                    .child("FALLBACK (API)")
+                )
+                .child(div().flex_1().h(1).bg(t.border))
+            )
+            .when(fb.state === "no_key", (fbEl) =>
+              fbEl.child(
+                div()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child(
+                    'Sem chave: rode "tchelvis supervisor fallback key" e cole a chave (stdin).'
+                  )
+              )
+            )
+            .when(fb.state === "needs_endpoint", (fbEl) =>
+              fbEl.child(
+                v_flex()
+                  .gap(5)
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .id("ck-fallback-host-input")
+                          .flex_1()
+                          .min_w(0)
+                          .px(8)
+                          .py(5)
+                          .rounded(6)
+                          .border(1)
+                          .border_color(
+                            this.editingField === "fallbackHost"
+                              ? t.accent
+                              : t.border
+                          )
+                          .bg(t.background)
+                          .text_size(11)
+                          .text_color(
+                            this.fallbackHostDraft || fbHostRaw
+                              ? t.foreground
+                              : t.dim
+                          )
+                          .cursor_text()
+                          .on_mouse_down("left", (_e, clickCx) =>
+                            clickCx.stop_propagation()
+                          )
+                          .on_click((_e, clickCx) => {
+                            if (!this.fallbackHostDraft && fbHostRaw) {
+                              this.fallbackHostDraft = fbHostRaw;
+                            }
+                            this.editingField = "fallbackHost";
+                            this.handle.focus();
+                            (clickCx ?? cx)?.notify();
+                          })
+                          .child(
+                            (() => {
+                              const isEditing =
+                                this.editingField === "fallbackHost";
+                              const val = this.fallbackHostDraft || fbHostRaw;
+                              if (!val) {
+                                return (
+                                  (isEditing ? "▏" : "") +
+                                  "Endpoint API (ex: https://openrouter.ai/api)"
+                                );
+                              }
+                              return val + (isEditing ? "▏" : "");
+                            })()
+                          )
+                      )
+                      .child(
+                        this.actionBtn(
+                          t,
+                          "ck-fallback-host-save",
+                          "Salvar",
+                          (_e, clickCx) => {
+                            if (!this.fallbackHostDraft && fbHostRaw) {
+                              this.fallbackHostDraft = fbHostRaw;
+                            }
+                            this.submitFallbackHost(clickCx ?? cx);
+                          }
+                        )
+                      )
+                      .when(Boolean(fbHostRaw), (el2) =>
+                        el2.child(
+                          this.actionBtn(
+                            t,
+                            "ck-fallback-trocar-empty",
+                            this.fallbackModelsOpen ? "Fechar" : "Trocar",
+                            (_e, clickCx) =>
+                              this.toggleFallbackModels(clickCx ?? cx)
+                          )
+                        )
+                      )
+                  )
+                  .child(
+                    div()
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(
+                        "Ex: https://opencode.ai/inference/go/openai/v1 · https://openrouter.ai/api"
+                      )
+                  )
+              )
+            )
+            .when(
+              fb.state === "standby" || fb.state === "active",
+              (fbEl) =>
+                fbEl.child(
+                  v_flex()
+                    .gap(5)
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .justify_between()
+                        .child(
+                          div()
+                            .flex_1()
+                            .min_w(0)
+                            .text_size(11.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(
+                              ellipsize(
+                                `${fbHostLabel || fbHostRaw} · ${fbModel}`,
+                                42
+                              )
+                            )
+                        )
+                        .child(
+                          this.actionBtn(
+                            t,
+                            "ck-fallback-trocar",
+                            this.fallbackModelsOpen ? "Fechar" : "Trocar",
+                            (_e, clickCx) =>
+                              this.toggleFallbackModels(clickCx ?? cx)
+                          )
+                        )
+                    )
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .justify_between()
+                        .child(
+                          div()
+                            .flex_1()
+                            .min_w(0)
+                            .text_size(11)
+                            .font_semibold()
+                            .text_color(
+                              fb.state === "active" ? t.working : t.muted
+                            )
+                            .child(fb.label)
+                        )
+                        .when(fb.state === "active", (el2) =>
+                          el2.child(
+                            this.actionBtn(
+                              t,
+                              "ck-fallback-return",
+                              isReturning
+                                ? "◌ Voltando…"
+                                : "Voltar ao principal",
+                              (_e, clickCx) => {
+                                if (!isReturning) {
+                                  this.returnToPrimary(clickCx ?? cx);
+                                }
+                              }
+                            )
+                          )
+                        )
+                    )
+                )
+            )
+            .when(Boolean(this.fallbackReturnError), (fbEl) =>
+              fbEl.child(
+                div()
+                  .px(8)
+                  .py(5)
+                  .rounded(6)
+                  .border(1)
+                  .border_color(withAlpha(t.blocked, "66", t.blocked))
+                  .bg(withAlpha(t.blocked, "1A", t.surface))
+                  .text_size(10.5)
+                  .text_color(t.blocked)
+                  .child(ellipsize(this.fallbackReturnError, 120))
+              )
+            )
+            .when(
+              !this.fallbackReturnError &&
+                fb.state === "active" &&
+                Boolean(supSnap?.fallback_detail),
+              (fbEl) =>
+                fbEl.child(
+                  div()
+                    .text_size(10.5)
+                    .text_color(t.muted)
+                    .child(ellipsize(String(supSnap.fallback_detail), 80))
+                )
+            )
+            .when(this.fallbackModelsOpen, (fbEl) =>
+              fbEl.child(
+                v_flex()
+                  .p(6)
+                  .gap(5)
+                  .rounded(6)
+                  .border(1)
+                  .border_color(t.border)
+                  .bg(t.surface)
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .id("ck-fallback-model-filter")
+                          .flex_1()
+                          .min_w(0)
+                          .px(7)
+                          .py(4)
+                          .rounded(5)
+                          .border(1)
+                          .border_color(
+                            this.editingField === "modelFilter"
+                              ? t.accent
+                              : t.border
+                          )
+                          .bg(t.background)
+                          .text_size(11)
+                          .text_color(
+                            this.modelFilterText ? t.foreground : t.dim
+                          )
+                          .cursor_text()
+                          .on_mouse_down("left", (_e, clickCx) =>
+                            clickCx.stop_propagation()
+                          )
+                          .on_click((_e, clickCx) => {
+                            this.editingField = "modelFilter";
+                            this.handle.focus();
+                            (clickCx ?? cx)?.notify();
+                          })
+                          .child(
+                            (() => {
+                              const isEditing =
+                                this.editingField === "modelFilter";
+                              if (!this.modelFilterText) {
+                                return (
+                                  (isEditing ? "▏" : "") +
+                                  "Filtrar modelos…"
+                                );
+                              }
+                              return (
+                                this.modelFilterText + (isEditing ? "▏" : "")
+                              );
+                            })()
+                          )
+                      )
+                      .child(
+                        this.actionBtn(
+                          t,
+                          "ck-fallback-models-refresh",
+                          this.fallbackModelsLoading ? "…" : "↻",
+                          (_e, clickCx) => {
+                            if (!this.fallbackModelsLoading) {
+                              this.fetchFallbackModels(clickCx ?? cx);
+                            }
+                          }
+                        )
+                      )
+                  )
+                  .when(this.fallbackModelsLoading, (el2) =>
+                    el2.child(
+                      div()
+                        .py(4)
+                        .text_size(11)
+                        .text_color(t.muted)
+                        .child("Buscando modelos…")
+                    )
+                  )
+                  .when(Boolean(this.fallbackModelsError), (el2) =>
+                    el2.child(
+                      div()
+                        .py(4)
+                        .text_size(11)
+                        .text_color(t.blocked)
+                        .child(ellipsize(this.fallbackModelsError, 120))
+                    )
+                  )
+                  .when(
+                    !this.fallbackModelsLoading &&
+                      !this.fallbackModelsError &&
+                      fbModelsFiltered.length === 0 &&
+                      Array.isArray(this.fallbackModels),
+                    (el2) =>
+                      el2.child(
+                        div()
+                          .py(4)
+                          .text_size(11)
+                          .text_color(t.muted)
+                          .child("Nenhum modelo encontrado.")
+                      )
+                  )
+                  .when(
+                    !this.fallbackModelsLoading && fbModelsFiltered.length > 0,
+                    (el2) =>
+                      el2.child(
+                        v_flex()
+                          .gap(3)
+                          .max_h(160)
+                          .overflow_y_scrollbar()
+                          .children(
+                            fbModelsFiltered.map((modelId, idx) => {
+                              const isCurrent = modelId === fbModel;
+                              const isPicking =
+                                this.fallbackSettingModel === modelId;
+                              return h_flex()
+                                .id(`ck-fb-model-row-${idx}`)
+                                .px(7)
+                                .py(4)
+                                .gap(6)
+                                .items_center()
+                                .justify_between()
+                                .rounded(5)
+                                .border(1)
+                                .border_color(
+                                  isCurrent
+                                    ? withAlpha(t.accent, "66", t.accent)
+                                    : t.border
+                                )
+                                .bg(isCurrent ? t.selected : t.background)
+                                .cursor_pointer()
+                                .hover((s) =>
+                                  s.bg(isCurrent ? t.selected : t.hover)
+                                )
+                                .on_mouse_down("left", (_e, clickCx) =>
+                                  clickCx.stop_propagation()
+                                )
+                                .on_click((_e, clickCx) =>
+                                  this.selectFallbackModel(
+                                    clickCx ?? cx,
+                                    modelId
+                                  )
+                                )
+                                .child(
+                                  div()
+                                    .flex_1()
+                                    .min_w(0)
+                                    .text_size(11)
+                                    .font_semibold()
+                                    .text_color(t.foreground)
+                                    .child(ellipsize(modelId, 44))
+                                )
+                                .child(
+                                  div()
+                                    .flex_none()
+                                    .text_size(10)
+                                    .text_color(
+                                      isPicking ? t.accent : t.muted
+                                    )
+                                    .child(
+                                      isPicking
+                                        ? "◌ Salvando…"
+                                        : isCurrent
+                                          ? "ativo"
+                                          : "Usar"
+                                    )
+                                );
+                            })
+                          )
+                      )
+                  )
+              )
+            )
+        )
       );
   }
 
