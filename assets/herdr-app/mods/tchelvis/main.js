@@ -442,6 +442,51 @@ export function pillModelName(name, maxLen = 28) {
   return s.slice(0, head) + "…" + s.slice(s.length - tail);
 }
 
+export function effectiveTaskTag(chosen, activeSpaceName, choices) {
+  const list = Array.isArray(choices) ? choices : [];
+  if (chosen && list.includes(chosen)) return chosen;
+  if (activeSpaceName && list.includes(activeSpaceName)) return activeSpaceName;
+  return "Geral";
+}
+
+export function taskProjectArgs(tag) {
+  const t = String(tag ?? "").trim();
+  if (!t || t === "Geral") return [];
+  return ["--project", t];
+}
+
+export function isBlankDraft(draft) {
+  return String(draft ?? "").trim().length === 0;
+}
+
+export function draftDisplayLines(draft, maxLines = 6) {
+  const lines = String(draft ?? "").split("\n");
+  if (lines.length <= maxLines) return lines;
+  if (maxLines <= 1) return ["…"];
+  return ["…", ...lines.slice(lines.length - (maxLines - 1))];
+}
+
+export function taskEditorArgv(draft, priority, tag) {
+  const args = [
+    "tchelvis",
+    "task",
+    "add",
+    "--edit",
+    "--priority",
+    priority || "normal",
+    ...taskProjectArgs(tag),
+  ];
+  if (!isBlankDraft(draft)) {
+    args.push("--", String(draft));
+  }
+  return args;
+}
+
+export function hasNewTask(prevIds, tasks) {
+  const prev = new Set(Array.isArray(prevIds) ? prevIds : []);
+  return (Array.isArray(tasks) ? tasks : []).some((t) => t?.id && !prev.has(t.id));
+}
+
 function pathBasename(p) {
   const clean = String(p ?? "").replace(/[\\/]+$/, "");
   if (!clean) return "";
