@@ -12,6 +12,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - **CLI:** `tchelvis task add --edit` opens `$VISUAL` / `$EDITOR` (falling back to `nvi` then `vi`) pre-filled with any positional draft; empty saved text cancels cleanly. Human list output (`task list`, `home`) displays the first line plus `…(+N linhas)`, while `--json` keeps full titles.
   - **Herdr mod:** the task input wraps across lines (`Shift+Enter` inserts a newline, `Enter` saves), a `✎` button opens `tchelvis task add --edit` in a new terminal tab and clears the draft once the task appears, and task rows render full multi-line titles and full project tags without truncation.
 - **Daily task tag menu.** Clicking the `📁 <tag>` pill opens a wrap-able menu listing `Geral` first followed by all Home projects instead of cycling one by one.
+- **Supervisor fallback model (M1b, phase 1 API).**
+  - When the managed `llama.cpp` container fails to start or fails `/health` on 2 consecutive ticks with active sessions, evaluation switches automatically to a configured OpenAI-compatible API model until the user chooses to return (`Voltar ao principal` / `▶ Load LLM` / `tchelvis supervisor fallback off`), or stops on `Unload LLM` / zero-idle.
+  - **CLI:** `tchelvis supervisor fallback {status,set,key,models,off,clear}`. Keys saved via stdin go to `~/.config/tchelvis/fallback_api_key` (`0600`) and are never written to `supervisor.toml`, snapshots, audit entries, or logs; shared runtime state lives in `~/.local/state/tchelvis/supervisor_fallback.json`.
+  - **Herdr mod:** active fallback shows `● LLM: <model> (Fallback)` in warning tone; the **Supervisor model** card splits into `PRINCIPAL (local)` (with `falhou` badge while active) and `FALLBACK (API)` with endpoint entry, `/v1/models` picker (`Trocar`), and `Voltar ao principal`.
+
+### Changed
+- **Host-matched API keys for `openai-compatible`.** Provider environment variables are now matched against the target host (`openai.com` → `OPENAI_API_KEY`, `openrouter.ai` → `OPENROUTER_API_KEY`, `deepseek.com` → `DEEPSEEK_API_KEY`, `opencode.ai` → `OPENCODE_API_KEY`); an `OPENAI_API_KEY` is no longer sent to non-OpenAI hosts. Explicit `TCHELVIS_LLM_API_KEY` (and `TCHELVIS_FALLBACK_API_KEY` / key file for fallback) still take precedence.
 
 ### Fixed
 - **Daily task tag pill vs saved tag.** When no explicit tag is chosen, the pill now defaults to the active Space only if it is a Home project (otherwise `Geral`) and falls back to `Geral` if a chosen project disappears, ensuring the saved `--project` always matches the displayed pill (`Geral` never passes `--project`).

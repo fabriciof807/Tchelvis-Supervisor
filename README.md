@@ -132,6 +132,19 @@ tchelvis supervisor unload    # stop the container (0 B RAM/VRAM)
 
 Container settings live in the `[llm_container]` table of `~/.config/tchelvis/supervisor.toml`. See [Configuration reference](#configuration-reference).
 
+#### API fallback model (optional, container mode)
+
+When the managed `llama.cpp` container fails to load or stops answering `/health`, the supervisor can fall back automatically to an OpenAI-compatible API endpoint until you ask to return to the primary model:
+
+```bash
+printf '%s' "$OPENROUTER_API_KEY" | tchelvis supervisor fallback key   # saves ~/.config/tchelvis/fallback_api_key (0600)
+tchelvis supervisor fallback set --host https://openrouter.ai/api --model openai/gpt-4.1-mini
+tchelvis supervisor fallback status
+tchelvis supervisor fallback off                                       # try returning to the primary container
+```
+
+Terminal output is never sent to a remote API unless both `[fallback]` `host` and `model` are set and a key resolves (`TCHELVIS_FALLBACK_API_KEY`, `~/.config/tchelvis/fallback_api_key`, `TCHELVIS_LLM_API_KEY`, or a host-matched provider key: `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `OPENCODE_API_KEY`).
+
 ---
 
 ## How to Use
@@ -213,6 +226,12 @@ tchelvis supervisor approve <agent_id> [payload...]
 tchelvis supervisor ignore <agent_id>
 tchelvis supervisor mode <semi-auto|alert-only|paused|cycle>
 tchelvis supervisor watch                     # long-running watcher daemon
+tchelvis supervisor fallback status [--json]  # fallback config & state (never outputs the key)
+tchelvis supervisor fallback key              # read fallback API key from stdin → 0600 key file
+tchelvis supervisor fallback set [--host <url>] [--model <name>]
+tchelvis supervisor fallback models [--json] [--filter <text>]
+tchelvis supervisor fallback off              # try returning to the primary local model
+tchelvis supervisor fallback clear            # remove [fallback] and deactivate
 
 # Self-update
 tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]
@@ -265,6 +284,10 @@ ctx_size = 4096
 # model_path = "/path/to/model.gguf"
 # hf_repo = "owner/repo-GGUF:Q4_K_M"
 extra_args = []
+
+# [fallback]
+# host = "https://openrouter.ai/api"
+# model = "openai/gpt-4.1-mini"
 ```
 
 > **Note:** Partial `supervisor.toml` files are supported; any omitted keys fall back to their defaults.
@@ -277,7 +300,8 @@ extra_args = []
 | `TCHELVIS_LLM_HOST` / `OLLAMA_HOST` | Base URL for that backend | `http://localhost:11434` |
 | `OLLAMA_FALLBACK_HOST` | Fallback Ollama host when the primary is unreachable | none |
 | `TCHELVIS_LLM_MODEL` / `OLLAMA_MODEL` | Model identifier | `lfm3:1.7b` |
-| `TCHELVIS_LLM_API_KEY` | Bearer token for `openai-compatible` (also reads `OPENAI_API_KEY` / `OPENROUTER_API_KEY`) | none |
+| `TCHELVIS_LLM_API_KEY` | Bearer token for `openai-compatible` (or host-matched `OPENAI_API_KEY` / `OPENROUTER_API_KEY` / `DEEPSEEK_API_KEY` / `OPENCODE_API_KEY`) | none |
+| `TCHELVIS_FALLBACK_API_KEY` | Bearer token override for `[fallback]` (else `~/.config/tchelvis/fallback_api_key`, `TCHELVIS_LLM_API_KEY`, or host-matched provider var) | none |
 | `TCHELVIS_ALLOW_GPU` | Allow GPU offload; overrides `tchelvis supervisor gpu` | `false` |
 | `OLLAMA_MODELS` | Extra Ollama model store searched for GGUF blobs | none |
 | `HC_BIN` | Path to the `hc` binary | `hc` |
