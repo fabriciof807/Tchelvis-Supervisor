@@ -309,6 +309,25 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 // Deferred to a later tick; keep the status transition pending.
                 continue;
             }
+            let slot_guard = if fb_backend.is_none() {
+                match super::slot_lock::try_acquire(&super::slot_lock::slot_lock_path(&self.config))
+                {
+                    Ok(Some(guard)) => Some(guard),
+                    Ok(None) => {
+                        // Local model slot held by chat; defer without consuming the trigger.
+                        continue;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "Failed to acquire LLM slot lock; proceeding without lock"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             evals_started += 1;
             state.last_hc_status = session.status.clone();
 
@@ -319,6 +338,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 Some(b) => b.evaluate(&state_snapshot, &output),
                 None => self.cognitive.evaluate(&state_snapshot, &output),
             };
+            drop(slot_guard);
             let raw_eval = match eval_result {
                 Ok(eval) => eval,
                 Err(e) => {
@@ -1939,5 +1959,52 @@ mod tests {
         let raw = std::fs::read_to_string(log_path).unwrap();
         let entry: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
         assert_eq!(entry["model"], "openai/gpt-4.1-mini");
+    }
+
+    #[test]
+    fn primary_evaluation_defers_while_slot_is_held_and_runs_next_tick() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("b1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(noop_eval());
+        let lock_path = crate::supervisor::slot_lock::slot_lock_path(&cfg);
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary);
+
+        let guard = crate::supervisor::slot_lock::try_acquire(&lock_path)
+            .unwrap()
+            .expect("test lock should succeed");
+        let o1 = engine.tick(1000).unwrap();
+        assert!(o1.evaluated_agents.is_empty());
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        drop(guard);
+
+        let o2 = engine.tick(1012).unwrap();
+        assert_eq!(o2.evaluated_agents, vec!["b1"]);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn fixed_rule_ignores_the_slot_lock() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        let primary = MockCognitive::new(noop_eval());
+        let lock_path = crate::supervisor::slot_lock::slot_lock_path(&cfg);
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary);
+
+        let _guard = crate::supervisor::slot_lock::try_acquire(&lock_path)
+            .unwrap()
+            .expect("test lock should succeed");
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t1"]);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t1".to_string(), "y".to_string(), true)]
+        );
     }
 }
