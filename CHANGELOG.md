@@ -7,6 +7,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+- **Multi-line daily tasks & external editor.**
+  - **CLI:** `tchelvis task add --edit` opens `$VISUAL` / `$EDITOR` (falling back to `nvi` then `vi`) pre-filled with any positional draft; empty saved text cancels cleanly. Human list output (`task list`, `home`) displays the first line plus `…(+N linhas)`, while `--json` keeps full titles.
+  - **Herdr mod:** the task input wraps across lines (`Shift+Enter` inserts a newline, `Enter` saves), a `✎` button opens `tchelvis task add --edit` in a new terminal tab and clears the draft once the task appears, and task rows render full multi-line titles and full project tags without truncation.
+- **Daily task tag menu.** Clicking the `📁 <tag>` pill opens a wrap-able menu listing `Geral` first followed by all Home projects instead of cycling one by one.
+
+### Fixed
+- **Daily task tag pill vs saved tag.** When no explicit tag is chosen, the pill now defaults to the active Space only if it is a Home project (otherwise `Geral`) and falls back to `Geral` if a chosen project disappears, ensuring the saved `--project` always matches the displayed pill (`Geral` never passes `--project`).
+
 ## [0.2.0] - 2026-11-16
 
 First tagged release, and the first published as `tchelvis` binaries (`x86_64` and `aarch64` musl).
