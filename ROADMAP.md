@@ -4,7 +4,7 @@ Direction, milestone order, and dependencies. Behavior details and acceptance cr
 milestone belong in its own spec/plan when the milestone starts. Session-level status lives in
 [`HANDOFF.md`](HANDOFF.md).
 
-_Last updated: 2026-11-16_
+_Last updated: 2026-11-17_
 
 ## Dependency graph
 
@@ -38,6 +38,8 @@ with the UI track.
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
 | M6 | Delegator mode: wake the coordinator when a worker finishes | — | Idea (not planned) |
 | M7 | Kanban board mod: daily tasks grouped by project tag | Daily-tasks tags | Idea (not planned) |
+| M8 | Supervisor chat ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`); host validation pending; phase B idea |
+| M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -125,6 +127,30 @@ Users install the TUI/CLI binary through a package manager. From there, `tchelvi
 A separate mod that reads the daily tasks (`tchelvis task list --json`) and shows them as a board,
 one column per project tag (plus Geral). Tasks stay general; the tag is the only grouping key
 (decision 2026-11-16, see `docs/superpowers/specs/2026-11-16-daily-tasks-input-design.md`).
+
+### M8 — Supervisor chat
+Read-only chat (`tchelvis chat ask` + a Chat tab in the drawer) about active agents and Daily Tasks,
+using the supervisor's effective model. Container mode only; shares the local model slot with the
+supervisor through `llm_slot.lock` (evaluations defer instead of timing out).
+- **Phase A (done):** answer questions only. [Design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md),
+  [plan](docs/superpowers/plans/2026-11-17-supervisor-chat.md).
+- **Phase B (idea):** act on tasks (create, complete, retag) — the model proposes, the user confirms
+  with a click, like the supervisor's Action Cards. Small models need the confirmation.
+
+### M9 — `files-yazi` mod (design agreed 2026-11-17, not planned)
+A new mod, separate from `tchelvis`, instead of replacing Herdr's Files (that button lives in
+Herdr's shipped `tabs` mod; changing it would mean forking it with `mod.clone`). Both buttons stay.
+- **Button:** a small block to the right of the tab bar (layout row becomes `[tabs | files-yazi]`).
+- **Click:** `terminal.open` with `argv: ["yazi"]` and no `folder`, placed to the right — the split
+  inherits the focused terminal's folder (Herdr behaviour). Click again closes the yazi pane of the
+  current tab (toggle); quitting yazi (`q`) closes it too.
+- **yazi is an optional prerequisite**, only for this button: missing → message "yazi não encontrado —
+  instale para usar Files", nothing opens; `tchelvis doctor` gets a `yazi` check (WARN, never error);
+  README and `install.sh` mention it as optional. `tchelvis setup` installs the mod with the rest.
+- **To confirm on the host before planning** (`herdr-app commands`, the `.d.ts` beside
+  `~/.config/herdr-app/AGENTS.md`): the `place` value for "right", whether a mod's `run()` returns
+  the created terminal id (else find yazi by foreground program among the tab's terminals), and
+  `herdr-app check` / `herdr-app shot` for the visual check.
 
 ### M6 — Delegator mode (idea, not planned)
 A coordinator agent opens worker agents in Herdr terminals and should not have to poll them (as the
