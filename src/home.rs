@@ -195,6 +195,80 @@ impl DailyTaskStore {
     }
 }
 
+pub fn resolve_editor(visual: Option<&str>, editor: Option<&str>, nvi_available: bool) -> String {
+    for candidate in [visual, editor].into_iter().flatten() {
+        let trimmed = candidate.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if nvi_available {
+        "nvi".to_string()
+    } else {
+        "vi".to_string()
+    }
+}
+
+pub fn edit_text_with_editor(editor: &str, initial: &str, dir: &Path) -> Result<Option<String>> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let temp_path = dir.join(format!("tchelvis-task-{}-{nanos}.txt", std::process::id()));
+    fs::write(&temp_path, initial).with_context(|| {
+        format!(
+            "failed writing initial task text to {}",
+            temp_path.display()
+        )
+    })?;
+
+    let status_res = Command::new("sh")
+        .args(["-c", &format!("{editor} \"$1\""), "sh"])
+        .arg(&temp_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status();
+
+    let status = match status_res {
+        Ok(s) => s,
+        Err(err) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(err).with_context(|| format!("failed launching editor '{editor}'"));
+        }
+    };
+
+    if !status.success() {
+        let _ = fs::remove_file(&temp_path);
+        anyhow::bail!("editor '{editor}' exited with status {status}");
+    }
+
+    let content_res = fs::read_to_string(&temp_path);
+    let _ = fs::remove_file(&temp_path);
+    let content = content_res
+        .with_context(|| format!("failed reading edited task from {}", temp_path.display()))?;
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(trimmed.to_string()))
+    }
+}
+
+pub fn table_title(title: &str) -> String {
+    let mut lines = title.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let rest = lines.count();
+    if rest == 0 {
+        first.to_string()
+    } else {
+        format!("{first} …(+{rest} linhas)")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSummary {
     pub name: String,
@@ -659,5 +733,74 @@ mod tests {
         assert_eq!(snap.projects[2].name, "beta");
         assert_eq!(snap.projects[2].status_label, "open_tasks");
         assert_eq!(snap.projects[2].open_tasks, 1);
+    }
+
+    #[test]
+    fn resolve_editor_prefers_visual_then_editor_then_nvi_then_vi() {
+        assert_eq!(resolve_editor(Some("hx"), Some("nano"), true), "hx");
+        assert_eq!(resolve_editor(Some("  "), Some("nano"), true), "nano");
+        assert_eq!(resolve_editor(None, None, true), "nvi");
+        assert_eq!(resolve_editor(None, None, false), "vi");
+    }
+
+    #[test]
+    fn edit_text_returns_saved_text_from_editor_with_args() {
+        let dir = tempfile::tempdir().unwrap();
+        // editor string carries an argument, like `code -w`
+        let script = dir.path().join("ed.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n# $1 = flag, $2 = file\nprintf 'linha 1\\nlinha 2\\n' > \"$2\"\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let editor = format!("{} --wait", script.display());
+        let out = edit_text_with_editor(&editor, "rascunho", dir.path()).unwrap();
+        assert_eq!(out.as_deref(), Some("linha 1\nlinha 2"));
+        // temp file cleaned up: only ed.sh remains
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn edit_text_prefills_initial_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        // `true` leaves the file untouched -> returns the draft
+        assert_eq!(
+            edit_text_with_editor("true", "rascunho\n", dir.path())
+                .unwrap()
+                .as_deref(),
+            Some("rascunho")
+        );
+    }
+
+    #[test]
+    fn edit_text_empty_file_means_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            edit_text_with_editor("truncate -s0", "x", dir.path()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn edit_text_nonzero_exit_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = edit_text_with_editor("false", "x", dir.path()).unwrap_err();
+        assert!(err.to_string().contains("editor"));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn add_task_keeps_inner_newlines() {
+        let mut store = DailyTaskStore::default();
+        let t = store.add_task("  a\n\nb  \n", None, TaskPriority::Normal, 1);
+        assert_eq!(t.title, "a\n\nb");
+    }
+
+    #[test]
+    fn table_title_shows_first_line_and_count() {
+        assert_eq!(table_title("só uma"), "só uma");
+        assert_eq!(table_title("a\nb\nc"), "a …(+2 linhas)");
     }
 }
