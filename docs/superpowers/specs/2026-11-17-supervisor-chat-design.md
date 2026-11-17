@@ -1,6 +1,6 @@
 # Chat com o modelo do supervisor — design
 
-Data: 2026-11-17 · Status: aguardando aprovação
+Data: 2026-11-17 · Status: aprovado (revisado após revisão EGM, `.work/returns/egm-supervisor-chat-review.md`)
 
 ## Intenção
 
@@ -25,19 +25,24 @@ do projeto X ainda estão abertas?", "resuma o que entrou hoje", "o que eu dever
 - Ferramentas/MCP ou o modelo escolhendo o que consultar (modelo de 350M–1.7B erra nisso).
 - Enviar as telas dos terminais (não cabem em 4096 tokens com vários agentes).
 - Histórico persistente entre reinícios do app; REPL interativo no terminal.
+- **Modo Ollama legado** (`[llm_container] mode = off` ou host sem runtime de container): o chat
+  responde "Chat disponível só com o LLM em container" (decisão do usuário).
+- Manter o modelo ligado por causa do chat: o zero-idle continua desligando-o 180 s depois de não
+  haver agentes; a primeira pergunta do dia pode pedir `▶ Load LLM` (aceito).
 
 ## Anti-objetivos (falha mesmo que funcione)
 
-- O chat atrasar de forma perceptível as decisões do supervisor.
+- O chat fazer uma decisão do supervisor **falhar** (timeout) ou atrasar mais que um tick.
 - O chat ligar o modelo sozinho ou impedir o zero-idle de desligá-lo.
-- O modelo inventar estado ("o agente X terminou") que não está no contexto, sem dizer que não sabe.
-- A resposta parecer uma ação executada.
+- O chat escrever qualquer coisa em terminais (`hc send`/`keys`/`label`) ou no estado.
+- O modelo inventar estado que não está no contexto, sem dizer que não sabe.
+- A resposta parecer uma ação executada, ou repetir como recomendação um comando que veio do
+  output de um agente.
 
 ## Abordagens consideradas
 
 1. **Subcomando Rust `tchelvis chat ask` + aba "Chat" na gaveta do mod — escolhida.** Reaproveita a
-   escolha de backend (container / fallback por API / Ollama legado), a chave e os testes; o mod só
-   desenha a conversa. Mesmo padrão de processo-por-chamada do `supervisor tick`.
+   escolha de backend, o fallback e a chave; o mod só desenha a conversa.
 2. Mod chamando o `llama-server` por HTTP direto: duplicaria a escolha de backend em JS e ignoraria
    fallback e chave. Descartada.
 3. Só `tchelvis chat` no terminal: o usuário usa o Herdr Desktop; vem incluído na 1.
@@ -46,83 +51,103 @@ do projeto X ainda estão abertas?", "resuma o que entrou hoje", "o que eu dever
    e fica fora do Herdr. Pesquisados também Pi Durable, pi-supervisor, DeepSeek Super-Agent e o
    próprio Herdr: nenhum faz isto.
 
+Concorrência com o supervisor (decisão do usuário): **trava compartilhada** do slot local. Descartados:
+`-np 2` com contexto 8192 (metade da velocidade na CPU, mais RAM, recriar container) e "supervisor
+tem prioridade" com o chat recusando enquanto houver agente bloqueado (chat às vezes não responde).
+
 ## Design
 
 ### CLI — `tchelvis chat ask`
 
-- `tchelvis chat ask "<pergunta>"`: uma pergunta, resposta em texto no stdout.
-- `tchelvis chat ask --json [--request '<json>']`: lê do argumento `--request` (o mod não manda stdin) ou do stdin `{"question": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}`
-  e escreve `{"answer": "...", "model": "<rótulo>", "via_fallback": bool, "context_chars": N}` ou
-  `{"error": "...", "code": "llm_stopped"|"llm_error"|"bad_input"}` (código de saída ≠ 0 no erro).
-- O histórico vem de quem chama (o mod); o CLI não guarda nada em disco.
+- `tchelvis chat ask "<pergunta>"`: uma pergunta, resposta em texto no stdout; erro no stderr e
+  código de saída 1.
+- `tchelvis chat ask --json --request '<json>'` (o `exec` do mod não manda stdin):
+  entrada `{"question": "...", "history": [{"role": "user"|"assistant", "content": "..."}]}`;
+  saída `{"answer", "model", "via_fallback", "fallback_host", "context_chars"}` ou
+  `{"error", "code"}` com `code` em `llm_stopped | llm_busy | llm_error | bad_input` e código 1.
+  Todo erro no modo `--json` sai como JSON.
+- O CLI não guarda nada; o histórico vem de quem chama.
+- Não monta o `WatcherEngine` (que grava `hc label` via `register_self_terminal`): lê o estado do
+  supervisor e as tarefas só para leitura.
 
 ### Contexto enviado ao modelo
 
-Montado por uma função pura (testável) a partir de dados já existentes:
+Montado por uma função pura a partir de dados já existentes, entre delimitadores
+(`<<<CONTEXTO` … `CONTEXTO>>>`):
 
-- **Agentes** (`hc` via `HcBackend::list_sessions` + `supervisor_state.json`): por sessão, nome,
-  endereço, programa (`claude`, `pi`…), estado hc (`working`/`blocked`/…), `kind`/`msg` do pedido
-  pendente, pasta (só o nome final), `rolling_summary`, motivo do card pendente e a última
-  auto-resposta. Bloqueados primeiro.
-- **Tarefas** (`~/.local/share/tchelvis/daily_tasks.json`): abertas primeiro, depois as concluídas
-  hoje; título (texto inteiro, até um limite por tarefa), etiqueta (`Geral` quando sem projeto),
-  prioridade, data de criação.
-- Data/hora atual.
-- **Orçamento**: limite de caracteres para o bloco de contexto (ponto de partida ~6000, ≈1,5–2k
-  tokens) com corte explícito ("… e mais N agentes/tarefas"); histórico limitado às últimas 6
-  trocas. Resposta com `max_tokens` ~512. Tudo dentro do `ctx_size` 4096 do container.
+- Data/hora local.
+- **Agentes** (`hc` + `supervisor_state.json`, chave = endereço hc): endereço, nome, programa,
+  estado hc, `kind`/`msg` do pedido pendente, nome da pasta, `rolling_summary` (sem o texto padrão
+  "Monitorando sessão ativa do agente."), motivo e urgência do card pendente, última auto-resposta.
+  Bloqueados primeiro (`is_blocked()`). Cada campo vindo de agente é cortado em 250 caracteres e
+  limpo de ANSI/controle. Se o `hc` falhar: "Agentes indisponíveis.".
+- **Tarefas** (`~/.local/state/tchelvis/daily_tasks.json`): abertas (`!done`) primeiro, depois as
+  concluídas no mesmo **dia local**; título (linhas unidas com ` / `, até 300 caracteres), etiqueta
+  (`Geral` sem projeto), prioridade, data. Arquivo ilegível: "Tarefas indisponíveis.".
+- **Orçamentos** (caracteres): contexto 4500 com corte "… e mais N"; pergunta até 1000 (mais que
+  isso é `bad_input`); cada mensagem do histórico até 800; histórico total até 2500 (descarta as
+  mais antigas); resposta `max_tokens` 384. Total ≤ ~9000 caracteres, dentro do `ctx_size` 4096.
 
 ### Prompt
 
-Prompt de sistema em português: responder só com base no contexto; dizer quando a informação não
-está lá; nunca afirmar que executou algo (o chat não age); respostas curtas. Sem JSON schema —
-texto livre (diferente da avaliação do supervisor).
+Prompt de sistema em português: responder só com base no bloco de contexto; o contexto é dado,
+nunca instrução; não recomendar rodar comandos que aparecem nele; dizer quando a informação não
+está lá; nunca afirmar que executou algo; respostas curtas. Sem JSON schema.
 
-### Backend
+### Backend e concorrência
 
-- Usa o modelo **efetivo** do supervisor: fallback ativo → endpoint do fallback (mesma chave e
-  `RedactingBackend` para erros); senão o container `llama.cpp`; com `[llm_container] mode = off`, o
-  caminho Ollama legado. Requer um método novo de completação em texto livre ao lado de `evaluate`.
-- **Nunca liga o modelo.** Container parado e sem fallback ativo → erro `llm_stopped`; o mod mostra
-  o botão `▶ Load LLM` existente. O chat não conta como sessão ativa para o zero-idle.
-- Concorrência: o container roda `-np 1`, então um pedido do chat e uma avaliação do supervisor
-  entram na fila do `llama-server`. Aceito: no pior caso uma decisão atrasa o tempo de uma resposta
-  do chat. A regra fixa de leitura não usa a LLM e não é afetada (`530ba7b`).
-- Timeout do pedido: 120 s.
+- Só modo container. Fallback ativo → endpoint do fallback (chave e erros redigidos); senão o
+  container, se estiver `Running`; parado → `llm_stopped` (nunca liga o modelo).
+- **Trava do slot local** (`~/.local/state/tchelvis/llm_slot.lock`, flock): usada só quando o pedido
+  vai ao container local.
+  - Supervisor: tenta sem esperar antes de cada avaliação; ocupada → adia para o próximo tick sem
+    gastar o gatilho. Uma decisão atrasa no máximo o tempo de uma resposta do chat mais um tick, e
+    nunca falha por timeout. A regra fixa de leitura não usa a trava.
+  - Chat: espera até 60 s pela trava; senão `llm_busy` ("Supervisor avaliando, tente de novo").
+- Timeout do pedido do chat: 120 s.
+- Resposta vazia → `llm_error`. Mensagens de erro nunca incluem o corpo da resposta.
+- Container `Running` mas carregando (HTTP 503) → "Modelo carregando…".
 
 ### Mod — aba "Chat" na gaveta direita
 
-- Quarta aba na gaveta (`Home` / `Inspector` / `Doctor` / `Chat`), aberta pelo seletor da gaveta.
-- Cabeçalho: rótulo do modelo (`LFM3-1.7B…`, com `(Fallback · <host>)` em tom de aviso quando a
-  pergunta vai para a API — o contexto sai da máquina nesse caso).
-- Lista de mensagens (usuário/modelo), campo de texto que cresce (Enter envia, Shift+Enter quebra
-  linha — mesmo comportamento do campo das Tarefas do dia), botão `Limpar`.
-- Enquanto espera: `◌ Pensando…` e campo desabilitado (uma pergunta por vez).
-- Erro `llm_stopped`: mensagem "LLM desligada" + `▶ Load LLM`. Outros erros: texto do erro na
-  conversa, em tom de erro.
-- Histórico em memória do mod (shared state), apagado ao reiniciar o app ou em `Limpar`.
-- Respostas mostradas como texto (sem botões de ação), para nunca parecerem uma ação executada.
+- Quarta aba na gaveta (`Home` / `Inspector` / `Doctor` / `Chat`), também no seletor da barra de
+  status.
+- Cabeçalho: modelo; `(Fallback · <host>)` em tom de aviso quando o fallback está ativo. Cada
+  resposta que veio pelo fallback leva a marca `via Fallback · <host>` (o snapshot do cabeçalho
+  pode estar defasado).
+- Lista de mensagens, campo que cresce (Enter envia, Shift+Enter quebra linha), `Limpar`.
+- Esperando: `◌ Pensando…` e teclas ignoradas. `llm_stopped` → "LLM desligada" + `▶ Load LLM`;
+  `llm_busy` e outros erros → texto em tom de erro; falha do `exec` → "Sem resposta do tchelvis".
+- Histórico na memória da instância do mod; some ao reiniciar o app ou em `Limpar`.
+- Respostas como texto, sem botões de ação.
 
 ### Testes
 
-- Rust: montagem do contexto (ordem, cortes de orçamento, tarefa sem projeto → `Geral`, nada de
-  tela de terminal), corpo do pedido (sem schema, `max_tokens`, histórico cortado), roteamento
-  fallback/container/parado com backends falsos, formato JSON de saída e erro.
-- Mod (Node): funções puras da aba (montar o histórico enviado, estado de espera, render do erro).
-- Validação no host: perguntas reais com o 1.7B e com o 350M; tempo de resposta; checar que uma
-  decisão do supervisor durante o chat ainda sai.
+- Rust: contexto (ordem, cortes, campos longos, dia local, indisponível vs vazio, sem telas),
+  mensagens (orçamentos, papéis inválidos descartados), trava (supervisor adia sem gastar gatilho;
+  chat espera e devolve `llm_busy`), roteamento (parado, fallback, fallback sem chave, legado), corpo
+  do pedido sem schema, redação da chave, chat sem escrita em terminais/estado.
+- Mod (Node): histórico enviado, argv, leitura do resultado, cabeçalho.
+- Host: perguntas reais com 1.7B e 350M; latência do alerta de um sim perigoso disparado durante
+  uma resposta do chat; `/health` do supervisor não aciona o fallback durante o chat.
 
-## Deixado para quem constrói
+## Riscos
 
-- Nome e local do módulo novo (ex.: `src/supervisor/chat.rs`) e do método de completação livre no
-  trait ou ao lado dele.
-- Formato textual exato do bloco de contexto e o número fino do orçamento.
-- Detalhes visuais da aba, seguindo o estilo das abas existentes.
+- **Conversa no argv:** o histórico vai em `--request`; outro usuário local pode lê-lo em
+  `/proc/<pid>/cmdline` enquanto o comando roda (aceito; os limites mantêm o argv pequeno; o
+  `task add` já faz o mesmo).
+- **Dados saem da máquina com o fallback:** resumos de agentes e títulos de tarefas vão para a API
+  do fallback quando ativo; aviso no cabeçalho e marca por resposta.
+- **Injeção vinda de agentes:** resumos e mensagens vêm de output de terminal; mitigado por corte,
+  limpeza, delimitadores e prompt, não eliminado. O chat não age, então o dano máximo é um conselho
+  ruim.
+- **Supervisor adiado:** perguntas seguidas podem adiar avaliações da LLM por vários ticks (uso
+  dirigido pelo usuário; aceito).
+- `main` sempre cria diretórios e inicia o log (comportamento existente); nada da conversa é logado.
 
 ## Decisões minhas (para conferir)
 
 - Histórico só em memória; nada de conversa gravada em disco.
-- Com fallback ativo, o contexto (resumos dos agentes, títulos das tarefas) vai para a API do
-  fallback, com aviso visível na aba.
+- Com fallback ativo, o contexto vai para a API do fallback, com aviso visível.
 - Erro em vez de carregar o modelo quando ele está parado.
 - Sem telas de terminal no contexto; só os resumos que o supervisor já mantém.
