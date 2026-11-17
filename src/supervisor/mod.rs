@@ -2,6 +2,7 @@ pub mod bench;
 pub mod config;
 pub mod config_write;
 pub mod container;
+pub mod fallback;
 pub mod gguf;
 pub mod guardrails;
 pub mod hc;

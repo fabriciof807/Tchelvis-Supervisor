@@ -2,6 +2,7 @@ use super::container::{
     binary_on_path, detect_runtime, detect_runtime_candidates, detect_runtime_with_pref,
     read_runtime_pref, ContainerRuntime, LlmContainerConfig,
 };
+use super::fallback::{resolve_primary_key, FallbackConfig};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
@@ -149,6 +150,9 @@ pub struct SupervisorConfig {
     /// Managed `llama.cpp` container settings.
     #[serde(default)]
     pub llm_container: LlmContainerConfig,
+    /// Optional API fallback model settings.
+    #[serde(default)]
+    pub fallback: FallbackConfig,
 }
 
 fn parse_env_bool(val: &str) -> bool {
@@ -223,13 +227,6 @@ fn resolve_llm_model_from_env() -> Option<String> {
     crate::envvars::var("LLM_MODEL").or_else(|| env::var("OLLAMA_MODEL").ok())
 }
 
-fn resolve_api_key_from_env() -> Option<String> {
-    crate::envvars::var("LLM_API_KEY")
-        .or_else(|| env::var("OPENAI_API_KEY").ok())
-        .or_else(|| env::var("OPENROUTER_API_KEY").ok())
-        .filter(|k| !k.trim().is_empty())
-}
-
 fn resolve_container_mode_from_env() -> Option<String> {
     let raw = crate::envvars::var("LLM_CONTAINER")?;
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -266,7 +263,6 @@ impl Default for SupervisorConfig {
             });
 
         let llm_backend = resolve_llm_backend_from_env().unwrap_or_default();
-        let api_key = resolve_api_key_from_env();
         let ollama_host =
             resolve_llm_host_from_env().unwrap_or_else(|| "http://localhost:11434".to_string());
         let ollama_fallback_host = env::var("OLLAMA_FALLBACK_HOST")
@@ -285,9 +281,9 @@ impl Default for SupervisorConfig {
             llm_container.gpu_backend = gb;
         }
 
-        Self {
+        let mut cfg = Self {
             llm_backend,
-            api_key,
+            api_key: None,
             ollama_host: normalize_host(&ollama_host),
             ollama_fallback_host: ollama_fallback_host.map(|h| normalize_host(&h)),
             ollama_model,
@@ -305,7 +301,11 @@ impl Default for SupervisorConfig {
             enable_desktop_notifications: true,
             hc: HcAdapterConfig::default(),
             llm_container,
-        }
+            fallback: FallbackConfig::default(),
+        };
+        cfg.api_key =
+            resolve_primary_key(&cfg.effective_primary_host(), None, |k| env::var(k).ok());
+        cfg
     }
 }
 
@@ -378,15 +378,15 @@ impl SupervisorConfig {
                 cfg.allow_gpu = allow;
             }
         }
+        cfg.api_key = resolve_primary_key(&cfg.effective_primary_host(), cfg.api_key.take(), |k| {
+            env::var(k).ok()
+        });
         cfg
     }
 
     fn apply_env_overrides(&mut self) {
         if let Some(backend) = resolve_llm_backend_from_env() {
             self.llm_backend = backend;
-        }
-        if let Some(api_key) = resolve_api_key_from_env() {
-            self.api_key = Some(api_key);
         }
         if let Some(host) = resolve_llm_host_from_env() {
             self.ollama_host = host;

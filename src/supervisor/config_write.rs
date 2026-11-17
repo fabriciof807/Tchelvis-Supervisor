@@ -90,6 +90,38 @@ pub fn write_hidden_models(path: &Path, ids: &[String]) -> Result<()> {
     })
 }
 
+fn ensure_fallback_table(doc: &mut DocumentMut) -> Result<&mut toml_edit::Table> {
+    if !doc.contains_key("fallback") {
+        doc["fallback"] = table();
+    }
+    match &mut doc["fallback"] {
+        Item::Table(t) => Ok(t),
+        _ => bail!("[fallback] in supervisor.toml is not a table"),
+    }
+}
+
+/// Persists `[fallback] host` and/or `model` in `supervisor.toml` without writing any API key.
+pub fn write_fallback(path: &Path, host: Option<&str>, model: Option<&str>) -> Result<()> {
+    edit_supervisor_toml(path, |doc| {
+        let tbl = ensure_fallback_table(doc)?;
+        if let Some(h) = host {
+            tbl["host"] = value(h.trim());
+        }
+        if let Some(m) = model {
+            tbl["model"] = value(m.trim());
+        }
+        Ok(())
+    })
+}
+
+/// Removes the `[fallback]` table from `supervisor.toml`.
+pub fn clear_fallback(path: &Path) -> Result<()> {
+    edit_supervisor_toml(path, |doc| {
+        doc.remove("fallback");
+        Ok(())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +238,38 @@ mod tests {
         assert!(cleared_parsed.llm_container.hidden_models.is_empty());
         assert_eq!(cleared_parsed.llm_container.model_filter, "8b");
         assert_eq!(cleared_parsed.poll_interval_secs, 25);
+    }
+
+    #[test]
+    fn write_and_clear_fallback_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.toml");
+        fs::write(
+            &path,
+            "# keep\npoll_interval_secs = 25\n\n[llm_container]\nport = 11435\n",
+        )
+        .unwrap();
+
+        write_fallback(&path, Some("https://openrouter.ai/api"), Some("m1")).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("# keep"));
+        assert!(raw.contains("poll_interval_secs = 25"));
+        assert!(raw.contains("port = 11435"));
+        let parsed: SupervisorConfig = toml::from_str(&raw).unwrap();
+        assert_eq!(parsed.fallback.host, "https://openrouter.ai/api");
+        assert_eq!(parsed.fallback.model, "m1");
+
+        write_fallback(&path, None, Some("m2")).unwrap();
+        let raw2 = fs::read_to_string(&path).unwrap();
+        let parsed2: SupervisorConfig = toml::from_str(&raw2).unwrap();
+        assert_eq!(parsed2.fallback.host, "https://openrouter.ai/api");
+        assert_eq!(parsed2.fallback.model, "m2");
+
+        clear_fallback(&path).unwrap();
+        let raw3 = fs::read_to_string(&path).unwrap();
+        assert!(!raw3.contains("[fallback]"));
+        let parsed3: SupervisorConfig = toml::from_str(&raw3).unwrap();
+        assert_eq!(parsed3.fallback, Default::default());
+        assert_eq!(parsed3.poll_interval_secs, 25);
     }
 }
