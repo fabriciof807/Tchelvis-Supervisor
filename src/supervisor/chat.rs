@@ -305,7 +305,7 @@ where
         let open_count = open_tasks.len();
         let done_today_count = done_today.len();
         let mut entries = Vec::with_capacity(open_count + done_today_count);
-        for t in open_tasks.into_iter().chain(done_today.into_iter()) {
+        for t in open_tasks.into_iter().chain(done_today) {
             entries.push(format_task_entry(t, now));
         }
         (open_count, done_today_count, entries)
