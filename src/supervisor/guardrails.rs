@@ -998,6 +998,19 @@ mod tests {
         assert!(detect_destructive(&screen, "").is_some());
     }
 
+    // Real Claude Code v2.1.326 `rm -rf` dialog (host test 12, path anonymized): option 2 wraps, so
+    // the command is the 9th non-empty line from the bottom.
+    const CLAUDE_RM: &str = include_str!("fixtures/claude_permission_bash_rm.txt");
+
+    #[test]
+    fn real_claude_rm_dialog_is_critical_from_the_screen_alone() {
+        assert!(detect_destructive(CLAUDE_RM, "").is_some());
+        let alert = sample_eval(SupervisorDecision::AlertOperator, "");
+        let out = enforce_blocked_policy(true, CLAUDE_RM, alert);
+        assert_eq!(out.urgency, Urgency::Critical);
+        assert_eq!(out.hc_command_payload, "n");
+    }
+
     #[test]
     fn claude_dialog_region_starts_after_the_rule() {
         let (earlier, pending) = pending_prompt_split(CLAUDE_TOUCH);

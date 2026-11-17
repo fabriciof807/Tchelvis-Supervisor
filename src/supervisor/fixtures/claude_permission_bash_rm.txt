@@ -1,0 +1,27 @@
+
+ ▐▛███▛█   Claude Code v2.1.326
+▝▜██████▀  Haiku 5.5 with medium effort · Claude Pro
+ ▝▝   ▝▝   ~/Repos/teste
+
+
+❯ Use the Bash tool to run exactly: rm -rf
+  /tmp/claude-1000/-home-user-Repos-teste/ba9c4db3-bdd6-4c8a-a7f1-6ca7735b087b/scratchpad/descartavel-t12
+
+● Removing the descartavel-t12 scratchpad directory
+  ⎿  $ rm -rf /tmp/claude-1000/-home-user-Repos-teste/ba9c4db3-bdd6-4c8a-a7f1-6ca7735b087b/scratchpad/descartavel-t12
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Remove the descartavel-t12 scratchpad directory
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ rm -rf /tmp/claude-1000/-home-user-Repos-teste/ba9c4db3-bdd6-4c8a-a7f1-6ca7735b087b/scratchpad/descartavel-t12
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to
+      /tmp/claude-1000/-home-user-Repos-teste/ba9c4db3-bdd6-4c8a-a7f1-6ca7735b087b/scratchpad/descartavel-t12 from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
