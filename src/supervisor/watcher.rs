@@ -1,4 +1,7 @@
 use super::config::SupervisorConfig;
+use super::fallback::{
+    apply_health_probe, primary_stopped, FallbackProvider, FallbackState, NoFallback, ProbeCtx,
+};
 use super::guardrails::{
     enforce_blocked_policy, has_error_or_loop_signature, readonly_fast_path_with_msg,
     sanitize_auto_reply, tidy_operator_reason, validate_evaluation,
@@ -50,6 +53,9 @@ pub struct WatcherEngine<H: HcBackend, C: CognitiveBackend> {
     pub zero_active_since: Option<u64>,
     pub model_loaded: bool,
     pub runtime_status: SupervisorRuntimeStatus,
+    pub fallback: Box<dyn FallbackProvider>,
+    last_fallback_state: FallbackState,
+    last_eval_model: Option<String>,
 }
 
 impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
@@ -64,7 +70,20 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             zero_active_since,
             model_loaded,
             runtime_status: SupervisorRuntimeStatus::Idle,
+            fallback: Box::new(NoFallback),
+            last_fallback_state: FallbackState::default(),
+            last_eval_model: None,
         }
+    }
+
+    pub fn with_fallback(mut self, p: Box<dyn FallbackProvider>) -> Self {
+        self.last_fallback_state = p.load_state();
+        self.fallback = p;
+        self
+    }
+
+    pub fn fallback_state(&self) -> FallbackState {
+        self.last_fallback_state.clone()
     }
 
     /// Executes one deterministic poll/diff/evaluate cycle at Unix timestamp `now`.
@@ -83,17 +102,26 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
         if sessions.is_empty() {
             let zero_since = *self.zero_active_since.get_or_insert(now);
-            if !self.model_loaded || now.saturating_sub(zero_since) >= self.config.idle_unload_secs
-            {
+            let mut fb = self.fallback.load_state();
+            let idle_expired = now.saturating_sub(zero_since) >= self.config.idle_unload_secs;
+            if !self.model_loaded || idle_expired {
                 if self.model_loaded {
                     let _ = self.cognitive.unload_model();
                     self.model_loaded = false;
                     outcome.model_unloaded = true;
+                    if let Ok(updated) = self.fallback.update_state(&mut primary_stopped) {
+                        fb = updated;
+                    }
+                } else if fb.active && idle_expired {
+                    if let Ok(updated) = self.fallback.update_state(&mut primary_stopped) {
+                        fb = updated;
+                    }
                 }
                 self.runtime_status = SupervisorRuntimeStatus::Idle;
             } else {
                 self.runtime_status = SupervisorRuntimeStatus::Watching(0);
             }
+            self.last_fallback_state = fb;
             self.store.zero_active_since = self.zero_active_since;
             self.store.model_loaded = self.model_loaded;
             self.store.save()?;
@@ -104,6 +132,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         self.runtime_status = SupervisorRuntimeStatus::Watching(sessions.len());
 
         if self.store.mode == SupervisorMode::Paused {
+            self.last_fallback_state = self.fallback.load_state();
             for session in &sessions {
                 let entry = self
                     .store
@@ -128,8 +157,45 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             return Ok(outcome);
         }
 
-        let llm_available = self.cognitive.is_available();
-        if !llm_available {
+        let mut fb = self.fallback.load_state();
+        if !fb.active && fb.primary_intended {
+            let (healthy, detail) = self.fallback.probe_primary();
+            let configured = self.fallback.backend().is_some();
+            match self.fallback.update_state(&mut |s| {
+                apply_health_probe(
+                    s,
+                    &ProbeCtx {
+                        healthy,
+                        paused: false,
+                        sessions: sessions.len(),
+                        configured,
+                        now,
+                        detail: detail.clone(),
+                    },
+                );
+            }) {
+                Ok(updated) => fb = updated,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "Failed to update fallback state"
+                    );
+                }
+            }
+        }
+        self.last_fallback_state = fb.clone();
+
+        let fb_backend = if fb.active {
+            self.fallback.backend()
+        } else {
+            None
+        };
+        let llm_available = if fb.active {
+            fb_backend.is_some()
+        } else {
+            self.cognitive.is_available()
+        };
+        if !fb.active && !llm_available {
             self.model_loaded = false;
         }
 
@@ -256,7 +322,11 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             let state_snapshot = state.clone();
             self.runtime_status = SupervisorRuntimeStatus::Evaluating(session.agent_id.clone());
 
-            let raw_eval = match self.cognitive.evaluate(&state_snapshot, &output) {
+            let eval_result = match &fb_backend {
+                Some(b) => b.evaluate(&state_snapshot, &output),
+                None => self.cognitive.evaluate(&state_snapshot, &output),
+            };
+            let raw_eval = match eval_result {
                 Ok(eval) => eval,
                 Err(e) => {
                     let msg: String = format!("{e:#}").chars().take(300).collect();
@@ -272,7 +342,15 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                     continue;
                 }
             };
-            self.model_loaded = true;
+            if fb_backend.is_none() {
+                self.model_loaded = true;
+            }
+            self.last_eval_model = Some(
+                fb_backend
+                    .as_ref()
+                    .map(|b| b.model_label())
+                    .unwrap_or_else(|| self.cognitive.model_label()),
+            );
             let llm_decision = raw_eval.decision;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy(session.is_blocked(), &output, eval);
@@ -363,6 +441,12 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                                 payload: eval.hc_command_payload.clone(),
                                 source,
                                 summary: eval.updated_summary.clone(),
+                                model: match source {
+                                    AutoReplySource::Llm => {
+                                        self.last_eval_model.clone().filter(|m| !m.is_empty())
+                                    }
+                                    AutoReplySource::FixedRule => None,
+                                },
                             });
                             outcome.auto_replied_agents.push(session.agent_id.clone());
                         }
@@ -1287,5 +1371,412 @@ mod tests {
             &[("t1".to_string(), "y".to_string(), true)]
         );
         assert_eq!(engine.store.agents["t1"].consecutive_auto_replies, 1);
+    }
+
+    struct SharedFakeCognitive {
+        eval_calls: std::sync::Arc<Mutex<usize>>,
+        model: String,
+        next_eval: CognitiveEvaluation,
+        next_error: Option<String>,
+    }
+
+    impl CognitiveBackend for SharedFakeCognitive {
+        fn evaluate(
+            &self,
+            _state: &AgentDurableState,
+            _recent_output: &str,
+        ) -> Result<CognitiveEvaluation> {
+            *self.eval_calls.lock().unwrap() += 1;
+            if let Some(err) = &self.next_error {
+                anyhow::bail!("{err}");
+            }
+            Ok(self.next_eval.clone())
+        }
+
+        fn unload_model(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn model_label(&self) -> String {
+            self.model.clone()
+        }
+    }
+
+    struct FakeFallback {
+        state_path: Option<std::path::PathBuf>,
+        state: Mutex<crate::supervisor::fallback::FallbackState>,
+        healthy: Mutex<bool>,
+        probe_calls: std::sync::Arc<Mutex<usize>>,
+        fb_eval_calls: std::sync::Arc<Mutex<usize>>,
+        backend_enabled: Mutex<bool>,
+        backend_model: String,
+        backend_eval: CognitiveEvaluation,
+        backend_error: Option<String>,
+        redact_secret: Option<String>,
+    }
+
+    impl FakeFallback {
+        fn new(
+            state: crate::supervisor::fallback::FallbackState,
+            healthy: bool,
+            eval: CognitiveEvaluation,
+        ) -> Self {
+            Self {
+                state_path: None,
+                state: Mutex::new(state),
+                healthy: Mutex::new(healthy),
+                probe_calls: std::sync::Arc::new(Mutex::new(0)),
+                fb_eval_calls: std::sync::Arc::new(Mutex::new(0)),
+                backend_enabled: Mutex::new(true),
+                backend_model: "openai/gpt-4.1-mini".to_string(),
+                backend_eval: eval,
+                backend_error: None,
+                redact_secret: None,
+            }
+        }
+    }
+
+    impl crate::supervisor::fallback::FallbackProvider for FakeFallback {
+        fn load_state(&self) -> crate::supervisor::fallback::FallbackState {
+            if let Some(p) = &self.state_path {
+                crate::supervisor::fallback::load_state(p)
+            } else {
+                self.state.lock().unwrap().clone()
+            }
+        }
+
+        fn update_state(
+            &self,
+            f: &mut dyn FnMut(&mut crate::supervisor::fallback::FallbackState),
+        ) -> Result<crate::supervisor::fallback::FallbackState> {
+            if let Some(p) = &self.state_path {
+                crate::supervisor::fallback::update_state(p, f)
+            } else {
+                let mut guard = self.state.lock().unwrap();
+                f(&mut guard);
+                Ok(guard.clone())
+            }
+        }
+
+        fn probe_primary(&self) -> (bool, String) {
+            *self.probe_calls.lock().unwrap() += 1;
+            let ok = *self.healthy.lock().unwrap();
+            if ok {
+                (true, String::new())
+            } else {
+                (false, "/health sem resposta".to_string())
+            }
+        }
+
+        fn backend(&self) -> Option<Box<dyn CognitiveBackend>> {
+            if !*self.backend_enabled.lock().unwrap() {
+                return None;
+            }
+            let inner: Box<dyn CognitiveBackend> = Box::new(SharedFakeCognitive {
+                eval_calls: self.fb_eval_calls.clone(),
+                model: self.backend_model.clone(),
+                next_eval: self.backend_eval.clone(),
+                next_error: self.backend_error.clone(),
+            });
+            if let Some(secret) = &self.redact_secret {
+                Some(Box::new(crate::supervisor::fallback::RedactingBackend {
+                    inner,
+                    key: secret.clone(),
+                }))
+            } else {
+                Some(inner)
+            }
+        }
+    }
+
+    fn auto_reply_eval() -> CognitiveEvaluation {
+        CognitiveEvaluation {
+            updated_summary: "Autorizando operação.".to_string(),
+            detected_state: LifecycleState::WaitingConfirmation,
+            decision: SupervisorDecision::AutoReply,
+            urgency: Urgency::Low,
+            hc_command_payload: "y".to_string(),
+            reason_for_operator: String::new(),
+        }
+    }
+
+    #[test]
+    fn health_failures_switch_evaluation_to_fallback_after_two_ticks() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(noop_eval());
+        *primary.available.lock().unwrap() = false;
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                ..Default::default()
+            },
+            false,
+            auto_reply_eval(),
+        );
+        let fb_eval_calls = fb.fb_eval_calls.clone();
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+
+        engine.tick(1000).unwrap();
+        assert!(!engine.fallback_state().active);
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 0);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+
+        engine.tick(1012).unwrap();
+        let st = engine.fallback_state();
+        assert!(st.active);
+        assert_eq!(
+            st.reason,
+            Some(crate::supervisor::fallback::FallbackReason::Health)
+        );
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 1);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn active_fallback_skips_probe_and_primary() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(noop_eval());
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            auto_reply_eval(),
+        );
+        let fb_eval_calls = fb.fb_eval_calls.clone();
+        let probe_calls = fb.probe_calls.clone();
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 1);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert_eq!(*probe_calls.lock().unwrap(), 0);
+        let snap = engine.fallback_state();
+        assert!(snap.active);
+    }
+
+    #[test]
+    fn engine_reads_state_written_by_other_writer() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let state_path = dir.path().join("supervisor_fallback.json");
+        crate::supervisor::fallback::update_state(&state_path, |s| {
+            s.primary_intended = true;
+            s.active = true;
+            s.reason = Some(crate::supervisor::fallback::FallbackReason::Health);
+            s.since = Some(900);
+        })
+        .unwrap();
+
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]", "Another risky step? [y/N]"],
+        );
+        let primary = MockCognitive::new(auto_reply_eval());
+        let mut fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState::default(),
+            true,
+            auto_reply_eval(),
+        );
+        fb.state_path = Some(state_path.clone());
+        let fb_eval_calls = fb.fb_eval_calls.clone();
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 1);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+
+        // External process returns to primary.
+        crate::supervisor::fallback::update_state(
+            &state_path,
+            crate::supervisor::fallback::primary_started,
+        )
+        .unwrap();
+
+        engine.tick(1012).unwrap();
+        assert!(!engine.fallback_state().active);
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 1);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn active_without_key_skips_evaluation() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(auto_reply_eval());
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::LoadFailed),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            auto_reply_eval(),
+        );
+        *fb.backend_enabled.lock().unwrap() = false;
+        let fb_eval_calls = fb.fb_eval_calls.clone();
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 0);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert!(engine.fallback_state().active);
+    }
+
+    #[test]
+    fn zero_idle_ends_fallback() {
+        let dir = tempdir().unwrap();
+        let mut cfg = test_config(&dir);
+        cfg.idle_unload_secs = 60;
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(vec![], vec![]);
+        let primary = MockCognitive::new(noop_eval());
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            noop_eval(),
+        );
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+        assert!(engine.fallback_state().active);
+
+        engine.tick(1060).unwrap();
+        let st = engine.fallback_state();
+        assert!(!st.active);
+        assert!(!st.primary_intended);
+    }
+
+    #[test]
+    fn paused_keeps_fallback_active_and_evaluates_nothing() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let mut store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        store.mode = SupervisorMode::Paused;
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(auto_reply_eval());
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            auto_reply_eval(),
+        );
+        let fb_eval_calls = fb.fb_eval_calls.clone();
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+        assert_eq!(*fb_eval_calls.lock().unwrap(), 0);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert!(engine.fallback_state().active);
+    }
+
+    #[test]
+    fn fallback_eval_error_keeps_fallback_and_is_redacted() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(noop_eval());
+        let mut fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            noop_eval(),
+        );
+        fb.backend_error = Some("401 unauthorized Bearer sk-secret".to_string());
+        fb.redact_secret = Some("sk-secret".to_string());
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+        assert!(engine.fallback_state().active);
+        let err = engine.store.agents["t1"]
+            .last_eval_error
+            .as_deref()
+            .unwrap();
+        assert!(err.contains("***"));
+        assert!(!err.contains("sk-secret"));
+
+        let snap = crate::supervisor::tui::build_desktop_mod_snapshot(&engine);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("sk-secret"));
+    }
+
+    #[test]
+    fn audit_entry_records_answering_model() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec!["Delete production db? [y/N]"],
+        );
+        let primary = MockCognitive::new(noop_eval());
+        let fb = FakeFallback::new(
+            crate::supervisor::fallback::FallbackState {
+                primary_intended: true,
+                active: true,
+                reason: Some(crate::supervisor::fallback::FallbackReason::Health),
+                since: Some(900),
+                ..Default::default()
+            },
+            false,
+            auto_reply_eval(),
+        );
+
+        let mut engine = WatcherEngine::new(cfg, store, hc, primary).with_fallback(Box::new(fb));
+        engine.tick(1000).unwrap();
+
+        let log_path = dir.path().join("auto_replies.jsonl");
+        let raw = std::fs::read_to_string(log_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(entry["model"], "openai/gpt-4.1-mini");
     }
 }

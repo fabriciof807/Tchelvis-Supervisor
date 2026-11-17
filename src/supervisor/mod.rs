@@ -42,7 +42,14 @@ pub fn build_engine_from_config(
     let hc = HcCliAdapter::new(config.hc.clone());
     hc.register_self_terminal();
     let cognitive = OllamaClient::new(config.clone());
-    Ok(WatcherEngine::new(config, store, hc, cognitive))
+    let mut engine = WatcherEngine::new(config.clone(), store, hc, cognitive);
+    if config.container_mode_active() {
+        engine = engine.with_fallback(Box::new(fallback::LiveFallback {
+            state_path: fallback::fallback_state_path(),
+            primary: config,
+        }));
+    }
+    Ok(engine)
 }
 
 /// Instantiates a `WatcherEngine` using `SupervisorConfig::load()`.

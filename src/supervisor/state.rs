@@ -110,6 +110,8 @@ pub struct DurableAutoReplyEntry {
     pub payload: String,
     pub source: AutoReplySource,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// Details of an active Operator Alert Banner / Action Card.
@@ -387,6 +389,7 @@ mod tests {
             payload: "y".to_string(),
             source: AutoReplySource::FixedRule,
             summary: "read-only".to_string(),
+            model: None,
         };
         empty_store.append_auto_reply_log(&sample).unwrap();
 
@@ -402,6 +405,7 @@ mod tests {
                 payload: "y".to_string(),
                 source: AutoReplySource::Llm,
                 summary: "continue".to_string(),
+                model: None,
             })
             .unwrap();
 
