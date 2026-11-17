@@ -15,6 +15,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - **Supervisor fallback model (M1b, phase 1 API).**
   - When the managed `llama.cpp` container fails to start or fails `/health` on 2 consecutive ticks with active sessions, evaluation switches automatically to a configured OpenAI-compatible API model until the user chooses to return (`Voltar ao principal` / `▶ Load LLM` / `tchelvis supervisor fallback off`), or stops on `Unload LLM` / zero-idle.
   - **CLI:** `tchelvis supervisor fallback {status,set,key,models,off,clear}`. Keys saved via stdin go to `~/.config/tchelvis/fallback_api_key` (`0600`) and are never written to `supervisor.toml`, snapshots, audit entries, or logs; shared runtime state lives in `~/.local/state/tchelvis/supervisor_fallback.json`.
+  - Intentional restarts (Load, model/GPU switch, CPU/GPU bench) never trigger it: probes are ignored during a 300 s start grace, and failures seen by several processes count once per poll interval. A fallback host typed without a scheme defaults to `https://`.
   - **Herdr mod:** active fallback shows `● LLM: <model> (Fallback)` in warning tone; the **Supervisor model** card splits into `PRINCIPAL (local)` (with `falhou` badge while active) and `FALLBACK (API)` with endpoint entry, `/v1/models` picker (`Trocar`), and `Voltar ao principal`.
 
 ### Changed
