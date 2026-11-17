@@ -1877,6 +1877,13 @@ export default class CockpitMod extends View {
           const parsed = JSON.parse(res.stdout);
           this.homeSnap = parsed;
           setShared("cockpit.home", parsed);
+          if (
+            this.taskEditorPrevIds &&
+            hasNewTask(this.taskEditorPrevIds, parsed.tasks ?? [])
+          ) {
+            this.taskDraft = "";
+            this.taskEditorPrevIds = null;
+          }
         }
       } catch (_e) {
         // Fallback smoothly to live Herdr spaces() / agents()
@@ -2014,6 +2021,13 @@ export default class CockpitMod extends View {
           const parsed = JSON.parse(res.stdout);
           this.homeSnap = parsed;
           setShared("cockpit.home", parsed);
+          if (
+            this.taskEditorPrevIds &&
+            hasNewTask(this.taskEditorPrevIds, parsed.tasks ?? [])
+          ) {
+            this.taskDraft = "";
+            this.taskEditorPrevIds = null;
+          }
           if (onSuccess) onSuccess(parsed);
         } else if (res.stderr) {
           this.note = res.stderr.trim();
@@ -2028,17 +2042,22 @@ export default class CockpitMod extends View {
   }
 
   addTaskGui(cx) {
+    if (isBlankDraft(this.taskDraft) || this.busy) return;
     const title = this.taskDraft.trim();
-    if (!title || this.busy) return;
-    const args = ["add", "--priority", this.taskPriority || "normal"];
-    if (this.taskProject && this.taskProject !== "Geral") {
-      args.push("--project", this.taskProject);
-    }
-    args.push("--json", title);
+    const args = [
+      "add",
+      "--priority",
+      this.taskPriority || "normal",
+      ...taskProjectArgs(this.currentTaskTag),
+      "--json",
+      "--",
+      title,
+    ];
     this.taskDraft = "";
     this.editingField = null;
+    this.taskTagMenuOpen = false;
     this.runTaskCommand(cx, args, () => {
-      this.note = `Tarefa adicionada: ${ellipsize(title, 36)}`;
+      this.note = `Tarefa adicionada: ${ellipsize(title.split("\n")[0], 36)}`;
     });
   }
 
@@ -2065,7 +2084,11 @@ export default class CockpitMod extends View {
       this.editingField = null;
     } else if (e.key === "enter") {
       if (this.editingField === "task") {
-        this.addTaskGui(cx);
+        if (m?.shift) {
+          this.taskDraft += "\n";
+        } else {
+          this.addTaskGui(cx);
+        }
       } else if (this.editingField === "command" && agent) {
         this.approveActionCard(cx, agent.address);
       } else if (this.editingField === "prompt" && agent) {
@@ -3468,8 +3491,12 @@ export default class CockpitMod extends View {
       "Geral",
       ...Array.from(new Set(projects.map((p) => p.name).filter(Boolean))),
     ];
-    const currentProjectTag =
-      this.taskProject || activeSpace?.name || "Geral";
+    const currentProjectTag = effectiveTaskTag(
+      this.taskProject,
+      activeSpace?.name,
+      projectChoices
+    );
+    this.currentTaskTag = currentProjectTag;
 
     const filteredTasks = tasks.filter((tk) => {
       if (this.taskFilter === "pending") return !tk.done;
@@ -3593,7 +3620,7 @@ export default class CockpitMod extends View {
           .child(
             h_flex()
               .gap(6)
-              .items_center()
+              .items_start()
               .child(
                 div()
                   .id("ck-task-input")
@@ -3616,11 +3643,26 @@ export default class CockpitMod extends View {
                     cx.notify();
                   })
                   .child(
-                    this.taskDraft
-                      ? ellipsize(this.taskDraft, 56) +
-                          (this.editingField === "task" ? "▏" : "")
-                      : (this.editingField === "task" ? "▏" : "") +
-                          "Nova tarefa (ex: revisar PR #94)…"
+                    (() => {
+                      const isEditingTask = this.editingField === "task";
+                      if (!this.taskDraft) {
+                        return div().child(
+                          (isEditingTask ? "▏" : "") +
+                            "Nova tarefa (Shift+Enter: nova linha)…"
+                        );
+                      }
+                      const lines = draftDisplayLines(this.taskDraft);
+                      return v_flex()
+                        .gap(2)
+                        .children(
+                          lines.map((line, idx) => {
+                            const isLast = idx === lines.length - 1;
+                            const text =
+                              line + (isLast && isEditingTask ? "▏" : "");
+                            return div().child(text || " ");
+                          })
+                        );
+                    })()
                   )
               )
               .child(
@@ -3639,6 +3681,39 @@ export default class CockpitMod extends View {
                   .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                   .on_click((_e, cx) => this.addTaskGui(cx))
                   .child("+ Add")
+              )
+              .child(
+                h_flex()
+                  .id("ck-task-edit")
+                  .h(26)
+                  .px(8)
+                  .items_center()
+                  .justify_center()
+                  .rounded(6)
+                  .border(1)
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .text_size(12)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((_e, cx) => {
+                    this.taskEditorPrevIds = tasks.map((tk) => tk.id);
+                    this.editingField = null;
+                    this.taskTagMenuOpen = false;
+                    run("tab.new", {
+                      space: activeSpace?.id,
+                      name: "nova tarefa",
+                      argv: taskEditorArgv(
+                        this.taskDraft,
+                        this.taskPriority || "normal",
+                        this.currentTaskTag
+                      ),
+                    });
+                    cx.notify();
+                  })
+                  .child("✎")
               )
           )
           // Priority & Project selector pills
@@ -3667,29 +3742,49 @@ export default class CockpitMod extends View {
               .child(div().flex_1())
               .child(
                 h_flex()
-                  .id("ck-task-project-cycle")
+                  .id("ck-task-project")
                   .h(24)
                   .px(8)
                   .gap(4)
                   .items_center()
                   .rounded(999)
                   .border(1)
-                  .border_color(t.border)
-                  .bg(t.background)
+                  .border_color(this.taskTagMenuOpen ? t.accent : t.border)
+                  .bg(this.taskTagMenuOpen ? t.selected : t.background)
                   .text_size(11)
                   .text_color(t.accent)
                   .cursor_pointer()
                   .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                   .on_click((_e, cx) => {
-                    const idx = projectChoices.indexOf(currentProjectTag);
-                    const next =
-                      projectChoices[(idx + 1) % projectChoices.length] ??
-                      "Geral";
-                    this.taskProject = next;
+                    this.taskTagMenuOpen = !this.taskTagMenuOpen;
                     cx.notify();
                   })
-                  .child(`📁 ${ellipsize(currentProjectTag, 18)}`)
+                  .child(`📁 ${currentProjectTag}`)
               )
+          )
+          .when(Boolean(this.taskTagMenuOpen), (el) =>
+            el.child(
+              h_flex()
+                .gap(5)
+                .flex_wrap()
+                .items_center()
+                .children(
+                  projectChoices.map((tag, idx) =>
+                    this.actionBtn(
+                      t,
+                      `ck-task-tag-${idx}`,
+                      tag,
+                      (_e, cx) => {
+                        this.taskProject = tag;
+                        this.taskTagMenuOpen = false;
+                        cx.notify();
+                      },
+                      tag === currentProjectTag
+                    )
+                  )
+                )
+            )
           )
           // Filter strip
           .child(
@@ -3777,7 +3872,7 @@ export default class CockpitMod extends View {
                 .px(10)
                 .py(7)
                 .gap(7)
-                .items_center()
+                .items_start()
                 .rounded(6)
                 .border(1)
                 .border_color(t.border)
@@ -3799,38 +3894,43 @@ export default class CockpitMod extends View {
                     .child(tk.done ? "[✓]" : "[ ]")
                 )
                 .child(
-                  div()
+                  v_flex()
                     .flex_1()
                     .min_w(0)
+                    .gap(2)
                     .text_size(12)
                     .text_color(tk.done ? t.dim : t.foreground)
-                    .child(ellipsize(tk.title, 54))
-                )
-                .when(Boolean(tk.project), (el) =>
-                  el.child(
-                    div()
-                      .id(`ck-task-proj-${tk.id}`)
-                      .cursor_pointer()
-                      .on_click(() => {
-                        if (projObj?.spaceId) {
-                          run("space.focus", { space: projObj.spaceId });
-                        }
-                      })
-                      .child(
-                        this.pillBadge(
-                          t,
-                          ellipsize(tk.project, 14),
-                          t.accent
-                        )
-                      )
-                  )
+                    .children(
+                      String(tk.title ?? "")
+                        .split("\n")
+                        .map((line) => div().child(line || " "))
+                    )
                 )
                 .child(
-                  this.pillBadge(
-                    t,
-                    String(tk.priority || "normal").toUpperCase(),
-                    prioCol
-                  )
+                  h_flex()
+                    .gap(4)
+                    .flex_wrap()
+                    .items_center()
+                    .when(Boolean(tk.project), (el) =>
+                      el.child(
+                        div()
+                          .id(`ck-task-proj-${tk.id}`)
+                          .cursor_pointer()
+                          .on_click(() => {
+                            if (projObj?.spaceId) {
+                              run("space.focus", { space: projObj.spaceId });
+                            }
+                          })
+                          .child(this.pillBadge(t, tk.project, t.accent))
+                      )
+                    )
+                    .child(
+                      this.pillBadge(
+                        t,
+                        String(tk.priority || "normal").toUpperCase(),
+                        prioCol
+                      )
+                    )
                 )
                 .child(
                   div()
