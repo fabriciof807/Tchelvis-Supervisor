@@ -2,7 +2,7 @@
 
 **Data da última atualização:** 2026-11-17  
 **Repositório:** `https://github.com/fabriciof807/Tchelvis-Supervisor` (público, branch `main`; antigo `cockpit` redireciona)  
-**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`). Primeiro stable publicado: **`v0.2.0`** (`a6a81d1`, 2026-11-16); nightly atual = `a6a81d1`.
+**Binário:** `tchelvis` (antes `cockpit`). Instalação/atualização via release: `install.sh` (1ª vez) e `tchelvis update` (canais `stable`/`nightly`). Primeiro stable publicado: **`v0.2.0`** (`a6a81d1`, 2026-11-16); nightly atual = `264760b` (2026-11-17, Tarefas do dia + M1b).
 
 ---
 
@@ -169,8 +169,8 @@ Só documentação; nenhum código mudou. As duas specs **aguardam aprovação d
   - Título e etiqueta inteiros na lista (sem `ellipsize`); menu de etiqueta ao clicar em `📁`; corrigir bug da pílula (mostra o Space ativo, `main.js:3427`, mas salva sem projeto, `main.js:1989`).
 - **ROADMAP:** novo **M7 — mod de board kanban** (ideia) que lê as tarefas e agrupa por etiqueta.
 
-### Atualização — 2026-11-17: Tarefas do dia e M1b implementados (sem push)
-Specs aprovadas pelo usuário; planos em `docs/superpowers/plans/2026-11-17-{daily-tasks-input,m1b-fallback-model}.md`. Ambos feitos pelo Hydrogen em worktree, revisados e integrados em `main` (fast-forward). **Push ainda não feito.**
+### Atualização — 2026-11-17: Tarefas do dia e M1b implementados e publicados no nightly
+Specs aprovadas pelo usuário; planos em `docs/superpowers/plans/2026-11-17-{daily-tasks-input,m1b-fallback-model}.md`. Ambos feitos pelo Hydrogen em worktree, revisados e integrados em `main` (fast-forward). Push com OK do usuário (`a6a81d1..264760b`); Release run `44002046294` verde (test, build x86_64/aarch64, publish); nightly `264760b` publicado 2026-11-17T02:23Z.
 - **Tarefas do dia** (`0ce3ad7`..`6c2805e`): `tchelvis task add --edit` (`$VISUAL`/`$EDITOR`/`nvi`/`vi`; arquivo vazio cancela); lista humana mostra 1ª linha + `…(+N linhas)`; mod com campo que quebra linha (Shift+Enter), botão `✎`, menu de etiqueta (`Geral` + projetos da Home) e pílula = etiqueta salva (`effectiveTaskTag`).
 - **M1b fallback API** (`1ca74d9`..`e670d5b`): novo `src/supervisor/fallback.rs` (config `[fallback] host/model`, chave por stdin em `~/.config/tchelvis/fallback_api_key` 0600, estado `~/.local/state/tchelvis/supervisor_fallback.json` com flock, `FallbackProvider`), roteamento no `tick`, CLI `supervisor fallback {status,set,key,models,off,clear}`, campos `fallback_*` no snapshot, pílula `(Fallback)` e card PRINCIPAL/FALLBACK.
   - Correções do coordenador após revisão independente: carência de 300 s (`starting_since`) em reinícios intencionais (Load, troca de modelo/GPU, bench); falhas de vários processos contam 1× por ~¾ do poll; host sem esquema → `https://`; fallback em `localhost:11434` não vira mais `api.openai.com` (`host_override`); chave casada por hostname exato/subdomínio; estado gravado antes do stop em Unload/GPU-off; restore `Stop` do bench não encerra fallback ativo.
@@ -270,7 +270,7 @@ tchelvis supervisor status --json
 ---
 
 ## 4. Próximos Passos Sugeridos
-1. **Push + nightly e validar no host** (Tarefas do dia e M1b). M1b: com sessão aberta, `podman stop` no container → pílula `(Fallback)` em ~2 ticks; `Voltar ao principal` recarrega; Unload encerra ambos; trocar modelo/GPU e rodar bench **não** ativam o fallback; `status --json` sem chave. Tarefas: quebra de linha, Shift+Enter, `✎`, menu, pílula/etiqueta num Space que não é projeto.
+1. **Validar no host o nightly `264760b`** (Tarefas do dia e M1b): `tchelvis update --channel nightly`, conferir `tchelvis --version`, reiniciar o Herdr Desktop. M1b antes do teste: `supervisor fallback key` (stdin), `supervisor fallback set --host <url> --model <m>` e **um Load** (arma `primary_intended`). OpenCode Go: host `https://opencode.ai/inference/go/openai/v1`, modelo Chat Completions (GLM/Kimi/DeepSeek). M1b: com sessão aberta, `podman stop` no container → pílula `(Fallback)` em ~2 ticks; `Voltar ao principal` recarrega; Unload encerra ambos; trocar modelo/GPU e rodar bench **não** ativam o fallback; `status --json` sem chave. Tarefas: quebra de linha, Shift+Enter, `✎`, menu, pílula/etiqueta num Space que não é projeto.
 2. **Validar no host** (com `v0.2.0`, reiniciar o Herdr Desktop):
    - Fleet em árvore: filhos recuados com `├`/`└`, `⚠ N` no pai, grupo vai para "Needs" se um filho bloqueia, clique no filho seleciona o filho.
    - Card de modelos: Ocultar/Mostrar e Apagar (segundo clique `Delete <size>?`); `ollama rm` real nunca foi testado.
