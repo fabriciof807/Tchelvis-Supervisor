@@ -182,6 +182,26 @@ enum Commands {
         #[arg(long)]
         detect: bool,
     },
+    /// Ask read-only questions about active agents and Daily Tasks
+    Chat {
+        #[command(subcommand)]
+        action: ChatCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ChatCommand {
+    /// Ask a single read-only question using the supervisor's effective model
+    Ask {
+        /// Output JSON (requires --request)
+        #[arg(long)]
+        json: bool,
+        /// JSON request payload {"question":"...","history":[...]}
+        #[arg(long)]
+        request: Option<String>,
+        /// Question text (when --request is not used)
+        question: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1046,6 +1066,136 @@ async fn main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Chat { action } => {
+            match action {
+                ChatCommand::Ask {
+                    json,
+                    request,
+                    question,
+                } => {
+                    use tchelvis::supervisor::chat::{
+                        parse_chat_request, run_chat, ChatDeps, ChatError, ChatRequest,
+                        QUESTION_MAX_CHARS,
+                    };
+                    use tchelvis::supervisor::hc::HcBackend;
+
+                    let req = match (json, request) {
+                        (true, None) => {
+                            let err = ChatError {
+                                code: "bad_input".to_string(),
+                                error: "--json requer --request".to_string(),
+                            };
+                            println!("{}", serde_json::to_string(&err)?);
+                            std::process::exit(1);
+                        }
+                        (_, Some(raw)) => match parse_chat_request(&raw) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                if json {
+                                    println!("{}", serde_json::to_string(&err)?);
+                                } else {
+                                    eprintln!("{}", err.error);
+                                }
+                                std::process::exit(1);
+                            }
+                        },
+                        (false, None) => {
+                            let q = question.join(" ");
+                            if q.trim().is_empty() {
+                                eprintln!("Pergunta vazia");
+                                std::process::exit(1);
+                            }
+                            if q.chars().count() > QUESTION_MAX_CHARS {
+                                eprintln!(
+                                    "Pergunta excede o limite de {QUESTION_MAX_CHARS} caracteres"
+                                );
+                                std::process::exit(1);
+                            }
+                            ChatRequest {
+                                question: q,
+                                history: Vec::new(),
+                            }
+                        }
+                    };
+
+                    let paths_clone = paths.clone();
+                    let res = tokio::task::spawn_blocking(move || -> Result<Result<_, ChatError>> {
+                    let mut cfg = tchelvis::supervisor::config::SupervisorConfig::load();
+                    cfg.ollama_timeout_secs = 120;
+                    let container_mode = cfg.container_mode_active();
+                    let ollama_roots =
+                        tchelvis::supervisor::container::default_ollama_roots();
+                    let primary_label =
+                        tchelvis::supervisor::models::effective_model(&cfg, &ollama_roots)
+                            .map(|m| m.display_name)
+                            .unwrap_or_else(|| cfg.ollama_model.clone());
+                    let primary = tchelvis::supervisor::ollama::OllamaClient::new(cfg.clone());
+                    let fb_host = cfg.fallback.host.trim().to_string();
+                    let fb = tchelvis::supervisor::fallback::LiveFallback {
+                        state_path: tchelvis::supervisor::fallback::fallback_state_path(),
+                        primary: cfg.clone(),
+                    };
+                    let hc = tchelvis::supervisor::hc::HcCliAdapter::new(cfg.hc.clone());
+                    let sessions = hc.list_sessions().ok();
+                    let store = tchelvis::supervisor::state::DurableStateStore::load_or_init_with_fallback(
+                        &cfg.state_file_path,
+                        tchelvis::supervisor::config::SupervisorConfig::legacy_state_file_path(),
+                    )?;
+                    let tasks = DailyTaskStore::load_or_init(&DailyTaskStore::default_path(&paths_clone))
+                        .ok()
+                        .map(|s| s.tasks);
+                    let slot_lock = tchelvis::supervisor::slot_lock::slot_lock_path(&cfg);
+                    let deps = ChatDeps {
+                        container_mode,
+                        sessions,
+                        agents: &store.agents,
+                        tasks,
+                        primary: &primary,
+                        primary_label,
+                        fallback: Some(&fb),
+                        fallback_host: fb_host,
+                        slot_lock,
+                        slot_wait: Duration::from_secs(60),
+                    };
+                    Ok(run_chat(deps, &req, &chrono::Local::now()))
+                })
+                .await
+                .context("chat task panicked");
+
+                    match res {
+                        Ok(Ok(Ok(answer))) => {
+                            if json {
+                                println!("{}", serde_json::to_string(&answer)?);
+                            } else {
+                                println!("{}", answer.answer);
+                            }
+                            Ok(())
+                        }
+                        Ok(Ok(Err(chat_err))) => {
+                            if json {
+                                println!("{}", serde_json::to_string(&chat_err)?);
+                            } else {
+                                eprintln!("{}", chat_err.error);
+                            }
+                            std::process::exit(1);
+                        }
+                        Ok(Err(err)) | Err(err) => {
+                            let msg: String = format!("{err:#}").chars().take(300).collect();
+                            if json {
+                                let chat_err = ChatError {
+                                    code: "llm_error".to_string(),
+                                    error: msg,
+                                };
+                                println!("{}", serde_json::to_string(&chat_err)?);
+                            } else {
+                                eprintln!("{msg}");
+                            }
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        }
         Commands::Home { json } => {
             let paths_clone = paths.clone();
             let snap = tokio::task::spawn_blocking(move || home::build_home_snapshot(&paths_clone))
