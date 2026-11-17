@@ -5229,7 +5229,7 @@ export default class CockpitMod extends View {
             {
               role: "error",
               code: "llm_stopped",
-              content: "LLM desligada",
+              content: parsed.error || "LLM desligada",
             },
           ];
         } else {
