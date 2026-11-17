@@ -442,6 +442,94 @@ export function pillModelName(name, maxLen = 28) {
   return s.slice(0, head) + "…" + s.slice(s.length - tail);
 }
 
+function extractHostname(rawHost) {
+  const s = String(rawHost ?? "").trim();
+  if (!s) return "";
+  try {
+    return new URL(s).hostname || s;
+  } catch {
+    return s;
+  }
+}
+
+export function chatHistoryForRequest(messages, maxMessages = 12) {
+  const list = Array.isArray(messages) ? messages : [];
+  const filtered = list
+    .filter((m) => m && (m.role === "user" || m.role === "assistant"))
+    .map((m) => ({ role: m.role, content: String(m.content ?? "") }));
+  if (maxMessages <= 0) return [];
+  return filtered.slice(-maxMessages);
+}
+
+export function chatRequestArgv(messages, question) {
+  return [
+    "chat",
+    "ask",
+    "--json",
+    "--request",
+    JSON.stringify({
+      question: String(question ?? ""),
+      history: chatHistoryForRequest(messages),
+    }),
+  ];
+}
+
+export function parseChatResult(code, stdout) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(stdout ?? "").trim());
+  } catch {
+    return {
+      ok: false,
+      code: "llm_error",
+      error: "Resposta inválida do tchelvis",
+    };
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return {
+      ok: false,
+      code: "llm_error",
+      error: "Resposta inválida do tchelvis",
+    };
+  }
+  if (code === 0 && typeof parsed.answer === "string") {
+    return {
+      ok: true,
+      answer: parsed.answer,
+      model: String(parsed.model ?? ""),
+      viaFallback: Boolean(parsed.via_fallback),
+      fallbackHost: parsed.fallback_host ? String(parsed.fallback_host) : null,
+    };
+  }
+  if (typeof parsed.error === "string" || typeof parsed.code === "string") {
+    return {
+      ok: false,
+      code: String(parsed.code || "llm_error"),
+      error: String(parsed.error || "Erro desconhecido"),
+    };
+  }
+  return {
+    ok: false,
+    code: "llm_error",
+    error: "Resposta inválida do tchelvis",
+  };
+}
+
+export function chatHeaderLabel(supSnap) {
+  const model = pillModelName(supSnap?.llm_model || "");
+  if (!supSnap?.fallback_active) return model;
+  const host = extractHostname(supSnap?.fallback_host);
+  return host
+    ? `${model ? `${model} ` : ""}(Fallback · ${host})`
+    : `${model ? `${model} ` : ""}(Fallback)`;
+}
+
+export function fallbackMarker(result) {
+  if (!result?.viaFallback) return "";
+  const host = extractHostname(result?.fallbackHost);
+  return host ? `via Fallback · ${host}` : "via Fallback";
+}
+
 function formatShortHm(ts) {
   if (ts == null) return "--:--";
   const d = new Date(Number(ts) * 1000);
