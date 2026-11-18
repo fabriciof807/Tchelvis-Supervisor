@@ -587,7 +587,7 @@ export const CHAT_STARTERS = [
   "Quem está esperando por mim?",
   "Quais tarefas estão abertas?",
   "Resumo dos agentes",
-  "O que faço primeiro?",
+  "Qual tarefa devo fazer primeiro?",
 ];
 
 export function extractMentionedAgents(text, rows) {

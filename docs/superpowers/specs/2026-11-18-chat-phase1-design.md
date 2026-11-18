@@ -36,7 +36,7 @@ partiu de uma premissa errada: a API de mods **tem** campos nativos.
 3. **Espera visível**: spinner nativo + segundos decorridos (`◌ Gerando… 6s`).
 4. **Markdown** nas respostas (`TextView.markdown`, com texto simples se indisponível).
 5. **Perguntas prontas** no chat vazio (4 botões: "Quem está esperando por mim?", "Quais tarefas
-   estão abertas?", "Resumo dos agentes", "O que faço primeiro?").
+   estão abertas?", "Resumo dos agentes", "Qual tarefa devo fazer primeiro?").
 6. **Erro recuperável**: `↻ Tentar de novo` (reenvia a mesma pergunta) e `Editar` (devolve ao campo).
 7. **Copiar** resposta (`wl-copy`, senão `xclip`, senão `xsel`), com "Copiado".
 8. **`↗ Abrir <agente>`** sob a resposta para cada agente da Fleet citado por endereço ou nome,

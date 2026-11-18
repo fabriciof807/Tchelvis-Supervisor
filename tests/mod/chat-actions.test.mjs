@@ -11,7 +11,7 @@ test("starters are the four agreed questions", () => {
     "Quem está esperando por mim?",
     "Quais tarefas estão abertas?",
     "Resumo dos agentes",
-    "O que faço primeiro?",
+    "Qual tarefa devo fazer primeiro?",
   ]);
 });
 
