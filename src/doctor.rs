@@ -1,5 +1,6 @@
 use crate::assets::{
-    asset_sha256, CLAUDE_HOOK_SH, HERDR_LAYOUT_JSON, HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, SHELL_SH,
+    asset_sha256, CLAUDE_HOOK_SH, HERDR_LAYOUT_JSON, HERDR_MOD_ICONS, HERDR_MOD_JSON,
+    HERDR_MOD_MAIN_JS, SHELL_SH,
 };
 use crate::config::{CockpitConfig, CockpitPaths};
 use crate::herdr::HerdrClient;
@@ -116,15 +117,21 @@ pub async fn run_doctor(
         let l_ok = fs::read_to_string(&layout_path)
             .map(|s| asset_sha256(&s) == asset_sha256(HERDR_LAYOUT_JSON))
             .unwrap_or(false);
+        let icons_dir = paths.home_dir.join(".config/herdr-app/mods/tchelvis/icons");
+        let icons_ok = HERDR_MOD_ICONS.iter().all(|(file_name, expected)| {
+            fs::read_to_string(icons_dir.join(file_name))
+                .map(|s| asset_sha256(&s) == asset_sha256(expected))
+                .unwrap_or(false)
+        });
         checks.push(DoctorCheck {
             name: "herdr_mod".into(),
-            status: if m_ok && mj_ok && l_ok && embedded_layout_valid {
+            status: if m_ok && mj_ok && l_ok && icons_ok && embedded_layout_valid {
                 "ok".into()
             } else {
                 "warn".into()
             },
             detail: format!(
-                "mod_hash_match={m_ok}, mod_json_hash_match={mj_ok}, layout_hash_match={l_ok}, schema_valid={embedded_layout_valid}"
+                "mod_hash_match={m_ok}, mod_json_hash_match={mj_ok}, layout_hash_match={l_ok}, icons_match={icons_ok}, schema_valid={embedded_layout_valid}"
             ),
         });
     } else {
@@ -228,4 +235,46 @@ pub async fn run_doctor(
     }
 
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::setup::{run_setup, SetupOptions};
+
+    #[tokio::test]
+    async fn doctor_warns_when_a_mod_icon_is_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        };
+        paths.ensure_dirs().unwrap();
+
+        let opts = SetupOptions {
+            only: Some("herdr-mod".into()),
+            ..Default::default()
+        };
+        run_setup(&paths, &opts).unwrap();
+
+        fs::remove_file(home.join(".config/herdr-app/mods/tchelvis/icons/zap.svg")).unwrap();
+
+        let cfg = CockpitConfig::default();
+        let report = run_doctor(&cfg, &paths, None).await.unwrap();
+        let herdr_mod = report
+            .checks
+            .iter()
+            .find(|c| c.name == "herdr_mod")
+            .expect("herdr_mod check present");
+        assert_eq!(herdr_mod.status, "warn");
+        assert!(
+            herdr_mod.detail.contains("icons_match=false"),
+            "unexpected detail: {}",
+            herdr_mod.detail
+        );
+    }
 }

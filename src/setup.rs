@@ -1,7 +1,7 @@
 use crate::assets::{
     asset_sha256, CLAUDE_HOOK_MARKER, CLAUDE_HOOK_SH, FENCE_END, FENCE_START, HERDR_LAYOUT_JSON,
-    HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_TCHELVIS_JS, PI_TCHELVIS_JS, SHELL_FISH, SHELL_NU,
-    SHELL_SH, SYSTEMD_UNIT_TEMPLATE,
+    HERDR_MOD_ICONS, HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_TCHELVIS_JS, PI_TCHELVIS_JS,
+    SHELL_FISH, SHELL_NU, SHELL_SH, SYSTEMD_UNIT_TEMPLATE,
 };
 use crate::config::CockpitPaths;
 use anyhow::{bail, Context, Result};
@@ -311,6 +311,18 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
             &mut manifest,
             &mut actions,
         )?;
+        let icons_dir = herdr_dir.join("mods/tchelvis/icons");
+        for (file_name, content) in HERDR_MOD_ICONS {
+            let icon_path = icons_dir.join(file_name);
+            apply_created_file(
+                &icon_path,
+                content,
+                0o644,
+                opts.dry_run,
+                &mut manifest,
+                &mut actions,
+            )?;
+        }
 
         if opts.set_default_layout && (had_herdr_dir || opts.only.as_deref() == Some("herdr-mod")) {
             let herdr_settings = herdr_dir.join("settings.json");
@@ -552,6 +564,23 @@ pub fn verify_installation(paths: &CockpitPaths) -> Result<SetupReport> {
         (".config/herdr-app/layouts/tchelvis.json", HERDR_LAYOUT_JSON),
     ] {
         let p = paths.home_dir.join(rel_path);
+        if p.exists() {
+            let actual = fs::read_to_string(&p).unwrap_or_default();
+            if asset_sha256(&actual) == asset_sha256(expected_content) {
+                checks.push(format!("OK: {} matches embedded SHA-256", p.display()));
+            } else {
+                all_ok = false;
+                checks.push(format!("MISMATCH: {}", p.display()));
+            }
+        } else {
+            all_ok = false;
+            checks.push(format!("MISSING: {}", p.display()));
+        }
+    }
+
+    let icons_dir = paths.home_dir.join(".config/herdr-app/mods/tchelvis/icons");
+    for (file_name, expected_content) in HERDR_MOD_ICONS {
+        let p = icons_dir.join(file_name);
         if p.exists() {
             let actual = fs::read_to_string(&p).unwrap_or_default();
             if asset_sha256(&actual) == asset_sha256(expected_content) {
@@ -992,5 +1021,43 @@ mod tests {
         assert!(!paths.data_dir.exists());
         assert!(!paths.state_dir.exists());
         assert!(!dummy_bin.exists());
+    }
+
+    #[test]
+    fn setup_installs_every_mod_icon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        };
+
+        let opts = SetupOptions {
+            only: Some("herdr-mod".into()),
+            ..Default::default()
+        };
+        let rep = run_setup(&paths, &opts).unwrap();
+        assert!(rep.verified_ok);
+
+        let icons_dir = home.join(".config/herdr-app/mods/tchelvis/icons");
+        for (name, content) in crate::assets::HERDR_MOD_ICONS {
+            let installed = fs::read_to_string(icons_dir.join(name)).unwrap();
+            assert_eq!(installed, *content, "mismatch for icon {name}");
+        }
+
+        let v_rep = verify_installation(&paths).unwrap();
+        for (name, _) in crate::assets::HERDR_MOD_ICONS {
+            let expected_path = icons_dir.join(name).display().to_string();
+            assert!(
+                v_rep
+                    .planned_or_applied
+                    .iter()
+                    .any(|line| line.starts_with("OK:") && line.contains(&expected_path)),
+                "missing OK verification line for {expected_path}"
+            );
+        }
     }
 }

@@ -3,6 +3,76 @@ use sha2::{Digest, Sha256};
 pub const HERDR_MOD_MAIN_JS: &str = include_str!("../assets/herdr-app/mods/tchelvis/main.js");
 pub const HERDR_MOD_JSON: &str = include_str!("../assets/herdr-app/mods/tchelvis/mod.json");
 pub const HERDR_LAYOUT_JSON: &str = include_str!("../assets/herdr-app/layouts/tchelvis.json");
+pub const HERDR_MOD_ICONS: &[(&str, &str)] = &[
+    (
+        "LICENSE-lucide.txt",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/LICENSE-lucide.txt"),
+    ),
+    (
+        "brain.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/brain.svg"),
+    ),
+    (
+        "clipboard-list.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/clipboard-list.svg"),
+    ),
+    (
+        "fish.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/fish.svg"),
+    ),
+    (
+        "folder.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/folder.svg"),
+    ),
+    (
+        "house.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/house.svg"),
+    ),
+    (
+        "key-round.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/key-round.svg"),
+    ),
+    (
+        "message-square.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/message-square.svg"),
+    ),
+    (
+        "monitor.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/monitor.svg"),
+    ),
+    (
+        "rocket.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/rocket.svg"),
+    ),
+    (
+        "search.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/search.svg"),
+    ),
+    (
+        "settings.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/settings.svg"),
+    ),
+    (
+        "sparkles.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/sparkles.svg"),
+    ),
+    (
+        "stethoscope.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/stethoscope.svg"),
+    ),
+    (
+        "timer.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/timer.svg"),
+    ),
+    (
+        "triangle-alert.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/triangle-alert.svg"),
+    ),
+    (
+        "zap.svg",
+        include_str!("../assets/herdr-app/mods/tchelvis/icons/zap.svg"),
+    ),
+];
 
 pub const FENCE_START: &str = "# >>> tchelvis managed >>>";
 pub const FENCE_END: &str = "# <<< tchelvis managed <<<";
@@ -361,5 +431,22 @@ mod tests {
         assert!(HERDR_MOD_MAIN_JS.contains("export function partitionAgents"));
         assert!(HERDR_MOD_MAIN_JS.contains("export function buildViewModel"));
         assert!(HERDR_MOD_MAIN_JS.contains("export function mount"));
+    }
+
+    #[test]
+    fn embedded_icons_match_the_icons_folder() {
+        use std::collections::BTreeSet;
+        let icons_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("assets/herdr-app/mods/tchelvis/icons");
+        let on_disk: BTreeSet<String> = std::fs::read_dir(&icons_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let embedded: BTreeSet<String> = HERDR_MOD_ICONS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(HERDR_MOD_ICONS.len(), 17);
+        assert_eq!(embedded, on_disk);
     }
 }

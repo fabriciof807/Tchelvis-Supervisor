@@ -355,3 +355,5 @@ Dual-licensed under either:
 - [Apache License, Version 2.0](LICENSE-APACHE)
 
 at your option.
+
+Icons in `assets/herdr-app/mods/tchelvis/icons/` are from [Lucide](https://lucide.dev) (ISC License; see [LICENSE-lucide.txt](assets/herdr-app/mods/tchelvis/icons/LICENSE-lucide.txt)).
