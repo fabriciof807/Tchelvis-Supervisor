@@ -26,6 +26,44 @@ export const id = "tchelvis";
 export const version = "0.1.0";
 export const schemaVersion = 1;
 
+export const ICONS = {
+  home: "house",
+  inspector: "search",
+  llm: "brain",
+  doctor: "stethoscope",
+  chat: "message-square",
+  tasks: "clipboard-list",
+  folder: "folder",
+  projects: "rocket",
+  poll: "zap",
+  warning: "triangle-alert",
+  key: "key-round",
+  tui: "monitor",
+  settings: "settings",
+  timer: "timer",
+  antigravity: "sparkles",
+  deepseek: "fish",
+};
+
+export function iconPath(name) {
+  if (!name || !Object.hasOwn(ICONS, name)) return null;
+  return `mods/tchelvis/icons/${ICONS[name]}.svg`;
+}
+
+function icon(name, size, color) {
+  const path = iconPath(name);
+  if (!path) return null;
+  let el = svg(path).size(size).flex_none();
+  if (color) el = el.text_color(color);
+  return el;
+}
+
+function iconLabel(name, text, { size = 12, color, gap = 4 } = {}) {
+  const ic = icon(name, size, color);
+  if (!ic) return div().child(text);
+  return h_flex().items_center().gap(gap).child(ic).child(text);
+}
+
 const BLOCKED_KIND_ORDER = {
   auth: 0,
   permission: 1,
@@ -228,7 +266,7 @@ export function childConnector(index, count) {
 export function blockedChildrenBadge(group) {
   const count = (group?.children ?? []).filter(isRowBlocked).length;
   if (count === 0) return null;
-  return count === 1 ? "⚠ 1 filho" : `⚠ ${count} filhos`;
+  return count === 1 ? "1 filho" : `${count} filhos`;
 }
 
 /**
@@ -2553,7 +2591,7 @@ export default class CockpitMod extends View {
     cx.notify();
   }
 
-  sectionTitle(t, title, subtitleOrCount = null) {
+  sectionTitle(t, title, subtitleOrCount = null, iconName = null) {
     return h_flex()
       .pt(10)
       .pb(5)
@@ -2566,7 +2604,11 @@ export default class CockpitMod extends View {
         h_flex()
           .gap(6)
           .items_center()
-          .child(div().size(6).rounded(3).bg(t.accent))
+          .child(
+            iconName
+              ? icon(iconName, 12, t.accent)
+              : div().size(6).rounded(3).bg(t.accent)
+          )
           .child(
             div()
               .text_size(11.5)
@@ -3109,6 +3151,7 @@ export default class CockpitMod extends View {
     );
     let llmPillText = `◌ LLM: ${llmModel} (verificando…)`;
     let llmPillColor = t.muted;
+    let llmPillIcon = null;
     if (fbPill) {
       llmPillText = fbPill.text;
       llmPillColor = t[fbPill.tone] ?? t.working;
@@ -3127,8 +3170,9 @@ export default class CockpitMod extends View {
       llmPillText = `● LLM: ${llmModel} (${llmBackend} · ${modelLoaded ? llmMemoryLabel(supSnap) || "EM RAM" : "PRONTO"})`;
       llmPillColor = t.done;
     } else if (llmConnected && !modelInstalled) {
-      llmPillText = `⚠ LLM: ${llmModel} (NÃO INSTALADO)`;
+      llmPillText = `LLM: ${llmModel} (NÃO INSTALADO)`;
       llmPillColor = t.working;
+      llmPillIcon = "warning";
     } else if (supSnap) {
       llmPillText = `○ LLM: ${llmModel} (OFFLINE)`;
       llmPillColor = t.blocked;
@@ -3230,7 +3274,17 @@ export default class CockpitMod extends View {
               )
           )
           .child(
-            this.pillBadge(t, llmPillText, llmPillColor)
+            this.pillBadge(
+              t,
+              llmPillIcon
+                ? iconLabel(llmPillIcon, llmPillText, {
+                    size: 11,
+                    color: llmPillColor,
+                    gap: 4,
+                  })
+                : llmPillText,
+              llmPillColor
+            )
               .id("ck-llm-pill")
               .cursor_pointer()
               .hover((s) => s.bg(t.hover))
@@ -3295,7 +3349,11 @@ export default class CockpitMod extends View {
             )
           )
           .child(
-            this.actionBtn(t, "ck-pill-poll", "⚡ Poll Now", (_e, cx) => {
+            this.actionBtn(
+              t,
+              "ck-pill-poll",
+              iconLabel("poll", "Poll Now", { size: 11.5, color: t.muted }),
+              (_e, cx) => {
               if (
                 llmManaged &&
                 !llmContainerRunning &&
@@ -3359,40 +3417,67 @@ export default class CockpitMod extends View {
           .child(
             this.segmentedTrack(t)
               .child(
-                this.segmentBtn(
-                  t,
-                  "ck-pill-view-home",
-                  "🏠 Home",
-                  rightView === "home" && !inspectorHidden && !onlyUsage,
-                  (_e, cx) => this.openDrawerView(cx, "home", true)
-                )
+                (() => {
+                  const active = rightView === "home" && !inspectorHidden && !onlyUsage;
+                  return this.segmentBtn(
+                    t,
+                    "ck-pill-view-home",
+                    iconLabel("home", "Home", {
+                      size: 11,
+                      color: active ? t.accent : t.muted,
+                    }),
+                    active,
+                    (_e, cx) => this.openDrawerView(cx, "home", true)
+                  );
+                })()
               )
               .child(
-                this.segmentBtn(
-                  t,
-                  "ck-pill-view-inspector",
-                  "🔍 Inspector",
-                  rightView === "inspector" && !inspectorHidden && !onlyUsage,
-                  (_e, cx) => this.openDrawerView(cx, "inspector", true)
-                )
+                (() => {
+                  const active =
+                    rightView === "inspector" && !inspectorHidden && !onlyUsage;
+                  return this.segmentBtn(
+                    t,
+                    "ck-pill-view-inspector",
+                    iconLabel("inspector", "Inspector", {
+                      size: 11,
+                      color: active ? t.accent : t.muted,
+                    }),
+                    active,
+                    (_e, cx) => this.openDrawerView(cx, "inspector", true)
+                  );
+                })()
               )
               .child(
-                this.segmentBtn(
-                  t,
-                  "ck-pill-view-doctor",
-                  "🩺 Doctor",
-                  rightView === "doctor" && !inspectorHidden && !onlyUsage,
-                  (_e, cx) => this.openDrawerView(cx, "doctor", true)
-                )
+                (() => {
+                  const active =
+                    rightView === "doctor" && !inspectorHidden && !onlyUsage;
+                  return this.segmentBtn(
+                    t,
+                    "ck-pill-view-doctor",
+                    iconLabel("doctor", "Doctor", {
+                      size: 11,
+                      color: active ? t.accent : t.muted,
+                    }),
+                    active,
+                    (_e, cx) => this.openDrawerView(cx, "doctor", true)
+                  );
+                })()
               )
               .child(
-                this.segmentBtn(
-                  t,
-                  "ck-pill-view-chat",
-                  "💬 Chat",
-                  rightView === "chat" && !inspectorHidden && !onlyUsage,
-                  (_e, cx) => this.openDrawerView(cx, "chat", true)
-                )
+                (() => {
+                  const active =
+                    rightView === "chat" && !inspectorHidden && !onlyUsage;
+                  return this.segmentBtn(
+                    t,
+                    "ck-pill-view-chat",
+                    iconLabel("chat", "Chat", {
+                      size: 11,
+                      color: active ? t.accent : t.muted,
+                    }),
+                    active,
+                    (_e, cx) => this.openDrawerView(cx, "chat", true)
+                  );
+                })()
               )
           )
           .child(
@@ -3591,7 +3676,13 @@ export default class CockpitMod extends View {
               .text_size(11)
               .font_semibold()
               .text_color(t.blocked)
-              .child(blockedBadge)
+              .child(
+                iconLabel("warning", blockedBadge, {
+                  size: 11,
+                  color: t.blocked,
+                  gap: 4,
+                })
+              )
           )
         )
         .when(!blockedBadge && a.blocked_children?.length > 0, (el) =>
@@ -3814,7 +3905,10 @@ export default class CockpitMod extends View {
                       this.actionBtn(
                         t,
                         "ck-empty-home",
-                        "🏠 Home Overview",
+                        iconLabel("home", "Home Overview", {
+                          size: 11.5,
+                          color: t.foreground,
+                        }),
                         (_e, cx) => this.openDrawerView(cx, "home", false),
                         true
                       )
@@ -4077,11 +4171,7 @@ export default class CockpitMod extends View {
       )
       // 2. Card 1: TAREFAS DO DIA
       .child(
-        this.sectionTitle(
-          t,
-          "📋 TAREFAS DO DIA",
-          "tchelvis task"
-        )
+        this.sectionTitle(t, "TAREFAS DO DIA", "tchelvis task", "tasks")
       )
       .child(
         this.cardBox(t)
@@ -4225,7 +4315,8 @@ export default class CockpitMod extends View {
                     this.taskTagMenuOpen = !this.taskTagMenuOpen;
                     cx.notify();
                   })
-                  .child(`📁 ${currentProjectTag}`)
+                  .child(icon("folder", 11, t.accent))
+                  .child(currentProjectTag)
               )
           )
           .when(Boolean(this.taskTagMenuOpen), (el) =>
@@ -4417,8 +4508,9 @@ export default class CockpitMod extends View {
       .child(
         this.sectionTitle(
           t,
-          "🚀 PROJETOS EM DESENVOLVIMENTO",
-          `${projects.length} projetos`
+          "PROJETOS EM DESENVOLVIMENTO",
+          `${projects.length} projetos`,
+          "projects"
         )
       )
       .when(projects.length === 0, (el) =>
@@ -4536,10 +4628,11 @@ export default class CockpitMod extends View {
       .child(
         this.sectionTitle(
           t,
-          "⚡ ATENÇÃO IMEDIATA & FROTA",
+          "ATENÇÃO IMEDIATA & FROTA",
           blockedAgents.length > 0
             ? `${blockedAgents.length} aguardando`
-            : "nominal"
+            : "nominal",
+          "poll"
         )
       )
       .when(blockedAgents.length === 0, (el) =>
@@ -4668,13 +4761,16 @@ export default class CockpitMod extends View {
           .border_b(1)
           .border_color(t.border)
           .child(
-            div()
+            h_flex()
               .flex_1()
               .min_w(0)
+              .gap(6)
+              .items_center()
               .text_size(13)
               .font_semibold()
               .text_color(t.foreground)
-              .child(ellipsize("🏠 TCHELVIS HOME · RESUMO DO DIA", 34))
+              .child(icon("home", 13, t.accent))
+              .child(ellipsize("TCHELVIS HOME · RESUMO DO DIA", 34))
           )
           .child(
             this.actionBtn(t, "ck-home-refresh", "↻ Atualizar", (_e, cx) => {
@@ -4815,12 +4911,13 @@ export default class CockpitMod extends View {
                 h_flex()
                   .gap(6)
                   .items_center()
+                  .child(icon("doctor", 13, t.accent))
                   .child(
                     div()
                       .text_size(13)
                       .font_semibold()
                       .text_color(t.foreground)
-                      .child("🩺 SYSTEM & PROVIDER DIAGNOSTICS")
+                      .child("SYSTEM & PROVIDER DIAGNOSTICS")
                   )
               )
               .child(
@@ -5651,7 +5748,7 @@ export default class CockpitMod extends View {
             h_flex()
               .gap(6)
               .items_center()
-              .child(div().text_size(13).text_color(t.accent).child("🧠"))
+              .child(icon("llm", 13, t.accent))
               .child(
                 div()
                   .text_size(12.5)
@@ -6447,24 +6544,28 @@ export default class CockpitMod extends View {
       const key = String(
         entry?.brand || entry?.id || entry?.name || ""
       ).toLowerCase();
-      if (key.includes("antigravity") || key.includes("agy")) return "✨";
-      if (key.includes("opencode")) return "</>";
-      if (key.includes("deepseek")) return "🐟";
-      if (key.includes("anthropic") || key.includes("claude")) return "✦";
-      if (key.includes("openai") || key.includes("codex")) return "◎";
-      if (key.includes("gemini") || key.includes("google")) return "✧";
-      if (key.includes("copilot") || key.includes("github")) return "◈";
-      if (key.includes("cursor")) return "⌘";
-      if (key.includes("zai") || key.includes("z.ai")) return "⚡";
+      if (key.includes("antigravity") || key.includes("agy"))
+        return { icon: "antigravity" };
+      if (key.includes("opencode")) return { text: "</>" };
+      if (key.includes("deepseek")) return { icon: "deepseek" };
+      if (key.includes("anthropic") || key.includes("claude"))
+        return { text: "✦" };
+      if (key.includes("openai") || key.includes("codex")) return { text: "◎" };
+      if (key.includes("gemini") || key.includes("google")) return { text: "✧" };
+      if (key.includes("copilot") || key.includes("github"))
+        return { text: "◈" };
+      if (key.includes("cursor")) return { text: "⌘" };
+      if (key.includes("zai") || key.includes("z.ai")) return { icon: "poll" };
       const rawIcon = String(entry?.icon ?? "").trim();
       if (
         rawIcon &&
         !/[\uE000-\uF8FF]/u.test(rawIcon) &&
-        !/[\u{F0000}-\u{10FFFF}]/u.test(rawIcon)
+        !/[\u{F0000}-\u{10FFFF}]/u.test(rawIcon) &&
+        !/\p{Extended_Pictographic}/u.test(rawIcon)
       ) {
-        return rawIcon;
+        return { text: rawIcon };
       }
-      return "◆";
+      return { text: "◆" };
     };
 
     const metricColor = (severity, pct) => {
@@ -6633,7 +6734,7 @@ export default class CockpitMod extends View {
             h_flex()
               .gap(6)
               .items_center()
-              .child(div().text_size(13).text_color(t.accent).child("🧠"))
+              .child(icon("llm", 13, t.accent))
               .child(
                 div()
                   .text_size(12.5)
@@ -6687,7 +6788,10 @@ export default class CockpitMod extends View {
               this.actionBtn(
                 t,
                 "ck-usage-detect",
-                "🔍 Detectar Contas",
+                iconLabel("inspector", "Detectar Contas", {
+                  size: 11.5,
+                  color: t.foreground,
+                }),
                 (_e, clickCx) => {
                   this.usageMenuOpen = false;
                   this.fetchUsageSnapshot(clickCx ?? cx, true, true);
@@ -6697,23 +6801,39 @@ export default class CockpitMod extends View {
             )
             .when(usageSnap?.installed !== false, (el2) =>
               el2.child(
-                this.actionBtn(t, "ck-usage-tui", "🖥 Abrir TUI", () => {
-                  this.usageMenuOpen = false;
-                  launchTabCmd("ai-usagebar", [
-                    usageSnap?.tui_binary_path || "ai-usagebar-tui",
-                  ]);
-                })
+                this.actionBtn(
+                  t,
+                  "ck-usage-tui",
+                  iconLabel("tui", "Abrir TUI", {
+                    size: 11.5,
+                    color: t.muted,
+                  }),
+                  () => {
+                    this.usageMenuOpen = false;
+                    launchTabCmd("ai-usagebar", [
+                      usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                    ]);
+                  }
+                )
               )
             )
             .when(Boolean(selVendorMeta?.login), (el2) =>
               el2.child(
-                this.actionBtn(t, "ck-usage-menu-login", "🔑 Login", () => {
-                  this.usageMenuOpen = false;
-                  launchTabCmd(
-                    selBrandKey || "login",
-                    String(selVendorMeta.login).trim().split(/\s+/)
-                  );
-                })
+                this.actionBtn(
+                  t,
+                  "ck-usage-menu-login",
+                  iconLabel("key", "Login", {
+                    size: 11.5,
+                    color: t.muted,
+                  }),
+                  () => {
+                    this.usageMenuOpen = false;
+                    launchTabCmd(
+                      selBrandKey || "login",
+                      String(selVendorMeta.login).trim().split(/\s+/)
+                    );
+                  }
+                )
               )
             )
         )
@@ -6728,11 +6848,12 @@ export default class CockpitMod extends View {
             .children(
               entries.map((entry, idx) => {
                 const isSel = entry?.id === selectedEntry?.id;
+                const tabColor = isSel ? t.accent : t.muted;
                 const tabName = ellipsize(
                   entry?.display_name || entry?.name || entry?.id || "AI",
                   16
                 );
-                const icon = usageVendorIcon(entry);
+                const vIcon = usageVendorIcon(entry);
                 return h_flex()
                   .id(`ck-usage-tab-${idx}`)
                   .flex_none()
@@ -6749,7 +6870,7 @@ export default class CockpitMod extends View {
                   .bg(isSel ? t.selected : t.surface)
                   .text_size(11)
                   .font_semibold()
-                  .text_color(isSel ? t.accent : t.muted)
+                  .text_color(tabColor)
                   .cursor_pointer()
                   .hover((s) =>
                     s
@@ -6764,7 +6885,10 @@ export default class CockpitMod extends View {
                     setShared("cockpit.usageEntryId", this.selectedUsageEntryId);
                     (clickCx ?? cx)?.notify();
                   })
-                  .child(`${icon} ${tabName}`);
+                  .child(
+                    vIcon.icon ? icon(vIcon.icon, 11, tabColor) : vIcon.text
+                  )
+                  .child(tabName);
               })
             )
         )
@@ -6870,17 +6994,27 @@ export default class CockpitMod extends View {
                   this.actionBtn(
                     t,
                     "ck-usage-empty-detect",
-                    "🔍 Detectar Contas",
+                    iconLabel("inspector", "Detectar Contas", {
+                      size: 11.5,
+                      color: t.foreground,
+                    }),
                     (_e, clickCx) =>
                       this.fetchUsageSnapshot(clickCx ?? cx, true, true),
                     true
                   )
                 )
                 .child(
-                  this.actionBtn(t, "ck-usage-empty-tui", "⚙ Abrir TUI", () =>
-                    launchTabCmd("ai-usagebar", [
-                      usageSnap?.tui_binary_path || "ai-usagebar-tui",
-                    ])
+                  this.actionBtn(
+                    t,
+                    "ck-usage-empty-tui",
+                    iconLabel("settings", "Abrir TUI", {
+                      size: 11.5,
+                      color: t.muted,
+                    }),
+                    () =>
+                      launchTabCmd("ai-usagebar", [
+                        usageSnap?.tui_binary_path || "ai-usagebar-tui",
+                      ])
                   )
                 )
             )
@@ -6912,7 +7046,10 @@ export default class CockpitMod extends View {
                         this.actionBtn(
                           t,
                           "ck-usage-entry-login",
-                          `🔑 ${selVendorMeta.login}`,
+                          iconLabel("key", selVendorMeta.login, {
+                            size: 11.5,
+                            color: t.muted,
+                          }),
                           () =>
                             launchTabCmd(
                               selBrandKey || "login",
@@ -6947,12 +7084,8 @@ export default class CockpitMod extends View {
                     isOver,
                     fallbackDetail,
                   } = parseMetricFooter(sec);
-                  const leftFooter = resetText
-                    ? `⏱ ${resetText}`
-                    : fallbackDetail || "";
-                  const rightFooter = pacingText
-                    ? `${isOver ? "⚠" : "✓"} ${pacingText}`
-                    : "";
+                  const hasLeftFooter = Boolean(resetText || fallbackDetail);
+                  const hasRightFooter = Boolean(pacingText);
 
                   return v_flex()
                     .id(`ck-usage-metric-${mIdx}`)
@@ -6986,7 +7119,7 @@ export default class CockpitMod extends View {
                           el3.child(progressBar24(elapsedPct, t.muted, 2, 1, "30"))
                         )
                     )
-                    .when(Boolean(leftFooter || rightFooter), (el3) =>
+                    .when(hasLeftFooter || hasRightFooter, (el3) =>
                       el3.child(
                         h_flex()
                           .gap(6)
@@ -6996,14 +7129,36 @@ export default class CockpitMod extends View {
                             div()
                               .text_size(10.5)
                               .text_color(t.muted)
-                              .child(ellipsize(leftFooter, 36))
+                              .child(
+                                resetText
+                                  ? iconLabel("timer", ellipsize(resetText, 34), {
+                                      size: 10.5,
+                                      color: t.muted,
+                                      gap: 4,
+                                    })
+                                  : ellipsize(fallbackDetail || "", 36)
+                              )
                           )
                           .child(
                             div()
                               .flex_none()
                               .text_size(10.5)
                               .text_color(isOver ? t.working : t.muted)
-                              .child(ellipsize(rightFooter, 24))
+                              .child(
+                                pacingText
+                                  ? isOver
+                                    ? iconLabel(
+                                        "warning",
+                                        ellipsize(pacingText, 22),
+                                        {
+                                          size: 10.5,
+                                          color: t.working,
+                                          gap: 4,
+                                        }
+                                      )
+                                    : ellipsize(`✓ ${pacingText}`, 24)
+                                  : ""
+                              )
                           )
                       )
                     );
@@ -7564,7 +7719,11 @@ export default class CockpitMod extends View {
                             .font_semibold()
                             .text_color(t.foreground)
                             .child(
-                              `🧠 ${supSnap?.llm_model || "lfm3:1.7b"} (${supSnap?.llm_backend || "ollama"} · ${gpuOn(supSnap) ? "GPU" : "CPU"}${llmMemoryLabel(supSnap) ? ` · ${llmMemoryLabel(supSnap)}` : ""})`
+                              iconLabel(
+                                "llm",
+                                `${supSnap?.llm_model || "lfm3:1.7b"} (${supSnap?.llm_backend || "ollama"} · ${gpuOn(supSnap) ? "GPU" : "CPU"}${llmMemoryLabel(supSnap) ? ` · ${llmMemoryLabel(supSnap)}` : ""})`,
+                                { size: 12, color: t.accent, gap: 5 }
+                              )
                             )
                         )
                         .child(
@@ -7616,7 +7775,13 @@ export default class CockpitMod extends View {
                         div()
                           .text_size(11)
                           .text_color(t.working)
-                          .child(`⚠ LLM evaluation failed: ${evalError}`)
+                          .child(
+                            iconLabel(
+                              "warning",
+                              `LLM evaluation failed: ${evalError}`,
+                              { size: 11, color: t.working, gap: 4 }
+                            )
+                          )
                       )
                     )
                 )
@@ -7904,7 +8069,10 @@ export default class CockpitMod extends View {
                             this.actionBtn(
                               t,
                               "ck-audit-eval",
-                              "⚡ Evaluate Now",
+                              iconLabel("poll", "Evaluate Now", {
+                                size: 11.5,
+                                color: t.muted,
+                              }),
                               (_e, cx) => this.tickSupervisor(cx, true)
                             )
                           )

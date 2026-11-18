@@ -158,7 +158,7 @@ test("badge_copy", () => {
       row: { address: "p", status: "working" },
       children: [{ address: "c1", status: "blocked" }],
     }),
-    "⚠ 1 filho"
+    "1 filho"
   );
   assert.equal(
     blockedChildrenBadge({
@@ -169,7 +169,7 @@ test("badge_copy", () => {
         { address: "c3", attention_state: { state: "blocked" } },
       ],
     }),
-    "⚠ 2 filhos"
+    "2 filhos"
   );
 });
 
