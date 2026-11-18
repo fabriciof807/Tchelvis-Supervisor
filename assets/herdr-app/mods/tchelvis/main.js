@@ -583,6 +583,59 @@ export function chatElapsedLabel(startedAtMs, nowMs = Date.now()) {
   return secs >= 1 ? `◌ Gerando… ${secs}s` : "◌ Gerando…";
 }
 
+export const CHAT_STARTERS = [
+  "Quem está esperando por mim?",
+  "Quais tarefas estão abertas?",
+  "Resumo dos agentes",
+  "O que faço primeiro?",
+];
+
+export function extractMentionedAgents(text, rows) {
+  const haystack = String(text ?? "");
+  if (!haystack || !Array.isArray(rows) || rows.length === 0) return [];
+  const matches = [];
+  const seen = new Set();
+  for (let i = 0; i < rows.length; i += 1) {
+    const row = rows[i];
+    if (!row) continue;
+    const key = row.address || row;
+    if (seen.has(key)) continue;
+    const candidates = [row.address, row.name, row.term_name];
+    let earliest = Infinity;
+    for (const raw of candidates) {
+      if (typeof raw !== "string") continue;
+      const token = raw.trim();
+      if (!token) continue;
+      const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(
+        `(?:^|[^A-Za-z0-9_-])(${escaped})(?=$|[^A-Za-z0-9_-])`,
+        "i"
+      );
+      const m = re.exec(haystack);
+      if (m) {
+        const pos = m.index + (m[0].length - m[1].length);
+        if (pos < earliest) earliest = pos;
+      }
+    }
+    if (earliest !== Infinity) {
+      seen.add(key);
+      matches.push({ row, pos: earliest, order: i });
+    }
+  }
+  matches.sort((a, b) => a.pos - b.pos || a.order - b.order);
+  return matches.slice(0, 4).map((m) => m.row);
+}
+
+export function clipboardArgv(text) {
+  return [
+    "sh",
+    "-c",
+    'printf %s "$1" | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel --clipboard --input)',
+    "sh",
+    String(text ?? ""),
+  ];
+}
+
 function formatShortHm(ts) {
   if (ts == null) return "--:--";
   const d = new Date(Number(ts) * 1000);
@@ -1530,6 +1583,8 @@ export default class CockpitMod extends View {
     this.chatMessages = [];
     this.chatPending = false;
     this.chatStartedAtMs = 0;
+    this.chatCopiedIdx = null;
+    this.chatCopiedTimer = null;
     this.wasChatVisible = false;
     this.chatScroll = base.ScrollHandle?.new?.() ?? null;
     this.handle = cx.focus_handle();
@@ -5331,12 +5386,17 @@ export default class CockpitMod extends View {
       );
   }
 
-  sendChatMessage(cx) {
-    const raw = this.fieldValue("chat");
+  sendChatMessage(cx, presetQuestion = null) {
+    const raw =
+      presetQuestion !== null && presetQuestion !== undefined
+        ? String(presetQuestion)
+        : this.fieldValue("chat");
     if (this.chatPending || isBlankDraft(raw)) return;
     const question = raw.trim();
     const history = chatHistoryForRequest(this.chatMessages);
-    this.clearField("chat");
+    if (presetQuestion === null || presetQuestion === undefined) {
+      this.clearField("chat");
+    }
     this.chatMessages = [
       ...this.chatMessages,
       { role: "user", content: question },
@@ -5347,7 +5407,7 @@ export default class CockpitMod extends View {
     cx?.notify();
 
     const elapsedTimer = cx?.timer?.every?.(1000, (tickCx) => {
-      if (this.chatPending) (tickCx ?? cx)?.notify();
+      if (this.chatPending) tickCx?.notify();
     });
 
     cx.spawn(async (cx) => {
@@ -5376,6 +5436,7 @@ export default class CockpitMod extends View {
               role: "error",
               code: "llm_stopped",
               content: parsed.error || "LLM desligada",
+              prompt: question,
             },
           ];
         } else {
@@ -5385,6 +5446,7 @@ export default class CockpitMod extends View {
               role: "error",
               code: parsed.code,
               content: parsed.error || "Erro desconhecido",
+              prompt: question,
             },
           ];
         }
@@ -5395,6 +5457,7 @@ export default class CockpitMod extends View {
             role: "error",
             code: "llm_error",
             content: "Sem resposta do tchelvis",
+            prompt: question,
           },
         ];
       } finally {
@@ -5407,12 +5470,53 @@ export default class CockpitMod extends View {
     });
   }
 
+  copyChatAnswer(cx, idx, content) {
+    const [cmd, ...args] = clipboardArgv(content);
+    cx?.spawn?.(async (spawnCx) => {
+      try {
+        const res = await exec(cmd, args, { timeout: 5000 });
+        if (res.code === 0) {
+          this.chatCopiedTimer?.cancel?.();
+          this.chatCopiedIdx = idx;
+          spawnCx.notify();
+          const clearCopied = (tCx) => {
+            if (this.chatCopiedIdx === idx) {
+              this.chatCopiedIdx = null;
+              tCx?.notify();
+            }
+          };
+          if (typeof spawnCx.timer?.after === "function") {
+            this.chatCopiedTimer = spawnCx.timer.after(2000, clearCopied);
+          } else {
+            const oneshot = spawnCx.timer?.every?.(2000, (tCx) => {
+              oneshot?.cancel?.();
+              clearCopied(tCx);
+            });
+            this.chatCopiedTimer = oneshot ?? null;
+          }
+        } else {
+          this.note = "Instale wl-copy, xclip ou xsel para copiar";
+          spawnCx.notify();
+        }
+      } catch (_e) {
+        this.note = "Falha ao copiar para a área de transferência";
+        spawnCx.notify();
+      }
+    });
+  }
+
   renderChatBody(cx, themeArg = null) {
     const t = themeArg ?? theme();
     const supSnap = shared("supervisor.snapshot");
     const headerLabel = chatHeaderLabel(supSnap) || "Chat";
     const isFallback = Boolean(supSnap?.fallback_active);
     const messages = Array.isArray(this.chatMessages) ? this.chatMessages : [];
+    const fleetRows = mergeFleetRows(
+      agents(),
+      terminals(),
+      shared("cockpit.snapshot"),
+      supSnap
+    );
 
     return v_flex()
       .flex_1()
@@ -5449,6 +5553,9 @@ export default class CockpitMod extends View {
           )
           .child(
             this.actionBtn(t, "ck-chat-clear", "Limpar", (_e, cx) => {
+              this.chatCopiedTimer?.cancel?.();
+              this.chatCopiedTimer = null;
+              this.chatCopiedIdx = null;
               this.chatMessages = [];
               cx.notify();
             })
@@ -5468,12 +5575,47 @@ export default class CockpitMod extends View {
             el.child(
               this.cardBox(t)
                 .rounded(10)
+                .gap(8)
                 .child(
                   div()
                     .text_size(12)
                     .text_color(t.muted)
                     .child(
                       "Pergunte sobre os agentes ativos ou as Tarefas do dia. Somente leitura."
+                    )
+                )
+                .child(
+                  v_flex()
+                    .gap(6)
+                    .children(
+                      CHAT_STARTERS.map((q, sIdx) =>
+                        h_flex()
+                          .id(`ck-chat-starter-${sIdx}`)
+                          .w_full()
+                          .px(10)
+                          .py(7)
+                          .rounded(6)
+                          .border(1)
+                          .border_color(t.border)
+                          .bg(t.raised)
+                          .text_size(11.5)
+                          .text_color(t.foreground)
+                          .cursor_pointer()
+                          .hover((s) =>
+                            s
+                              .bg(t.hover)
+                              .border_color(
+                                withAlpha(t.accent, "66", t.border)
+                              )
+                          )
+                          .on_mouse_down("left", (_e, clickCx) =>
+                            clickCx.stop_propagation()
+                          )
+                          .on_click((_e, clickCx) =>
+                            this.sendChatMessage(clickCx ?? cx, q)
+                          )
+                          .child(q)
+                      )
                     )
                 )
             )
@@ -5518,22 +5660,53 @@ export default class CockpitMod extends View {
                       .text_color(t.blocked)
                       .child(String(m.content ?? "Erro"))
                   )
-                  .when(m.code === "llm_stopped", (el) =>
+                  .when(m.code === "llm_stopped" || Boolean(m.prompt), (el) =>
                     el.child(
-                      h_flex().child(
-                        this.actionBtn(
-                          t,
-                          `ck-chat-load-llm-${idx}`,
-                          this.loadingLlm ? "◌ Carregando…" : "▶ Load LLM",
-                          (_e, cx) => this.loadSupervisorLlm(cx),
-                          true
+                      h_flex()
+                        .gap(6)
+                        .flex_wrap()
+                        .when(m.code === "llm_stopped", (el2) =>
+                          el2.child(
+                            this.actionBtn(
+                              t,
+                              `ck-chat-load-llm-${idx}`,
+                              this.loadingLlm ? "◌ Carregando…" : "▶ Load LLM",
+                              (_e, clickCx) => this.loadSupervisorLlm(clickCx),
+                              true
+                            )
+                          )
                         )
-                      )
+                        .when(Boolean(m.prompt), (el2) =>
+                          el2
+                            .child(
+                              this.actionBtn(
+                                t,
+                                `ck-chat-retry-${idx}`,
+                                "↻ Tentar de novo",
+                                (_e, clickCx) =>
+                                  this.sendChatMessage(clickCx ?? cx, m.prompt),
+                                m.code !== "llm_stopped"
+                              )
+                            )
+                            .child(
+                              this.actionBtn(
+                                t,
+                                `ck-chat-edit-${idx}`,
+                                "Editar",
+                                (_e, clickCx) => {
+                                  this.inputs.chat.set_value(m.prompt);
+                                  this.focusField("chat");
+                                  (clickCx ?? cx)?.notify();
+                                }
+                              )
+                            )
+                        )
                     )
                   );
               }
               const fbMark = fallbackMarker(m);
               const content = String(m.content ?? "");
+              const mentioned = extractMentionedAgents(content, fleetRows);
               return v_flex()
                 .id(`ck-chat-msg-${idx}`)
                 .p(9)
@@ -5576,6 +5749,44 @@ export default class CockpitMod extends View {
                         .text_size(12)
                         .text_color(t.foreground)
                         .child(content)
+                )
+                .child(
+                  h_flex()
+                    .pt(2)
+                    .gap(6)
+                    .flex_wrap()
+                    .items_center()
+                    .child(
+                      this.actionBtn(
+                        t,
+                        `ck-chat-copy-${idx}`,
+                        this.chatCopiedIdx === idx ? "Copiado" : "Copiar",
+                        (_e, clickCx) =>
+                          this.copyChatAnswer(clickCx ?? cx, idx, content),
+                        this.chatCopiedIdx === idx
+                      )
+                    )
+                    .children(
+                      mentioned.map((row, aIdx) => {
+                        const agentLabel = ellipsize(
+                          row.name || row.term_name || row.address,
+                          24
+                        );
+                        return this.actionBtn(
+                          t,
+                          `ck-chat-open-${idx}-${aIdx}`,
+                          `↗ Abrir ${agentLabel}`,
+                          (_e, clickCx) => {
+                            setShared("cockpit.selected", row.address);
+                            void this.focusOrAttachTerminal(
+                              clickCx ?? cx,
+                              row,
+                              false
+                            );
+                          }
+                        );
+                      })
+                    )
                 );
             })
           )
