@@ -630,7 +630,9 @@ export function clipboardArgv(text) {
   return [
     "sh",
     "-c",
-    'printf %s "$1" | (wl-copy 2>/dev/null || xclip -selection clipboard 2>/dev/null || xsel --clipboard --input)',
+    'if [ -n "$WAYLAND_DISPLAY" ] && command -v wl-copy >/dev/null 2>&1; then printf %s "$1" | wl-copy; ' +
+      'elif command -v xclip >/dev/null 2>&1; then printf %s "$1" | xclip -selection clipboard; ' +
+      'else printf %s "$1" | xsel --clipboard --input; fi',
     "sh",
     String(text ?? ""),
   ];
@@ -7396,8 +7398,13 @@ export default class CockpitMod extends View {
       !(modelPickerOpen && modelPickerOnlyDrawer);
     if (chatVisible && !this.wasChatVisible) {
       this.wasChatVisible = true;
-      this.scrollChatToBottom();
-      this.focusField("chat");
+      // Requested from render: never let a refused host call break drawing.
+      try {
+        this.scrollChatToBottom();
+        this.focusField("chat");
+      } catch (_e) {
+        // The tab switch handlers also focus the field.
+      }
     } else if (!chatVisible) {
       this.wasChatVisible = false;
     }
