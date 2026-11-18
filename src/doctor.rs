@@ -6,13 +6,16 @@ use crate::config::{CockpitConfig, CockpitPaths};
 use crate::herdr::HerdrClient;
 use crate::logging::redact_secrets;
 use crate::model::{ProviderHealth, ProviderId};
+use crate::orch::preamble::{
+    orchestration_opencode_command_markdown, orchestration_skill_file_markdown, ORCH_SKILL_NAME,
+};
 use crate::providers::ProviderCoordinator;
 use crate::store::CacheStore;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorCheck {
@@ -189,6 +192,92 @@ pub async fn run_doctor(
         }
     }
 
+    // 4c. Check /orchestration-tchelvis agent skill installations
+    let skill_md = orchestration_skill_file_markdown();
+    let skill_command_md = orchestration_opencode_command_markdown();
+    let skill_targets: [(PathBuf, &str); 7] = [
+        (
+            paths
+                .home_dir
+                .join(format!(".claude/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            skill_md.as_str(),
+        ),
+        (
+            paths.home_dir.join(format!(
+                ".config/opencode/skills/{ORCH_SKILL_NAME}/SKILL.md"
+            )),
+            skill_md.as_str(),
+        ),
+        (
+            paths
+                .home_dir
+                .join(format!(".config/opencode/commands/{ORCH_SKILL_NAME}.md")),
+            skill_command_md.as_str(),
+        ),
+        (
+            paths
+                .home_dir
+                .join(format!(".pi/agent/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            skill_md.as_str(),
+        ),
+        (
+            paths
+                .home_dir
+                .join(format!(".agents/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            skill_md.as_str(),
+        ),
+        (
+            paths
+                .home_dir
+                .join(format!(".codex/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            skill_md.as_str(),
+        ),
+        (
+            paths
+                .home_dir
+                .join(format!(".gemini/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            skill_md.as_str(),
+        ),
+    ];
+    let mut skill_installed = 0usize;
+    let mut skill_matched = 0usize;
+    for (path, expected) in skill_targets {
+        if path.exists() {
+            skill_installed += 1;
+            let matches = fs::read_to_string(&path)
+                .map(|s| asset_sha256(&s) == asset_sha256(expected))
+                .unwrap_or(false);
+            if matches {
+                skill_matched += 1;
+            }
+        }
+    }
+    if skill_installed == 0 {
+        checks.push(DoctorCheck {
+            name: "orch_skill".into(),
+            status: "not_installed".into(),
+            detail: format!("Run `tchelvis setup --only skills` to install /{ORCH_SKILL_NAME}"),
+        });
+    } else {
+        checks.push(DoctorCheck {
+            name: "orch_skill".into(),
+            status: if skill_matched == skill_installed {
+                "ok".into()
+            } else {
+                "warn".into()
+            },
+            detail: if skill_matched == skill_installed {
+                format!(
+                    "{skill_matched}/{skill_installed} installed /{ORCH_SKILL_NAME} skill files up to date"
+                )
+            } else {
+                format!(
+                    "{skill_matched}/{skill_installed} /{ORCH_SKILL_NAME} skill files match; run `tchelvis setup --only skills`"
+                )
+            },
+        });
+    }
+
     // 5. Check all 6 providers
     let coord = ProviderCoordinator::new();
     let providers = coord.check_all_health(cfg, &store, &paths.home_dir).await;
@@ -294,6 +383,64 @@ mod tests {
             herdr_mod.detail.contains("icons_match=false"),
             "unexpected detail: {}",
             herdr_mod.detail
+        );
+
+        let orch_skill = report
+            .checks
+            .iter()
+            .find(|c| c.name == "orch_skill")
+            .expect("orch_skill check present");
+        assert_eq!(orch_skill.status, "not_installed");
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_orch_skill_install_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        };
+        paths.ensure_dirs().unwrap();
+        let cfg = CockpitConfig::default();
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+        run_setup(&paths, &opts).unwrap();
+
+        let report = run_doctor(&cfg, &paths, None).await.unwrap();
+        let orch_skill = report
+            .checks
+            .iter()
+            .find(|c| c.name == "orch_skill")
+            .expect("orch_skill check present");
+        assert_eq!(orch_skill.status, "ok");
+        assert_eq!(
+            orch_skill.detail,
+            "1/1 installed /orchestration-tchelvis skill files up to date"
+        );
+
+        fs::write(
+            home.join(".agents/skills/orchestration-tchelvis/SKILL.md"),
+            "stale",
+        )
+        .unwrap();
+
+        let report = run_doctor(&cfg, &paths, None).await.unwrap();
+        let orch_skill = report
+            .checks
+            .iter()
+            .find(|c| c.name == "orch_skill")
+            .expect("orch_skill check present");
+        assert_eq!(orch_skill.status, "warn");
+        assert_eq!(
+            orch_skill.detail,
+            "0/1 /orchestration-tchelvis skill files match; run `tchelvis setup --only skills`"
         );
     }
 }

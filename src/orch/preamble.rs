@@ -25,6 +25,33 @@ pub fn build_dispatch_preamble(
     )
 }
 
+pub const ORCH_SKILL_NAME: &str = "orchestration-tchelvis";
+
+pub fn orchestration_skill_file_markdown() -> String {
+    format!(
+        "---\n\
+         name: {ORCH_SKILL_NAME}\n\
+         description: Delegate work to parallel child coding agents over Herdr terminals using Tchelvis M6 (`tchelvis orch`). Use when orchestrating multi-agent tasks, spawning workers in shared or isolated git worktrees, and waking automatically on completion without polling.\n\
+         ---\n\
+         \n\
+         {}",
+        orchestration_skill_markdown()
+    )
+}
+
+pub fn orchestration_opencode_command_markdown() -> String {
+    format!(
+        "---\n\
+         description: \"Orchestrate parallel child agents with Tchelvis (`tchelvis orch`)\"\n\
+         ---\n\
+         \n\
+         {}\n\
+         \n\
+         User request: $ARGUMENTS\n",
+        orchestration_skill_markdown().trim_end()
+    )
+}
+
 pub fn orchestration_skill_markdown() -> &'static str {
     r#"# Tchelvis Multi-Agent Orchestration (`tchelvis orch`)
 
@@ -100,6 +127,26 @@ mod tests {
         assert!(preamble.contains("[TASK PROMPT]\nImplement JWT validation and run cargo test."));
     }
 
+    fn assert_skill_documents_subcommands(skill: &str) {
+        assert!(skill.contains("description:"));
+        for subcmd in [
+            "run-create",
+            "task-create",
+            "dispatch",
+            "check",
+            "reply",
+            "status",
+            "release",
+            "send",
+            "ask",
+        ] {
+            assert!(
+                skill.contains(&format!("tchelvis orch {subcmd}")),
+                "skill markdown missing `tchelvis orch {subcmd}`"
+            );
+        }
+    }
+
     #[test]
     fn test_orchestration_skill_markdown_documents_subcommands() {
         let skill = orchestration_skill_markdown();
@@ -119,5 +166,22 @@ mod tests {
                 "skill markdown missing subcommand {subcmd}"
             );
         }
+    }
+
+    #[test]
+    fn test_orchestration_skill_file_markdown_has_frontmatter_and_subcommands() {
+        let skill = orchestration_skill_file_markdown();
+        assert!(skill.starts_with("---\n"));
+        assert!(skill.contains("name: orchestration-tchelvis"));
+        assert_skill_documents_subcommands(&skill);
+    }
+
+    #[test]
+    fn test_orchestration_opencode_command_markdown_has_frontmatter_and_subcommands() {
+        let command = orchestration_opencode_command_markdown();
+        assert!(command.starts_with("---\n"));
+        assert!(command.contains("description: \"Orchestrate parallel child agents"));
+        assert!(command.ends_with("User request: $ARGUMENTS\n"));
+        assert_skill_documents_subcommands(&command);
     }
 }

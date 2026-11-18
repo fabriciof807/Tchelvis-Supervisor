@@ -119,9 +119,9 @@ Then:
 
 ## Procedure B — Install integrations (C2)
 
-Valid targets: `shell`, `claude`, `opencode`, `pi`, `herdr-mod`, `systemd`. Without `--only`, every
-target except `systemd` is applied. Agent targets are skipped when that agent's config directory does
-not exist, unless you pass that target alone with `--only`.
+Valid targets: `shell`, `claude`, `opencode`, `pi`, `herdr-mod`, `skills`, `systemd`. Without `--only`,
+every target except `systemd` is applied. Agent targets are skipped when that agent's config directory
+does not exist, unless you pass that target alone with `--only`.
 
 ```bash
 tchelvis setup --dry-run                        # 1. preview; show the plan to the user
@@ -144,6 +144,7 @@ Desktop after installing `herdr-mod`. The UI needs the collector running: `tchel
 | `opencode` | `~/.config/opencode/plugins/tchelvis.js` |
 | `pi` | `~/.pi/agent/extensions/tchelvis.js` |
 | `herdr-mod` | `~/.config/herdr-app/mods/tchelvis/`, `~/.config/herdr-app/layouts/tchelvis.json`; with `--set-default-layout`, also `~/.config/herdr-app/settings.json` |
+| `skills` | `<agent>/skills/orchestration-tchelvis/SKILL.md` for `claude`, `opencode`, `pi`, `agents`, `codex`, and `gemini`; OpenCode also gets `~/.config/opencode/commands/orchestration-tchelvis.md` |
 | `systemd` | `~/.config/systemd/user/tchelvis.service` |
 
 ## Procedure C — Set up the supervisor LLM container (C3)

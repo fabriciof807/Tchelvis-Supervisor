@@ -93,7 +93,7 @@ enum Commands {
         /// Preview planned file changes without modifying disk
         #[arg(long)]
         dry_run: bool,
-        /// Comma-separated targets: shell,claude,opencode,pi,herdr-mod,systemd
+        /// Comma-separated targets: shell,claude,opencode,pi,herdr-mod,skills,systemd
         #[arg(long)]
         only: Option<String>,
         /// Comma-separated targets to skip

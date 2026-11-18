@@ -18,7 +18,7 @@ Tchelvis Supervisor combines an **Attention-First Fleet Queue & Context Correlat
 - **`tchelvis` binary**: Rust CLI, Unix Domain Socket daemon (`tchelvis daemon`), Durable FSM Supervisor (`src/supervisor/`), Ratatui TUI (`tchelvis tui`), and a Herdr Desktop mod (`assets/herdr-app/`).
 - **Agent session detection**: Monitors active coding agent sessions (`claude`, `opencode`, `pi`, `codex`, `aider`, `goose`, `cursor-agent`, `amp`, `OSC 7501` status hooks, or `cockpit.*` labeled sessions). Plain idle shells (`zsh`, `bash`, `fish`, `sh`, `nu`, `dash`, `tmux`, `screen`) and supervisor/UI processes are ignored.
 - **Containerized supervisor LLM**: Stalled or blocked agents are triaged by a deterministic watcher plus a small local model (`lfm3:1.7b` by default). The model is served by **`llama.cpp` (`llama-server`) in a managed container** (`tchelvis-supervisor-llm`). The container only runs after you explicitly click **Load LLM**. When stopped, it uses **0 B of RAM/VRAM**. Ollama, LM Studio, and OpenAI-compatible APIs remain available as alternative backends.
-- **State persistence**: Supervisor state lives in `~/.local/state/tchelvis/supervisor_state.json`. Closed and plain-shell terminals are pruned automatically.
+- **State persistence**: Supervisor state lives in `~/.local/state/tchelvis/supervisor_state.json`. Closed and plain-shell terminals are pruned automatically. Multi-agent orchestration state (runs, DAG tasks, fenced dispatches, and mailbox messages) lives in `~/.local/share/tchelvis/orch.db` (SQLite WAL), reconciled deterministically by `tchelvis daemon` with zero LLM dependency.
 
 ---
 
@@ -44,6 +44,12 @@ Each agent's git worktree, branch name, commit subject, and `cockpit.*` labels a
 
 ### 4. Herdr Desktop mod + terminal TUI
 Manage your fleet from **Herdr Desktop** (`herdr-app`) with the multi-zone `tchelvis` layout (Top Bar, Fleet Queue, Inspector, Status Bar). Over SSH or inside containers, use `tchelvis tui` instead.
+
+### 5. Event-driven multi-agent orchestration (`tchelvis orch`)
+A coordinator agent running inside a Herdr terminal can delegate work to parallel child coding agents without polling loops or copy-pasting:
+- Invoke **`/orchestration-tchelvis`** inside Claude Code, OpenCode, Pi, Codex, or Gemini CLI (or run `tchelvis orch skill`) to create runs, define DAG tasks, and dispatch workers in shared or isolated git worktrees (`--worktree current|new-child`).
+- `tchelvis daemon` manages `orch.db` (SQLite WAL) and wakes coordinators or workers atomically via `hc send --if idle`—including a `1500 ms` post-turn silent-stop safety net and a `3000 ms` blocked-prompt fallback that work even when the local supervisor LLM is unloaded.
+- Coordinators with active child dispatches surface as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
 
 ---
 
@@ -92,7 +98,7 @@ cargo build --release
 mkdir -p ~/.local/bin
 install -m 0755 target/release/tchelvis ~/.local/bin/tchelvis
 
-# 3. Install shell helpers, agent hooks, and the Herdr Desktop mod/layout
+# 3. Install shell helpers, agent hooks, /orchestration-tchelvis skill, and the Herdr Desktop mod/layout
 tchelvis setup --set-default-layout
 
 # 4. (Optional) Pre-pull the llama.cpp server image used by the supervisor
@@ -102,6 +108,8 @@ docker pull ghcr.io/ggml-org/llama.cpp:server        # or: podman pull ...
 tchelvis doctor
 ```
 
+> `tchelvis setup` (also run automatically by `tchelvis update`) applies the `shell`, `claude`, `opencode`, `pi`, `herdr-mod`, and `skills` targets by default (plus `systemd` with `--systemd`; filter with `--only` / `--skip`). The `skills` target installs **`/orchestration-tchelvis`** for Claude Code, OpenCode, Pi, Codex, Gemini CLI, and `~/.agents/skills`, and `tchelvis doctor` verifies `orch.db`, `tchelvis daemon`, and skill installation alongside `hc` and LLM health.
+>
 > If `which -a tchelvis` lists an older binary (e.g. `~/.cargo/bin/tchelvis`) ahead of `~/.local/bin/tchelvis`, replace or remove it. The Herdr mod calls plain `tchelvis`.
 
 ### Supervisor LLM setup (`llama.cpp` container)
@@ -165,7 +173,7 @@ Select the **`tchelvis`** layout in Herdr Desktop:
   - **Poll Now**: loads the LLM first if the container is stopped.
   - A single **Load LLM ⇄ Unload LLM** button.
   - View switcher (Home, Inspector, Doctor) and **Switch Layout**.
-- **Left Sidebar (`tchelvis-fleet`)**: Attention-first Fleet Queue (`Needs You` / `Active` / `Done`), Home toggle, `+ Agent` quick launcher, and filter tabs. Clicking an agent with no visible pane (a background `herdr-core` session) attaches it in a new tab.
+- **Left Sidebar (`tchelvis-fleet`)**: Attention-first Fleet Queue (`Needs You` / `Active` / `Done`), Home toggle, `+ Agent` quick launcher, and filter tabs. Coordinators with active child dispatches show a `Waiting on children (N)` badge. Clicking an agent with no visible pane (a background `herdr-core` session) attaches it in a new tab.
 - **Right Drawer (`tchelvis-inspector`)**: Home, Inspector, and Doctor views.
   - **Home**: KPI cards (Projects, Agents, Daily Tasks, Supervisor), Daily Tasks with priority and project tags, Projects in Development (live Herdr Spaces + git status), and Immediate Attention cards.
   - **Inspector**:
@@ -235,6 +243,49 @@ tchelvis supervisor fallback clear            # remove [fallback] and deactivate
 
 # Self-update
 tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]
+```
+
+#### Multi-Agent Orchestration (`tchelvis orch`)
+
+Event-driven parent-child agent orchestration over Herdr (`hc`) terminals, backed by `~/.local/share/tchelvis/orch.db` (SQLite WAL) and `tchelvis daemon`. Reconciliation is 100% deterministic (zero-LLM), so coordinator/worker orchestration works identically even when the local supervisor LLM is unloaded.
+
+- **Invoke inside coding agents**: Run **`/orchestration-tchelvis`** in Claude Code, OpenCode, Pi, Codex, or Gemini CLI (installed automatically by `tchelvis setup` / `tchelvis update` via the `skills` target into agent skill paths and `~/.agents/skills`), or print the guide on demand with `tchelvis orch skill`.
+- **Automatic wakeup (no polling loops)**: Coordinators dispatch workers and end their turn immediately. `tchelvis daemon` wakes the target terminal with a single-line inbox pointer via Herdr's guarded `hc send --if idle` (never `--force`).
+- **Safety nets when workers stop or block**:
+  - **`1500 ms` post-turn silent-stop safety net**: If a dispatched worker returns to its prompt (`idle` / `done`) for `>= 1500 ms` without calling `worker_done` or `ask`, `tchelvis daemon` captures the last 25 sanitized lines and wakes the coordinator with an `escalation`.
+  - **`3000 ms` blocked-prompt fallback**: If a worker stays `blocked` on a prompt for `>= 3000 ms` (for example, when the local supervisor LLM is unloaded or the command is outside the read-only whitelist), `tchelvis daemon` escalates to the coordinator so the worker never stalls silently.
+- **Fleet visibility**: Coordinators waiting on active dispatches render as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
+
+| Subcommand | Purpose & Key Flags |
+| :--- | :--- |
+| `tchelvis orch run-create` | Create a run bound to the coordinator terminal (`[--title <str>] [--coordinator <term>]`) |
+| `tchelvis orch task-create` | Add a DAG task (`--run <id> --id <task> --title <str> --prompt <str> [--deps <csv\|json>]`) |
+| `tchelvis orch dispatch` | Spawn or attach a worker (`--run <id> --task <task> (--agent <claude\|codex\|gemini\|opencode\|pi\|cmd> \| --terminal <term>) [--worktree current\|new-child]`) |
+| `tchelvis orch send` | Worker report to parent (`--type <worker_done\|escalation\|status> [--outcome succeeded\|failed] --dispatch-id <id> --body <str>`) |
+| `tchelvis orch ask` | Worker asks a blocking question and ends turn (`--dispatch-id <id> --question <str>`) |
+| `tchelvis orch reply` | Coordinator answers an open question and wakes the worker (`--question-id <id> --body <str>`) |
+| `tchelvis orch check` | Read and acknowledge pending inbox messages (`[--run <id>] [--terminal <term>] [--peek]`) |
+| `tchelvis orch status` | Inspect run DAG tasks, dispatches, open questions, and unread counts (`[--run <id>]`) |
+| `tchelvis orch release` | Opt-in cleanup of a finished worker terminal and clean/merged `--worktree new-child` (`--dispatch-id <id> [--force]`) |
+| `tchelvis orch skill` | Print the self-contained Markdown guide for coordinator and worker agents |
+
+All mutating `tchelvis orch` subcommands also accept `--request-id <id>` (idempotency receipt) and `--json`:
+
+```bash
+# Coordinator: create a run, dispatch a worker in an isolated git worktree, and end turn
+tchelvis orch run-create --title "Auth refactor"
+tchelvis orch dispatch --run <run_id> --task jwt --title "Implement JWT" \
+  --prompt "Add JWT middleware and run cargo test." --agent claude --worktree new-child
+
+# Coordinator: check inbox when woken by [tchelvis] pointer, reply to questions, or release
+tchelvis orch check --run <run_id>
+tchelvis orch reply --question-id <q_id> --body "Default token expiry to 15m."
+tchelvis orch status --run <run_id>
+tchelvis orch release --dispatch-id <dispatch_id>
+
+# Worker: report completion, failure, or ask a blocking question
+tchelvis orch send --type worker_done --outcome succeeded --dispatch-id <dispatch_id> --body "Implemented JWT and passed cargo test"
+tchelvis orch ask --dispatch-id <dispatch_id> --question "Should token expiry default to 15m or 1h?"
 ```
 
 ### 4. GPU offload

@@ -4,16 +4,27 @@ use crate::assets::{
     SHELL_FISH, SHELL_NU, SHELL_SH, SYSTEMD_UNIT_TEMPLATE,
 };
 use crate::config::CockpitPaths;
+use crate::orch::preamble::{
+    orchestration_opencode_command_markdown, orchestration_skill_file_markdown, ORCH_SKILL_NAME,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-pub const VALID_TARGETS: [&str; 6] = ["shell", "claude", "opencode", "pi", "herdr-mod", "systemd"];
+pub const VALID_TARGETS: [&str; 7] = [
+    "shell",
+    "claude",
+    "opencode",
+    "pi",
+    "herdr-mod",
+    "skills",
+    "systemd",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -92,7 +103,7 @@ pub fn resolve_active_targets(opts: &SetupOptions) -> Result<BTreeSet<String>> {
         }
         s
     } else {
-        ["shell", "claude", "opencode", "pi", "herdr-mod"]
+        ["shell", "claude", "opencode", "pi", "herdr-mod", "skills"]
             .into_iter()
             .map(|s| s.to_string())
             .collect()
@@ -272,6 +283,62 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
             apply_created_file(
                 &ext_path,
                 PI_TCHELVIS_JS,
+                0o644,
+                opts.dry_run,
+                &mut manifest,
+                &mut actions,
+            )?;
+        }
+    }
+
+    // 4b. /orchestration-tchelvis agent skill files (deduplicated across targets)
+    {
+        let mut skill_files: BTreeMap<PathBuf, String> = BTreeMap::new();
+        let skill_md = orchestration_skill_file_markdown();
+        let skill_rel = PathBuf::from(format!("skills/{ORCH_SKILL_NAME}/SKILL.md"));
+
+        if targets.contains("claude") || targets.contains("skills") {
+            let claude_dir = paths.home_dir.join(".claude");
+            if claude_dir.exists() || opts.only.as_deref() == Some("claude") {
+                skill_files.insert(claude_dir.join(&skill_rel), skill_md.clone());
+            }
+        }
+
+        if targets.contains("opencode") || targets.contains("skills") {
+            let opencode_dir = paths.home_dir.join(".config/opencode");
+            if opencode_dir.exists() || opts.only.as_deref() == Some("opencode") {
+                skill_files.insert(opencode_dir.join(&skill_rel), skill_md.clone());
+                skill_files.insert(
+                    opencode_dir.join(format!("commands/{ORCH_SKILL_NAME}.md")),
+                    orchestration_opencode_command_markdown(),
+                );
+            }
+        }
+
+        if targets.contains("pi") || targets.contains("skills") {
+            let pi_dir = paths.home_dir.join(".pi/agent");
+            if pi_dir.exists() || opts.only.as_deref() == Some("pi") {
+                skill_files.insert(pi_dir.join(&skill_rel), skill_md.clone());
+            }
+        }
+
+        if targets.contains("skills") {
+            let agents_dir = paths.home_dir.join(".agents");
+            if agents_dir.exists() || opts.only.as_deref() == Some("skills") {
+                skill_files.insert(agents_dir.join(&skill_rel), skill_md.clone());
+            }
+            for agent_dir_name in [".codex", ".gemini"] {
+                let agent_dir = paths.home_dir.join(agent_dir_name);
+                if agent_dir.exists() {
+                    skill_files.insert(agent_dir.join(&skill_rel), skill_md.clone());
+                }
+            }
+        }
+
+        for (path, content) in skill_files {
+            apply_created_file(
+                &path,
+                &content,
                 0o644,
                 opts.dry_run,
                 &mut manifest,
@@ -471,6 +538,27 @@ pub fn run_uninstall(
             paths.home_dir.join(".pi/agent/extensions/tchelvis.js"),
             paths.home_dir.join(".config/opencode/plugins/tchelvis.js"),
             paths.home_dir.join(".config/systemd/user/tchelvis.service"),
+            paths
+                .home_dir
+                .join(format!(".claude/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            paths.home_dir.join(format!(
+                ".config/opencode/skills/{ORCH_SKILL_NAME}/SKILL.md"
+            )),
+            paths
+                .home_dir
+                .join(format!(".config/opencode/commands/{ORCH_SKILL_NAME}.md")),
+            paths
+                .home_dir
+                .join(format!(".pi/agent/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            paths
+                .home_dir
+                .join(format!(".agents/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            paths
+                .home_dir
+                .join(format!(".codex/skills/{ORCH_SKILL_NAME}/SKILL.md")),
+            paths
+                .home_dir
+                .join(format!(".gemini/skills/{ORCH_SKILL_NAME}/SKILL.md")),
         ] {
             if extra_file.exists() {
                 actions.push(format!("remove file {}", extra_file.display()));
@@ -1021,6 +1109,86 @@ mod tests {
         assert!(!paths.data_dir.exists());
         assert!(!paths.state_dir.exists());
         assert!(!dummy_bin.exists());
+    }
+
+    #[test]
+    fn default_targets_include_skills_and_skills_is_a_valid_target() {
+        let targets = resolve_active_targets(&SetupOptions::default()).unwrap();
+        assert!(targets.contains("skills"));
+
+        let only_skills = resolve_active_targets(&SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(only_skills.into_iter().collect::<Vec<_>>(), vec!["skills"]);
+    }
+
+    #[test]
+    fn setup_installs_orchestration_skill_and_uninstall_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        };
+
+        for agent_dir in [
+            ".claude",
+            ".config/opencode",
+            ".pi/agent",
+            ".agents",
+            ".codex",
+            ".gemini",
+        ] {
+            fs::create_dir_all(home.join(agent_dir)).unwrap();
+        }
+
+        run_setup(&paths, &SetupOptions::default()).unwrap();
+
+        let skill_paths = [
+            ".claude/skills/orchestration-tchelvis/SKILL.md",
+            ".config/opencode/skills/orchestration-tchelvis/SKILL.md",
+            ".pi/agent/skills/orchestration-tchelvis/SKILL.md",
+            ".agents/skills/orchestration-tchelvis/SKILL.md",
+            ".codex/skills/orchestration-tchelvis/SKILL.md",
+            ".gemini/skills/orchestration-tchelvis/SKILL.md",
+        ];
+        let expected_skill = crate::orch::preamble::orchestration_skill_file_markdown();
+        for rel in skill_paths {
+            let installed =
+                fs::read_to_string(home.join(rel)).unwrap_or_else(|e| panic!("missing {rel}: {e}"));
+            assert_eq!(installed, expected_skill, "unexpected content for {rel}");
+        }
+
+        let command_path = home.join(".config/opencode/commands/orchestration-tchelvis.md");
+        assert_eq!(
+            fs::read_to_string(&command_path).unwrap(),
+            crate::orch::preamble::orchestration_opencode_command_markdown()
+        );
+
+        let manifest = load_manifest(&paths).unwrap().expect("setup manifest");
+        for rel in skill_paths {
+            let expected = home.join(rel).to_string_lossy().to_string();
+            assert!(
+                manifest.entries.iter().any(|e| e.path == expected),
+                "manifest missing {rel}"
+            );
+        }
+        assert!(manifest
+            .entries
+            .iter()
+            .any(|e| e.path == command_path.to_string_lossy()));
+
+        run_uninstall(&paths, false, false, None).unwrap();
+
+        for rel in skill_paths {
+            assert!(!home.join(rel).exists(), "{rel} was not removed");
+        }
+        assert!(!command_path.exists(), "opencode command was not removed");
     }
 
     #[test]
