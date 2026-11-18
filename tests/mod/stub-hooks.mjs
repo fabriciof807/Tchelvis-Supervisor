@@ -12,7 +12,31 @@ const STUBS = {
     export const setAgentOrder = () => {}, window = {}, layout = {}, keys = {};
   `,
   "gpui-kit": `export class View {}; export const div = () => ({}), svg = () => ({}), image = () => ({});`,
-  "gpui-base": `export const v_flex = () => ({}), h_flex = () => ({});`,
+  "gpui-base": `
+    const noop = () => {};
+    const chain = () => new Proxy(() => {}, { get: () => chain, apply: () => chain() });
+    const makeState = (opts = {}) => {
+      let val = String(opts?.value ?? "");
+      return {
+        value: () => val,
+        set_value: (v) => { val = String(v ?? ""); },
+        on: noop,
+        focus: noop,
+        release: noop,
+        set_auto_grow: noop,
+        set_rows: noop,
+        set_soft_wrap: noop,
+        set_selected_range: noop,
+        selected_range: () => ({ start: 0, end: 0 }),
+        replace: noop,
+      };
+    };
+    export const v_flex = () => ({}), h_flex = () => ({});
+    export const InputState = { new: makeState };
+    export const TextareaState = { new: makeState };
+    export const Input = { new: chain };
+    export const Textarea = { new: chain };
+  `,
 };
 
 registerHooks({

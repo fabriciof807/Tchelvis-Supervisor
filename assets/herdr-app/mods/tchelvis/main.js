@@ -2,7 +2,15 @@
 // Version: 0.1.0 | Schema Version: 1
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import * as base from "gpui-base";
+import {
+  v_flex,
+  h_flex,
+  InputState,
+  Input,
+  TextareaState,
+  Textarea,
+} from "gpui-base";
 import {
   agents,
   terminals,
@@ -662,86 +670,6 @@ export function taskProjectArgs(tag) {
 
 export function isBlankDraft(draft) {
   return String(draft ?? "").trim().length === 0;
-}
-
-export const TEXT_FIELDS = {
-  task: "taskDraft",
-  chat: "chatDraft",
-  fallbackHost: "fallbackHostDraft",
-  modelFilter: "modelFilterText",
-  command: "commandDraft",
-  prompt: "promptText",
-  label: "labelValue",
-};
-
-export const MULTILINE_FIELDS = new Set(["task", "chat"]);
-
-function clampTextCursor(cursor, len) {
-  if (cursor === null || cursor === undefined) return len;
-  const n = Number(cursor);
-  if (!Number.isFinite(n)) return len;
-  return Math.max(0, Math.min(len, Math.trunc(n)));
-}
-
-export function applyTextKey(
-  text,
-  cursor,
-  key,
-  { keyChar = null, shift = false, multiline = false } = {}
-) {
-  const raw = String(text ?? "");
-  const chars = Array.from(raw);
-  const len = chars.length;
-  const pos = clampTextCursor(cursor, len);
-
-  if (key === "left") {
-    return { text: chars.join(""), cursor: Math.max(0, pos - 1), handled: true };
-  }
-  if (key === "right") {
-    return { text: chars.join(""), cursor: Math.min(len, pos + 1), handled: true };
-  }
-  if (key === "home") {
-    if (!multiline) return { text: chars.join(""), cursor: 0, handled: true };
-    let start = pos;
-    while (start > 0 && chars[start - 1] !== "\n") start -= 1;
-    return { text: chars.join(""), cursor: start, handled: true };
-  }
-  if (key === "end") {
-    if (!multiline) return { text: chars.join(""), cursor: len, handled: true };
-    let end = pos;
-    while (end < len && chars[end] !== "\n") end += 1;
-    return { text: chars.join(""), cursor: end, handled: true };
-  }
-  if (key === "backspace") {
-    if (pos === 0) return { text: chars.join(""), cursor: 0, handled: true };
-    chars.splice(pos - 1, 1);
-    return { text: chars.join(""), cursor: pos - 1, handled: true };
-  }
-  if (key === "delete") {
-    if (pos >= len) return { text: chars.join(""), cursor: len, handled: true };
-    chars.splice(pos, 1);
-    return { text: chars.join(""), cursor: pos, handled: true };
-  }
-  if (key === "enter") {
-    if (shift && multiline) {
-      chars.splice(pos, 0, "\n");
-      return { text: chars.join(""), cursor: pos + 1, handled: true };
-    }
-    return { text: raw, cursor, handled: false };
-  }
-  if (typeof keyChar === "string" && keyChar.length > 0) {
-    const insert = Array.from(keyChar);
-    chars.splice(pos, 0, ...insert);
-    return { text: chars.join(""), cursor: pos + insert.length, handled: true };
-  }
-  return { text: raw, cursor, handled: false };
-}
-
-export function textWithCaret(text, cursor, caret = "▏") {
-  const chars = Array.from(String(text ?? ""));
-  const pos = clampTextCursor(cursor, chars.length);
-  chars.splice(pos, 0, caret);
-  return chars.join("");
 }
 
 export function draftDisplayLines(draft, maxLines = 6) {
@@ -1547,13 +1475,11 @@ export default class CockpitMod extends View {
     this.pollingSupervisor = false;
     this.fetchingHome = false;
     this.note = "";
-    this.promptText = "";
     this.labelKey = "issue";
-    this.labelValue = "";
-    this.commandDraft = "";
     this.commandDraftKey = "";
+    this.activeAgentAddress = null;
+    this.fallbackHostPrefilled = "";
     this.editingField = null; // "prompt" | "label" | "command" | "task" | "fallbackHost" | "modelFilter" | "chat" | null
-    this.caret = null;
     this.inspectCache = {}; // address -> InspectResponse
     this.doctorReport = null;
     this.homeSnap = shared("cockpit.home") ?? null;
@@ -1575,14 +1501,11 @@ export default class CockpitMod extends View {
     this.modelDeletingId = shared("cockpit.modelDeletingId") ?? null;
     this.fallbackReturning = false;
     this.fallbackReturnError = "";
-    this.fallbackHostDraft = "";
     this.fallbackModelsOpen = false;
     this.fallbackModels = null;
     this.fallbackModelsLoading = false;
     this.fallbackModelsError = "";
     this.fallbackSettingModel = "";
-    this.modelFilterText = "";
-    this.taskDraft = "";
     this.taskPriority = "normal";
     this.taskProject = "";
     this.taskFilter = "pending"; // "pending" | "all" | "done"
@@ -1598,9 +1521,95 @@ export default class CockpitMod extends View {
         ? initialViewMode
         : "inspector"; // "home" | "inspector" | "doctor" | "chat"
     this.chatMessages = [];
-    this.chatDraft = "";
     this.chatPending = false;
     this.handle = cx.focus_handle();
+
+    const taskInput = TextareaState.new({
+      placeholder: "Nova tarefa (Shift+Enter: nova linha)…",
+      value: "",
+      rows: 1,
+    });
+    taskInput.set_auto_grow(1, 6);
+
+    const chatInput = TextareaState.new({
+      placeholder: "Pergunte sobre agentes ou tarefas (Shift+Enter: nova linha)…",
+      value: "",
+      rows: 1,
+    });
+    chatInput.set_auto_grow(1, 6);
+
+    const fallbackHostInput = InputState.new({
+      placeholder: "Endpoint API (ex: https://openrouter.ai/api)",
+      value: "",
+    });
+    const modelFilterInput = InputState.new({
+      placeholder: "Filtrar modelos…",
+      value: "",
+    });
+    const commandInput = InputState.new({
+      placeholder: "Digite o comando para enviar via hc…",
+      value: "",
+    });
+    const promptInput = InputState.new({
+      placeholder: "Send message to agent…",
+      value: "",
+    });
+    const labelInput = InputState.new({
+      placeholder: "Valor (ex: ENG-42)…",
+      value: "",
+    });
+
+    this.inputs = {
+      task: taskInput,
+      chat: chatInput,
+      fallbackHost: fallbackHostInput,
+      modelFilter: modelFilterInput,
+      command: commandInput,
+      prompt: promptInput,
+      label: labelInput,
+    };
+
+    for (const [name, state] of Object.entries(this.inputs)) {
+      state.on("focus", (_e, evCx) => {
+        this.editingField = name;
+        evCx?.notify();
+      });
+      state.on("blur", (_e, evCx) => {
+        if (this.editingField === name) {
+          this.editingField = null;
+        }
+        evCx?.notify();
+      });
+    }
+    for (const name of ["chat", "modelFilter", "prompt", "label"]) {
+      this.inputs[name].on("change", (_e, evCx) => evCx?.notify());
+    }
+    taskInput.on("submit", (_e, evCx) => this.addTaskGui(evCx));
+    chatInput.on("submit", (_e, evCx) => this.sendChatMessage(evCx));
+    fallbackHostInput.on("submit", (_e, evCx) => this.submitFallbackHost(evCx));
+    modelFilterInput.on("submit", (_e, evCx) => {
+      if (this.fallbackModelsOpen) {
+        this.fetchFallbackModels(evCx);
+      } else {
+        this.setEditingField(null);
+        evCx?.notify();
+      }
+    });
+    commandInput.on("submit", (_e, evCx) => {
+      const addr = this.activeAgentAddress ?? this.selectedAddress();
+      if (addr) this.approveActionCard(evCx, addr);
+    });
+    promptInput.on("submit", (_e, evCx) => {
+      const addr = this.activeAgentAddress ?? this.selectedAddress();
+      if (addr) this.sendPromptGui(evCx, addr);
+    });
+    labelInput.on("submit", (_e, evCx) => {
+      const addr = this.activeAgentAddress ?? this.selectedAddress();
+      const val = this.fieldValue("label");
+      if (addr && !isBlankDraft(val)) {
+        this.applyLabelGui(evCx, addr, this.labelKey, val.trim());
+      }
+    });
 
     const role = props()?.role ?? "fleet";
     if (role === "fleet") {
@@ -1947,8 +1956,9 @@ export default class CockpitMod extends View {
   }
 
   submitFallbackHost(cx) {
-    const host = String(this.fallbackHostDraft || "").trim();
-    if (!host || this.busy) return;
+    const raw = this.fieldValue("fallbackHost");
+    if (isBlankDraft(raw) || this.busy) return;
+    const host = raw.trim();
     this.setEditingField(null);
     this.fallbackReturnError = "";
     this.busy = true;
@@ -1998,7 +2008,7 @@ export default class CockpitMod extends View {
     this.fallbackModelsError = "";
     cx?.notify();
 
-    const filterText = String(this.modelFilterText || "").trim();
+    const filterText = this.fieldValue("modelFilter").trim();
     const args = ["supervisor", "fallback", "models", "--json"];
     if (filterText) {
       args.push("--filter", filterText);
@@ -2062,7 +2072,7 @@ export default class CockpitMod extends View {
 
   approveActionCard(cx, agentId) {
     if (!agentId) return;
-    const payload = this.commandDraft;
+    const payload = this.fieldValue("command");
     this.setEditingField(null);
     this.runSupervisorAction(
       cx,
@@ -2296,7 +2306,7 @@ export default class CockpitMod extends View {
     cx.spawn(async (cx) => {
       try {
         await hc(["label", address, `${fullKey}=${value}`]);
-        this.labelValue = "";
+        this.clearField("label");
         this.setEditingField(null);
         this.note = value
           ? `Set ${fullKey}=${value}`
@@ -2313,9 +2323,10 @@ export default class CockpitMod extends View {
   }
 
   sendPromptGui(cx, address) {
-    const text = this.promptText.trim();
-    if (!address || !text) return;
-    this.promptText = "";
+    const raw = this.fieldValue("prompt");
+    if (!address || isBlankDraft(raw)) return;
+    const text = raw.trim();
+    this.clearField("prompt");
     this.setEditingField(null);
     this.note = `Sent to ${address}`;
     cx.notify();
@@ -2338,7 +2349,7 @@ export default class CockpitMod extends View {
             this.taskEditorPrevIds &&
             hasNewTask(this.taskEditorPrevIds, parsed.tasks ?? [])
           ) {
-            this.taskDraft = "";
+            this.clearField("task");
             this.taskEditorPrevIds = null;
           }
         }
@@ -2482,7 +2493,7 @@ export default class CockpitMod extends View {
             this.taskEditorPrevIds &&
             hasNewTask(this.taskEditorPrevIds, parsed.tasks ?? [])
           ) {
-            this.taskDraft = "";
+            this.clearField("task");
             this.taskEditorPrevIds = null;
           }
           if (onSuccess) onSuccess(parsed);
@@ -2499,8 +2510,9 @@ export default class CockpitMod extends View {
   }
 
   addTaskGui(cx) {
-    if (isBlankDraft(this.taskDraft) || this.busy) return;
-    const title = this.taskDraft.trim();
+    const draft = this.fieldValue("task");
+    if (isBlankDraft(draft) || this.busy) return;
+    const title = draft.trim();
     const args = [
       "add",
       "--priority",
@@ -2510,7 +2522,7 @@ export default class CockpitMod extends View {
       "--",
       title,
     ];
-    this.taskDraft = "";
+    this.clearField("task");
     this.setEditingField(null);
     this.taskTagMenuOpen = false;
     this.runTaskCommand(cx, args, () => {
@@ -2534,61 +2546,39 @@ export default class CockpitMod extends View {
     });
   }
 
-  setEditingField(name) {
-    this.editingField = name;
-    this.caret = null;
+  fieldValue(name) {
+    return this.inputs?.[name]?.value() ?? "";
   }
 
-  handleKeyDown(e, cx, agent = null) {
+  clearField(name) {
+    this.inputs?.[name]?.set_value("");
+  }
+
+  focusField(name) {
+    this.editingField = name;
+    this.inputs?.[name]?.focus();
+  }
+
+  setEditingField(name) {
+    if (!name) {
+      const hadEditing = this.editingField !== null;
+      this.editingField = null;
+      if (hadEditing) {
+        this.handle?.focus?.();
+      }
+      return;
+    }
+    this.focusField(name);
+  }
+
+  handleKeyDown(e, cx) {
     if (!this.editingField) return;
     if (this.editingField === "chat" && this.chatPending) return;
-    const m = e.modifiers;
     if (e.key === "escape") {
       this.setEditingField(null);
-    } else if (
-      e.key === "enter" &&
-      !(m?.shift && MULTILINE_FIELDS.has(this.editingField))
-    ) {
-      if (this.editingField === "task") {
-        this.addTaskGui(cx);
-      } else if (this.editingField === "chat") {
-        this.sendChatMessage(cx);
-      } else if (this.editingField === "fallbackHost") {
-        this.submitFallbackHost(cx);
-      } else if (this.editingField === "modelFilter") {
-        if (this.fallbackModelsOpen) {
-          this.fetchFallbackModels(cx);
-        } else {
-          this.setEditingField(null);
-        }
-      } else if (this.editingField === "command" && agent) {
-        this.approveActionCard(cx, agent.address);
-      } else if (this.editingField === "prompt" && agent) {
-        this.sendPromptGui(cx, agent.address);
-      } else if (this.editingField === "label" && agent) {
-        this.applyLabelGui(
-          cx,
-          agent.address,
-          this.labelKey,
-          this.labelValue.trim()
-        );
-      }
-    } else {
-      const prop = TEXT_FIELDS[this.editingField];
-      if (!prop) return;
-      const keyChar =
-        e.key_char && !m?.control && !m?.platform ? e.key_char : null;
-      const res = applyTextKey(this[prop] ?? "", this.caret, e.key, {
-        keyChar,
-        shift: Boolean(m?.shift),
-        multiline: MULTILINE_FIELDS.has(this.editingField),
-      });
-      if (!res.handled) return;
-      this[prop] = res.text;
-      this.caret = res.cursor;
+      cx.stop_propagation();
+      cx.notify();
     }
-    cx.stop_propagation();
-    cx.notify();
   }
 
   sectionTitle(t, title, subtitleOrCount = null, iconName = null) {
@@ -2799,6 +2789,7 @@ export default class CockpitMod extends View {
     this.modelListShowAll = false;
     this.modelDeletePending = null;
     this.fallbackModelsOpen = false;
+    this.clearField("modelFilter");
     if (
       this.editingField === "fallbackHost" ||
       this.editingField === "modelFilter"
@@ -4181,8 +4172,7 @@ export default class CockpitMod extends View {
               .gap(6)
               .items_start()
               .child(
-                div()
-                  .id("ck-task-input")
+                Textarea.new(this.inputs.task)
                   .flex_1()
                   .min_w(0)
                   .px(9)
@@ -4194,31 +4184,7 @@ export default class CockpitMod extends View {
                   )
                   .bg(t.background)
                   .text_size(12)
-                  .text_color(this.taskDraft ? t.foreground : t.dim)
-                  .cursor_text()
-                  .on_click((_e, cx) => {
-                    this.setEditingField("task");
-                    this.handle.focus();
-                    cx.notify();
-                  })
-                  .child(
-                    (() => {
-                      const isEditingTask = this.editingField === "task";
-                      if (!this.taskDraft) {
-                        return div().child(
-                          (isEditingTask ? "▏" : "") +
-                            "Nova tarefa (Shift+Enter: nova linha)…"
-                        );
-                      }
-                      const displayDraft = isEditingTask
-                        ? textWithCaret(this.taskDraft, this.caret)
-                        : this.taskDraft;
-                      const lines = draftDisplayLines(displayDraft);
-                      return v_flex()
-                        .gap(2)
-                        .children(lines.map((line) => div().child(line || " ")));
-                    })()
-                  )
+                  .text_color(t.foreground)
               )
               .child(
                 h_flex()
@@ -4261,7 +4227,7 @@ export default class CockpitMod extends View {
                       space: activeSpace?.id,
                       name: "nova tarefa",
                       argv: taskEditorArgv(
-                        this.taskDraft,
+                        this.fieldValue("task"),
                         this.taskPriority || "normal",
                         this.currentTaskTag
                       ),
@@ -4598,8 +4564,7 @@ export default class CockpitMod extends View {
                     "+ Tarefa",
                     (_e, cx) => {
                       this.taskProject = proj.name;
-                      this.setEditingField("task");
-                      this.handle.focus();
+                      this.focusField("task");
                       cx.notify();
                     }
                   )
@@ -5346,11 +5311,11 @@ export default class CockpitMod extends View {
   }
 
   sendChatMessage(cx) {
-    if (this.chatPending || isBlankDraft(this.chatDraft)) return;
-    const question = this.chatDraft.trim();
+    const raw = this.fieldValue("chat");
+    if (this.chatPending || isBlankDraft(raw)) return;
+    const question = raw.trim();
     const history = chatHistoryForRequest(this.chatMessages);
-    this.chatDraft = "";
-    this.caret = null;
+    this.clearField("chat");
     this.chatMessages = [
       ...this.chatMessages,
       { role: "user", content: question },
@@ -5595,81 +5560,47 @@ export default class CockpitMod extends View {
       )
       // Input bar styled like Daily Tasks input
       .child(
-        h_flex()
-          .flex_none()
-          .gap(6)
-          .items_start()
-          .child(
-            div()
-              .id("ck-chat-input")
-              .flex_1()
-              .min_w(0)
-              .px(9)
-              .py(6)
-              .rounded(6)
-              .border(1)
-              .border_color(
-                this.editingField === "chat" ? t.accent : t.border
-              )
-              .bg(t.background)
-              .text_size(12)
-              .text_color(this.chatDraft ? t.foreground : t.dim)
-              .cursor_text()
-              .on_click((_e, cx) => {
-                this.setEditingField("chat");
-                this.handle.focus();
-                cx.notify();
-              })
-              .child(
-                (() => {
-                  const isEditingChat = this.editingField === "chat";
-                  if (!this.chatDraft) {
-                    return div().child(
-                      (isEditingChat && !this.chatPending ? "▏" : "") +
-                        "Pergunte sobre agentes ou tarefas (Shift+Enter: nova linha)…"
-                    );
-                  }
-                  const displayDraft =
-                    isEditingChat && !this.chatPending
-                      ? textWithCaret(this.chatDraft, this.caret)
-                      : this.chatDraft;
-                  const lines = draftDisplayLines(displayDraft);
-                  return v_flex()
-                    .gap(2)
-                    .children(lines.map((line) => div().child(line || " ")));
-                })()
-              )
-          )
-          .child(
-            h_flex()
-              .id("ck-chat-send")
-              .h(26)
-              .px(10)
-              .items_center()
-              .rounded(6)
-              .bg(
-                this.chatPending || isBlankDraft(this.chatDraft)
-                  ? t.raised
-                  : t.accent
-              )
-              .border(1)
-              .border_color(
-                this.chatPending || isBlankDraft(this.chatDraft)
-                  ? t.border
-                  : t.accent
-              )
-              .text_size(11.5)
-              .font_semibold()
-              .text_color(
-                this.chatPending || isBlankDraft(this.chatDraft)
-                  ? t.dim
-                  : t.background
-              )
-              .cursor_pointer()
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => this.sendChatMessage(cx))
-              .child(this.chatPending ? "…" : "Enviar")
-          )
+        (() => {
+          const chatDisabled =
+            this.chatPending || isBlankDraft(this.fieldValue("chat"));
+          return h_flex()
+            .flex_none()
+            .gap(6)
+            .items_start()
+            .child(
+              Textarea.new(this.inputs.chat)
+                .flex_1()
+                .min_w(0)
+                .px(9)
+                .py(6)
+                .rounded(6)
+                .border(1)
+                .border_color(
+                  this.editingField === "chat" ? t.accent : t.border
+                )
+                .bg(t.background)
+                .text_size(12)
+                .text_color(t.foreground)
+            )
+            .child(
+              h_flex()
+                .id("ck-chat-send")
+                .h(26)
+                .px(10)
+                .items_center()
+                .rounded(6)
+                .bg(chatDisabled ? t.raised : t.accent)
+                .border(1)
+                .border_color(chatDisabled ? t.border : t.accent)
+                .text_size(11.5)
+                .font_semibold()
+                .text_color(chatDisabled ? t.dim : t.background)
+                .cursor_pointer()
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => this.sendChatMessage(cx))
+                .child(this.chatPending ? "…" : "Enviar")
+            );
+        })()
       );
   }
 
@@ -5705,10 +5636,19 @@ export default class CockpitMod extends View {
 
     const fb = fallbackSection(supSnap);
     const fbHostRaw = String(supSnap?.fallback_host || "").trim();
+    if (
+      fbHostRaw &&
+      this.editingField !== "fallbackHost" &&
+      !this.fieldValue("fallbackHost") &&
+      this.fallbackHostPrefilled !== fbHostRaw
+    ) {
+      this.inputs.fallbackHost.set_value(fbHostRaw);
+      this.fallbackHostPrefilled = fbHostRaw;
+    }
     const fbHostLabel = fallbackHostLabel(fbHostRaw);
     const fbModel = String(supSnap?.fallback_model || "").trim();
     const isReturning = Boolean(this.fallbackReturning);
-    const fbFilterQuery = String(this.modelFilterText || "").trim().toLowerCase();
+    const fbFilterQuery = this.fieldValue("modelFilter").trim().toLowerCase();
     const fbModelsAll = Array.isArray(this.fallbackModels)
       ? this.fallbackModels
       : [];
@@ -6155,13 +6095,15 @@ export default class CockpitMod extends View {
                     h_flex()
                       .gap(6)
                       .items_center()
+                      .on_mouse_down("left", (_e, clickCx) =>
+                        clickCx.stop_propagation()
+                      )
                       .child(
-                        div()
-                          .id("ck-fallback-host-input")
+                        Input.new(this.inputs.fallbackHost)
                           .flex_1()
                           .min_w(0)
+                          .h(28)
                           .px(8)
-                          .py(5)
                           .rounded(6)
                           .border(1)
                           .border_color(
@@ -6171,39 +6113,7 @@ export default class CockpitMod extends View {
                           )
                           .bg(t.background)
                           .text_size(11)
-                          .text_color(
-                            this.fallbackHostDraft || fbHostRaw
-                              ? t.foreground
-                              : t.dim
-                          )
-                          .cursor_text()
-                          .on_mouse_down("left", (_e, clickCx) =>
-                            clickCx.stop_propagation()
-                          )
-                          .on_click((_e, clickCx) => {
-                            if (!this.fallbackHostDraft && fbHostRaw) {
-                              this.fallbackHostDraft = fbHostRaw;
-                            }
-                            this.setEditingField("fallbackHost");
-                            this.handle.focus();
-                            (clickCx ?? cx)?.notify();
-                          })
-                          .child(
-                            (() => {
-                              const isEditing =
-                                this.editingField === "fallbackHost";
-                              const val = this.fallbackHostDraft || fbHostRaw;
-                              if (!val) {
-                                return (
-                                  (isEditing ? "▏" : "") +
-                                  "Endpoint API (ex: https://openrouter.ai/api)"
-                                );
-                              }
-                              return isEditing
-                                ? textWithCaret(val, this.caret)
-                                : val;
-                            })()
-                          )
+                          .text_color(t.foreground)
                       )
                       .child(
                         this.actionBtn(
@@ -6211,8 +6121,8 @@ export default class CockpitMod extends View {
                           "ck-fallback-host-save",
                           "Salvar",
                           (_e, clickCx) => {
-                            if (!this.fallbackHostDraft && fbHostRaw) {
-                              this.fallbackHostDraft = fbHostRaw;
+                            if (!this.fieldValue("fallbackHost") && fbHostRaw) {
+                              this.inputs.fallbackHost.set_value(fbHostRaw);
                             }
                             this.submitFallbackHost(clickCx ?? cx);
                           }
@@ -6349,13 +6259,15 @@ export default class CockpitMod extends View {
                     h_flex()
                       .gap(6)
                       .items_center()
+                      .on_mouse_down("left", (_e, clickCx) =>
+                        clickCx.stop_propagation()
+                      )
                       .child(
-                        div()
-                          .id("ck-fallback-model-filter")
+                        Input.new(this.inputs.modelFilter)
                           .flex_1()
                           .min_w(0)
+                          .h(26)
                           .px(7)
-                          .py(4)
                           .rounded(5)
                           .border(1)
                           .border_color(
@@ -6365,36 +6277,7 @@ export default class CockpitMod extends View {
                           )
                           .bg(t.background)
                           .text_size(11)
-                          .text_color(
-                            this.modelFilterText ? t.foreground : t.dim
-                          )
-                          .cursor_text()
-                          .on_mouse_down("left", (_e, clickCx) =>
-                            clickCx.stop_propagation()
-                          )
-                          .on_click((_e, clickCx) => {
-                            this.setEditingField("modelFilter");
-                            this.handle.focus();
-                            (clickCx ?? cx)?.notify();
-                          })
-                          .child(
-                            (() => {
-                              const isEditing =
-                                this.editingField === "modelFilter";
-                              if (!this.modelFilterText) {
-                                return (
-                                  (isEditing ? "▏" : "") +
-                                  "Filtrar modelos…"
-                                );
-                              }
-                              return isEditing
-                                ? textWithCaret(
-                                    this.modelFilterText,
-                                    this.caret
-                                  )
-                                : this.modelFilterText;
-                            })()
-                          )
+                          .text_color(t.foreground)
                       )
                       .child(
                         this.actionBtn(
@@ -7222,6 +7105,7 @@ export default class CockpitMod extends View {
     }
     const agent =
       merged.find((a) => a.address === addr) ?? merged[0] ?? null;
+    this.activeAgentAddress = agent?.address ?? null;
     const detailed =
       (addr && this.inspectCache[addr]?.agent) ||
       (snap?.agents ?? []).find((a) => a.address === agent?.address) ||
@@ -7248,11 +7132,13 @@ export default class CockpitMod extends View {
     if (actionCard && agent) {
       const nextKey = `${agent.address}:${actionCard.triggered_at ?? ""}`;
       if (this.editingField !== "command" && this.commandDraftKey !== nextKey) {
-        this.commandDraft = actionCard.hc_command_payload ?? "";
+        this.inputs.command.set_value(actionCard.hc_command_payload ?? "");
         this.commandDraftKey = nextKey;
       }
     } else if (this.editingField !== "command") {
-      this.commandDraft = "";
+      if (this.commandDraftKey || this.fieldValue("command")) {
+        this.clearField("command");
+      }
       this.commandDraftKey = "";
     }
 
@@ -7631,12 +7517,11 @@ export default class CockpitMod extends View {
                         .gap(6)
                         .items_center()
                         .child(
-                          div()
-                            .id("ck-prompt-box")
+                          Input.new(this.inputs.prompt)
                             .flex_1()
                             .min_w(0)
+                            .h(28)
                             .px(9)
-                            .py(5)
                             .rounded(6)
                             .border(1)
                             .border_color(
@@ -7646,23 +7531,7 @@ export default class CockpitMod extends View {
                             )
                             .bg(t.background)
                             .text_size(12)
-                            .text_color(
-                              this.promptText ? t.foreground : t.dim
-                            )
-                            .cursor_text()
-                            .on_click((_e, cx) => {
-                              this.setEditingField("prompt");
-                              this.handle.focus();
-                              cx.notify();
-                            })
-                            .child(
-                              this.promptText
-                                ? this.editingField === "prompt"
-                                  ? textWithCaret(this.promptText, this.caret)
-                                  : ellipsize(this.promptText, 48)
-                                : (this.editingField === "prompt" ? "▏" : "") +
-                                    `Send message to ${agent.address}…`
-                            )
+                            .text_color(t.foreground)
                         )
                         .child(
                           this.actionBtn(
@@ -7670,7 +7539,7 @@ export default class CockpitMod extends View {
                             "ck-prompt-send",
                             "Send ↵",
                             (_e, cx) => this.sendPromptGui(cx, agent.address),
-                            Boolean(this.promptText.trim())
+                            !isBlankDraft(this.fieldValue("prompt"))
                           )
                         )
                     )
@@ -7839,10 +7708,10 @@ export default class CockpitMod extends View {
                           .child("hc_command_payload (editável):")
                       )
                       .child(
-                        div()
-                          .id("ck-action-cmd-input")
+                        Input.new(this.inputs.command)
+                          .w_full()
+                          .h(30)
                           .px(9)
-                          .py(6)
                           .rounded(6)
                           .border(1)
                           .border_color(
@@ -7852,23 +7721,7 @@ export default class CockpitMod extends View {
                           )
                           .bg(t.background)
                           .text_size(12)
-                          .text_color(
-                            this.commandDraft ? t.foreground : t.dim
-                          )
-                          .cursor_text()
-                          .on_click((_e, cx) => {
-                            this.setEditingField("command");
-                            this.handle.focus();
-                            cx.notify();
-                          })
-                          .child(
-                            this.commandDraft
-                              ? this.editingField === "command"
-                                ? textWithCaret(this.commandDraft, this.caret)
-                                : this.commandDraft
-                              : (this.editingField === "command" ? "▏" : "") +
-                                  "Digite o comando para enviar via hc…"
-                          )
+                          .text_color(t.foreground)
                       )
                       .child(
                         h_flex()
@@ -8556,8 +8409,7 @@ export default class CockpitMod extends View {
                                 this.labelKey === k,
                                 (_e, cx) => {
                                   this.labelKey = k;
-                                  this.setEditingField("label");
-                                  this.handle.focus();
+                                  this.focusField("label");
                                   cx.notify();
                                 }
                               )
@@ -8569,12 +8421,11 @@ export default class CockpitMod extends View {
                             .gap(6)
                             .items_center()
                             .child(
-                              div()
-                                .id("ck-lbl-input")
+                              Input.new(this.inputs.label)
                                 .flex_1()
                                 .min_w(0)
+                                .h(26)
                                 .px(8)
-                                .py(4)
                                 .rounded(6)
                                 .border(1)
                                 .border_color(
@@ -8584,44 +8435,24 @@ export default class CockpitMod extends View {
                                 )
                                 .bg(t.surface)
                                 .text_size(11.5)
-                                .text_color(
-                                  this.labelValue ? t.foreground : t.dim
-                                )
-                                .cursor_text()
-                                .on_click((_e, cx) => {
-                                  this.setEditingField("label");
-                                  this.handle.focus();
-                                  cx.notify();
-                                })
-                                .child(
-                                  this.labelValue
-                                    ? `${this.labelKey}=${
-                                        this.editingField === "label"
-                                          ? textWithCaret(
-                                              this.labelValue,
-                                              this.caret
-                                            )
-                                          : this.labelValue
-                                      }`
-                                    : (this.editingField === "label"
-                                        ? "▏"
-                                        : "") +
-                                        `Set cockpit.${this.labelKey} (e.g. ENG-42)…`
-                                )
+                                .text_color(t.foreground)
                             )
                             .child(
                               this.actionBtn(
                                 t,
                                 "ck-lbl-save",
                                 "Tag",
-                                (_e, cx) =>
+                                (_e, cx) => {
+                                  const val = this.fieldValue("label");
+                                  if (isBlankDraft(val)) return;
                                   this.applyLabelGui(
                                     cx,
                                     agent.address,
                                     this.labelKey,
-                                    this.labelValue.trim()
-                                  ),
-                                Boolean(this.labelValue.trim())
+                                    val.trim()
+                                  );
+                                },
+                                !isBlankDraft(this.fieldValue("label"))
                               )
                             )
                         )
