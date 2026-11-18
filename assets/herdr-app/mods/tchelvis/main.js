@@ -8103,7 +8103,7 @@ export default class CockpitMod extends View {
                       cleanedPreviewLines.map((line, idx) => {
                         const isCmd = line.trim().startsWith("$");
                         const isWarn =
-                          line.includes("⚠") || line.includes("Interceptado");
+                          line.includes("\u26a0") || line.includes("Interceptado");
                         const isOk = line.includes("✓");
                         const lineCol = isWarn
                           ? t.blocked

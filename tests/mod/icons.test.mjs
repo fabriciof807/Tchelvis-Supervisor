@@ -11,12 +11,9 @@ const mainJsPath = path.join(repoRoot, "assets/herdr-app/mods/tchelvis/main.js")
 
 test("main.js has no emoji left", () => {
   const src = fs.readFileSync(mainJsPath, "utf8");
-  // The single alert-detection literal `line.includes("⚠")` stays per spec;
-  // typographic symbols `▶` and `↗` stay as text per spec even though Unicode
-  // marks them Extended_Pictographic.
-  const withoutAllowed = src
-    .replace('line.includes("⚠")', 'line.includes("")')
-    .replace(/[▶↗]/g, "");
+  // Typographic symbols `▶` and `↗` stay as text per spec even though Unicode
+  // marks them Extended_Pictographic. The alert detection uses "\\u26a0".
+  const withoutAllowed = src.replace(/[▶↗]/g, "");
   const matches = withoutAllowed.match(/\p{Extended_Pictographic}/gu) ?? [];
   assert.deepEqual(matches, []);
 });
