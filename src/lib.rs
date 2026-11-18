@@ -8,6 +8,7 @@ pub mod herdr;
 pub mod home;
 pub mod logging;
 pub mod model;
+pub mod orch;
 pub mod procs;
 pub mod providers;
 pub mod setup;

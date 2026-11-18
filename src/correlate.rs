@@ -108,6 +108,8 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
             "cockpit.pr",
             "cockpit.slack",
             "cockpit.runbook",
+            "cockpit.orch.role",
+            "cockpit.orch.run",
         ]
         .iter()
         .any(|k| term.labels.get(*k).is_some_and(|v| !v.trim().is_empty()));
@@ -552,12 +554,23 @@ pub fn build_initial_agent_row(
     AgentRow {
         address: sanitize_terminal_text(&term.address),
         name: sanitize_terminal_text(&term.display_name()),
-        parent: term.parent.as_deref().map(sanitize_terminal_text),
+        parent: term
+            .parent
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(sanitize_terminal_text)
+            .or_else(|| {
+                term.labels
+                    .get("cockpit.parent")
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| sanitize_terminal_text(s))
+            }),
         agent_kind,
         lifecycle: term.lifecycle(),
         attention_state,
         prompt_destructive,
         blocked_children,
+        active_children: Vec::new(),
         turn: term.turn,
         reported: term.reported,
         labels: term.labels.clone(),
@@ -745,5 +758,30 @@ mod tests {
         };
         assert_eq!(classify_agent_kind(&term), AgentKind::Antigravity);
         assert!(should_include_terminal(&term, false));
+    }
+
+    #[test]
+    fn test_should_include_orchestrated_plain_shell_and_parent_fallback() {
+        use crate::herdr::HcForeground;
+
+        let mut labels = BTreeMap::new();
+        labels.insert("cockpit.orch.role".into(), "worker".into());
+        labels.insert("cockpit.orch.run".into(), "run_01".into());
+        labels.insert("cockpit.parent".into(), "t1".into());
+        let term = HcTerminal {
+            address: "t30".into(),
+            state: "live".into(),
+            foreground: Some(HcForeground {
+                name: Some("zsh".into()),
+                argv: vec!["/bin/zsh".into()],
+                ..Default::default()
+            }),
+            labels,
+            ..Default::default()
+        };
+        assert!(should_include_terminal(&term, false));
+        let row = build_initial_agent_row(&term, AttentionState::Idle, Vec::new(), 1_000);
+        assert_eq!(row.parent.as_deref(), Some("t1"));
+        assert!(row.active_children.is_empty());
     }
 }

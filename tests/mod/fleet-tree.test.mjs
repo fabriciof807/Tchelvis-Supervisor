@@ -193,3 +193,61 @@ test("merge_rows_carry_parent", () => {
   assert.equal(r1.parent, null);
   assert.equal(r2.parent, "t1");
 });
+
+test("merge_rows_carry_active_children_and_cockpit_parent_fallback", () => {
+  const terms = [
+    { address: "t1", state: "live", program: "claude" },
+    {
+      address: "t2",
+      state: "live",
+      program: "claude",
+      labels: { "cockpit.parent": "t1" },
+    },
+    {
+      address: "t3",
+      state: "live",
+      program: "claude",
+    },
+  ];
+  const snap = {
+    agents: [
+      {
+        address: "t1",
+        name: "delegator-agent",
+        active_children: ["t2", "t3"],
+      },
+      {
+        address: "t3",
+        name: "worker-agent",
+        labels: { "cockpit.parent": "t1" },
+      },
+    ],
+  };
+
+  const rows = mergeFleetRows(
+    [{ address: "t2", program: "claude", status: "working" }],
+    terms,
+    snap,
+    null
+  );
+  const r1 = rows.find((r) => r.address === "t1");
+  const r2 = rows.find((r) => r.address === "t2");
+  const r3 = rows.find((r) => r.address === "t3");
+  assert.ok(r1, "row for t1");
+  assert.ok(r2, "row for t2");
+  assert.ok(r3, "row for t3");
+  assert.deepEqual(r1.active_children, ["t2", "t3"]);
+  assert.deepEqual(r2.active_children, []);
+  assert.deepEqual(r3.active_children, []);
+  assert.equal(r2.parent, "t1");
+  assert.equal(r3.parent, "t1");
+
+  const groups = groupFleetRows(rows);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].row.address, "t1");
+  assert.deepEqual(
+    groups[0].children.map((c) => c.address).sort(),
+    ["t2", "t3"]
+  );
+});
+

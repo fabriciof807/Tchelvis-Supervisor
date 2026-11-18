@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -37,7 +38,20 @@ pub struct HcStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HcFirstMessage {
+    #[serde(default)]
+    pub sent: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub started: Option<bool>,
+    #[serde(default)]
+    pub turn: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HcTerminal {
+    #[serde(default, alias = "id", alias = "terminal")]
     pub address: String,
     #[serde(default)]
     pub name: Option<String>,
@@ -73,6 +87,8 @@ pub struct HcTerminal {
     pub agent: Option<String>,
     #[serde(default)]
     pub r#where: Option<String>,
+    #[serde(default)]
+    pub first_message: Option<HcFirstMessage>,
 }
 
 impl HcTerminal {
@@ -82,6 +98,32 @@ impl HcTerminal {
             .filter(|n| !n.is_empty())
             .unwrap_or(&self.address)
             .to_string()
+    }
+
+    pub fn status_name(&self) -> Option<&str> {
+        self.status
+            .as_ref()
+            .map(|s| s.state.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.labels
+                    .get("cockpit.state")
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    pub fn status_msg(&self) -> Option<&str> {
+        self.status
+            .as_ref()
+            .and_then(|s| s.msg.as_deref())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                self.labels
+                    .get("cockpit.msg")
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+            })
     }
 
     pub fn effective_cwd(&self) -> String {
@@ -382,6 +424,14 @@ impl FleetTracker {
                 self.blocked_hold.insert(t.address.clone(), (raw_att, None));
             } else if t.state == "finished" {
                 self.blocked_hold.remove(&t.address);
+            } else if let Some((_, clear_ts)) = self.blocked_hold.get_mut(&t.address) {
+                match clear_ts {
+                    None => *clear_ts = Some(now_ms),
+                    Some(since) if now_ms - *since >= BLOCKED_CLEAR_HYSTERESIS_MS => {
+                        self.blocked_hold.remove(&t.address);
+                    }
+                    _ => {}
+                }
             }
             next_map.insert(t.address.clone(), t);
         }
@@ -529,33 +579,46 @@ impl FleetTracker {
         }
     }
 
+    pub fn resolved_parent(term: &HcTerminal) -> Option<&str> {
+        term.parent
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .or_else(|| {
+                term.labels
+                    .get("cockpit.parent")
+                    .map(String::as_str)
+                    .filter(|p| !p.is_empty())
+            })
+    }
+
     /// Evaluates effective attention state for `addr` at `now_ms`, applying 1.5s clear-hysteresis.
-    pub fn effective_attention(&mut self, addr: &str, now_ms: i64) -> AttentionState {
+    pub fn effective_attention(&self, addr: &str, now_ms: i64) -> AttentionState {
         let Some(term) = self.terminals.get(addr) else {
             return AttentionState::Idle;
         };
         if term.state == "finished" {
-            self.blocked_hold.remove(addr);
             return term.raw_attention_state(now_ms);
         }
         let raw = term.raw_attention_state(now_ms);
         if matches!(raw, AttentionState::Blocked { .. }) {
-            self.blocked_hold
-                .insert(addr.to_string(), (raw.clone(), None));
             return raw;
         }
-        if let Some((held_state, clear_since)) = self.blocked_hold.get_mut(addr) {
-            let since = *clear_since.get_or_insert(now_ms);
-            if now_ms - since < BLOCKED_CLEAR_HYSTERESIS_MS {
+        if let Some((held_state, clear_since)) = self.blocked_hold.get(addr) {
+            let since = clear_since.unwrap_or(now_ms);
+            let effective_now_ms = if since >= 1_000 && now_ms > 0 && now_ms <= since / 500 {
+                now_ms * 1000
+            } else {
+                now_ms
+            };
+            if effective_now_ms - since < BLOCKED_CLEAR_HYSTERESIS_MS {
                 return held_state.clone();
             }
-            let _ = self.blocked_hold.remove(addr);
         }
         raw
     }
 
-    /// Computes child terminals (`parent == Some(parent_addr)`) that are currently in `Blocked` state.
-    pub fn blocked_children_map(&mut self, now_ms: i64) -> BTreeMap<String, Vec<String>> {
+    /// Computes child terminals (`parent == Some(parent_addr)` or `labels["cockpit.parent"]`) that are currently in `Blocked` state.
+    pub fn blocked_children_map(&self, now_ms: i64) -> BTreeMap<String, Vec<String>> {
         let addresses: Vec<String> = self.terminals.keys().cloned().collect();
         let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for addr in addresses {
@@ -564,12 +627,65 @@ impl FleetTracker {
                 if let Some(parent) = self
                     .terminals
                     .get(&addr)
-                    .and_then(|t| t.parent.clone())
-                    .filter(|p| !p.is_empty())
+                    .and_then(Self::resolved_parent)
+                    .map(str::to_string)
                 {
                     map.entry(parent).or_default().push(addr);
                 }
             }
+        }
+        for children in map.values_mut() {
+            children.sort();
+            children.dedup();
+        }
+        map
+    }
+
+    /// Computes active child terminals per parent:
+    /// 1. Live child terminals listed in `active_orch_children` (`status IN ('starting', 'dispatched', 'waiting_for_reply')`), AND
+    /// 2. Non-orchestrated live child terminals (`cockpit.orch.role != Some("worker")`) whose `effective_attention` is `Working` or `Blocked`.
+    pub fn active_children_map(
+        &self,
+        active_orch_children: &BTreeMap<String, Vec<String>>,
+        now_sec: i64,
+    ) -> BTreeMap<String, Vec<String>> {
+        let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        for (parent, child_ids) in active_orch_children {
+            for child_id in child_ids {
+                if self
+                    .terminals
+                    .get(child_id)
+                    .is_some_and(|term| term.state != "finished")
+                {
+                    map.entry(parent.clone())
+                        .or_default()
+                        .push(child_id.clone());
+                }
+            }
+        }
+
+        for (addr, term) in &self.terminals {
+            if term.state == "finished" {
+                continue;
+            }
+            if term.labels.get("cockpit.orch.role").map(String::as_str) == Some("worker") {
+                continue;
+            }
+            if let Some(parent) = Self::resolved_parent(term).map(str::to_string) {
+                let att = self.effective_attention(addr, now_sec);
+                if matches!(
+                    att,
+                    AttentionState::Working { .. } | AttentionState::Blocked { .. }
+                ) {
+                    map.entry(parent).or_default().push(addr.clone());
+                }
+            }
+        }
+
+        for children in map.values_mut() {
+            children.sort();
+            children.dedup();
         }
         map
     }
@@ -795,6 +911,164 @@ impl HerdrClient {
         let stdout = BufReader::new(child.stdout.take().context("missing hc events stdout")?);
         Ok((child, stdout))
     }
+
+    pub async fn send_guarded_if_idle(&self, terminal: &str, text: &str) -> Result<bool> {
+        let out = tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(&self.hc_bin)
+                .args(["send", "--if", "idle", terminal, text, "--json"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .context("hc send --if idle timed out")??;
+
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(9) | Some(10) => Ok(false),
+            other => bail!(
+                "hc send --if idle {} failed (exit code {:?}): {}",
+                terminal,
+                other,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ),
+        }
+    }
+
+    pub async fn run_worker(
+        &self,
+        parent_terminal: &str,
+        cwd: &Path,
+        labels: &[(&str, &str)],
+        agent_cmd: &str,
+        first_message: &str,
+    ) -> Result<HcTerminal> {
+        let mut cmd = Command::new(&self.hc_bin);
+        cmd.args([
+            "run",
+            "--bg",
+            "--no-notify",
+            "--outlive-parent",
+            "--parent",
+            parent_terminal,
+            "--cwd",
+        ]);
+        cmd.arg(cwd);
+        for (k, v) in labels {
+            cmd.arg("--label").arg(format!("{k}={v}"));
+        }
+        cmd.arg("--json");
+        let cmd_tokens: Vec<&str> = agent_cmd.split_whitespace().collect();
+        if cmd_tokens.is_empty() {
+            bail!("agent_cmd cannot be empty");
+        }
+        for tok in cmd_tokens {
+            cmd.arg(tok);
+        }
+        cmd.arg(first_message);
+        cmd.stdin(Stdio::null());
+
+        let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
+            .await
+            .context("hc run timed out")??;
+
+        if !out.status.success() {
+            bail!(
+                "hc run failed with status {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+
+        let val: Value = serde_json::from_slice(&out.stdout)
+            .context("invalid JSON output from hc run --json")?;
+        let parsed_fm: Option<HcFirstMessage> = val
+            .get("first_message")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        let has_full_terminal_fields =
+            val.get("state").is_some() || val.get("created_ms").is_some();
+        if has_full_terminal_fields {
+            if let Ok(mut term) = serde_json::from_value::<HcTerminal>(val.clone()) {
+                if !term.address.is_empty() {
+                    if term.first_message.is_none() {
+                        term.first_message = parsed_fm;
+                    }
+                    return Ok(term);
+                }
+            }
+        }
+
+        let id = val
+            .get("address")
+            .or_else(|| val.get("terminal"))
+            .or_else(|| val.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .context("hc run --json output missing terminal id/address")?;
+
+        let mut rpc = None;
+        if let Ok(mut fetched) = self.get_terminal(&mut rpc, &id).await {
+            if fetched.first_message.is_none() {
+                fetched.first_message = parsed_fm;
+            }
+            return Ok(fetched);
+        }
+
+        if let Ok(Ok(get_out)) = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(&self.hc_bin)
+                .args(["get", &id, "--json"])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        {
+            if get_out.status.success() {
+                if let Ok(mut fetched) = serde_json::from_slice::<HcTerminal>(&get_out.stdout) {
+                    if fetched.first_message.is_none() {
+                        fetched.first_message = parsed_fm;
+                    }
+                    return Ok(fetched);
+                }
+            }
+        }
+
+        let mut term: HcTerminal = serde_json::from_value(val)?;
+        if term.address.is_empty() {
+            term.address = id;
+        }
+        if term.state.is_empty() {
+            term.state = "live".to_string();
+        }
+        if term.first_message.is_none() {
+            term.first_message = parsed_fm;
+        }
+        Ok(term)
+    }
+
+    pub async fn read_tail_lines(&self, terminal: &str, lines: usize) -> Result<String> {
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            Command::new(&self.hc_bin)
+                .args(["read", terminal])
+                .stdin(Stdio::null())
+                .output(),
+        )
+        .await
+        .context("hc read timed out")??;
+
+        if !out.status.success() {
+            bail!(
+                "hc read {} failed with status {}: {}",
+                terminal,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let raw = String::from_utf8_lossy(&out.stdout);
+        crate::supervisor::hc::extract_tail_lines(&raw, lines)
+    }
 }
 
 #[cfg(test)]
@@ -931,5 +1205,157 @@ mod tests {
             ..Default::default()
         };
         assert!(attached_to_named_agent.is_plain_shell_foreground());
+    }
+
+    #[test]
+    fn test_active_children_map_and_resolved_parent() {
+        let mut tracker = FleetTracker::new();
+        let coord = HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            status: Some(HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // t2: orchestrated worker with active dispatch (even if currently idle at prompt)
+        let mut t2_labels = BTreeMap::new();
+        t2_labels.insert("cockpit.orch.role".into(), "worker".into());
+        t2_labels.insert("cockpit.parent".into(), "t1".into());
+        let worker_active = HcTerminal {
+            address: "t2".into(),
+            state: "live".into(),
+            labels: t2_labels,
+            status: Some(HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // t3: orchestrated worker whose dispatch already completed (not in active_orch_children)
+        let mut t3_labels = BTreeMap::new();
+        t3_labels.insert("cockpit.orch.role".into(), "worker".into());
+        t3_labels.insert("cockpit.parent".into(), "t1".into());
+        let worker_completed = HcTerminal {
+            address: "t3".into(),
+            state: "live".into(),
+            labels: t3_labels,
+            status: Some(HcStatus {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // t4: non-orchestrated child via cockpit.parent label that is Working
+        let mut t4_labels = BTreeMap::new();
+        t4_labels.insert("cockpit.parent".into(), "t1".into());
+        let adhoc_working = HcTerminal {
+            address: "t4".into(),
+            state: "live".into(),
+            labels: t4_labels,
+            status: Some(HcStatus {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // t5: non-orchestrated child that is Idle -> should NOT be in active_children
+        let adhoc_idle = HcTerminal {
+            address: "t5".into(),
+            parent: Some("t1".into()),
+            state: "live".into(),
+            status: Some(HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        tracker.apply_snapshot(
+            vec![
+                coord,
+                worker_active,
+                worker_completed,
+                adhoc_working,
+                adhoc_idle,
+            ],
+            1_000,
+        );
+
+        let mut active_orch = BTreeMap::new();
+        active_orch.insert("t1".to_string(), vec!["t2".to_string()]);
+        let active_map = tracker.active_children_map(&active_orch, 1);
+        assert_eq!(
+            active_map.get("t1"),
+            Some(&vec!["t2".to_string(), "t4".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_hc_first_message_deserialization() {
+        let raw = r#"{"address":"t8","state":"live","created_ms":5000,"turn":1,"first_message":{"sent":false,"reason":"trust_dialog","started":false,"turn":0}}"#;
+        let term: HcTerminal = serde_json::from_str(raw).unwrap();
+        let fm = term.first_message.unwrap();
+        assert!(!fm.sent);
+        assert_eq!(fm.reason.as_deref(), Some("trust_dialog"));
+        assert_eq!(fm.started, Some(false));
+        assert_eq!(fm.turn, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_run_worker_and_read_tail_lines() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_hc = tmp.path().join("fake-hc");
+        let args_file = tmp.path().join("args.txt");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               printf '%s\\n' \"$@\" > \"{}\"\n\
+               echo '{{\"address\":\"t12\",\"state\":\"live\",\"created_ms\":4200,\"turn\":1,\"first_message\":{{\"sent\":true,\"started\":true,\"turn\":1}}}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"read\" ]; then\n\
+               printf 'line 1\\nline 2\\nline 3\\n'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            args_file.display()
+        );
+        fs::write(&fake_hc, script).unwrap();
+        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+        let labels = [
+            ("cockpit.orch.role", "worker"),
+            ("cockpit.orch.run", "run_1"),
+        ];
+        let term = client
+            .run_worker(
+                "t1",
+                tmp.path(),
+                &labels,
+                "codex --no-daemon",
+                "[TCHELVIS] Do task",
+            )
+            .await
+            .unwrap();
+        assert_eq!(term.address, "t12");
+        assert_eq!(term.created_ms, Some(4200));
+        assert!(term.first_message.unwrap().sent);
+
+        let recorded_args = fs::read_to_string(&args_file).unwrap();
+        let arg_lines: Vec<&str> = recorded_args.lines().collect();
+        assert!(arg_lines.contains(&"--bg"));
+        assert!(arg_lines.contains(&"--no-notify"));
+        assert!(arg_lines.contains(&"--outlive-parent"));
+        assert!(arg_lines.contains(&"codex"));
+        assert!(arg_lines.contains(&"--no-daemon"));
+        assert_eq!(arg_lines.last().copied(), Some("[TCHELVIS] Do task"));
+
+        let tail = client.read_tail_lines("t12", 2).await.unwrap();
+        assert_eq!(tail, "line 2\nline 3");
     }
 }

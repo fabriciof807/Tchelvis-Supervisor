@@ -170,6 +170,25 @@ pub async fn run_doctor(
         }
     };
 
+    // 4b. Check Orchestration SQLite store (`orch.db`)
+    match crate::orch::store::OrchStore::open(&paths.orch_db_file()) {
+        Ok(_) => {
+            checks.push(DoctorCheck {
+                name: "orch_db".into(),
+                status: "ok".into(),
+                detail: format!("SQLite WAL ready at {}", paths.orch_db_file().display()),
+            });
+        }
+        Err(e) => {
+            has_fail = true;
+            checks.push(DoctorCheck {
+                name: "orch_db".into(),
+                status: "fail".into(),
+                detail: format!("SQLite error: {e}"),
+            });
+        }
+    }
+
     // 5. Check all 6 providers
     let coord = ProviderCoordinator::new();
     let providers = coord.check_all_health(cfg, &store, &paths.home_dir).await;

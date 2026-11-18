@@ -296,10 +296,8 @@ impl SupervisorTuiApp {
         match &agent.action_card {
             Some(card) => {
                 let agent_changed = self.command_draft_agent_id.as_deref() != Some(&agent.agent_id);
-                if agent_changed && !self.editing_command {
-                    self.command_draft = card.hc_command_payload.clone();
-                    self.command_draft_agent_id = Some(agent.agent_id.clone());
-                } else if self.command_draft_agent_id.is_none() {
+                if (agent_changed && !self.editing_command) || self.command_draft_agent_id.is_none()
+                {
                     self.command_draft = card.hc_command_payload.clone();
                     self.command_draft_agent_id = Some(agent.agent_id.clone());
                 }

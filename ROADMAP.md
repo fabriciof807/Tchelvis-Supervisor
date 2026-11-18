@@ -36,7 +36,7 @@ with the UI track.
 | M4 | Inspector multi-terminal view | M3 | Planned |
 | M5a | Rename to `tchelvis` + release pipeline | M0 | **Done** — `v0.2.0` published 2026-11-16 |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
-| M6 | Delegator mode: wake the coordinator when a worker finishes | — | Idea (not planned) |
+| M6 | Delegator mode: multi-agent orchestration (`tchelvis orch`, [design](docs/designs/m6-orchestration.md)) | — | **Implemented** |
 | M7 | Kanban board mod: daily tasks grouped by project tag | Daily-tasks tags | Idea (not planned) |
 | M8 | Supervisor chat ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`); host validation pending; phase B idea |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
@@ -152,23 +152,13 @@ Herdr's shipped `tabs` mod; changing it would mean forking it with `mod.clone`).
   the created terminal id (else find yazi by foreground program among the tab's terminals), and
   `herdr-app check` / `herdr-app shot` for the visual check.
 
-### M6 — Delegator mode (idea, not planned)
-A coordinator agent opens worker agents in Herdr terminals and should not have to poll them (as the
-Orca orchestration skill does). Instead the supervisor watches and wakes the coordinator.
-- **Link:** each worker is marked as working for a coordinator (hc `parent` field or a label).
-- **"Finished"** = the worker is back at its prompt waiting for input. A worker blocked on a
-  permission prompt (`[y/N]`) keeps the normal auto-reply/alert flow and does not count.
-- **Notice:** the supervisor sends the coordinator a short deterministic message (e.g. "worker
-  t11g is back at its prompt"). No LLM, no summary.
-- **Judgement stays with the coordinator:** it reads the worker's screen and decides whether it was
-  a checkpoint or the task is done.
-- **Prior art: T3 Code delegation.** The parent delegates, ends its turn, and the child's
-  completion wakes the parent with a short summary plus a pointer to the child's thread; the
-  parent never polls. M6 is the same contract over Herdr terminals.
-- **Open case:** a coordinator can show as `working` while it only waits on its own subagents.
-  Delivery must detect "only waiting on children" (static screen + active children, cf.
-  `blocked_children` rollup) instead of trusting the status, and account for how each agent
-  handles text typed mid-turn (queued vs. mixed into its input).
+### M6 — Delegator mode & multi-agent orchestration (implemented)
+Event-driven parent-child agent orchestration (`tchelvis orch`) over Herdr (`hc`) terminals. Design: [M6 spec](docs/designs/m6-orchestration.md).
+- **CLI (`tchelvis orch`):** `run-create`, `task-create`, `dispatch`, `send`, `ask`, `reply`, `check`, `status`, `release`, and `skill`. Workers are spawned via `hc run --bg --no-notify --outlive-parent` (or attached to existing terminals) with an auto-generated `[TCHELVIS ORCHESTRATION WORKER CONTRACT]` preamble and `--request-id` idempotency receipts.
+- **Durable SQLite mailbox (`orch.db` in WAL mode):** Tracks `runs`, `tasks` (composite `PRIMARY KEY (run_id, id)` with automatic `pending -> ready` / `blocked` DAG propagation and 3-failure circuit breaking), fenced `dispatch_contexts` (`(assignee_terminal, terminal_created_ms)`), `messages`, `question_threads`, and `mutation_receipts`.
+- **Atomic guarded pointer delivery (`OrchDeliveryCoordinator` in `tchelvis daemon`):** Serializes single-line pointer wakeups (`[tchelvis] You have N orchestration message(s) in run <run_id>...`) via `hc send --if idle <terminal> "<pointer>"` (non-force), coalescing concurrent child messages and retrying after 30s (`MAX_DELIVERY_ATTEMPTS = 3`).
+- **Zero-LLM safety net & unloaded-LLM fallback (`OrchReconciler` in `tchelvis daemon`):** Synthesizes deterministic escalations when a worker returns to its prompt for `>= 1500ms` after `turn > turn_at_dispatch` without `worker_done` (`msg_stop_<dispatch_id>_<turn>`), exits/errors out, or remains `blocked` on a prompt for `>= 3000ms` (`msg_block_<dispatch_id>_<turn>`, giving the supervisor read-only fast path and optional loaded LLM first refusal).
+- **Waiting-on-children visibility:** `FleetTracker::active_children_map` populates `active_children` on `AgentRow` and `AgentSummaryRow` so idle coordinators with live child dispatches render `"Waiting on children (N)"` in `tchelvis status` and the Herdr Desktop mod.
 
 ## Decisions
 

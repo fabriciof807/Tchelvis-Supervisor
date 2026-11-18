@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::time::Duration;
 use tchelvis::config::{CockpitConfig, CockpitPaths};
 use tchelvis::daemon::{collect_once, query_socket_once, run_daemon};
@@ -186,6 +185,11 @@ enum Commands {
     Chat {
         #[command(subcommand)]
         action: ChatCommand,
+    },
+    /// Multi-agent parent-child orchestration and mailbox commands
+    Orch {
+        #[command(subcommand)]
+        action: tchelvis::orch::cli::OrchCommands,
     },
 }
 
@@ -423,7 +427,7 @@ enum ModelCommand {
     },
 }
 
-const VALID_LABEL_KEYS: [&str; 7] = [
+const VALID_LABEL_KEYS: [&str; 12] = [
     "cockpit.issue",
     "cockpit.pr",
     "cockpit.slack",
@@ -431,6 +435,11 @@ const VALID_LABEL_KEYS: [&str; 7] = [
     "cockpit.agent",
     "cockpit.supervisor_state",
     "cockpit.supervisor_decision",
+    "cockpit.parent",
+    "cockpit.orch.role",
+    "cockpit.orch.run",
+    "cockpit.orch.task",
+    "cockpit.orch.dispatch",
 ];
 
 #[tokio::main]
@@ -470,7 +479,7 @@ async fn main() -> Result<()> {
         Commands::Watch { json } => {
             let sock = paths.socket_file();
             if !sock.exists() {
-                let _ = try_autospawn_daemon(&sock).await;
+                let _ = tchelvis::daemon::ensure_daemon_running(&paths).await;
             }
             if let Ok(stream) = UnixStream::connect(&sock).await {
                 let (read_half, mut write_half) = stream.into_split();
@@ -1368,6 +1377,9 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Commands::Orch { action } => {
+            tchelvis::orch::cli::execute_orch_command(action, &cfg, &paths).await
+        }
     }
 }
 
@@ -1394,7 +1406,7 @@ async fn obtain_snapshot(
     }
 
     if !no_spawn {
-        let _ = try_autospawn_daemon(&sock).await;
+        let _ = tchelvis::daemon::ensure_daemon_running(paths).await;
         if let Ok(snap) = query_socket_once::<CockpitSnapshot>(&sock, &req).await {
             return Ok(snap);
         }
@@ -1404,25 +1416,6 @@ async fn obtain_snapshot(
     let herdr = HerdrClient::default();
     let coord = ProviderCoordinator::new();
     collect_once(cfg, paths, &store, &herdr, &coord, include_all, refresh).await
-}
-
-async fn try_autospawn_daemon(sock_path: &std::path::Path) -> Result<()> {
-    let exe = std::env::current_exe()?;
-    let _child = Command::new(exe)
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    for _ in 0..10 {
-        if sock_path.exists() {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Ok(())
 }
 
 fn print_human_status(snap: &CockpitSnapshot) {
@@ -1449,6 +1442,12 @@ fn print_human_status(snap: &CockpitSnapshot) {
             other => {
                 if !row.lifecycle.is_live() {
                     "finished".to_string()
+                } else if matches!(
+                    row.attention_state,
+                    AttentionState::Idle | AttentionState::Done { .. }
+                ) && !row.active_children.is_empty()
+                {
+                    format!("Waiting on children ({})", row.active_children.len())
                 } else {
                     other.label().to_string()
                 }
@@ -1492,6 +1491,9 @@ fn print_human_inspect(resp: &InspectResponse) {
     println!("Attention State: {:?}", a.attention_state);
     if !a.blocked_children.is_empty() {
         println!("Blocked Children: {}", a.blocked_children.join(", "));
+    }
+    if !a.active_children.is_empty() {
+        println!("Active Children: {}", a.active_children.join(", "));
     }
     println!("Workspace CWD: {}", a.workspace.cwd);
     println!(
@@ -1686,8 +1688,8 @@ fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
         return;
     }
     println!(
-        "{:<2} {:<28} {:<7} {:<15} {:<9} {:<8} {}",
-        "·", "NAME", "PARAMS", "SOURCE", "SIZE", "QUANT", "ID"
+        "{:<2} {:<28} {:<7} {:<15} {:<9} {:<8} ID",
+        "·", "NAME", "PARAMS", "SOURCE", "SIZE", "QUANT"
     );
     for m in &out.models {
         let dot = if m.in_use { "●" } else { " " };

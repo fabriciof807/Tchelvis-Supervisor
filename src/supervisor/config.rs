@@ -518,8 +518,10 @@ mod tests {
 
     #[test]
     fn test_default_gpu_and_idle_unload() {
-        let mut cfg = SupervisorConfig::default();
-        cfg.allow_gpu = false;
+        let cfg = SupervisorConfig {
+            allow_gpu: false,
+            ..Default::default()
+        };
         assert_eq!(cfg.effective_num_gpu(), 0);
         assert_eq!(cfg.idle_unload_secs, 180);
     }

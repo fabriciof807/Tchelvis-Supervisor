@@ -879,9 +879,11 @@ mod tests {
 
     #[test]
     fn test_request_payload_sets_num_gpu_zero_when_allow_gpu_false() {
-        let mut config = SupervisorConfig::default();
-        config.allow_gpu = false;
-        config.gpu_layers = 99;
+        let config = SupervisorConfig {
+            allow_gpu: false,
+            gpu_layers: 99,
+            ..Default::default()
+        };
         let client = OllamaClient::new(config);
         let state = sample_state();
 
@@ -897,9 +899,11 @@ mod tests {
 
     #[test]
     fn test_build_openai_chat_request_body_structure() {
-        let mut config = SupervisorConfig::default();
-        config.llm_backend = LlmBackendKind::OpenAiCompatible;
-        config.ollama_model = "openai/gpt-4o-mini".to_string();
+        let config = SupervisorConfig {
+            llm_backend: LlmBackendKind::OpenAiCompatible,
+            ollama_model: "openai/gpt-4o-mini".to_string(),
+            ..Default::default()
+        };
         let client = OllamaClient::new(config);
         let state = sample_state();
 

@@ -178,6 +178,10 @@ impl CockpitPaths {
         self.data_dir.join("state.db")
     }
 
+    pub fn orch_db_file(&self) -> PathBuf {
+        self.data_dir.join("orch.db")
+    }
+
     pub fn log_file(&self) -> PathBuf {
         self.state_dir.join("tchelvis.log")
     }

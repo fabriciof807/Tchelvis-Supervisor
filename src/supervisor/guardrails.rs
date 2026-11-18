@@ -26,7 +26,7 @@ pub fn contains_forbidden_payload(payload: &str) -> Option<&'static str> {
             let boundary_ok = lower[..abs]
                 .chars()
                 .next_back()
-                .map_or(true, |c| !c.is_alphanumeric());
+                .is_none_or(|c| !c.is_alphanumeric());
             if boundary_ok {
                 return true;
             }

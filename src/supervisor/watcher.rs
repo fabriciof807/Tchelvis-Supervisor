@@ -686,13 +686,14 @@ mod tests {
     use tempfile::tempdir;
 
     type SharedScreens = std::sync::Arc<Mutex<std::collections::HashMap<String, String>>>;
+    type RecordedLabels = Mutex<Vec<(String, Vec<(String, String)>)>>;
 
     struct MockHc {
         sessions: Mutex<Vec<HcSession>>,
         outputs: Mutex<VecDeque<String>>,
         sent_inputs: Mutex<Vec<(String, String, bool)>>,
         fail_send_input: Mutex<Option<String>>,
-        labels: Mutex<Vec<(String, Vec<(String, String)>)>>,
+        labels: RecordedLabels,
         /// Per-agent screens; when set for an agent it wins over the shared `outputs` queue.
         outputs_by_agent: SharedScreens,
         /// Shared call log (`send:<id>`, `eval`) to assert ordering across both mocks.
@@ -837,10 +838,11 @@ mod tests {
     }
 
     fn test_config(dir: &tempfile::TempDir) -> SupervisorConfig {
-        let mut cfg = SupervisorConfig::default();
-        cfg.state_file_path = dir.path().join("supervisor_state.json");
-        cfg.enable_desktop_notifications = false;
-        cfg
+        SupervisorConfig {
+            state_file_path: dir.path().join("supervisor_state.json"),
+            enable_desktop_notifications: false,
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -5,6 +5,9 @@ use crate::model::{
     AgentRow, CockpitSnapshot, FleetSummary, FleetSummaryProjection, InspectResponse, IpcOp,
     IpcRequest, SNAPSHOT_SCHEMA_VERSION,
 };
+use crate::orch::delivery::OrchDeliveryCoordinator;
+use crate::orch::reconciler::OrchReconciler;
+use crate::orch::store::OrchStore;
 use crate::providers::ProviderCoordinator;
 use crate::store::CacheStore;
 use anyhow::{bail, Context, Result};
@@ -13,11 +16,36 @@ use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Command;
 use tokio::sync::{broadcast, RwLock};
+
+pub async fn ensure_daemon_running(paths: &CockpitPaths) -> Result<()> {
+    let sock_path = paths.socket_file();
+    if sock_path.exists() && UnixStream::connect(&sock_path).await.is_ok() {
+        return Ok(());
+    }
+    let exe = std::env::current_exe()?;
+    let _child = Command::new(exe)
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    for _ in 0..10 {
+        if sock_path.exists() {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
 
 pub struct DaemonLock {
     file: File,
@@ -113,6 +141,10 @@ pub async fn materialize_snapshot(
     let now_sec = now_ms / 1000;
     let ttl_cutoff_ms = now_ms - (cfg.retention.finished_ttl_hours as i64) * 3600 * 1000;
     let blocked_children_map = tracker.blocked_children_map(now_ms);
+    let active_orch_children = OrchStore::open(&paths.orch_db_file())
+        .and_then(|s| s.active_dispatches_by_parent())
+        .unwrap_or_default();
+    let active_children_map = tracker.active_children_map(&active_orch_children, now_sec);
     let addresses: Vec<String> = tracker.terminals.keys().cloned().collect();
 
     let mut agents = Vec::new();
@@ -132,7 +164,8 @@ pub async fn materialize_snapshot(
         }
         let att = tracker.effective_attention(&addr, now_ms);
         let blocked_children = blocked_children_map.get(&addr).cloned().unwrap_or_default();
-        let row = build_initial_agent_row(&term, att, blocked_children, now_sec);
+        let mut row = build_initial_agent_row(&term, att, blocked_children, now_sec);
+        row.active_children = active_children_map.get(&addr).cloned().unwrap_or_default();
         agents.push(row);
     }
 
@@ -180,6 +213,7 @@ pub async fn run_daemon(
     fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o600))?;
 
     let store = CacheStore::open(&paths.db_file())?;
+    let orch_store = OrchStore::open(&paths.orch_db_file())?;
     let herdr = HerdrClient::default();
     let coord = ProviderCoordinator::new();
     let mut rpc: Option<HcRpcSession> = None;
@@ -217,12 +251,14 @@ pub async fn run_daemon(
     let shared_snap = Arc::new(RwLock::new(initial_snap));
     let (tx, _) = broadcast::channel::<CockpitSnapshot>(32);
     let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<bool>(8);
+    let (orch_wake_tx, mut orch_wake_rx) = tokio::sync::mpsc::channel::<()>(32);
 
     // Spawn hc events --json consumer if available
     let mut event_child_and_reader = herdr.spawn_events_stream().ok();
     let mut event_line = String::new();
     let mut git_head_cache: BTreeMap<String, String> = BTreeMap::new();
 
+    let mut orch_tick = tokio::time::interval(Duration::from_millis(500));
     let mut worktree_tick = tokio::time::interval(Duration::from_secs(2));
     let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
 
@@ -237,6 +273,7 @@ pub async fn run_daemon(
                     let snap_clone = Arc::clone(&shared_snap);
                     let sub_rx = tx.subscribe();
                     let r_tx = refresh_tx.clone();
+                    let o_tx = orch_wake_tx.clone();
                     let cfg_c = cfg.clone();
                     let paths_c = paths.clone();
                     let store_c = store.clone();
@@ -248,6 +285,7 @@ pub async fn run_daemon(
                             snap_clone,
                             sub_rx,
                             r_tx,
+                            o_tx,
                             cfg_c,
                             paths_c,
                             store_c,
@@ -279,6 +317,38 @@ pub async fn run_daemon(
                 *shared_snap.write().await = updated.clone();
                 let _ = tx.send(updated);
             }
+            Some(()) = orch_wake_rx.recv() => {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                let reconcile_outcome =
+                    OrchReconciler::reconcile_active_dispatches(&orch_store, &herdr, &tracker, ts_ms)
+                        .await
+                        .unwrap_or_default();
+                let delivery_outcome =
+                    OrchDeliveryCoordinator::deliver_pending_pointers(&orch_store, &herdr, &tracker, ts_ms)
+                        .await
+                        .unwrap_or_default();
+                if reconcile_outcome.state_changed
+                    || delivery_outcome.delivered_count > 0
+                    || delivery_outcome.stalled_count > 0
+                {
+                    let updated = materialize_snapshot(
+                        &mut tracker,
+                        &cfg,
+                        &paths,
+                        &store,
+                        &coord,
+                        rpc.is_some(),
+                        Some(pid),
+                        false,
+                        false,
+                        ts_ms,
+                    ).await;
+                    let proj = FleetSummaryProjection::from_snapshot(&updated);
+                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
+                    *shared_snap.write().await = updated.clone();
+                    let _ = tx.send(updated);
+                }
+            }
             line_res = async {
                 if let Some((_, ref mut reader)) = event_child_and_reader {
                     event_line.clear();
@@ -295,6 +365,20 @@ pub async fn run_daemon(
                         let ts_ms = chrono::Utc::now().timestamp_millis();
                         if let Ok(item) = parse_hc_event_line(event_line.trim()) {
                             if tracker.apply_stream_item(item, ts_ms) {
+                                let _ = OrchReconciler::reconcile_active_dispatches(
+                                    &orch_store,
+                                    &herdr,
+                                    &tracker,
+                                    ts_ms,
+                                )
+                                .await;
+                                let _ = OrchDeliveryCoordinator::deliver_pending_pointers(
+                                    &orch_store,
+                                    &herdr,
+                                    &tracker,
+                                    ts_ms,
+                                )
+                                .await;
                                 let updated = materialize_snapshot(
                                     &mut tracker,
                                     &cfg,
@@ -314,6 +398,38 @@ pub async fn run_daemon(
                             }
                         }
                     }
+                }
+            }
+            _ = orch_tick.tick() => {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                let reconcile_outcome =
+                    OrchReconciler::reconcile_active_dispatches(&orch_store, &herdr, &tracker, ts_ms)
+                        .await
+                        .unwrap_or_default();
+                let delivery_outcome =
+                    OrchDeliveryCoordinator::deliver_pending_pointers(&orch_store, &herdr, &tracker, ts_ms)
+                        .await
+                        .unwrap_or_default();
+                if reconcile_outcome.state_changed
+                    || delivery_outcome.delivered_count > 0
+                    || delivery_outcome.stalled_count > 0
+                {
+                    let updated = materialize_snapshot(
+                        &mut tracker,
+                        &cfg,
+                        &paths,
+                        &store,
+                        &coord,
+                        rpc.is_some(),
+                        Some(pid),
+                        false,
+                        false,
+                        ts_ms,
+                    ).await;
+                    let proj = FleetSummaryProjection::from_snapshot(&updated);
+                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
+                    *shared_snap.write().await = updated.clone();
+                    let _ = tx.send(updated);
                 }
             }
             _ = worktree_tick.tick() => {
@@ -361,6 +477,20 @@ pub async fn run_daemon(
                 }
                 if let Ok(terms) = herdr.list_terminals_full(&mut rpc).await {
                     tracker.apply_snapshot(terms, ts_ms);
+                    let _ = OrchReconciler::reconcile_active_dispatches(
+                        &orch_store,
+                        &herdr,
+                        &tracker,
+                        ts_ms,
+                    )
+                    .await;
+                    let _ = OrchDeliveryCoordinator::deliver_pending_pointers(
+                        &orch_store,
+                        &herdr,
+                        &tracker,
+                        ts_ms,
+                    )
+                    .await;
                     let updated = materialize_snapshot(
                         &mut tracker,
                         &cfg,
@@ -397,6 +527,7 @@ async fn handle_ipc_client(
     shared_snap: Arc<RwLock<CockpitSnapshot>>,
     mut sub_rx: broadcast::Receiver<CockpitSnapshot>,
     refresh_tx: tokio::sync::mpsc::Sender<bool>,
+    orch_wake_tx: tokio::sync::mpsc::Sender<()>,
     cfg: CockpitConfig,
     paths: CockpitPaths,
     store: CacheStore,
@@ -478,6 +609,10 @@ async fn handle_ipc_client(
                     break;
                 }
             }
+        }
+        IpcOp::OrchWake => {
+            let _ = orch_wake_tx.try_send(());
+            write_half.write_all(b"{\"ok\":true}\n").await?;
         }
     }
     Ok(())

@@ -150,9 +150,10 @@ fn run_cmd_with_timeout(bin: &Path, args: &[&str], timeout: Duration) -> Result<
     })
 }
 
-pub fn parse_usage_document(
-    raw: &str,
-) -> Result<(Option<String>, Option<Vec<String>>, Vec<serde_json::Value>), String> {
+/// Parsed `usage.json` shape: `(primary vendor, overview vendors, raw usage entries)`.
+pub type UsageDocument = (Option<String>, Option<Vec<String>>, Vec<serde_json::Value>);
+
+pub fn parse_usage_document(raw: &str) -> Result<UsageDocument, String> {
     let val: serde_json::Value =
         serde_json::from_str(raw.trim()).map_err(|e| format!("invalid usage JSON: {e}"))?;
     let primary = val

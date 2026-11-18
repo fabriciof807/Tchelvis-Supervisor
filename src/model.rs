@@ -435,6 +435,8 @@ pub struct AgentRow {
     #[serde(default)]
     pub blocked_children: Vec<String>,
     #[serde(default)]
+    pub active_children: Vec<String>,
+    #[serde(default)]
     pub turn: u64,
     #[serde(default)]
     pub reported: bool,
@@ -558,6 +560,8 @@ pub struct AgentSummaryRow {
     pub prompt_destructive: bool,
     #[serde(default)]
     pub blocked_children: Vec<String>,
+    #[serde(default)]
+    pub active_children: Vec<String>,
     pub cwd: String,
     #[serde(default)]
     pub git_branch: Option<String>,
@@ -589,6 +593,7 @@ impl AgentSummaryRow {
             attention_state: row.attention_state.clone(),
             prompt_destructive: row.prompt_destructive,
             blocked_children: row.blocked_children.clone(),
+            active_children: row.active_children.clone(),
             cwd: row.workspace.cwd.clone(),
             git_branch: row.workspace.git_branch.clone(),
             correlation_tier: row.correlation_tier,
@@ -690,6 +695,8 @@ pub enum IpcOp {
     Watch,
     Inspect,
     Refresh,
+    #[serde(rename = "orch_wake")]
+    OrchWake,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

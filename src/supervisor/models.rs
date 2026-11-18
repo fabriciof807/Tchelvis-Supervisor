@@ -135,10 +135,9 @@ pub fn parse_params_label(s: &str) -> Option<u64> {
         (n, 1_000_000_000.0)
     } else if let Some(n) = upper.strip_suffix('M') {
         (n, 1_000_000.0)
-    } else if let Some(n) = upper.strip_suffix('K') {
-        (n, 1_000.0)
     } else {
-        return None;
+        let n = upper.strip_suffix('K')?;
+        (n, 1_000.0)
     };
     let val: f64 = num_str.trim().parse().ok()?;
     if !val.is_finite() || val <= 0.0 {
@@ -919,10 +918,9 @@ pub fn env_override_note(
     let (var_name, val) =
         if let Some(v) = tchelvis_llm_model.map(str::trim).filter(|s| !s.is_empty()) {
             ("TCHELVIS_LLM_MODEL", v)
-        } else if let Some(v) = ollama_model_env.map(str::trim).filter(|s| !s.is_empty()) {
-            ("OLLAMA_MODEL", v)
         } else {
-            return None;
+            let v = ollama_model_env.map(str::trim).filter(|s| !s.is_empty())?;
+            ("OLLAMA_MODEL", v)
         };
 
     if val != effective_display {

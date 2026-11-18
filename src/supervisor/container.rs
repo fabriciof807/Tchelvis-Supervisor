@@ -320,6 +320,7 @@ pub fn resolve_gpu_backend(cfg: &LlmContainerConfig) -> (GpuBackend, String) {
 
 /// Attempts `start` + `wait_health` across `candidates` in order, cleaning up failed containers
 /// and persisting the first runtime that succeeds.
+#[allow(clippy::too_many_arguments)]
 pub fn start_with_fallback<C, F, H>(
     candidates: &[ContainerRuntime],
     ngl: u32,

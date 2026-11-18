@@ -1299,7 +1299,13 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: enriched?.correlation_tier ?? null,
       context: enriched?.context ?? null,
       blocked_children: enriched?.blocked_children ?? [],
-      parent: enriched?.parent || term?.parent || a?.parent || null,
+      active_children: enriched?.active_children ?? [],
+      parent:
+        enriched?.parent ||
+        term?.parent ||
+        a?.parent ||
+        rowLabels?.["cockpit.parent"] ||
+        null,
       lifecycle: isFinished ? { state: "finished" } : { state: "live" },
       focused: Boolean(a.focused),
       pinned: Boolean(a.pinned),
@@ -1376,7 +1382,13 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: sa?.correlation_tier ?? null,
       context: sa?.context ?? null,
       blocked_children: sa?.blocked_children ?? [],
-      parent: sa?.parent || term?.parent || null,
+      active_children: sa?.active_children ?? [],
+      parent:
+        sa?.parent ||
+        term?.parent ||
+        sa?.labels?.["cockpit.parent"] ||
+        rowLabels?.["cockpit.parent"] ||
+        null,
       lifecycle: isFinished
         ? { state: "finished" }
         : (sa?.lifecycle ?? { state: term.state ?? "live" }),
@@ -1445,7 +1457,8 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: null,
       context: null,
       blocked_children: [],
-      parent: term?.parent || sup?.parent || null,
+      active_children: [],
+      parent: term?.parent || sup?.parent || rowLabels?.["cockpit.parent"] || null,
       lifecycle: {
         state: sup.lifecycle_state === "COMPLETED" ? "finished" : "live",
       },
@@ -1511,7 +1524,8 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       correlation_tier: null,
       context: null,
       blocked_children: [],
-      parent: term?.parent || null,
+      active_children: [],
+      parent: term?.parent || rowLabels?.["cockpit.parent"] || null,
       lifecycle: { state: term?.state ?? "live" },
       focused: false,
       pinned: false,
@@ -3607,22 +3621,31 @@ export default class CockpitMod extends View {
         a.lifecycle?.state === "finished" || a.state === "finished";
       const isBlocked = !isFinished && a.status === "blocked";
       const isWorking = !isFinished && a.status === "working";
+      const isWaitingOnChildren =
+        !isFinished &&
+        (a.status === "idle" || a.status === "done") &&
+        Array.isArray(a.active_children) &&
+        a.active_children.length > 0;
       const isDone = isFinished || a.status === "done";
       const hasAlert = !isFinished && Boolean(a.action_card);
       const statusLabel = isBlocked
         ? (a.kind ?? "NEEDS YOU").toUpperCase()
         : isWorking
           ? "WORKING"
-          : isDone
-            ? "DONE"
-            : "IDLE";
+          : isWaitingOnChildren
+            ? `Waiting on children (${a.active_children.length})`
+            : isDone
+              ? "DONE"
+              : "IDLE";
       const statusColor = isBlocked
         ? t.blocked
         : isWorking
           ? t.working
-          : isDone
-            ? t.done
-            : t.muted;
+          : isWaitingOnChildren
+            ? t.accent
+            : isDone
+              ? t.done
+              : t.muted;
       const pr = a.context?.pull_request;
       const issue = a.context?.issues?.[0]?.key ?? a.labels?.["cockpit.issue"];
       const tier = a.correlation_tier;
@@ -3766,6 +3789,23 @@ export default class CockpitMod extends View {
                 )
               )
           )
+        )
+        .when(
+          !isFinished &&
+            Array.isArray(a.active_children) &&
+            a.active_children.length > 0,
+          (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.accent)
+                .child(
+                  ellipsize(
+                    `↳ Active children: ${a.active_children.join(", ")}`,
+                    48
+                  )
+                )
+            )
         )
         // Row 3: Branch & Correlation Footer
         .child(
@@ -7481,23 +7521,35 @@ export default class CockpitMod extends View {
     const runbooks = detailed?.context?.runbooks ?? [];
     const labels = agent?.labels ?? {};
 
+    const selectedFinished =
+      agent?.lifecycle?.state === "finished" || agent?.state === "finished";
+    const selectedWaitingOnChildren =
+      Boolean(agent) &&
+      !selectedFinished &&
+      (agent.status === "idle" || agent.status === "done") &&
+      Array.isArray(agent.active_children) &&
+      agent.active_children.length > 0;
     const agentStatusLabel = agent
       ? agent.status === "blocked"
         ? (agent.kind ?? "NEEDS YOU").toUpperCase()
         : agent.status === "working"
           ? "WORKING"
-          : agent.status === "done" || agent.lifecycle?.state === "finished"
-            ? "DONE"
-            : "IDLE"
+          : selectedWaitingOnChildren
+            ? `Waiting on children (${agent.active_children.length})`
+            : agent.status === "done" || selectedFinished
+              ? "DONE"
+              : "IDLE"
       : "IDLE";
     const agentStatusColor = agent
       ? agent.status === "blocked"
         ? t.blocked
         : agent.status === "working"
           ? t.working
-          : agent.status === "done" || agent.lifecycle?.state === "finished"
-            ? t.done
-            : t.muted
+          : selectedWaitingOnChildren
+            ? t.accent
+            : agent.status === "done" || selectedFinished
+              ? t.done
+              : t.muted
       : t.muted;
 
     const corrTier = detailed?.correlation_tier ?? "local_only";

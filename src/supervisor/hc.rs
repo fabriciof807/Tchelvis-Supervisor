@@ -445,6 +445,7 @@ fn extract_status_fields(status: Option<&serde_json::Value>) -> (Option<String>,
 
 /// Returns `true` if the `hc` terminal represents an active coding agent session rather than
 /// an idle plain shell or a supervisor/tchelvis UI process.
+#[allow(clippy::too_many_arguments)]
 pub fn is_coding_agent_terminal(
     agent: Option<&str>,
     name: Option<&str>,
