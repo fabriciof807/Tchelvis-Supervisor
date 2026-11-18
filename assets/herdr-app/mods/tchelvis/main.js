@@ -576,6 +576,13 @@ export function fallbackMarker(result) {
   return host ? `via Fallback · ${host}` : "via Fallback";
 }
 
+export function chatElapsedLabel(startedAtMs, nowMs = Date.now()) {
+  const secs = Math.floor(
+    Math.max(0, Number(nowMs) - Number(startedAtMs)) / 1000
+  );
+  return secs >= 1 ? `◌ Gerando… ${secs}s` : "◌ Gerando…";
+}
+
 function formatShortHm(ts) {
   if (ts == null) return "--:--";
   const d = new Date(Number(ts) * 1000);
@@ -1522,6 +1529,9 @@ export default class CockpitMod extends View {
         : "inspector"; // "home" | "inspector" | "doctor" | "chat"
     this.chatMessages = [];
     this.chatPending = false;
+    this.chatStartedAtMs = 0;
+    this.wasChatVisible = false;
+    this.chatScroll = base.ScrollHandle?.new?.() ?? null;
     this.handle = cx.focus_handle();
 
     const taskInput = TextareaState.new({
@@ -2559,6 +2569,13 @@ export default class CockpitMod extends View {
     this.inputs?.[name]?.focus();
   }
 
+  scrollChatToBottom() {
+    if (!this.chatScroll) return;
+    const len = Array.isArray(this.chatMessages) ? this.chatMessages.length : 0;
+    const lastIndex = this.chatPending ? len : Math.max(0, len - 1);
+    this.chatScroll.scroll_to_item(lastIndex);
+  }
+
   setEditingField(name) {
     if (!name) {
       const hadEditing = this.editingField !== null;
@@ -3045,6 +3062,10 @@ export default class CockpitMod extends View {
       this.refreshInspector(cx);
     } else if (normalizedTab === "chat") {
       if (!shared("supervisor.snapshot")) this.fetchSupervisorStatus(cx);
+      if ((props()?.role ?? "fleet") === "inspector") {
+        this.scrollChatToBottom();
+        this.focusField("chat");
+      }
     }
     if (inspectorHidden) {
       run("layout.toggle", { id: "tchelvis-inspector" });
@@ -5321,7 +5342,13 @@ export default class CockpitMod extends View {
       { role: "user", content: question },
     ];
     this.chatPending = true;
+    this.chatStartedAtMs = Date.now();
+    this.scrollChatToBottom();
     cx?.notify();
+
+    const elapsedTimer = cx?.timer?.every?.(1000, (tickCx) => {
+      if (this.chatPending) (tickCx ?? cx)?.notify();
+    });
 
     cx.spawn(async (cx) => {
       try {
@@ -5371,7 +5398,10 @@ export default class CockpitMod extends View {
           },
         ];
       } finally {
+        elapsedTimer?.cancel?.();
         this.chatPending = false;
+        this.chatStartedAtMs = 0;
+        this.scrollChatToBottom();
         cx.notify();
       }
     });
@@ -5430,6 +5460,9 @@ export default class CockpitMod extends View {
           .flex_1()
           .min_h(0)
           .overflow_y_scrollbar()
+          .when(Boolean(this.chatScroll), (el) =>
+            el.track_scroll(this.chatScroll)
+          )
           .gap(8)
           .when(messages.length === 0 && !this.chatPending, (el) =>
             el.child(
@@ -5500,6 +5533,7 @@ export default class CockpitMod extends View {
                   );
               }
               const fbMark = fallbackMarker(m);
+              const content = String(m.content ?? "");
               return v_flex()
                 .id(`ck-chat-msg-${idx}`)
                 .p(9)
@@ -5533,30 +5567,48 @@ export default class CockpitMod extends View {
                     )
                 )
                 .child(
-                  div()
-                    .text_size(12)
-                    .text_color(t.foreground)
-                    .child(String(m.content ?? ""))
+                  typeof base.TextView?.markdown === "function"
+                    ? div()
+                        .text_size(12)
+                        .text_color(t.foreground)
+                        .child(base.TextView.markdown(`ck-chat-md-${idx}`, content))
+                    : div()
+                        .text_size(12)
+                        .text_color(t.foreground)
+                        .child(content)
                 );
             })
           )
-          .when(Boolean(this.chatPending), (el) =>
-            el.child(
-              v_flex()
+          .when(Boolean(this.chatPending), (el) => {
+            const label = chatElapsedLabel(this.chatStartedAtMs, Date.now());
+            const textOnly = label.replace(/^◌\s*/, "");
+            const spinnerEl = div().text_size(12).text_color(t.accent);
+            const hasFrames = typeof spinnerEl.frames === "function";
+            const indicator = hasFrames
+              ? spinnerEl.frames(
+                  ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                  90
+                )
+              : spinnerEl.child("◌");
+            return el.child(
+              h_flex()
                 .id("ck-chat-pending")
                 .p(9)
+                .gap(6)
+                .items_center()
                 .rounded(8)
                 .border(1)
                 .border_color(t.border)
                 .bg(t.surface)
+                .child(indicator)
                 .child(
                   div()
                     .text_size(12)
                     .text_color(t.muted)
-                    .child("◌ Pensando…")
+                    .child(textOnly)
                 )
-            )
-          )
+            );
+          })
       )
       // Input bar styled like Daily Tasks input
       .child(
@@ -7123,6 +7175,21 @@ export default class CockpitMod extends View {
     const modelPickerOnlyDrawer = Boolean(
       shared("cockpit.modelPickerOnlyDrawer") ?? this.modelPickerOnlyDrawer
     );
+    const inspectorHidden = Boolean(
+      findNode(layout(), "tchelvis-inspector")?.hidden
+    );
+    const chatVisible =
+      !inspectorHidden &&
+      activeView === "chat" &&
+      !(usageOpen && usageOnlyDrawer) &&
+      !(modelPickerOpen && modelPickerOnlyDrawer);
+    if (chatVisible && !this.wasChatVisible) {
+      this.wasChatVisible = true;
+      this.scrollChatToBottom();
+      this.focusField("chat");
+    } else if (!chatVisible) {
+      this.wasChatVisible = false;
+    }
 
     const supAgent =
       (supSnap?.agents ?? []).find((a) => a.agent_id === agent?.address) ??
