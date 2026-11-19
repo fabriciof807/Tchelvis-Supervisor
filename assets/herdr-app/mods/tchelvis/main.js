@@ -6857,7 +6857,6 @@ export default class CockpitMod extends View {
                       div()
                         .flex_none()
                         .text_size(10.5)
-                        .font_mono()
                         .text_color(t.muted)
                         .child(row.time || "—")
                     )

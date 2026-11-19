@@ -128,3 +128,17 @@ test("LOG_FILTERS declares the five stable chips in order", () => {
   );
   assert.ok(LOG_FILTERS[0].kinds === null);
 });
+
+test("mod source calls no element methods missing from gpui-kit", async () => {
+  // gpui-kit has no `font_mono`; calling it throws at render time
+  // ("unknown element method") and blanks the Log view. `herdr-app check`
+  // does not render the view, so guard the source directly.
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(
+    new URL("../../assets/herdr-app/mods/tchelvis/main.js", import.meta.url),
+    "utf8"
+  );
+  for (const method of ["font_mono"]) {
+    assert.ok(!src.includes(`.${method}(`), `main.js calls unknown method .${method}()`);
+  }
+});
