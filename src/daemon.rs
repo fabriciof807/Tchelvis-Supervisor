@@ -19,32 +19,88 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
+
+const DAEMON_START_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const DAEMON_START_MAX_ATTEMPTS: usize = 20;
+const MAX_DRAIN_EVENT_LINES: usize = 64;
+const IPC_REFRESH_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+
+struct RefreshRequest {
+    force: bool,
+    reply: oneshot::Sender<CockpitSnapshot>,
+}
+
+struct DaemonPublishCtx<'a> {
+    cfg: &'a CockpitConfig,
+    paths: &'a CockpitPaths,
+    store: &'a CacheStore,
+    coord: &'a ProviderCoordinator,
+    shared_snap: &'a Arc<RwLock<CockpitSnapshot>>,
+    tx: &'a broadcast::Sender<CockpitSnapshot>,
+    pid: u32,
+}
 
 pub async fn ensure_daemon_running(paths: &CockpitPaths) -> Result<()> {
+    let exe = std::env::current_exe().context("failed resolving current tchelvis executable")?;
+    ensure_daemon_running_with_exe(
+        paths,
+        &exe,
+        DAEMON_START_POLL_INTERVAL,
+        DAEMON_START_MAX_ATTEMPTS,
+    )
+    .await
+}
+
+async fn ensure_daemon_running_with_exe(
+    paths: &CockpitPaths,
+    exe: &Path,
+    poll_interval: Duration,
+    max_attempts: usize,
+) -> Result<()> {
     let sock_path = paths.socket_file();
-    if sock_path.exists() && UnixStream::connect(&sock_path).await.is_ok() {
+    if UnixStream::connect(&sock_path).await.is_ok() {
         return Ok(());
     }
-    let exe = std::env::current_exe()?;
-    let _child = Command::new(exe)
+    let mut child = Command::new(exe)
         .arg("daemon")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+        .with_context(|| format!("failed spawning daemon process `{}`", exe.display()))?;
 
-    for _ in 0..10 {
-        if sock_path.exists() {
-            tokio::time::sleep(Duration::from_millis(30)).await;
-            return Ok(());
+    let mut last_connect_err = None;
+    for _ in 0..max_attempts.max(1) {
+        tokio::time::sleep(poll_interval).await;
+        match UnixStream::connect(&sock_path).await {
+            Ok(_) => return Ok(()),
+            Err(err) => last_connect_err = Some(err),
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                bail!(
+                    "daemon process `{}` exited with status {} before socket `{}` accepted connections",
+                    exe.display(),
+                    status,
+                    sock_path.display()
+                );
+            }
+        }
     }
-    Ok(())
+
+    let err_detail = last_connect_err
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "socket never became connectable".to_string());
+    bail!(
+        "timed out waiting for daemon socket `{}` to accept connections (exe `{}`): {}",
+        sock_path.display(),
+        exe.display(),
+        err_detail
+    )
 }
 
 pub struct DaemonLock {
@@ -144,7 +200,7 @@ pub async fn materialize_snapshot(
     let active_orch_children = OrchStore::open(&paths.orch_db_file())
         .and_then(|s| s.active_dispatches_by_parent())
         .unwrap_or_default();
-    let active_children_map = tracker.active_children_map(&active_orch_children, now_sec);
+    let active_children_map = tracker.active_children_map(&active_orch_children, now_ms);
     let addresses: Vec<String> = tracker.terminals.keys().cloned().collect();
 
     let mut agents = Vec::new();
@@ -190,6 +246,144 @@ pub async fn materialize_snapshot(
     }
 }
 
+async fn refresh_and_publish_snapshot(
+    ctx: &DaemonPublishCtx<'_>,
+    tracker: &mut FleetTracker,
+    herdr: &HerdrClient,
+    rpc: &mut Option<HcRpcSession>,
+    herdr_connected: bool,
+    force_refresh: bool,
+    ts_ms: i64,
+) -> CockpitSnapshot {
+    let updated = materialize_snapshot(
+        tracker,
+        ctx.cfg,
+        ctx.paths,
+        ctx.store,
+        ctx.coord,
+        herdr_connected,
+        Some(ctx.pid),
+        false,
+        force_refresh,
+        ts_ms,
+    )
+    .await;
+    if herdr_connected {
+        let proj = FleetSummaryProjection::from_snapshot(&updated);
+        if let Err(err) = herdr.publish_doc_snapshot(rpc, &proj).await {
+            tracing::warn!("failed publishing doc snapshot to herdr: {err:#}");
+            *rpc = None;
+        }
+    }
+    *ctx.shared_snap.write().await = updated.clone();
+    let _ = ctx.tx.send(updated.clone());
+    updated
+}
+
+async fn run_orch_cycle(
+    orch_store: &OrchStore,
+    herdr: &HerdrClient,
+    tracker: &FleetTracker,
+    ts_ms: i64,
+    source: &str,
+) -> (crate::orch::ReconcileOutcome, crate::orch::DeliveryOutcome) {
+    let reconcile_outcome = match OrchReconciler::reconcile_active_dispatches(
+        orch_store, herdr, tracker, ts_ms,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!("orch reconcile failed ({source}): {err:#}");
+            Default::default()
+        }
+    };
+    let delivery_outcome =
+        match OrchDeliveryCoordinator::deliver_pending_pointers(orch_store, herdr, tracker, ts_ms)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                tracing::warn!("orch pointer delivery failed ({source}): {err:#}");
+                Default::default()
+            }
+        };
+    (reconcile_outcome, delivery_outcome)
+}
+
+async fn read_event_line_cancel_safe<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    loop {
+        let n = reader.read_until(b'\n', buf).await?;
+        if n == 0 {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            let raw = std::mem::take(buf);
+            return Ok(Some(String::from_utf8_lossy(&raw).into_owned()));
+        }
+        if buf.ends_with(b"\n") {
+            let raw = std::mem::take(buf);
+            return Ok(Some(String::from_utf8_lossy(&raw).into_owned()));
+        }
+    }
+}
+
+async fn drain_ready_event_lines<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    event_buf: &mut Vec<u8>,
+    tracker: &mut FleetTracker,
+    herdr_connected: &mut bool,
+    ts_ms: i64,
+    max_drain: usize,
+) -> (bool, bool) {
+    let mut any_changed = false;
+    let mut stream_closed = false;
+    for _ in 0..max_drain {
+        tokio::select! {
+            biased;
+            next_res = read_event_line_cancel_safe(reader, event_buf) => {
+                match next_res {
+                    Ok(Some(next_line)) => {
+                        if let Ok(item) = parse_hc_event_line(next_line.trim()) {
+                            *herdr_connected = true;
+                            if tracker.apply_stream_item(item, ts_ms) {
+                                any_changed = true;
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        stream_closed = true;
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::warn!("hc events stream read error: {err}");
+                        stream_closed = true;
+                        break;
+                    }
+                }
+            }
+            _ = std::future::ready(()) => break,
+        }
+    }
+    (any_changed, stream_closed)
+}
+
+async fn kill_and_reap_events_child(
+    event_child_and_reader: &mut Option<(
+        tokio::process::Child,
+        BufReader<tokio::process::ChildStdout>,
+    )>,
+) {
+    if let Some((mut child, reader)) = event_child_and_reader.take() {
+        drop(reader);
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
+    }
+}
+
 /// Runs the single-instance background daemon and Unix domain socket server.
 pub async fn run_daemon(
     cfg: CockpitConfig,
@@ -221,12 +415,15 @@ pub async fn run_daemon(
     let pid = std::process::id();
 
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let herdr_connected = match herdr.list_terminals_full(&mut rpc).await {
+    let mut herdr_connected = match herdr.list_terminals_full(&mut rpc).await {
         Ok(terms) => {
             tracker.apply_snapshot(terms, now_ms);
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            rpc = None;
+            false
+        }
     };
 
     let initial_snap = materialize_snapshot(
@@ -245,17 +442,30 @@ pub async fn run_daemon(
 
     if herdr_connected {
         let proj = FleetSummaryProjection::from_snapshot(&initial_snap);
-        let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
+        if let Err(err) = herdr.publish_doc_snapshot(&mut rpc, &proj).await {
+            tracing::warn!("failed publishing initial doc snapshot to herdr: {err:#}");
+            rpc = None;
+        }
     }
 
     let shared_snap = Arc::new(RwLock::new(initial_snap));
     let (tx, _) = broadcast::channel::<CockpitSnapshot>(32);
-    let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<bool>(8);
-    let (orch_wake_tx, mut orch_wake_rx) = tokio::sync::mpsc::channel::<()>(32);
+    let (refresh_tx, mut refresh_rx) = mpsc::channel::<RefreshRequest>(8);
+    let (orch_wake_tx, mut orch_wake_rx) = mpsc::channel::<()>(32);
+
+    let pub_ctx = DaemonPublishCtx {
+        cfg: &cfg,
+        paths: &paths,
+        store: &store,
+        coord: &coord,
+        shared_snap: &shared_snap,
+        tx: &tx,
+        pid,
+    };
 
     // Spawn hc events --json consumer if available
     let mut event_child_and_reader = herdr.spawn_events_stream().ok();
-    let mut event_line = String::new();
+    let mut event_buf: Vec<u8> = Vec::new();
     let mut git_head_cache: BTreeMap<String, String> = BTreeMap::new();
 
     let mut orch_tick = tokio::time::interval(Duration::from_millis(500));
@@ -295,141 +505,133 @@ pub async fn run_daemon(
                     });
                 }
             }
-            Some(force) = refresh_rx.recv() => {
+            Some(req) = refresh_rx.recv() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
-                if let Ok(terms) = herdr.list_terminals_full(&mut rpc).await {
-                    tracker.apply_snapshot(terms, ts_ms);
+                match herdr.list_terminals_full(&mut rpc).await {
+                    Ok(terms) => {
+                        tracker.apply_snapshot(terms, ts_ms);
+                        herdr_connected = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!("herdr list_terminals_full failed during refresh: {err:#}");
+                        rpc = None;
+                        herdr_connected = false;
+                    }
                 }
-                let updated = materialize_snapshot(
+                let updated = refresh_and_publish_snapshot(
+                    &pub_ctx,
                     &mut tracker,
-                    &cfg,
-                    &paths,
-                    &store,
-                    &coord,
-                    true,
-                    Some(pid),
-                    false,
-                    force,
+                    &herdr,
+                    &mut rpc,
+                    herdr_connected,
+                    req.force,
                     ts_ms,
-                ).await;
-                let proj = FleetSummaryProjection::from_snapshot(&updated);
-                let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                *shared_snap.write().await = updated.clone();
-                let _ = tx.send(updated);
+                )
+                .await;
+                let _ = req.reply.send(updated);
             }
             Some(()) = orch_wake_rx.recv() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
-                let reconcile_outcome =
-                    OrchReconciler::reconcile_active_dispatches(&orch_store, &herdr, &tracker, ts_ms)
-                        .await
-                        .unwrap_or_default();
-                let delivery_outcome =
-                    OrchDeliveryCoordinator::deliver_pending_pointers(&orch_store, &herdr, &tracker, ts_ms)
-                        .await
-                        .unwrap_or_default();
+                let (reconcile_outcome, delivery_outcome) =
+                    run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "wake").await;
                 if reconcile_outcome.state_changed
                     || delivery_outcome.delivered_count > 0
                     || delivery_outcome.stalled_count > 0
                 {
-                    let updated = materialize_snapshot(
+                    let _ = refresh_and_publish_snapshot(
+                        &pub_ctx,
                         &mut tracker,
-                        &cfg,
-                        &paths,
-                        &store,
-                        &coord,
-                        rpc.is_some(),
-                        Some(pid),
-                        false,
+                        &herdr,
+                        &mut rpc,
+                        herdr_connected,
                         false,
                         ts_ms,
-                    ).await;
-                    let proj = FleetSummaryProjection::from_snapshot(&updated);
-                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                    *shared_snap.write().await = updated.clone();
-                    let _ = tx.send(updated);
+                    )
+                    .await;
                 }
             }
             line_res = async {
                 if let Some((_, ref mut reader)) = event_child_and_reader {
-                    event_line.clear();
-                    reader.read_line(&mut event_line).await
+                    read_event_line_cancel_safe(reader, &mut event_buf).await
                 } else {
                     std::future::pending().await
                 }
             }, if has_event_stream => {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                let mut any_changed = false;
+                let mut stream_closed = false;
+
                 match line_res {
-                    Ok(0) | Err(_) => {
-                        event_child_and_reader = None;
-                    }
-                    Ok(_) => {
-                        let ts_ms = chrono::Utc::now().timestamp_millis();
-                        if let Ok(item) = parse_hc_event_line(event_line.trim()) {
+                    Ok(Some(line)) => {
+                        if let Ok(item) = parse_hc_event_line(line.trim()) {
+                            herdr_connected = true;
                             if tracker.apply_stream_item(item, ts_ms) {
-                                let _ = OrchReconciler::reconcile_active_dispatches(
-                                    &orch_store,
-                                    &herdr,
-                                    &tracker,
-                                    ts_ms,
-                                )
-                                .await;
-                                let _ = OrchDeliveryCoordinator::deliver_pending_pointers(
-                                    &orch_store,
-                                    &herdr,
-                                    &tracker,
-                                    ts_ms,
-                                )
-                                .await;
-                                let updated = materialize_snapshot(
-                                    &mut tracker,
-                                    &cfg,
-                                    &paths,
-                                    &store,
-                                    &coord,
-                                    true,
-                                    Some(pid),
-                                    false,
-                                    false,
-                                    ts_ms,
-                                ).await;
-                                let proj = FleetSummaryProjection::from_snapshot(&updated);
-                                let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                                *shared_snap.write().await = updated.clone();
-                                let _ = tx.send(updated);
+                                any_changed = true;
                             }
                         }
+                        if let Some((_, ref mut reader)) = event_child_and_reader {
+                            let (drained_changed, drained_closed) = drain_ready_event_lines(
+                                reader,
+                                &mut event_buf,
+                                &mut tracker,
+                                &mut herdr_connected,
+                                ts_ms,
+                                MAX_DRAIN_EVENT_LINES,
+                            )
+                            .await;
+                            any_changed |= drained_changed;
+                            stream_closed |= drained_closed;
+                        }
                     }
+                    Ok(None) => {
+                        stream_closed = true;
+                    }
+                    Err(err) => {
+                        tracing::warn!("hc events stream read error: {err}");
+                        stream_closed = true;
+                    }
+                }
+
+                if stream_closed {
+                    kill_and_reap_events_child(&mut event_child_and_reader).await;
+                    event_buf.clear();
+                    if rpc.is_none() {
+                        herdr_connected = false;
+                    }
+                }
+
+                if any_changed {
+                    let _ = run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "event").await;
+                    let _ = refresh_and_publish_snapshot(
+                        &pub_ctx,
+                        &mut tracker,
+                        &herdr,
+                        &mut rpc,
+                        herdr_connected,
+                        false,
+                        ts_ms,
+                    )
+                    .await;
                 }
             }
             _ = orch_tick.tick() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
-                let reconcile_outcome =
-                    OrchReconciler::reconcile_active_dispatches(&orch_store, &herdr, &tracker, ts_ms)
-                        .await
-                        .unwrap_or_default();
-                let delivery_outcome =
-                    OrchDeliveryCoordinator::deliver_pending_pointers(&orch_store, &herdr, &tracker, ts_ms)
-                        .await
-                        .unwrap_or_default();
+                let (reconcile_outcome, delivery_outcome) =
+                    run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "tick").await;
                 if reconcile_outcome.state_changed
                     || delivery_outcome.delivered_count > 0
                     || delivery_outcome.stalled_count > 0
                 {
-                    let updated = materialize_snapshot(
+                    let _ = refresh_and_publish_snapshot(
+                        &pub_ctx,
                         &mut tracker,
-                        &cfg,
-                        &paths,
-                        &store,
-                        &coord,
-                        rpc.is_some(),
-                        Some(pid),
-                        false,
+                        &herdr,
+                        &mut rpc,
+                        herdr_connected,
                         false,
                         ts_ms,
-                    ).await;
-                    let proj = FleetSummaryProjection::from_snapshot(&updated);
-                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                    *shared_snap.write().await = updated.clone();
-                    let _ = tx.send(updated);
+                    )
+                    .await;
                 }
             }
             _ = worktree_tick.tick() => {
@@ -451,88 +653,143 @@ pub async fn run_daemon(
                 }
                 if head_changed {
                     let ts_ms = chrono::Utc::now().timestamp_millis();
-                    let updated = materialize_snapshot(
+                    let _ = refresh_and_publish_snapshot(
+                        &pub_ctx,
                         &mut tracker,
-                        &cfg,
-                        &paths,
-                        &store,
-                        &coord,
-                        rpc.is_some(),
-                        Some(pid),
-                        false,
+                        &herdr,
+                        &mut rpc,
+                        herdr_connected,
                         false,
                         ts_ms,
-                    ).await;
-                    let proj = FleetSummaryProjection::from_snapshot(&updated);
-                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                    *shared_snap.write().await = updated.clone();
-                    let _ = tx.send(updated);
+                    )
+                    .await;
                 }
             }
             _ = reconcile_tick.tick() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
                 let _ = store.prune_expired(ts_ms / 1000, cfg.retention.finished_ttl_hours);
                 if event_child_and_reader.is_none() {
+                    event_buf.clear();
                     event_child_and_reader = herdr.spawn_events_stream().ok();
                 }
-                if let Ok(terms) = herdr.list_terminals_full(&mut rpc).await {
-                    tracker.apply_snapshot(terms, ts_ms);
-                    let _ = OrchReconciler::reconcile_active_dispatches(
-                        &orch_store,
-                        &herdr,
-                        &tracker,
-                        ts_ms,
-                    )
-                    .await;
-                    let _ = OrchDeliveryCoordinator::deliver_pending_pointers(
-                        &orch_store,
-                        &herdr,
-                        &tracker,
-                        ts_ms,
-                    )
-                    .await;
-                    let updated = materialize_snapshot(
-                        &mut tracker,
-                        &cfg,
-                        &paths,
-                        &store,
-                        &coord,
-                        true,
-                        Some(pid),
-                        false,
-                        false,
-                        ts_ms,
-                    ).await;
-                    let proj = FleetSummaryProjection::from_snapshot(&updated);
-                    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
-                    *shared_snap.write().await = updated.clone();
-                    let _ = tx.send(updated);
+                let prev_connected = herdr_connected;
+                match herdr.list_terminals_full(&mut rpc).await {
+                    Ok(terms) => {
+                        herdr_connected = true;
+                        tracker.apply_snapshot(terms, ts_ms);
+                        let _ = run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "reconcile").await;
+                        let _ = refresh_and_publish_snapshot(
+                            &pub_ctx,
+                            &mut tracker,
+                            &herdr,
+                            &mut rpc,
+                            herdr_connected,
+                            false,
+                            ts_ms,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!("herdr list_terminals_full failed during reconcile: {err:#}");
+                        rpc = None;
+                        herdr_connected = false;
+                        if prev_connected {
+                            let _ = refresh_and_publish_snapshot(
+                                &pub_ctx,
+                                &mut tracker,
+                                &herdr,
+                                &mut rpc,
+                                herdr_connected,
+                                false,
+                                ts_ms,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Graceful shutdown: clear daemon_pid in doc.set and remove socket
-    let mut final_snap = shared_snap.read().await.clone();
-    final_snap.daemon_pid = None;
-    let proj = FleetSummaryProjection::from_snapshot(&final_snap);
-    let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
+    // Graceful shutdown: reap event stream child, clear daemon_pid in doc.set, and remove socket
+    kill_and_reap_events_child(&mut event_child_and_reader).await;
+    if herdr_connected {
+        let mut final_snap = shared_snap.read().await.clone();
+        final_snap.daemon_pid = None;
+        let proj = FleetSummaryProjection::from_snapshot(&final_snap);
+        let _ = herdr.publish_doc_snapshot(&mut rpc, &proj).await;
+    }
     let _ = fs::remove_file(&sock_path);
     Ok(())
+}
+
+async fn request_refresh_and_wait(
+    refresh_tx: &mpsc::Sender<RefreshRequest>,
+    shared_snap: &Arc<RwLock<CockpitSnapshot>>,
+    force: bool,
+    timeout: Duration,
+) -> CockpitSnapshot {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let req = RefreshRequest {
+        force,
+        reply: reply_tx,
+    };
+    if refresh_tx.send(req).await.is_ok() {
+        match tokio::time::timeout(timeout, reply_rx).await {
+            Ok(Ok(snap)) => return snap,
+            Ok(Err(_)) => {
+                tracing::warn!("refresh reply channel dropped before completing");
+            }
+            Err(_) => {
+                tracing::warn!("timed out waiting for daemon refresh cycle after {timeout:?}");
+            }
+        }
+    }
+    shared_snap.read().await.clone()
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_ipc_client(
     stream: UnixStream,
     shared_snap: Arc<RwLock<CockpitSnapshot>>,
-    mut sub_rx: broadcast::Receiver<CockpitSnapshot>,
-    refresh_tx: tokio::sync::mpsc::Sender<bool>,
-    orch_wake_tx: tokio::sync::mpsc::Sender<()>,
+    sub_rx: broadcast::Receiver<CockpitSnapshot>,
+    refresh_tx: mpsc::Sender<RefreshRequest>,
+    orch_wake_tx: mpsc::Sender<()>,
     cfg: CockpitConfig,
     paths: CockpitPaths,
     store: CacheStore,
     herdr: HerdrClient,
     coord: ProviderCoordinator,
+) -> Result<()> {
+    handle_ipc_client_with_timeout(
+        stream,
+        shared_snap,
+        sub_rx,
+        refresh_tx,
+        orch_wake_tx,
+        cfg,
+        paths,
+        store,
+        herdr,
+        coord,
+        IPC_REFRESH_WAIT_TIMEOUT,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_ipc_client_with_timeout(
+    stream: UnixStream,
+    shared_snap: Arc<RwLock<CockpitSnapshot>>,
+    mut sub_rx: broadcast::Receiver<CockpitSnapshot>,
+    refresh_tx: mpsc::Sender<RefreshRequest>,
+    orch_wake_tx: mpsc::Sender<()>,
+    cfg: CockpitConfig,
+    paths: CockpitPaths,
+    store: CacheStore,
+    herdr: HerdrClient,
+    coord: ProviderCoordinator,
+    refresh_timeout: Duration,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -551,19 +808,19 @@ async fn handle_ipc_client(
                 let stale =
                     chrono::Utc::now().timestamp() - shared_snap.read().await.generated_at >= 2;
                 if stale {
-                    let _ = refresh_tx.send(false).await;
-                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    request_refresh_and_wait(&refresh_tx, &shared_snap, false, refresh_timeout)
+                        .await
+                } else {
+                    shared_snap.read().await.clone()
                 }
-                shared_snap.read().await.clone()
             };
             let mut out = serde_json::to_string(&snap)?;
             out.push('\n');
             write_half.write_all(out.as_bytes()).await?;
         }
         IpcOp::Refresh => {
-            let _ = refresh_tx.send(true).await;
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let snap = shared_snap.read().await.clone();
+            let snap =
+                request_refresh_and_wait(&refresh_tx, &shared_snap, true, refresh_timeout).await;
             let mut out = serde_json::to_string(&snap)?;
             out.push('\n');
             write_half.write_all(out.as_bytes()).await?;
@@ -657,5 +914,479 @@ mod tests {
         drop(lock1);
         let lock3 = DaemonLock::try_acquire(&lock_file).unwrap();
         assert!(lock3.is_some());
+    }
+
+    fn make_test_paths(root: &Path) -> CockpitPaths {
+        let paths = CockpitPaths {
+            home_dir: root.to_path_buf(),
+            config_dir: root.join("cfg"),
+            data_dir: root.join("data"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+        };
+        paths.ensure_dirs().unwrap();
+        paths
+    }
+
+    #[tokio::test]
+    async fn test_materialize_snapshot_active_children_uses_ms_not_sec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let cfg = CockpitConfig::default();
+        let store = CacheStore::open(&paths.db_file()).unwrap();
+        let coord = ProviderCoordinator::new();
+
+        let mut tracker = FleetTracker::new();
+        let agent_fg = Some(crate::herdr::HcForeground {
+            name: Some("claude".into()),
+            argv: vec!["claude".into()],
+            ..Default::default()
+        });
+        let parent = crate::herdr::HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            reported: true,
+            foreground: agent_fg.clone(),
+            status: Some(crate::herdr::HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = crate::herdr::HcTerminal {
+            address: "t2".into(),
+            parent: Some("t1".into()),
+            state: "live".into(),
+            reported: true,
+            foreground: agent_fg,
+            status: Some(crate::herdr::HcStatus {
+                state: "blocked".into(),
+                kind: Some("permission".into()),
+                msg: Some("Confirm?".into()),
+                app: None,
+            }),
+            status_ms: Some(10_000),
+            turn: 1,
+            ..Default::default()
+        };
+        tracker.apply_snapshot(vec![parent, child], 10_000);
+
+        let clear_ev = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"idle"},"seq":2,"terminal":"t2","type":"status"}}"#,
+        )
+        .unwrap();
+        tracker.apply_stream_item(clear_ev, 10_200);
+
+        // At 11_800 ms (1600 ms after clear at 10_200 ms), hysteresis has expired.
+        let snap = materialize_snapshot(
+            &mut tracker,
+            &cfg,
+            &paths,
+            &store,
+            &coord,
+            true,
+            Some(1),
+            false,
+            false,
+            11_800,
+        )
+        .await;
+        let t1 = snap.agents.iter().find(|a| a.address == "t1").unwrap();
+        assert!(t1.blocked_children.is_empty());
+        assert!(
+            t1.active_children.is_empty(),
+            "active_children should clear on ms boundary, got: {:?}",
+            t1.active_children
+        );
+    }
+
+    #[tokio::test]
+    async fn test_event_stream_partial_line_across_cancelled_poll() {
+        let (mut writer, reader) = tokio::io::duplex(128);
+        let mut buf_reader = BufReader::new(reader);
+        let mut event_buf: Vec<u8> = Vec::new();
+
+        // Write first chunk without newline.
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"working"},"#,
+            )
+            .await
+            .unwrap();
+
+        // Poll read_event_line_cancel_safe inside select! and cancel it when another branch wins.
+        let cancelled = tokio::select! {
+            biased;
+            res = read_event_line_cancel_safe(&mut buf_reader, &mut event_buf) => {
+                panic!("partial line should not resolve before newline, got {res:?}");
+            }
+            _ = std::future::ready(()) => true,
+        };
+        assert!(cancelled);
+        assert!(
+            !event_buf.is_empty(),
+            "partial buffer must be retained across cancelled polls"
+        );
+
+        // Write second chunk completing the line, plus a second back-to-back line, then close.
+        writer
+            .write_all(
+                br#""seq":7,"terminal":"t1","type":"status"}}
+{"jsonrpc":"2.0","method":"heartbeat","params":{}}
+"#,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+
+        let line1 = read_event_line_cancel_safe(&mut buf_reader, &mut event_buf)
+            .await
+            .unwrap()
+            .expect("expected first completed line");
+        assert!(event_buf.is_empty());
+        let item1 = parse_hc_event_line(line1.trim()).unwrap();
+        assert!(matches!(
+            item1,
+            crate::herdr::HcStreamItem::Event {
+                seq: 7,
+                terminal: Some(_),
+                ..
+            }
+        ));
+
+        let line2 = read_event_line_cancel_safe(&mut buf_reader, &mut event_buf)
+            .await
+            .unwrap()
+            .expect("expected second line");
+        assert_eq!(
+            parse_hc_event_line(line2.trim()).unwrap(),
+            crate::herdr::HcStreamItem::Heartbeat
+        );
+
+        assert!(read_event_line_cancel_safe(&mut buf_reader, &mut event_buf)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_ensure_daemon_running_errors_when_socket_never_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+
+        let fake_exe = tmp.path().join("fake-tchelvis");
+        fs::write(&fake_exe, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = ensure_daemon_running_with_exe(&paths, &fake_exe, Duration::from_millis(2), 3)
+            .await
+            .expect_err("expected error when daemon socket never appears");
+        assert!(
+            err.to_string()
+                .contains("timed out waiting for daemon socket"),
+            "unexpected error message: {err}"
+        );
+
+        // Also verify a stale non-listening socket file on disk does NOT falsely return Ok.
+        let sock_path = paths.socket_file();
+        {
+            let _stale_listener = UnixListener::bind(&sock_path).unwrap();
+        }
+        assert!(sock_path.exists());
+        let err_stale =
+            ensure_daemon_running_with_exe(&paths, &fake_exe, Duration::from_millis(2), 3)
+                .await
+                .expect_err("stale non-accepting socket file must still fail");
+        assert!(err_stale
+            .to_string()
+            .contains("timed out waiting for daemon socket"));
+    }
+
+    #[tokio::test]
+    async fn test_ensure_daemon_running_succeeds_when_socket_accepts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let sock_path = paths.socket_file();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let missing_exe = tmp.path().join("should-not-be-spawned");
+        ensure_daemon_running_with_exe(&paths, &missing_exe, Duration::from_millis(2), 3)
+            .await
+            .unwrap();
+        accept_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_ipc_status_and_refresh_wait_for_fresh_snapshot_and_timeout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let cfg = CockpitConfig::default();
+        let store = CacheStore::open(&paths.db_file()).unwrap();
+        let herdr = HerdrClient::new("/nonexistent-hc");
+        let coord = ProviderCoordinator::new();
+
+        let stale_snap = CockpitSnapshot {
+            generated_at: 0,
+            published_at: 0,
+            daemon_pid: Some(100),
+            ..Default::default()
+        };
+        let shared_snap = Arc::new(RwLock::new(stale_snap));
+        let (tx, _) = broadcast::channel::<CockpitSnapshot>(8);
+        let (refresh_tx, mut refresh_rx) = mpsc::channel::<RefreshRequest>(8);
+        let (orch_wake_tx, _) = mpsc::channel::<()>(8);
+
+        let got_req = Arc::new(tokio::sync::Notify::new());
+        let allow_reply = Arc::new(tokio::sync::Notify::new());
+        let got_req_w = Arc::clone(&got_req);
+        let allow_reply_w = Arc::clone(&allow_reply);
+        let shared_clone = Arc::clone(&shared_snap);
+
+        let refresh_worker = tokio::spawn(async move {
+            while let Some(req) = refresh_rx.recv().await {
+                got_req_w.notify_one();
+                allow_reply_w.notified().await;
+                let fresh = CockpitSnapshot {
+                    generated_at: chrono::Utc::now().timestamp(),
+                    published_at: chrono::Utc::now().timestamp(),
+                    daemon_pid: Some(if req.force { 202 } else { 201 }),
+                    herdr_connected: true,
+                    ..Default::default()
+                };
+                *shared_clone.write().await = fresh.clone();
+                let _ = req.reply.send(fresh);
+            }
+        });
+
+        // 1. Stale IpcOp::Status must block until refresh completes and receive pid=201.
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let srv_handle = tokio::spawn(handle_ipc_client_with_timeout(
+            server_stream,
+            Arc::clone(&shared_snap),
+            tx.subscribe(),
+            refresh_tx.clone(),
+            orch_wake_tx.clone(),
+            cfg.clone(),
+            paths.clone(),
+            store.clone(),
+            herdr.clone(),
+            coord.clone(),
+            Duration::from_secs(2),
+        ));
+        let (rh, mut wh) = client_stream.into_split();
+        let req_line = serde_json::to_string(&IpcRequest {
+            op: IpcOp::Status,
+            terminal: None,
+            include_all: false,
+        })
+        .unwrap()
+            + "\n";
+        wh.write_all(req_line.as_bytes()).await.unwrap();
+        got_req.notified().await;
+        allow_reply.notify_one();
+
+        let mut reader = BufReader::new(rh);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await.unwrap();
+        let status_resp: CockpitSnapshot = serde_json::from_str(resp_line.trim()).unwrap();
+        assert_eq!(status_resp.daemon_pid, Some(201));
+        assert!(status_resp.herdr_connected);
+        srv_handle.await.unwrap().unwrap();
+
+        // 2. IpcOp::Refresh must wait for forced refresh and receive pid=202.
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let srv_handle = tokio::spawn(handle_ipc_client_with_timeout(
+            server_stream,
+            Arc::clone(&shared_snap),
+            tx.subscribe(),
+            refresh_tx.clone(),
+            orch_wake_tx.clone(),
+            cfg.clone(),
+            paths.clone(),
+            store.clone(),
+            herdr.clone(),
+            coord.clone(),
+            Duration::from_secs(2),
+        ));
+        let (rh, mut wh) = client_stream.into_split();
+        let req_line = serde_json::to_string(&IpcRequest {
+            op: IpcOp::Refresh,
+            terminal: None,
+            include_all: false,
+        })
+        .unwrap()
+            + "\n";
+        wh.write_all(req_line.as_bytes()).await.unwrap();
+        got_req.notified().await;
+        allow_reply.notify_one();
+
+        let mut reader = BufReader::new(rh);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await.unwrap();
+        let refresh_resp: CockpitSnapshot = serde_json::from_str(resp_line.trim()).unwrap();
+        assert_eq!(refresh_resp.daemon_pid, Some(202));
+        srv_handle.await.unwrap().unwrap();
+
+        drop(refresh_tx);
+        refresh_worker.await.unwrap();
+
+        // 3. Bounded timeout fallback returns current shared_snap if refresh worker stalls.
+        let (stalled_tx, _stalled_rx) = mpsc::channel::<RefreshRequest>(4);
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        let srv_handle = tokio::spawn(handle_ipc_client_with_timeout(
+            server_stream,
+            Arc::clone(&shared_snap),
+            tx.subscribe(),
+            stalled_tx,
+            orch_wake_tx,
+            cfg,
+            paths,
+            store,
+            herdr,
+            coord,
+            Duration::from_millis(15),
+        ));
+        let (rh, mut wh) = client_stream.into_split();
+        let req_line = serde_json::to_string(&IpcRequest {
+            op: IpcOp::Refresh,
+            terminal: None,
+            include_all: false,
+        })
+        .unwrap()
+            + "\n";
+        wh.write_all(req_line.as_bytes()).await.unwrap();
+        let mut reader = BufReader::new(rh);
+        let mut resp_line = String::new();
+        reader.read_line(&mut resp_line).await.unwrap();
+        let fallback_resp: CockpitSnapshot = serde_json::from_str(resp_line.trim()).unwrap();
+        assert_eq!(fallback_resp.daemon_pid, Some(202));
+        srv_handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_refresh_and_publish_snapshot_updates_shared_and_broadcast_consistently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let cfg = CockpitConfig::default();
+        let store = CacheStore::open(&paths.db_file()).unwrap();
+        let herdr = HerdrClient::new("/nonexistent-hc");
+        let coord = ProviderCoordinator::new();
+        let shared_snap = Arc::new(RwLock::new(CockpitSnapshot::default()));
+        let (tx, mut rx) = broadcast::channel::<CockpitSnapshot>(8);
+        let mut tracker = FleetTracker::new();
+        let mut rpc: Option<HcRpcSession> = None;
+
+        let pub_ctx = DaemonPublishCtx {
+            cfg: &cfg,
+            paths: &paths,
+            store: &store,
+            coord: &coord,
+            shared_snap: &shared_snap,
+            tx: &tx,
+            pid: 777,
+        };
+
+        let out = refresh_and_publish_snapshot(
+            &pub_ctx,
+            &mut tracker,
+            &herdr,
+            &mut rpc,
+            false,
+            false,
+            12_000,
+        )
+        .await;
+        assert_eq!(out.daemon_pid, Some(777));
+        assert!(!out.herdr_connected);
+        assert_eq!(shared_snap.read().await.daemon_pid, Some(777));
+        assert!(!shared_snap.read().await.herdr_connected);
+        let bcast = rx.recv().await.unwrap();
+        assert_eq!(bcast.daemon_pid, Some(777));
+        assert!(!bcast.herdr_connected);
+    }
+
+    #[tokio::test]
+    async fn test_drain_ready_event_lines_coalesces_and_preserves_partial() {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let mut buf_reader = BufReader::new(reader);
+        let mut event_buf: Vec<u8> = Vec::new();
+        let mut tracker = FleetTracker::new();
+        let mut herdr_connected = false;
+
+        writer
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"working"},"seq":1,"terminal":"t1","type":"status"}}
+{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"blocked","kind":"permission","msg":"Run?"},"seq":2,"terminal":"t1","type":"status"}}
+{"jsonrpc":"2.0","method":"event","params":{"data":{"turn":2},"seq":3,"terminal":"t1","type":"turn"#,
+            )
+            .await
+            .unwrap();
+
+        let (any_changed, stream_closed) = drain_ready_event_lines(
+            &mut buf_reader,
+            &mut event_buf,
+            &mut tracker,
+            &mut herdr_connected,
+            5_000,
+            MAX_DRAIN_EVENT_LINES,
+        )
+        .await;
+        assert!(any_changed);
+        assert!(!stream_closed);
+        assert!(herdr_connected);
+        assert_eq!(
+            tracker
+                .terminals
+                .get("t1")
+                .and_then(|t| t.status.as_ref())
+                .map(|s| s.state.as_str()),
+            Some("blocked")
+        );
+        assert!(
+            !event_buf.is_empty(),
+            "trailing partial line must stay buffered across drain"
+        );
+
+        // Complete the trailing line and close stream.
+        writer.write_all(b"\"}}\n").await.unwrap();
+        drop(writer);
+
+        let (any_changed2, stream_closed2) = drain_ready_event_lines(
+            &mut buf_reader,
+            &mut event_buf,
+            &mut tracker,
+            &mut herdr_connected,
+            5_100,
+            MAX_DRAIN_EVENT_LINES,
+        )
+        .await;
+        assert!(any_changed2);
+        assert!(stream_closed2);
+        assert_eq!(tracker.terminals.get("t1").map(|t| t.turn), Some(2));
+        assert!(event_buf.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_kill_and_reap_events_child() {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().expect("spawned child should have pid");
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut slot = Some((child, stdout));
+
+        kill_and_reap_events_child(&mut slot).await;
+        assert!(slot.is_none());
+        // Verify process is reaped (kill(pid, 0) fails with ESRCH).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(rc, -1);
     }
 }

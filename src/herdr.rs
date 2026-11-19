@@ -591,7 +591,8 @@ impl FleetTracker {
             })
     }
 
-    /// Evaluates effective attention state for `addr` at `now_ms`, applying 1.5s clear-hysteresis.
+    /// Evaluates effective attention state for `addr` at `now_ms` (Unix epoch milliseconds),
+    /// applying 1.5s clear-hysteresis.
     pub fn effective_attention(&self, addr: &str, now_ms: i64) -> AttentionState {
         let Some(term) = self.terminals.get(addr) else {
             return AttentionState::Idle;
@@ -605,12 +606,7 @@ impl FleetTracker {
         }
         if let Some((held_state, clear_since)) = self.blocked_hold.get(addr) {
             let since = clear_since.unwrap_or(now_ms);
-            let effective_now_ms = if since >= 1_000 && now_ms > 0 && now_ms <= since / 500 {
-                now_ms * 1000
-            } else {
-                now_ms
-            };
-            if effective_now_ms - since < BLOCKED_CLEAR_HYSTERESIS_MS {
+            if now_ms - since < BLOCKED_CLEAR_HYSTERESIS_MS {
                 return held_state.clone();
             }
         }
@@ -618,6 +614,7 @@ impl FleetTracker {
     }
 
     /// Computes child terminals (`parent == Some(parent_addr)` or `labels["cockpit.parent"]`) that are currently in `Blocked` state.
+    /// `now_ms` is Unix epoch milliseconds.
     pub fn blocked_children_map(&self, now_ms: i64) -> BTreeMap<String, Vec<String>> {
         let addresses: Vec<String> = self.terminals.keys().cloned().collect();
         let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -641,13 +638,13 @@ impl FleetTracker {
         map
     }
 
-    /// Computes active child terminals per parent:
+    /// Computes active child terminals per parent at `now_ms` (Unix epoch milliseconds):
     /// 1. Live child terminals listed in `active_orch_children` (`status IN ('starting', 'dispatched', 'waiting_for_reply')`), AND
     /// 2. Non-orchestrated live child terminals (`cockpit.orch.role != Some("worker")`) whose `effective_attention` is `Working` or `Blocked`.
     pub fn active_children_map(
         &self,
         active_orch_children: &BTreeMap<String, Vec<String>>,
-        now_sec: i64,
+        now_ms: i64,
     ) -> BTreeMap<String, Vec<String>> {
         let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
@@ -673,7 +670,7 @@ impl FleetTracker {
                 continue;
             }
             if let Some(parent) = Self::resolved_parent(term).map(str::to_string) {
-                let att = self.effective_attention(addr, now_sec);
+                let att = self.effective_attention(addr, now_ms);
                 if matches!(
                     att,
                     AttentionState::Working { .. } | AttentionState::Blocked { .. }
@@ -906,6 +903,7 @@ impl HerdrClient {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed spawning `{} events --json`", self.hc_bin))?;
         let stdout = BufReader::new(child.stdout.take().context("missing hc events stdout")?);
@@ -1285,7 +1283,7 @@ mod tests {
 
         let mut active_orch = BTreeMap::new();
         active_orch.insert("t1".to_string(), vec!["t2".to_string()]);
-        let active_map = tracker.active_children_map(&active_orch, 1);
+        let active_map = tracker.active_children_map(&active_orch, 1_000);
         assert_eq!(
             active_map.get("t1"),
             Some(&vec!["t2".to_string(), "t4".to_string()])
@@ -1390,5 +1388,92 @@ mod tests {
             .unwrap();
         assert_eq!(term.address, "t4");
         assert_eq!(term.created_ms, Some(1795046353550));
+    }
+
+    #[test]
+    fn test_effective_attention_ms_no_heuristic() {
+        let mut tracker = FleetTracker::new();
+        let term = HcTerminal {
+            address: "t2".into(),
+            state: "live".into(),
+            reported: true,
+            status: Some(HcStatus {
+                state: "blocked".into(),
+                kind: Some("permission".into()),
+                msg: Some("Approve?".into()),
+                app: None,
+            }),
+            status_ms: Some(1_000_000),
+            turn: 1,
+            ..Default::default()
+        };
+        tracker.apply_snapshot(vec![term], 1_000_000);
+
+        let ev = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"idle"},"seq":2,"terminal":"t2","type":"status"}}"#,
+        )
+        .unwrap();
+        tracker.apply_stream_item(ev, 1_000_000);
+
+        // 2_000 <= 1_000_000 / 500 previously triggered the *1000 heuristic and falsely cleared Blocked.
+        assert!(matches!(
+            tracker.effective_attention("t2", 2_000),
+            AttentionState::Blocked { .. }
+        ));
+        // Still held within 1500ms hysteresis window.
+        assert!(matches!(
+            tracker.effective_attention("t2", 1_001_400),
+            AttentionState::Blocked { .. }
+        ));
+        // Clears once 1500ms has elapsed.
+        assert_eq!(
+            tracker.effective_attention("t2", 1_001_500),
+            AttentionState::Idle
+        );
+    }
+
+    #[test]
+    fn test_active_children_map_uses_ms_hysteresis() {
+        let mut tracker = FleetTracker::new();
+        let parent = HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            status: Some(HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let child = HcTerminal {
+            address: "t2".into(),
+            parent: Some("t1".into()),
+            state: "live".into(),
+            reported: true,
+            status: Some(HcStatus {
+                state: "blocked".into(),
+                kind: Some("permission".into()),
+                msg: Some("Confirm?".into()),
+                app: None,
+            }),
+            status_ms: Some(10_000),
+            turn: 1,
+            ..Default::default()
+        };
+        tracker.apply_snapshot(vec![parent, child], 10_000);
+
+        let clear_ev = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"idle"},"seq":2,"terminal":"t2","type":"status"}}"#,
+        )
+        .unwrap();
+        tracker.apply_stream_item(clear_ev, 10_200);
+
+        let empty_orch = BTreeMap::new();
+        assert_eq!(
+            tracker.active_children_map(&empty_orch, 11_600).get("t1"),
+            Some(&vec!["t2".to_string()])
+        );
+        assert!(!tracker
+            .active_children_map(&empty_orch, 11_800)
+            .contains_key("t1"));
     }
 }
