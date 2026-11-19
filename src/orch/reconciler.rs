@@ -35,22 +35,43 @@ impl OrchReconciler {
 
             if exited_or_errored {
                 let turn = term.map(|t| t.turn).unwrap_or(disp.turn_at_dispatch);
-                let tail = if term.is_some() {
+                let same_instance =
+                    term.is_some_and(|t| t.created_ms == Some(disp.terminal_created_ms));
+                let tail = if same_instance {
                     herdr
-                        .read_tail_lines(&disp.assignee_terminal, 25)
+                        .read_tail_lines(&disp.assignee_terminal, 20)
                         .await
                         .unwrap_or_default()
                 } else {
                     String::new()
                 };
+                let reason = match term {
+                    Some(t) if t.created_ms != Some(disp.terminal_created_ms) => {
+                        "worker_exited_or_errored (terminal_recreated)".to_string()
+                    }
+                    Some(t) => {
+                        let mut details = Vec::new();
+                        if let Some(code) = t.exit_code {
+                            details.push(format!("exit_code={code}"));
+                        }
+                        if let Some(detail) = t
+                            .status_msg()
+                            .or(t.reason.as_deref())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            details.push(format!("detail={detail}"));
+                        }
+                        if details.is_empty() {
+                            "worker_exited_or_errored".to_string()
+                        } else {
+                            format!("worker_exited_or_errored ({})", details.join(", "))
+                        }
+                    }
+                    None => "worker_exited_or_errored (terminal_missing)".to_string(),
+                };
                 if store
-                    .record_turn_stop_escalation(
-                        &disp.id,
-                        turn,
-                        "worker_exited_or_errored",
-                        &tail,
-                        now_ms,
-                    )?
+                    .record_turn_stop_escalation(&disp.id, turn, &reason, &tail, now_ms)?
                     .is_some()
                 {
                     outcome.stop_escalations += 1;
@@ -412,6 +433,112 @@ mod tests {
         assert_eq!(
             store.get_dispatch("disp_1").unwrap().unwrap().status,
             DispatchStatus::NeedsReview
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciler_exited_worker_includes_exit_code_and_tail_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_hc = tmp.path().join("fake-hc");
+        let script = "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"read\" ]; then\n\
+               for i in $(seq 1 25); do\n\
+                 echo \"output line $i\"\n\
+               done\n\
+               echo \"Error: unexpected argument '--bad-flag'\"\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n";
+        fs::write(&fake_hc, script).unwrap();
+        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+        let store = setup_store_with_dispatch("disp_1", "t2", 2_000);
+        let mut tracker = FleetTracker::new();
+        tracker.apply_snapshot(
+            vec![HcTerminal {
+                address: "t2".into(),
+                state: "finished".into(),
+                created_ms: Some(2_000),
+                exit_code: Some(2),
+                turn: 0,
+                ..Default::default()
+            }],
+            3_000,
+        );
+
+        let out = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &tracker, 3_000)
+            .await
+            .unwrap();
+        assert_eq!(out.stop_escalations, 1);
+        assert!(out.state_changed);
+
+        let inbox = store
+            .claim_inbox_messages("t1", Some("run_1"), true, 3_100)
+            .unwrap();
+        assert_eq!(inbox.messages.len(), 1);
+        let body = &inbox.messages[0].body;
+        assert!(
+            body.contains("exit_code=2"),
+            "body missing exit_code=2: {body}"
+        );
+        assert!(
+            body.contains("Error: unexpected argument '--bad-flag'"),
+            "body missing error tail: {body}"
+        );
+        // Should cap at ~20 lines so early lines (1..6) are trimmed
+        assert!(
+            !body.contains("output line 1\n"),
+            "body should keep only last ~20 lines: {body}"
+        );
+        assert!(
+            body.contains("output line 25"),
+            "body missing recent lines: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciler_exited_worker_succeeds_when_read_tail_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_hc = tmp.path().join("fake-hc");
+        let script = "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"read\" ]; then\n\
+               echo \"cannot read terminal\" >&2\n\
+               exit 1\n\
+             fi\n\
+             exit 1\n";
+        fs::write(&fake_hc, script).unwrap();
+        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+        let store = setup_store_with_dispatch("disp_1", "t2", 2_000);
+        let mut tracker = FleetTracker::new();
+        tracker.apply_snapshot(
+            vec![HcTerminal {
+                address: "t2".into(),
+                state: "finished".into(),
+                created_ms: Some(2_000),
+                exit_code: Some(127),
+                turn: 0,
+                ..Default::default()
+            }],
+            3_000,
+        );
+
+        let out = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &tracker, 3_000)
+            .await
+            .unwrap();
+        assert_eq!(out.stop_escalations, 1);
+        assert!(out.state_changed);
+
+        let inbox = store
+            .claim_inbox_messages("t1", Some("run_1"), true, 3_100)
+            .unwrap();
+        assert_eq!(inbox.messages.len(), 1);
+        let body = &inbox.messages[0].body;
+        assert!(
+            body.contains("exit_code=127"),
+            "body missing exit_code=127: {body}"
         );
     }
 }

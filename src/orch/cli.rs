@@ -14,11 +14,80 @@ use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::str::FromStr;
 use std::time::Duration;
 use tokio::process::Command;
+
+pub const DISPATCH_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DISPATCH_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub const DISPATCH_LIVENESS_RECHECK_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DISPATCH_LIVENESS_RECHECK_INTERVAL: Duration = Duration::from_millis(250);
+pub const WORKER_LAUNCH_TAIL_LINES: usize = 20;
+
+pub trait OrchSleeper: Send + Sync {
+    fn now_ms(&self) -> i64;
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemOrchSleeper;
+
+impl OrchSleeper for SystemOrchSleeper {
+    fn now_ms(&self) -> i64 {
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(duration))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DispatchOutput {
+    #[serde(flatten)]
+    pub dispatch: DispatchContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchDispatchArgs {
+    pub run: String,
+    pub task: String,
+    pub title: Option<String>,
+    pub prompt: Option<String>,
+    pub terminal: Option<String>,
+    pub agent: Option<String>,
+    pub worktree: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchSendArgs {
+    pub msg_type: String,
+    pub outcome: Option<String>,
+    pub dispatch_id: String,
+    pub body: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchAskArgs {
+    pub dispatch_id: String,
+    pub question: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum OrchCommands {
@@ -512,231 +581,27 @@ pub async fn execute_orch_command(
             request_id,
             json,
         } => {
-            if let Some(ref req_id) = request_id {
-                if let Some(cached) = store.get_mutation_receipt(req_id)? {
-                    let disp: DispatchContext = serde_json::from_str(&cached)?;
-                    print_dispatch(&disp, json)?;
-                    return Ok(());
-                }
-            }
-
-            if !matches!(worktree.as_str(), "current" | "new-child") {
-                bail!(
-                    "invalid --worktree mode '{}'; expected 'current' or 'new-child'",
-                    worktree
-                );
-            }
-
             let _ = crate::daemon::ensure_daemon_running(paths).await;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-
-            let run_row = store
-                .get_run(&run)?
-                .with_context(|| format!("run '{}' does not exist", run))?;
-
-            let caller_terminal = std::env::var("HC_TERMINAL_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| run_row.coordinator_terminal.clone());
-
-            let caller_term_info = fetch_hc_terminal(&herdr, &caller_terminal).await.ok();
-            let caller_created_ms = caller_term_info
-                .as_ref()
-                .and_then(|t| t.created_ms)
-                .unwrap_or(run_row.coordinator_created_ms);
-
-            let depth = store.caller_orchestration_depth(&caller_terminal, caller_created_ms)?;
-            if depth > MAX_ORCH_DEPTH {
-                bail!(
-                    "orchestration depth {} exceeds MAX_ORCH_DEPTH ({})",
-                    depth,
-                    MAX_ORCH_DEPTH
-                );
-            }
-
-            // Ensure task exists (create inline if --prompt is provided)
-            let task_row = match store.get_task(&run, &task)? {
-                Some(mut existing) => {
-                    if existing.failure_count >= MAX_DISPATCH_FAILURES
-                        || existing.status == TaskStatus::CircuitBroken
-                    {
-                        bail!(
-                            "circuit breaker tripped for task '{}' in run '{}' (failure_count = {})",
-                            task,
-                            run,
-                            existing.failure_count
-                        );
-                    }
-                    if let Some(new_prompt) = prompt {
-                        existing.prompt = new_prompt;
-                        if let Some(new_title) = title {
-                            existing.title = new_title;
-                        }
-                        existing.updated_at_ms = now_ms;
-                        store.create_or_update_task(&existing)?
-                    } else {
-                        existing
-                    }
-                }
-                None => {
-                    let inline_prompt = prompt.with_context(|| {
-                        format!(
-                            "task '{}' does not exist in run '{}'; provide --prompt to create it inline",
-                            task, run
-                        )
-                    })?;
-                    let inline_title = title.unwrap_or_else(|| format!("Task {task}"));
-                    store.create_or_update_task(&OrchTask {
-                        id: task.clone(),
-                        run_id: run.clone(),
-                        title: inline_title,
-                        prompt: inline_prompt,
-                        deps: Vec::new(),
-                        failure_count: 0,
-                        status: TaskStatus::Ready,
-                        result_summary: None,
-                        created_at_ms: now_ms,
-                        updated_at_ms: now_ms,
-                    })?
-                }
-            };
-
-            let base_cwd = caller_term_info
-                .as_ref()
-                .map(|t| PathBuf::from(t.effective_cwd()))
-                .filter(|p| p.exists())
-                .or_else(|| std::env::current_dir().ok())
-                .unwrap_or_else(|| PathBuf::from("."));
-
-            let (dispatch_cwd, worktree_path_opt) = if worktree == "new-child" {
-                let ws = resolve_git_workspace(&base_cwd.to_string_lossy());
-                let repo_root = ws
-                    .repo_root
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| base_cwd.clone());
-                let wt_dir = create_child_worktree(&repo_root, &run, &task).await?;
-                let wt_str = wt_dir.to_string_lossy().to_string();
-                (wt_dir, Some(wt_str))
-            } else {
-                (base_cwd, None)
-            };
-
-            let dispatch_id = generate_orch_id("disp");
-            let preamble = build_dispatch_preamble(
-                &run,
-                &task_row.id,
-                &dispatch_id,
-                &caller_terminal,
-                depth,
-                &task_row.prompt,
-            );
-
-            let labels = [
-                ("cockpit.orch.role", "worker"),
-                ("cockpit.orch.run", run.as_str()),
-                ("cockpit.orch.task", task_row.id.as_str()),
-                ("cockpit.orch.dispatch", dispatch_id.as_str()),
-                ("cockpit.parent", caller_terminal.as_str()),
-            ];
-
-            let (agent_kind_str, worker_term, attach_send_failed) =
-                if let Some(existing_term) = terminal {
-                    let fetched = fetch_hc_terminal(&herdr, &existing_term).await?;
-                    let _ = apply_hc_labels(&herdr, &existing_term, &labels).await;
-                    let sent = herdr
-                        .send_guarded_if_idle(&existing_term, &preamble)
-                        .await
-                        .unwrap_or(false);
-                    ("attached".to_string(), fetched, !sent)
-                } else {
-                    let raw_agent = agent.unwrap_or_else(|| "claude".to_string());
-                    let agent_cmd = map_agent_preset(&raw_agent);
-                    let spawned = herdr
-                        .run_worker(
-                            &caller_terminal,
-                            &dispatch_cwd,
-                            &labels,
-                            &agent_cmd,
-                            &preamble,
-                        )
-                        .await?;
-                    if spawned.first_message.is_none()
-                        && spawned.turn == 0
-                        && spawned.state != "finished"
-                        && matches!(spawned.status_name(), None | Some("idle" | "done" | ""))
-                    {
-                        let _ = herdr
-                            .send_guarded_if_idle(&spawned.address, &preamble)
-                            .await;
-                    }
-                    (raw_agent, spawned, false)
-                };
-
-            let worker_created_ms = worker_term.created_ms.unwrap_or(now_ms);
-            let mut disp = DispatchContext {
-                id: dispatch_id.clone(),
-                run_id: run.clone(),
-                task_id: task_row.id.clone(),
-                parent_terminal: caller_terminal,
-                assignee_terminal: worker_term.address.clone(),
-                terminal_created_ms: worker_created_ms,
-                turn_at_dispatch: worker_term.turn,
-                agent_kind: agent_kind_str,
-                worktree_mode: worktree,
-                worktree_path: worktree_path_opt,
-                depth,
-                status: DispatchStatus::Dispatched,
-                idle_since_ms: None,
-                blocked_since_ms: None,
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-
-            store.create_dispatch(&disp)?;
-
-            // Check first_message or spawn/attach error states outside SQLite lock
-            let failure_reason = if attach_send_failed {
-                Some(
-                    "failed delivering dispatch preamble to attached terminal (not idle)"
-                        .to_string(),
-                )
-            } else if let Some(ref fm) = worker_term.first_message {
-                if !fm.sent {
-                    Some(format!(
-                        "first_message not sent ({})",
-                        fm.reason.as_deref().unwrap_or("blocked_or_trust_dialog")
-                    ))
-                } else {
-                    None
-                }
-            } else if worker_term.state == "finished" || worker_term.status_name() == Some("error")
-            {
-                Some("worker terminal exited or entered error state at spawn".to_string())
-            } else {
-                None
-            };
-
-            if let Some(reason) = failure_reason {
-                store.record_task_failure(
-                    &run,
-                    &task_row.id,
-                    Some(&dispatch_id),
-                    &reason,
-                    now_ms,
-                )?;
-                if let Some(updated) = store.get_dispatch(&dispatch_id)? {
-                    disp = updated;
-                }
-            }
-
-            let resp_json = serde_json::to_string(&disp)?;
-            if let Some(ref req_id) = request_id {
-                store.save_mutation_receipt(req_id, "dispatch", &resp_json, now_ms)?;
-            }
-
+            let sleeper = SystemOrchSleeper;
+            let out = execute_dispatch(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchDispatchArgs {
+                    run,
+                    task,
+                    title,
+                    prompt,
+                    terminal,
+                    agent,
+                    worktree,
+                    request_id,
+                    caller_terminal: None,
+                },
+            )
+            .await?;
             notify_daemon_orch_wake(paths).await;
-            print_dispatch(&disp, json)?;
+            print_dispatch(&out, json)?;
             Ok(())
         }
         OrchCommands::Send {
@@ -748,63 +613,21 @@ pub async fn execute_orch_command(
             request_id,
             json,
         } => {
-            if let Some(ref req_id) = request_id {
-                if let Some(cached) = store.get_mutation_receipt(req_id)? {
-                    let msg: OrchMessage = serde_json::from_str(&cached)?;
-                    print_message(&msg, json)?;
-                    return Ok(());
-                }
-            }
-
-            let parsed_type = MessageType::from_str(msg_type.trim())?;
-            let disp = store
-                .get_dispatch(&dispatch_id)?
-                .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
-
-            let caller_terminal = std::env::var("HC_TERMINAL_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| disp.assignee_terminal.clone());
-
-            let caller_created_ms = fetch_hc_terminal(&herdr, &caller_terminal)
-                .await
-                .ok()
-                .and_then(|t| t.created_ms)
-                .unwrap_or(disp.terminal_created_ms);
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let msg = match parsed_type {
-                MessageType::WorkerDone => {
-                    let out_str = outcome.as_deref().unwrap_or("succeeded");
-                    store.record_worker_done(
-                        &dispatch_id,
-                        &caller_terminal,
-                        caller_created_ms,
-                        out_str,
-                        &body,
-                        now_ms,
-                    )?
-                }
-                MessageType::Escalation | MessageType::Status => store.record_worker_message(
-                    &dispatch_id,
-                    &caller_terminal,
-                    caller_created_ms,
-                    parsed_type,
-                    &body,
-                    now_ms,
-                )?,
-                other => bail!(
-                    "`tchelvis orch send` supports worker_done, escalation, or status (got {})",
-                    other
-                ),
-            };
-
-            let resp_json = serde_json::to_string(&msg)?;
-            if let Some(ref req_id) = request_id {
-                store.save_mutation_receipt(req_id, "send", &resp_json, now_ms)?;
-            }
-
+            let sleeper = SystemOrchSleeper;
+            let msg = execute_send(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchSendArgs {
+                    msg_type,
+                    outcome,
+                    dispatch_id,
+                    body,
+                    request_id,
+                    caller_terminal: None,
+                },
+            )
+            .await?;
             notify_daemon_orch_wake(paths).await;
             print_message(&msg, json)?;
             Ok(())
@@ -815,45 +638,19 @@ pub async fn execute_orch_command(
             request_id,
             json,
         } => {
-            if let Some(ref req_id) = request_id {
-                if let Some(cached) = store.get_mutation_receipt(req_id)? {
-                    let (q_thread, msg): (QuestionThread, OrchMessage) =
-                        serde_json::from_str(&cached)?;
-                    print_ask(&q_thread, &msg, json)?;
-                    return Ok(());
-                }
-            }
-
-            let disp = store
-                .get_dispatch(&dispatch_id)?
-                .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
-
-            let caller_terminal = std::env::var("HC_TERMINAL_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| disp.assignee_terminal.clone());
-
-            let caller_created_ms = fetch_hc_terminal(&herdr, &caller_terminal)
-                .await
-                .ok()
-                .and_then(|t| t.created_ms)
-                .unwrap_or(disp.terminal_created_ms);
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let (q_thread, msg) = store.record_question(
-                &dispatch_id,
-                &caller_terminal,
-                caller_created_ms,
-                &question,
-                now_ms,
-            )?;
-
-            let resp_json = serde_json::to_string(&(&q_thread, &msg))?;
-            if let Some(ref req_id) = request_id {
-                store.save_mutation_receipt(req_id, "ask", &resp_json, now_ms)?;
-            }
-
+            let sleeper = SystemOrchSleeper;
+            let (q_thread, msg) = execute_ask(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchAskArgs {
+                    dispatch_id,
+                    question,
+                    request_id,
+                    caller_terminal: None,
+                },
+            )
+            .await?;
             notify_daemon_orch_wake(paths).await;
             print_ask(&q_thread, &msg, json)?;
             Ok(())
@@ -1098,6 +895,513 @@ pub async fn execute_orch_command(
     }
 }
 
+pub async fn execute_dispatch(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchDispatchArgs,
+) -> Result<DispatchOutput> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let out: DispatchOutput = serde_json::from_str(&cached)?;
+            return Ok(out);
+        }
+    }
+
+    if !matches!(args.worktree.as_str(), "current" | "new-child") {
+        bail!(
+            "invalid --worktree mode '{}'; expected 'current' or 'new-child'",
+            args.worktree
+        );
+    }
+
+    let now_ms = sleeper.now_ms();
+    let run_row = store
+        .get_run(&args.run)?
+        .with_context(|| format!("run '{}' does not exist", args.run))?;
+
+    let caller_terminal = args
+        .caller_terminal
+        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| run_row.coordinator_terminal.clone());
+
+    let caller_term_info = fetch_hc_terminal(herdr, &caller_terminal).await.ok();
+    let caller_created_ms = caller_term_info
+        .as_ref()
+        .and_then(|t| t.created_ms)
+        .unwrap_or(run_row.coordinator_created_ms);
+
+    let depth = store.caller_orchestration_depth(&caller_terminal, caller_created_ms)?;
+    if depth > MAX_ORCH_DEPTH {
+        bail!(
+            "orchestration depth {} exceeds MAX_ORCH_DEPTH ({})",
+            depth,
+            MAX_ORCH_DEPTH
+        );
+    }
+
+    let task_row = match store.get_task(&args.run, &args.task)? {
+        Some(mut existing) => {
+            if existing.failure_count >= MAX_DISPATCH_FAILURES
+                || existing.status == TaskStatus::CircuitBroken
+            {
+                bail!(
+                    "circuit breaker tripped for task '{}' in run '{}' (failure_count = {})",
+                    args.task,
+                    args.run,
+                    existing.failure_count
+                );
+            }
+            if let Some(new_prompt) = args.prompt {
+                existing.prompt = new_prompt;
+                if let Some(new_title) = args.title {
+                    existing.title = new_title;
+                }
+                existing.updated_at_ms = now_ms;
+                store.create_or_update_task(&existing)?
+            } else {
+                existing
+            }
+        }
+        None => {
+            let inline_prompt = args.prompt.with_context(|| {
+                format!(
+                    "task '{}' does not exist in run '{}'; provide --prompt to create it inline",
+                    args.task, args.run
+                )
+            })?;
+            let inline_title = args.title.unwrap_or_else(|| format!("Task {}", args.task));
+            store.create_or_update_task(&OrchTask {
+                id: args.task.clone(),
+                run_id: args.run.clone(),
+                title: inline_title,
+                prompt: inline_prompt,
+                deps: Vec::new(),
+                failure_count: 0,
+                status: TaskStatus::Ready,
+                result_summary: None,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+            })?
+        }
+    };
+
+    let base_cwd = caller_term_info
+        .as_ref()
+        .map(|t| PathBuf::from(t.effective_cwd()))
+        .filter(|p| p.exists())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let (dispatch_cwd, worktree_path_opt) = if args.worktree == "new-child" {
+        let ws = resolve_git_workspace(&base_cwd.to_string_lossy());
+        let repo_root = ws
+            .repo_root
+            .map(PathBuf::from)
+            .unwrap_or_else(|| base_cwd.clone());
+        let wt_dir = create_child_worktree(&repo_root, &args.run, &args.task).await?;
+        let wt_str = wt_dir.to_string_lossy().to_string();
+        (wt_dir, Some(wt_str))
+    } else {
+        (base_cwd, None)
+    };
+
+    let dispatch_id = generate_orch_id("disp");
+    let preamble = build_dispatch_preamble(
+        &args.run,
+        &task_row.id,
+        &dispatch_id,
+        &caller_terminal,
+        depth,
+        &task_row.prompt,
+    );
+
+    let labels = [
+        ("cockpit.orch.role", "worker"),
+        ("cockpit.orch.run", args.run.as_str()),
+        ("cockpit.orch.task", task_row.id.as_str()),
+        ("cockpit.orch.dispatch", dispatch_id.as_str()),
+        ("cockpit.parent", caller_terminal.as_str()),
+    ];
+
+    let is_attached = args.terminal.is_some();
+    let (agent_kind_str, mut worker_term) = if let Some(ref existing_term) = args.terminal {
+        let fetched = fetch_hc_terminal(herdr, existing_term).await?;
+        let _ = apply_hc_labels(herdr, existing_term, &labels).await;
+        ("attached".to_string(), fetched)
+    } else {
+        let raw_agent = args.agent.unwrap_or_else(|| "claude".to_string());
+        let agent_cmd = map_agent_preset(&raw_agent);
+        let spawned = herdr
+            .run_worker(
+                &caller_terminal,
+                &dispatch_cwd,
+                &labels,
+                &agent_cmd,
+                &preamble,
+            )
+            .await?;
+        (raw_agent, spawned)
+    };
+
+    let worker_created_ms = worker_term.created_ms.unwrap_or(now_ms);
+    let mut disp = DispatchContext {
+        id: dispatch_id.clone(),
+        run_id: args.run.clone(),
+        task_id: task_row.id.clone(),
+        parent_terminal: caller_terminal,
+        assignee_terminal: worker_term.address.clone(),
+        terminal_created_ms: worker_created_ms,
+        turn_at_dispatch: worker_term.turn,
+        agent_kind: agent_kind_str,
+        worktree_mode: args.worktree,
+        worktree_path: worktree_path_opt,
+        depth,
+        status: DispatchStatus::Dispatched,
+        idle_since_ms: None,
+        blocked_since_ms: None,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+
+    store.create_dispatch(&disp)?;
+
+    let attach_send_failed = if let Some(ref existing_term) = args.terminal {
+        !herdr
+            .send_guarded_if_idle(existing_term, &preamble)
+            .await
+            .unwrap_or(false)
+    } else {
+        if worker_term.first_message.is_none()
+            && worker_term.turn == 0
+            && worker_term.state != "finished"
+            && matches!(worker_term.status_name(), None | Some("idle" | "done" | ""))
+        {
+            let _ = herdr
+                .send_guarded_if_idle(&worker_term.address, &preamble)
+                .await;
+        }
+        false
+    };
+
+    let first_message_failed = matches!(worker_term.first_message, Some(ref fm) if !fm.sent);
+
+    if !is_attached
+        && !first_message_failed
+        && worker_term.state != "finished"
+        && worker_term.status_name() != Some("error")
+    {
+        let recheck_start_ms = sleeper.now_ms();
+        let recheck_timeout_ms = DISPATCH_LIVENESS_RECHECK_TIMEOUT.as_millis() as i64;
+        let recheck_step_ms = (DISPATCH_LIVENESS_RECHECK_INTERVAL.as_millis() as i64).max(1);
+
+        loop {
+            if let Some(current) = store.get_dispatch(&dispatch_id)? {
+                if current.status != DispatchStatus::Dispatched {
+                    disp = current;
+                    break;
+                }
+            }
+            let elapsed_ms = sleeper.now_ms().saturating_sub(recheck_start_ms);
+            if elapsed_ms >= recheck_timeout_ms {
+                break;
+            }
+            let step_ms = (recheck_timeout_ms - elapsed_ms)
+                .min(recheck_step_ms)
+                .max(1);
+            sleeper.sleep(Duration::from_millis(step_ms as u64)).await;
+
+            if let Some(current) = store.get_dispatch(&dispatch_id)? {
+                if current.status != DispatchStatus::Dispatched {
+                    disp = current;
+                    break;
+                }
+            }
+            if let Ok(fetched) = fetch_hc_terminal(herdr, &worker_term.address).await {
+                if let Some(current) = store.get_dispatch(&dispatch_id)? {
+                    if current.status != DispatchStatus::Dispatched {
+                        disp = current;
+                        break;
+                    }
+                }
+                let preserved_fm = worker_term.first_message.clone();
+                worker_term = fetched;
+                if worker_term.first_message.is_none() {
+                    worker_term.first_message = preserved_fm;
+                }
+                if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(current) = store.get_dispatch(&dispatch_id)? {
+        disp = current;
+    }
+
+    let failure_info: Option<(String, Option<i32>, Option<String>)> = if attach_send_failed {
+        Some((
+            "failed delivering dispatch preamble to attached terminal (not idle)".to_string(),
+            None,
+            None,
+        ))
+    } else if disp.status != DispatchStatus::Dispatched {
+        None
+    } else if let Some(fm) = worker_term.first_message.as_ref().filter(|fm| !fm.sent) {
+        let base = format!(
+            "first_message not sent ({})",
+            fm.reason.as_deref().unwrap_or("blocked_or_trust_dialog")
+        );
+        if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+            let tail = herdr
+                .read_tail_lines(&worker_term.address, WORKER_LAUNCH_TAIL_LINES)
+                .await
+                .unwrap_or_default();
+            let tail_trimmed = tail.trim().to_string();
+            let tail_opt = (!tail_trimmed.is_empty()).then_some(tail_trimmed);
+            let reason = format_launch_failure_reason(
+                &base,
+                worker_term.exit_code,
+                worker_term.status_msg().or(worker_term.reason.as_deref()),
+                tail_opt.as_deref(),
+            );
+            Some((reason, worker_term.exit_code, tail_opt))
+        } else {
+            Some((base, None, None))
+        }
+    } else if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+        let tail = herdr
+            .read_tail_lines(&worker_term.address, WORKER_LAUNCH_TAIL_LINES)
+            .await
+            .unwrap_or_default();
+        let tail_trimmed = tail.trim().to_string();
+        let tail_opt = (!tail_trimmed.is_empty()).then_some(tail_trimmed);
+        let reason = format_launch_failure_reason(
+            "worker terminal exited or entered error state at spawn",
+            worker_term.exit_code,
+            worker_term.status_msg().or(worker_term.reason.as_deref()),
+            tail_opt.as_deref(),
+        );
+        Some((reason, worker_term.exit_code, tail_opt))
+    } else {
+        None
+    };
+
+    let (failure_reason, exit_code, output_tail) = match failure_info {
+        Some((reason, code, tail)) => {
+            store.record_task_failure(
+                &args.run,
+                &task_row.id,
+                Some(&dispatch_id),
+                &reason,
+                sleeper.now_ms(),
+            )?;
+            if let Some(updated) = store.get_dispatch(&dispatch_id)? {
+                disp = updated;
+            }
+            (Some(reason), code, tail)
+        }
+        None => (None, None, None),
+    };
+
+    let out = DispatchOutput {
+        dispatch: disp,
+        failure_reason,
+        exit_code,
+        output_tail,
+    };
+
+    let resp_json = serde_json::to_string(&out)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "dispatch", &resp_json, sleeper.now_ms())?;
+    }
+
+    Ok(out)
+}
+
+fn format_launch_failure_reason(
+    base: &str,
+    exit_code: Option<i32>,
+    detail: Option<&str>,
+    tail: Option<&str>,
+) -> String {
+    let mut meta = Vec::new();
+    if let Some(code) = exit_code {
+        meta.push(format!("exit_code={code}"));
+    }
+    if let Some(d) = detail.map(str::trim).filter(|s| !s.is_empty()) {
+        meta.push(format!("detail={d}"));
+    }
+    let header = if meta.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} ({})", meta.join(", "))
+    };
+    match tail.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => format!("{header}\n--- last lines ---\n{t}"),
+        None => header,
+    }
+}
+
+pub async fn wait_for_dispatch(
+    store: &OrchStore,
+    dispatch_id: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    sleeper: &dyn OrchSleeper,
+) -> Result<DispatchContext> {
+    let start_ms = sleeper.now_ms();
+    let timeout_ms = timeout.as_millis() as i64;
+    let poll_ms = (poll_interval.as_millis() as i64).max(1);
+
+    loop {
+        if let Some(disp) = store.get_dispatch(dispatch_id)? {
+            if disp.status != DispatchStatus::Starting && !disp.assignee_terminal.is_empty() {
+                return Ok(disp);
+            }
+        }
+        let elapsed_ms = sleeper.now_ms().saturating_sub(start_ms);
+        if elapsed_ms >= timeout_ms {
+            bail!("dispatch '{}' does not exist", dispatch_id);
+        }
+        let step_ms = (timeout_ms - elapsed_ms).min(poll_ms).max(1);
+        sleeper.sleep(Duration::from_millis(step_ms as u64)).await;
+    }
+}
+
+pub async fn execute_send(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchSendArgs,
+) -> Result<OrchMessage> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let msg: OrchMessage = serde_json::from_str(&cached)?;
+            return Ok(msg);
+        }
+    }
+
+    let parsed_type = MessageType::from_str(args.msg_type.trim())?;
+    if !matches!(
+        parsed_type,
+        MessageType::WorkerDone | MessageType::Escalation | MessageType::Status
+    ) {
+        bail!(
+            "`tchelvis orch send` supports worker_done, escalation, or status (got {})",
+            parsed_type
+        );
+    }
+
+    let disp = wait_for_dispatch(
+        store,
+        &args.dispatch_id,
+        DISPATCH_WAIT_TIMEOUT,
+        DISPATCH_WAIT_POLL_INTERVAL,
+        sleeper,
+    )
+    .await?;
+
+    let caller_terminal = args
+        .caller_terminal
+        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| disp.assignee_terminal.clone());
+
+    let caller_created_ms = fetch_hc_terminal(herdr, &caller_terminal)
+        .await
+        .ok()
+        .and_then(|t| t.created_ms)
+        .unwrap_or(disp.terminal_created_ms);
+
+    let now_ms = sleeper.now_ms();
+    let msg = match parsed_type {
+        MessageType::WorkerDone => {
+            let out_str = args.outcome.as_deref().unwrap_or("succeeded");
+            store.record_worker_done(
+                &args.dispatch_id,
+                &caller_terminal,
+                caller_created_ms,
+                out_str,
+                &args.body,
+                now_ms,
+            )?
+        }
+        MessageType::Escalation | MessageType::Status => store.record_worker_message(
+            &args.dispatch_id,
+            &caller_terminal,
+            caller_created_ms,
+            parsed_type,
+            &args.body,
+            now_ms,
+        )?,
+        _ => unreachable!(),
+    };
+
+    let resp_json = serde_json::to_string(&msg)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "send", &resp_json, now_ms)?;
+    }
+
+    Ok(msg)
+}
+
+pub async fn execute_ask(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchAskArgs,
+) -> Result<(QuestionThread, OrchMessage)> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let (q_thread, msg): (QuestionThread, OrchMessage) = serde_json::from_str(&cached)?;
+            return Ok((q_thread, msg));
+        }
+    }
+
+    let disp = wait_for_dispatch(
+        store,
+        &args.dispatch_id,
+        DISPATCH_WAIT_TIMEOUT,
+        DISPATCH_WAIT_POLL_INTERVAL,
+        sleeper,
+    )
+    .await?;
+
+    let caller_terminal = args
+        .caller_terminal
+        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| disp.assignee_terminal.clone());
+
+    let caller_created_ms = fetch_hc_terminal(herdr, &caller_terminal)
+        .await
+        .ok()
+        .and_then(|t| t.created_ms)
+        .unwrap_or(disp.terminal_created_ms);
+
+    let now_ms = sleeper.now_ms();
+    let (q_thread, msg) = store.record_question(
+        &args.dispatch_id,
+        &caller_terminal,
+        caller_created_ms,
+        &args.question,
+        now_ms,
+    )?;
+
+    let resp_json = serde_json::to_string(&(&q_thread, &msg))?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "ask", &resp_json, now_ms)?;
+    }
+
+    Ok((q_thread, msg))
+}
+
 fn print_run_create(run: &OrchRun, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(run)?);
@@ -1122,18 +1426,35 @@ fn print_task_create(task: &OrchTask, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_dispatch(disp: &DispatchContext, json: bool) -> Result<()> {
+fn print_dispatch(out: &DispatchOutput, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(disp)?);
+        println!("{}", serde_json::to_string_pretty(out)?);
+    } else if let Some(ref reason) = out.failure_reason {
+        let exit_part = out
+            .exit_code
+            .map(|c| format!(", exit_code={c}"))
+            .unwrap_or_default();
+        println!(
+            "Dispatch {} for task {} in run {} -> worker {} failed at launch (status={}{}, depth={}/{}): {}",
+            out.dispatch.id,
+            out.dispatch.task_id,
+            out.dispatch.run_id,
+            out.dispatch.assignee_terminal,
+            out.dispatch.status,
+            exit_part,
+            out.dispatch.depth,
+            MAX_ORCH_DEPTH,
+            reason
+        );
     } else {
         println!(
             "Dispatched {} for task {} in run {} -> worker {} (status={}, depth={}/{})",
-            disp.id,
-            disp.task_id,
-            disp.run_id,
-            disp.assignee_terminal,
-            disp.status,
-            disp.depth,
+            out.dispatch.id,
+            out.dispatch.task_id,
+            out.dispatch.run_id,
+            out.dispatch.assignee_terminal,
+            out.dispatch.status,
+            out.dispatch.depth,
             MAX_ORCH_DEPTH
         );
     }

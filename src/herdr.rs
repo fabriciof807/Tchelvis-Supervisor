@@ -1048,10 +1048,11 @@ impl HerdrClient {
     }
 
     pub async fn read_tail_lines(&self, terminal: &str, lines: usize) -> Result<String> {
+        let lines_arg = lines.to_string();
         let out = tokio::time::timeout(
             Duration::from_secs(5),
             Command::new(&self.hc_bin)
-                .args(["read", terminal])
+                .args(["read", terminal, "--lines", &lines_arg])
                 .stdin(Stdio::null())
                 .output(),
         )
