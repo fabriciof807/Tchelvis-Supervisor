@@ -791,6 +791,9 @@ async fn test_cli_execute_orch_commands_and_worktree_release_guard() {
     // 3. Test helper functions and git worktree creation + release safety guard
     assert_eq!(map_agent_preset("codex"), "codex --no-daemon");
     assert_eq!(map_agent_preset("claude"), "claude");
+    // agy rejects a positional prompt; it reads the first prompt only via -i.
+    assert_eq!(map_agent_preset("agy"), "agy -i");
+    assert_eq!(map_agent_preset("antigravity"), "agy -i");
     assert_eq!(
         parse_deps_arg(Some("a, b ,c")).unwrap(),
         vec!["a", "b", "c"]

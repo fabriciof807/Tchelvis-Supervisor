@@ -173,6 +173,8 @@ pub fn map_agent_preset(agent: &str) -> String {
         "opencode" => "opencode".to_string(),
         "pi" => "pi".to_string(),
         "gemini" => "gemini".to_string(),
+        // agy rejects a positional prompt; `-i` starts an interactive session with it.
+        "agy" | "antigravity" => "agy -i".to_string(),
         other => other.to_string(),
     }
 }

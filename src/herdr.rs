@@ -986,9 +986,9 @@ impl HerdrClient {
             .get("first_message")
             .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-        let has_full_terminal_fields =
-            val.get("state").is_some() || val.get("created_ms").is_some();
-        if has_full_terminal_fields {
+        // `hc run --json` (0.1.21) omits `created_ms`; only trust it when present,
+        // otherwise fetch the terminal so attempt fencing gets the real value.
+        if val.get("created_ms").is_some() {
             if let Ok(mut term) = serde_json::from_value::<HcTerminal>(val.clone()) {
                 if !term.address.is_empty() {
                     if term.first_message.is_none() {
@@ -1357,5 +1357,37 @@ mod tests {
 
         let tail = client.read_tail_lines("t12", 2).await.unwrap();
         assert_eq!(tail, "line 2\nline 3");
+    }
+
+    /// hc 0.1.21 `run --json` returns `{address, agent, cwd, state, turn}` with no
+    /// `created_ms`; the real creation time only comes from `hc get`. Attempt
+    /// fencing compares against that value, so it must not be left empty.
+    #[tokio::test]
+    async fn test_run_worker_fetches_created_ms_when_run_output_lacks_it() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_hc = tmp.path().join("fake-hc");
+        let script = "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               echo '{\"address\":\"t4\",\"agent\":\"pi\",\"cwd\":\"/r\",\"state\":\"live\",\"turn\":0}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               echo '{\"address\":\"t4\",\"created_ms\":1795046353550,\"state\":\"live\",\"turn\":0,\"labels\":{}}'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n";
+        fs::write(&fake_hc, script).unwrap();
+        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+        let term = client
+            .run_worker("t1", tmp.path(), &[], "pi", "[TCHELVIS] Do task")
+            .await
+            .unwrap();
+        assert_eq!(term.address, "t4");
+        assert_eq!(term.created_ms, Some(1795046353550));
     }
 }
