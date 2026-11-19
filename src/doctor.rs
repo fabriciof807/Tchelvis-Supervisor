@@ -156,8 +156,9 @@ pub async fn run_doctor(
                 name: "storage_ipc".into(),
                 status: "ok".into(),
                 detail: format!(
-                    "SQLite WAL ready at {}; socket_present={sock_exists}",
-                    paths.db_file().display()
+                    "SQLite WAL ready at {}; socket_present={sock_exists}; log={}",
+                    paths.db_file().display(),
+                    paths.log_file().display()
                 ),
             });
             s

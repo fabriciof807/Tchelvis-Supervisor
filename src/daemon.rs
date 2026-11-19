@@ -5,7 +5,7 @@ use crate::model::{
     AgentRow, CockpitSnapshot, FleetSummary, FleetSummaryProjection, InspectResponse, IpcOp,
     IpcRequest, SNAPSHOT_SCHEMA_VERSION,
 };
-use crate::orch::delivery::OrchDeliveryCoordinator;
+use crate::orch::delivery::{DeliveryScheduler, ScheduleOutcome};
 use crate::orch::reconciler::OrchReconciler;
 use crate::orch::store::OrchStore;
 use crate::providers::ProviderCoordinator;
@@ -283,10 +283,11 @@ async fn refresh_and_publish_snapshot(
 async fn run_orch_cycle(
     orch_store: &OrchStore,
     herdr: &HerdrClient,
+    delivery_scheduler: &mut DeliveryScheduler,
     tracker: &FleetTracker,
     ts_ms: i64,
     source: &str,
-) -> (crate::orch::ReconcileOutcome, crate::orch::DeliveryOutcome) {
+) -> (crate::orch::ReconcileOutcome, ScheduleOutcome) {
     let reconcile_outcome = match OrchReconciler::reconcile_active_dispatches(
         orch_store, herdr, tracker, ts_ms,
     )
@@ -298,17 +299,14 @@ async fn run_orch_cycle(
             Default::default()
         }
     };
-    let delivery_outcome =
-        match OrchDeliveryCoordinator::deliver_pending_pointers(orch_store, herdr, tracker, ts_ms)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                tracing::warn!("orch pointer delivery failed ({source}): {err:#}");
-                Default::default()
-            }
-        };
-    (reconcile_outcome, delivery_outcome)
+    let schedule_outcome = match delivery_scheduler.schedule_pending(orch_store, tracker, ts_ms) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!("orch pointer scheduling failed ({source}): {err:#}");
+            Default::default()
+        }
+    };
+    (reconcile_outcome, schedule_outcome)
 }
 
 async fn read_event_line_cancel_safe<R: AsyncBufRead + Unpin>(
@@ -471,6 +469,7 @@ pub async fn run_daemon(
     let mut orch_tick = tokio::time::interval(Duration::from_millis(500));
     let mut worktree_tick = tokio::time::interval(Duration::from_secs(2));
     let mut reconcile_tick = tokio::time::interval(Duration::from_secs(5));
+    let mut delivery_scheduler = DeliveryScheduler::new(herdr.clone());
 
     loop {
         let has_event_stream = event_child_and_reader.is_some();
@@ -532,12 +531,16 @@ pub async fn run_daemon(
             }
             Some(()) = orch_wake_rx.recv() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
-                let (reconcile_outcome, delivery_outcome) =
-                    run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "wake").await;
-                if reconcile_outcome.state_changed
-                    || delivery_outcome.delivered_count > 0
-                    || delivery_outcome.stalled_count > 0
-                {
+                let (reconcile_outcome, schedule_outcome) = run_orch_cycle(
+                    &orch_store,
+                    &herdr,
+                    &mut delivery_scheduler,
+                    &tracker,
+                    ts_ms,
+                    "wake",
+                )
+                .await;
+                if reconcile_outcome.state_changed || schedule_outcome.stalled_count > 0 {
                     let _ = refresh_and_publish_snapshot(
                         &pub_ctx,
                         &mut tracker,
@@ -548,6 +551,28 @@ pub async fn run_daemon(
                         ts_ms,
                     )
                     .await;
+                }
+            }
+            Some(completed) = delivery_scheduler.recv_completed() => {
+                let ts_ms = chrono::Utc::now().timestamp_millis();
+                match delivery_scheduler.handle_completed(&orch_store, completed, ts_ms) {
+                    Ok(true) => {
+                        let _ = delivery_scheduler.schedule_pending(&orch_store, &tracker, ts_ms);
+                        let _ = refresh_and_publish_snapshot(
+                            &pub_ctx,
+                            &mut tracker,
+                            &herdr,
+                            &mut rpc,
+                            herdr_connected,
+                            false,
+                            ts_ms,
+                        )
+                        .await;
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        tracing::warn!("orch pointer completion update failed: {err:#}");
+                    }
                 }
             }
             line_res = async {
@@ -601,7 +626,15 @@ pub async fn run_daemon(
                 }
 
                 if any_changed {
-                    let _ = run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "event").await;
+                    let _ = run_orch_cycle(
+                        &orch_store,
+                        &herdr,
+                        &mut delivery_scheduler,
+                        &tracker,
+                        ts_ms,
+                        "event",
+                    )
+                    .await;
                     let _ = refresh_and_publish_snapshot(
                         &pub_ctx,
                         &mut tracker,
@@ -616,12 +649,16 @@ pub async fn run_daemon(
             }
             _ = orch_tick.tick() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
-                let (reconcile_outcome, delivery_outcome) =
-                    run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "tick").await;
-                if reconcile_outcome.state_changed
-                    || delivery_outcome.delivered_count > 0
-                    || delivery_outcome.stalled_count > 0
-                {
+                let (reconcile_outcome, schedule_outcome) = run_orch_cycle(
+                    &orch_store,
+                    &herdr,
+                    &mut delivery_scheduler,
+                    &tracker,
+                    ts_ms,
+                    "tick",
+                )
+                .await;
+                if reconcile_outcome.state_changed || schedule_outcome.stalled_count > 0 {
                     let _ = refresh_and_publish_snapshot(
                         &pub_ctx,
                         &mut tracker,
@@ -677,7 +714,15 @@ pub async fn run_daemon(
                     Ok(terms) => {
                         herdr_connected = true;
                         tracker.apply_snapshot(terms, ts_ms);
-                        let _ = run_orch_cycle(&orch_store, &herdr, &tracker, ts_ms, "reconcile").await;
+                        let _ = run_orch_cycle(
+                            &orch_store,
+                            &herdr,
+                            &mut delivery_scheduler,
+                            &tracker,
+                            ts_ms,
+                            "reconcile",
+                        )
+                        .await;
                         let _ = refresh_and_publish_snapshot(
                             &pub_ctx,
                             &mut tracker,

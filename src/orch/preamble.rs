@@ -11,10 +11,10 @@ pub fn build_dispatch_preamble(
          Run ID: {run_id} | Task ID: {task_id} | Dispatch ID: {dispatch_id} | Parent: {parent_terminal} | Depth: {depth}/2\n\
          \n\
          Mandatory Rules:\n\
-         1. Report `worker_done` exactly once per dispatch, only after all implementation and verification are complete (never send a preliminary `worker_done` followed by another):\n\
-            - When your task is complete, report back before ending your turn:\n\
+         1. Report `worker_done` exactly once per dispatch, only after all implementation and verification are complete (never send a preliminary `worker_done` followed by another), and then stop immediately (take no further turns unless woken by a coordinator directive):\n\
+            - When your task is complete, report back and stop immediately with no further turns:\n\
               tchelvis orch send --type worker_done --outcome succeeded --dispatch-id {dispatch_id} --body \"<concise summary of changes and verification>\"\n\
-            - If you fail or cannot complete the task, report failure:\n\
+            - If you fail or cannot complete the task, report failure and stop immediately with no further turns:\n\
               tchelvis orch send --type worker_done --outcome failed --dispatch-id {dispatch_id} --body \"<failure reason>\"\n\
          2. If you need clarification from the coordinator, ask and then end your turn immediately (never poll or sleep):\n\
             tchelvis orch ask --dispatch-id {dispatch_id} --question \"<question>\"\n\
@@ -73,8 +73,9 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
    ```
 3. **End your turn immediately (Never Poll!)**:
    - Do **not** run `sleep`, `hc wait`, or `hc read` loops waiting for workers.
-   - `tchelvis daemon` monitors child terminals and automatically injects a single-line `[tchelvis] You have N orchestration message(s) in run <run_id>...` pointer via `hc send --if idle` when a worker finishes (`worker_done`), asks a question (`ask`), blocks on a prompt, or stops silently (`1500ms` post-turn safety net).
-4. **Check your inbox when woken**:
+   - `tchelvis daemon` monitors child terminals and automatically injects a single-line `[tchelvis] You have N orchestration message(s) in run <run_id>...` pointer when a worker finishes (`worker_done`), asks a question (`ask`), blocks on a prompt, or stops silently (`1500ms` post-turn safety net). Delivery uses `hc send --if idle` when `idle` and re-checks via `hc get` before plain `hc send` when `done` (never while `working`, `blocked`, `error`, or `unknown`).
+4. **Check your inbox when woken (or if no pointer arrives)**:
+   - When woken by a `[tchelvis]` pointer, or if no pointer arrives and the user asks for results, run:
    ```bash
    tchelvis orch check --run <run_id>
    ```
@@ -97,7 +98,7 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
    ```bash
    tchelvis orch send --to dispatch:<dispatch_id> --body "Finish verification and report worker_done"
    ```
-   Delivers immediately when the worker is live and idle (or queues for delivery when busy) and records a `directive` in `orch.db`. Rejected if the worker terminal is already `finished` (use `retry` next).
+   Delivers immediately when the worker is live and `idle` (via `--if idle`) or `done` (after `hc get` re-check, via plain `hc send`), or queues for delivery when busy, recording a `directive` in `orch.db`. Rejected if the worker terminal is already `finished` (use `retry` next).
 2. **`retry` (worker finished, errored, or stalled)**:
    ```bash
    tchelvis orch retry <dispatch_id>
@@ -112,8 +113,8 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
 ## Worker Rules
 
 When spawned or attached as an orchestrated worker, follow the `[TCHELVIS ORCHESTRATION WORKER CONTRACT]` in your prompt:
-- Report completion: `tchelvis orch send --type worker_done --outcome succeeded --dispatch-id <dispatch_id> --body "<summary>"`
-- Report failure: `tchelvis orch send --type worker_done --outcome failed --dispatch-id <dispatch_id> --body "<reason>"`
+- Report completion and stop immediately (no further turns unless woken by a coordinator directive): `tchelvis orch send --type worker_done --outcome succeeded --dispatch-id <dispatch_id> --body "<summary>"`
+- Report failure and stop immediately (no further turns): `tchelvis orch send --type worker_done --outcome failed --dispatch-id <dispatch_id> --body "<reason>"`
 - Ask a blocking question (then end your turn immediately): `tchelvis orch ask --dispatch-id <dispatch_id> --question "<question>"`
 "#
 }
@@ -142,6 +143,8 @@ mod tests {
         assert!(preamble.contains(
             "tchelvis orch send --type worker_done --outcome failed --dispatch-id disp_01"
         ));
+        assert!(preamble.contains("stop immediately"));
+        assert!(preamble.contains("no further turns"));
         assert!(preamble.contains("tchelvis orch ask --dispatch-id disp_01"));
         assert!(preamble.contains("tchelvis orch check --run run_01"));
         assert!(preamble.contains("[TASK PROMPT]\nImplement JWT validation and run cargo test."));
@@ -173,6 +176,9 @@ mod tests {
         assert!(skill
             .to_ascii_lowercase()
             .contains("silence is never proof of exit"));
+        assert!(skill
+            .to_ascii_lowercase()
+            .contains("if no pointer arrives and the user asks for results"));
     }
 
     #[test]
@@ -202,6 +208,10 @@ mod tests {
         assert!(skill
             .to_ascii_lowercase()
             .contains("silence is never proof of exit"));
+        assert!(skill
+            .to_ascii_lowercase()
+            .contains("if no pointer arrives and the user asks for results"));
+        assert!(skill.contains("no further turns"));
     }
 
     #[test]

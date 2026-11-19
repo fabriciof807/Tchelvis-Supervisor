@@ -2071,6 +2071,10 @@ async fn lot_d_coordinator_claude_done_receives_worker_done_pointer_after_deferr
     let fake_hc = tmp.path().join("fake-hc");
     let script = format!(
         "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{{\"address\":\"t1\",\"state\":\"live\",\"status\":{{\"state\":\"done\",\"app\":\"claude\"}}}}'\n\
+           exit 0\n\
+         fi\n\
          if [ \"$1\" = \"send\" ]; then\n\
            echo \"$*\" >> \"{}\"\n\
            exit 0\n\
@@ -2922,4 +2926,96 @@ async fn lot_f_stop_closes_terminal_marks_stopped_restores_task_and_preserves_di
     let db_task = store.get_task("run_1", "task_dirty").unwrap().unwrap();
     assert_eq!(db_task.status, TaskStatus::Ready);
     assert_eq!(db_task.failure_count, 0);
+}
+
+#[tokio::test]
+async fn lot_g_send_to_and_attach_on_done_terminal_use_get_recheck_and_plain_send() {
+    let tmp = tempfile::tempdir().unwrap();
+    let hc_log = tmp.path().join("hc_calls.log");
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        format!(
+            "#!/usr/bin/env bash\n\
+             echo \"$*\" >> \"{}\"\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               if [ \"$2\" = \"t1\" ]; then\n\
+                 echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"reported\":true,\"status\":{{\"state\":\"idle\",\"app\":\"claude\"}},\"turn\":1,\"cwd\":\"/tmp\"}}'\n\
+               else\n\
+                 echo '{{\"address\":\"'$2'\",\"created_ms\":2000,\"state\":\"live\",\"reported\":true,\"status\":{{\"state\":\"done\",\"app\":\"claude\"}},\"turn\":1,\"cwd\":\"/tmp\"}}'\n\
+               fi\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"send\" ]; then\n\
+               echo '{{\"started\":false,\"status\":\"done\"}}'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            hc_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+
+    // 1. Attach to existing terminal `t_done` that reports `done`:
+    //    `execute_dispatch` delivers preamble via `send_guarded` -> `get` recheck -> plain `send` (no `--if idle`).
+    let disp = execute_dispatch(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(5_000),
+        OrchDispatchArgs {
+            run: "run_1".into(),
+            task: "task_a".into(),
+            title: None,
+            prompt: None,
+            terminal: Some("t_done".into()),
+            agent: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    // 2. `send --to` targeting that same `done` worker dispatch -> `get` recheck -> plain `send` (no `--if idle`).
+    let sent = execute_send_to(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(6_000),
+        OrchSendToArgs {
+            to: format!("dispatch:{}", disp.dispatch.id),
+            body: "Please double-check tests.".into(),
+            request_id: Some("req_send_to_done".into()),
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(sent.delivered_immediately);
+
+    let calls = fs::read_to_string(&hc_log).unwrap();
+    let send_lines: Vec<&str> = calls.lines().filter(|l| l.starts_with("send ")).collect();
+    assert_eq!(
+        send_lines.len(),
+        2,
+        "expected preamble send + directive send, got:\n{calls}"
+    );
+    for line in &send_lines {
+        assert!(
+            line.starts_with("send t_done "),
+            "expected plain send to t_done, got: {line}"
+        );
+        assert!(
+            !line.contains("--if"),
+            "done terminal must not use --if idle, got: {line}"
+        );
+    }
 }

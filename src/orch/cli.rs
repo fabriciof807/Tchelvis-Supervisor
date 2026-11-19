@@ -1427,22 +1427,28 @@ pub async fn execute_dispatch(
         return Err(err);
     }
 
-    let attach_send_failed = if let Some(ref existing_term) = args.terminal {
-        !herdr
-            .send_guarded_if_idle(existing_term, &preamble)
+    let attach_send_failure: Option<String> = if args.terminal.is_some() {
+        match herdr
+            .send_guarded(&worker_term, None, &preamble, None)
             .await
-            .unwrap_or(false)
+        {
+            crate::herdr::GuardedSendOutcome::Sent { .. } => None,
+            crate::herdr::GuardedSendOutcome::Deferred { reason, detail }
+            | crate::herdr::GuardedSendOutcome::Error { reason, detail } => Some(match detail {
+                Some(d) if !d.is_empty() => format!("{reason}: {d}"),
+                _ => reason,
+            }),
+        }
     } else {
         if worker_term.first_message.is_none()
             && worker_term.turn == 0
             && worker_term.state != "finished"
-            && matches!(worker_term.status_name(), None | Some("idle" | "done" | ""))
         {
             let _ = herdr
-                .send_guarded_if_idle(&worker_term.address, &preamble)
+                .send_guarded(&worker_term, None, &preamble, None)
                 .await;
         }
-        false
+        None
     };
 
     let first_message_failed = matches!(worker_term.first_message, Some(ref fm) if !fm.sent);
@@ -1501,20 +1507,38 @@ pub async fn execute_dispatch(
         disp = current;
     }
 
-    let failure_info: Option<(String, Option<i32>, Option<String>)> = if attach_send_failed {
-        Some((
-            "failed delivering dispatch preamble to attached terminal (not idle)".to_string(),
-            None,
-            None,
-        ))
-    } else if disp.status != DispatchStatus::Dispatched {
-        None
-    } else if let Some(fm) = worker_term.first_message.as_ref().filter(|fm| !fm.sent) {
-        let base = format!(
-            "first_message not sent ({})",
-            fm.reason.as_deref().unwrap_or("blocked_or_trust_dialog")
-        );
-        if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+    let failure_info: Option<(String, Option<i32>, Option<String>)> =
+        if let Some(attach_err) = attach_send_failure {
+            Some((
+                format!("failed delivering dispatch preamble to attached terminal ({attach_err})"),
+                None,
+                None,
+            ))
+        } else if disp.status != DispatchStatus::Dispatched {
+            None
+        } else if let Some(fm) = worker_term.first_message.as_ref().filter(|fm| !fm.sent) {
+            let base = format!(
+                "first_message not sent ({})",
+                fm.reason.as_deref().unwrap_or("blocked_or_trust_dialog")
+            );
+            if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+                let tail = herdr
+                    .read_tail_lines(&worker_term.address, WORKER_LAUNCH_TAIL_LINES)
+                    .await
+                    .unwrap_or_default();
+                let tail_trimmed = tail.trim().to_string();
+                let tail_opt = (!tail_trimmed.is_empty()).then_some(tail_trimmed);
+                let reason = format_launch_failure_reason(
+                    &base,
+                    worker_term.exit_code,
+                    worker_term.status_msg().or(worker_term.reason.as_deref()),
+                    tail_opt.as_deref(),
+                );
+                Some((reason, worker_term.exit_code, tail_opt))
+            } else {
+                Some((base, None, None))
+            }
+        } else if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
             let tail = herdr
                 .read_tail_lines(&worker_term.address, WORKER_LAUNCH_TAIL_LINES)
                 .await
@@ -1522,32 +1546,15 @@ pub async fn execute_dispatch(
             let tail_trimmed = tail.trim().to_string();
             let tail_opt = (!tail_trimmed.is_empty()).then_some(tail_trimmed);
             let reason = format_launch_failure_reason(
-                &base,
+                "worker terminal exited or entered error state at spawn",
                 worker_term.exit_code,
                 worker_term.status_msg().or(worker_term.reason.as_deref()),
                 tail_opt.as_deref(),
             );
             Some((reason, worker_term.exit_code, tail_opt))
         } else {
-            Some((base, None, None))
-        }
-    } else if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
-        let tail = herdr
-            .read_tail_lines(&worker_term.address, WORKER_LAUNCH_TAIL_LINES)
-            .await
-            .unwrap_or_default();
-        let tail_trimmed = tail.trim().to_string();
-        let tail_opt = (!tail_trimmed.is_empty()).then_some(tail_trimmed);
-        let reason = format_launch_failure_reason(
-            "worker terminal exited or entered error state at spawn",
-            worker_term.exit_code,
-            worker_term.status_msg().or(worker_term.reason.as_deref()),
-            tail_opt.as_deref(),
-        );
-        Some((reason, worker_term.exit_code, tail_opt))
-    } else {
-        None
-    };
+            None
+        };
 
     let (failure_reason, exit_code, output_tail, worktree_cleanup) = match failure_info {
         Some((mut reason, code, tail)) => {
@@ -2142,16 +2149,14 @@ pub async fn execute_send_to(
         );
     }
 
-    let can_try_immediate = matches!(worker_term.status_name(), Some("idle" | "done" | "") | None)
-        && !args.body.contains('\n')
-        && !args.body.contains('\r')
-        && args.body.len() <= 500;
+    let can_try_immediate =
+        !args.body.contains('\n') && !args.body.contains('\r') && args.body.len() <= 500;
 
     let delivered_immediately = if can_try_immediate {
         herdr
-            .send_guarded_if_idle(&disp.assignee_terminal, &args.body)
+            .send_guarded(&worker_term, None, &args.body, None)
             .await
-            .unwrap_or(false)
+            .is_sent()
     } else {
         false
     };

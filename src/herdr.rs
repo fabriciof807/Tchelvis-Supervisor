@@ -30,6 +30,146 @@ impl fmt::Display for HcRunError {
 
 impl std::error::Error for HcRunError {}
 
+pub const DEFAULT_HC_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HcErrorInfo {
+    pub kind: Option<String>,
+    pub message: String,
+}
+
+fn extract_hc_error_from_str(raw: &str) -> Option<HcErrorInfo> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let try_parse = |s: &str| -> Option<HcErrorInfo> {
+        let val: Value = serde_json::from_str(s).ok()?;
+        let err = val.get("error")?;
+        let kind = err
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if kind.is_some() || !message.is_empty() {
+            Some(HcErrorInfo { kind, message })
+        } else {
+            None
+        }
+    };
+    if let Some(info) = try_parse(trimmed) {
+        return Some(info);
+    }
+    for line in trimmed.lines().rev() {
+        if let Some(info) = try_parse(line.trim()) {
+            return Some(info);
+        }
+    }
+    None
+}
+
+pub fn parse_hc_json_error(stdout: &[u8], stderr: &[u8]) -> Option<HcErrorInfo> {
+    let stdout_str = String::from_utf8_lossy(stdout);
+    if let Some(info) = extract_hc_error_from_str(&stdout_str) {
+        return Some(info);
+    }
+    let stderr_str = String::from_utf8_lossy(stderr);
+    if let Some(info) = extract_hc_error_from_str(&stderr_str) {
+        return Some(info);
+    }
+    let fallback = stderr_str.trim();
+    if !fallback.is_empty() {
+        return Some(HcErrorInfo {
+            kind: None,
+            message: fallback.to_string(),
+        });
+    }
+    let out_fallback = stdout_str.trim();
+    if !out_fallback.is_empty() {
+        return Some(HcErrorInfo {
+            kind: None,
+            message: out_fallback.to_string(),
+        });
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardedSendMode {
+    IfIdle,
+    DoneRecheckThenPlain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedSendOutcome {
+    Sent {
+        used_plain_send: bool,
+    },
+    Deferred {
+        reason: String,
+        detail: Option<String>,
+    },
+    Error {
+        reason: String,
+        detail: Option<String>,
+    },
+}
+
+impl GuardedSendOutcome {
+    pub fn is_sent(&self) -> bool {
+        matches!(self, Self::Sent { .. })
+    }
+}
+
+pub fn classify_terminal_for_send(
+    term: Option<&HcTerminal>,
+    attention_override: Option<AttentionState>,
+) -> (String, std::result::Result<GuardedSendMode, &'static str>) {
+    let Some(term) = term else {
+        return ("missing".to_string(), Err("terminal_missing_from_tracker"));
+    };
+    if term.state == "finished" {
+        return ("finished".to_string(), Err("terminal_finished"));
+    }
+    let att = attention_override.unwrap_or_else(|| term.raw_attention_state(0));
+    match att {
+        AttentionState::Blocked { .. } => {
+            return ("blocked".to_string(), Err("terminal_blocked"));
+        }
+        AttentionState::Working { .. } => {
+            return ("working".to_string(), Err("terminal_working"));
+        }
+        AttentionState::Error { .. } => {
+            return ("error".to_string(), Err("terminal_error"));
+        }
+        AttentionState::Done { .. } => {
+            return (
+                "done".to_string(),
+                Ok(GuardedSendMode::DoneRecheckThenPlain),
+            );
+        }
+        AttentionState::Idle => {}
+    }
+
+    match term.status_name() {
+        Some("idle") => ("idle".to_string(), Ok(GuardedSendMode::IfIdle)),
+        Some("done") => (
+            "done".to_string(),
+            Ok(GuardedSendMode::DoneRecheckThenPlain),
+        ),
+        Some("working") => ("working".to_string(), Err("terminal_working")),
+        Some("blocked") => ("blocked".to_string(), Err("terminal_blocked")),
+        Some("error") | Some("failed") => ("error".to_string(), Err("terminal_error")),
+        None | Some("") => ("unknown".to_string(), Err("terminal_unknown")),
+        Some(other) => (other.to_string(), Err("terminal_unknown")),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HcForeground {
     #[serde(default)]
@@ -868,26 +1008,199 @@ impl HerdrClient {
         Ok((child, stdout))
     }
 
-    pub async fn send_guarded_if_idle(&self, terminal: &str, text: &str) -> Result<bool> {
-        let out = tokio::time::timeout(
-            Duration::from_secs(15),
-            Command::new(&self.hc_bin)
-                .args(["send", "--if", "idle", terminal, text, "--json"])
-                .stdin(Stdio::null())
-                .output(),
-        )
-        .await
-        .context("hc send --if idle timed out")??;
+    pub async fn send_guarded(
+        &self,
+        term: &HcTerminal,
+        attention_override: Option<AttentionState>,
+        text: &str,
+        timeout: Option<Duration>,
+    ) -> GuardedSendOutcome {
+        let (_status, mode_res) = classify_terminal_for_send(Some(term), attention_override);
+        match mode_res {
+            Ok(mode) => {
+                self.send_guarded_with_mode(
+                    &term.address,
+                    text,
+                    mode,
+                    timeout.unwrap_or(DEFAULT_HC_SEND_TIMEOUT),
+                )
+                .await
+            }
+            Err(reason) => GuardedSendOutcome::Deferred {
+                reason: reason.to_string(),
+                detail: None,
+            },
+        }
+    }
+
+    pub async fn send_guarded_with_mode(
+        &self,
+        terminal: &str,
+        text: &str,
+        mode: GuardedSendMode,
+        timeout: Duration,
+    ) -> GuardedSendOutcome {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let use_plain = match mode {
+            GuardedSendMode::IfIdle => false,
+            GuardedSendMode::DoneRecheckThenPlain => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return GuardedSendOutcome::Deferred {
+                        reason: "send_timeout".to_string(),
+                        detail: Some(format!("hc get {terminal} timed out before send")),
+                    };
+                }
+                let get_out = match tokio::time::timeout(
+                    remaining,
+                    Command::new(&self.hc_bin)
+                        .args(["get", terminal, "--json"])
+                        .stdin(Stdio::null())
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await
+                {
+                    Ok(Ok(out)) => out,
+                    Ok(Err(err)) => {
+                        return GuardedSendOutcome::Error {
+                            reason: "hc_spawn_failed".to_string(),
+                            detail: Some(err.to_string()),
+                        };
+                    }
+                    Err(_) => {
+                        return GuardedSendOutcome::Deferred {
+                            reason: "send_timeout".to_string(),
+                            detail: Some(format!("hc get {terminal} timed out before send")),
+                        };
+                    }
+                };
+
+                if !get_out.status.success() {
+                    let info = parse_hc_json_error(&get_out.stdout, &get_out.stderr);
+                    return GuardedSendOutcome::Deferred {
+                        reason: info
+                            .as_ref()
+                            .and_then(|i| i.kind.clone())
+                            .unwrap_or_else(|| "hc_get_failed".to_string()),
+                        detail: info.map(|i| i.message).filter(|m| !m.is_empty()),
+                    };
+                }
+
+                let Ok(fresh) = serde_json::from_slice::<HcTerminal>(&get_out.stdout) else {
+                    return GuardedSendOutcome::Deferred {
+                        reason: "hc_get_invalid_json".to_string(),
+                        detail: Some(format!("invalid JSON from `hc get {terminal} --json`")),
+                    };
+                };
+
+                if fresh.state == "finished" {
+                    return GuardedSendOutcome::Deferred {
+                        reason: "terminal_finished".to_string(),
+                        detail: Some(format!("{terminal} is finished on recheck")),
+                    };
+                }
+
+                match fresh.status_name() {
+                    Some("done") => true,
+                    Some("idle") => false,
+                    Some("working") => {
+                        return GuardedSendOutcome::Deferred {
+                            reason: "terminal_working".to_string(),
+                            detail: Some(format!("{terminal} became working on recheck")),
+                        };
+                    }
+                    Some("blocked") => {
+                        return GuardedSendOutcome::Deferred {
+                            reason: "terminal_blocked".to_string(),
+                            detail: Some(format!("{terminal} became blocked on recheck")),
+                        };
+                    }
+                    Some("error") | Some("failed") => {
+                        return GuardedSendOutcome::Deferred {
+                            reason: "terminal_error".to_string(),
+                            detail: Some(format!("{terminal} became error on recheck")),
+                        };
+                    }
+                    other => {
+                        let st = other.filter(|s| !s.is_empty()).unwrap_or("unknown");
+                        return GuardedSendOutcome::Deferred {
+                            reason: "terminal_unknown".to_string(),
+                            detail: Some(format!("{terminal} status is '{st}' on recheck")),
+                        };
+                    }
+                }
+            }
+        };
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return GuardedSendOutcome::Deferred {
+                reason: "send_timeout".to_string(),
+                detail: Some(format!("hc send timed out after {}ms", timeout.as_millis())),
+            };
+        }
+
+        let mut cmd = Command::new(&self.hc_bin);
+        if use_plain {
+            cmd.args(["send", terminal, text, "--json"]);
+        } else {
+            cmd.args(["send", "--if", "idle", terminal, text, "--json"]);
+        }
+        cmd.stdin(Stdio::null()).kill_on_drop(true);
+
+        let out = match tokio::time::timeout(remaining, cmd.output()).await {
+            Ok(Ok(out)) => out,
+            Ok(Err(err)) => {
+                return GuardedSendOutcome::Error {
+                    reason: "hc_spawn_failed".to_string(),
+                    detail: Some(err.to_string()),
+                };
+            }
+            Err(_) => {
+                return GuardedSendOutcome::Deferred {
+                    reason: "send_timeout".to_string(),
+                    detail: Some(format!("hc send timed out after {}ms", timeout.as_millis())),
+                };
+            }
+        };
 
         match out.status.code() {
-            Some(0) => Ok(true),
-            Some(9) | Some(10) => Ok(false),
-            other => bail!(
-                "hc send --if idle {} failed (exit code {:?}): {}",
-                terminal,
-                other,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
+            Some(0) => GuardedSendOutcome::Sent {
+                used_plain_send: use_plain,
+            },
+            Some(9) => {
+                let info = parse_hc_json_error(&out.stdout, &out.stderr);
+                GuardedSendOutcome::Deferred {
+                    reason: info
+                        .as_ref()
+                        .and_then(|i| i.kind.clone())
+                        .unwrap_or_else(|| "blocked".to_string()),
+                    detail: info.map(|i| i.message).filter(|m| !m.is_empty()),
+                }
+            }
+            Some(10) => {
+                let info = parse_hc_json_error(&out.stdout, &out.stderr);
+                GuardedSendOutcome::Deferred {
+                    reason: info
+                        .as_ref()
+                        .and_then(|i| i.kind.clone())
+                        .unwrap_or_else(|| "status_mismatch".to_string()),
+                    detail: info.map(|i| i.message).filter(|m| !m.is_empty()),
+                }
+            }
+            other => {
+                let info = parse_hc_json_error(&out.stdout, &out.stderr);
+                let reason = info
+                    .as_ref()
+                    .and_then(|i| i.kind.clone())
+                    .unwrap_or_else(|| "hc_send_failed".to_string());
+                let detail = info
+                    .map(|i| i.message)
+                    .filter(|m| !m.is_empty())
+                    .or_else(|| Some(format!("exit code {:?}", other)));
+                GuardedSendOutcome::Error { reason, detail }
+            }
         }
     }
 
@@ -1482,5 +1795,208 @@ mod tests {
 
         // 4. Unknown HOME skips home candidates and falls back to "hc" on PATH
         assert_eq!(default_hc_bin_with(|_| None, |_| true), "hc");
+    }
+
+    #[test]
+    fn test_parse_hc_json_error_extracts_kind_and_message() {
+        let json = br#"{"error":{"hint":"nothing was typed","kind":"status_mismatch","message":"t1b3 is done, not idle"}}"#;
+        let info = parse_hc_json_error(json, b"").expect("expected parsed HcErrorInfo");
+        assert_eq!(info.kind.as_deref(), Some("status_mismatch"));
+        assert_eq!(info.message, "t1b3 is done, not idle");
+
+        let from_stderr = br#"{"error":{"kind":"blocked","message":"t2 is blocked"}}"#;
+        let info2 = parse_hc_json_error(b"", from_stderr).expect("expected stderr parsed");
+        assert_eq!(info2.kind.as_deref(), Some("blocked"));
+        assert_eq!(info2.message, "t2 is blocked");
+    }
+
+    #[test]
+    fn test_classify_terminal_for_send_matrix() {
+        let make = |state: &str, status_state: Option<&str>| HcTerminal {
+            address: "t1".into(),
+            state: state.into(),
+            reported: status_state.is_some(),
+            status: status_state.map(|s| HcStatus {
+                state: s.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            classify_terminal_for_send(None, None),
+            ("missing".into(), Err("terminal_missing_from_tracker"))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("finished", Some("idle"))), None),
+            ("finished".into(), Err("terminal_finished"))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", Some("idle"))), None),
+            ("idle".into(), Ok(GuardedSendMode::IfIdle))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", Some("done"))), None),
+            ("done".into(), Ok(GuardedSendMode::DoneRecheckThenPlain))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", Some("working"))), None),
+            ("working".into(), Err("terminal_working"))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", Some("blocked"))), None),
+            ("blocked".into(), Err("terminal_blocked"))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", Some("error"))), None),
+            ("error".into(), Err("terminal_error"))
+        );
+        assert_eq!(
+            classify_terminal_for_send(Some(&make("live", None)), None),
+            ("unknown".into(), Err("terminal_unknown"))
+        );
+        // Hysteresis attention override holds blocked even when status turned idle
+        assert_eq!(
+            classify_terminal_for_send(
+                Some(&make("live", Some("idle"))),
+                Some(AttentionState::Blocked {
+                    kind: crate::model::BlockedKind::Permission,
+                    message: None,
+                    since_ms: 0,
+                }),
+            ),
+            ("blocked".into(), Err("terminal_blocked"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_guarded_by_status_recheck_and_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let calls_log = tmp.path().join("calls.log");
+        let get_state_file = tmp.path().join("get_state");
+        let send_mode_file = tmp.path().join("send_behavior");
+        std::fs::write(&get_state_file, "done").unwrap();
+        std::fs::write(&send_mode_file, "ok").unwrap();
+
+        let fake_hc = tmp.path().join("fake-hc");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             echo \"$*\" >> \"{}\"\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               st=$(cat \"{}\")\n\
+               echo \"{{\\\"address\\\":\\\"$2\\\",\\\"state\\\":\\\"live\\\",\\\"status\\\":{{\\\"state\\\":\\\"$st\\\",\\\"app\\\":\\\"claude\\\"}}}}\"\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"send\" ]; then\n\
+               beh=$(cat \"{}\")\n\
+               if [ \"$beh\" = \"mismatch\" ]; then\n\
+                 echo '{{\"error\":{{\"hint\":\"nothing was typed\",\"kind\":\"status_mismatch\",\"message\":\"t1b3 is done, not idle\"}}}}'\n\
+                 exit 10\n\
+               elif [ \"$beh\" = \"sleep\" ]; then\n\
+                 sleep 2\n\
+                 exit 0\n\
+               fi\n\
+               echo '{{\"started\":false,\"status\":\"done\"}}'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            calls_log.display(),
+            get_state_file.display(),
+            send_mode_file.display(),
+        );
+        std::fs::write(&fake_hc, script).unwrap();
+        std::fs::set_permissions(&fake_hc, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+        let make = |status: &str| HcTerminal {
+            address: "t1b3".into(),
+            state: "live".into(),
+            reported: true,
+            status: Some(HcStatus {
+                state: status.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // 1. Working terminal -> deferred without spawning hc
+        let res_work = herdr
+            .send_guarded(&make("working"), None, "hello", None)
+            .await;
+        assert_eq!(
+            res_work,
+            GuardedSendOutcome::Deferred {
+                reason: "terminal_working".into(),
+                detail: None,
+            }
+        );
+        assert!(!calls_log.exists());
+
+        // 2. Idle terminal -> calls `send --if idle`
+        let res_idle = herdr.send_guarded(&make("idle"), None, "hello", None).await;
+        assert_eq!(
+            res_idle,
+            GuardedSendOutcome::Sent {
+                used_plain_send: false
+            }
+        );
+        let calls1 = std::fs::read_to_string(&calls_log).unwrap();
+        assert!(calls1.contains("send --if idle t1b3 hello --json"));
+
+        // 3. Done terminal -> calls `get` first, sees `done`, then plain `send` (no `--if idle`)
+        std::fs::write(&calls_log, "").unwrap();
+        std::fs::write(&get_state_file, "done").unwrap();
+        let res_done = herdr.send_guarded(&make("done"), None, "hello", None).await;
+        assert_eq!(
+            res_done,
+            GuardedSendOutcome::Sent {
+                used_plain_send: true
+            }
+        );
+        let calls2 = std::fs::read_to_string(&calls_log).unwrap();
+        let lines2: Vec<&str> = calls2.lines().collect();
+        assert_eq!(lines2.len(), 2, "expected get + plain send, got: {calls2}");
+        assert!(lines2[0].starts_with("get t1b3 --json"));
+        assert!(lines2[1].starts_with("send t1b3 hello --json"));
+        assert!(!lines2[1].contains("--if"));
+
+        // 4. Done terminal flips to `working` during recheck -> deferred, no `send` issued
+        std::fs::write(&calls_log, "").unwrap();
+        std::fs::write(&get_state_file, "working").unwrap();
+        let res_flipped = herdr.send_guarded(&make("done"), None, "hello", None).await;
+        assert!(matches!(
+            res_flipped,
+            GuardedSendOutcome::Deferred { ref reason, .. } if reason == "terminal_working"
+        ));
+        let calls3 = std::fs::read_to_string(&calls_log).unwrap();
+        assert_eq!(calls3.lines().count(), 1, "must not call send: {calls3}");
+
+        // 5. Idle terminal returns exit 10 status_mismatch JSON -> detail preserved
+        std::fs::write(&send_mode_file, "mismatch").unwrap();
+        let res_mismatch = herdr.send_guarded(&make("idle"), None, "hello", None).await;
+        assert_eq!(
+            res_mismatch,
+            GuardedSendOutcome::Deferred {
+                reason: "status_mismatch".into(),
+                detail: Some("t1b3 is done, not idle".into()),
+            }
+        );
+
+        // 6. Slow send hits timeout -> Deferred(send_timeout)
+        std::fs::write(&send_mode_file, "sleep").unwrap();
+        let res_timeout = herdr
+            .send_guarded(
+                &make("idle"),
+                None,
+                "hello",
+                Some(Duration::from_millis(60)),
+            )
+            .await;
+        assert!(matches!(
+            res_timeout,
+            GuardedSendOutcome::Deferred { ref reason, .. } if reason == "send_timeout"
+        ));
     }
 }

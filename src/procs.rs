@@ -1,7 +1,7 @@
 //! Process discovery, graceful shutdown, and detached restart for `tchelvis` daemons.
 
 use anyhow::{Context, Result};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -149,19 +149,11 @@ fn systemd_unit_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn log_filename_for_args(args: &[String]) -> String {
-    match (
-        args.first().map(String::as_str),
-        args.get(1).map(String::as_str),
-    ) {
-        (Some("daemon"), _) => "daemon.log".to_string(),
-        (Some("supervisor"), Some("watch")) => "supervisor-watch.log".to_string(),
-        _ => format!("{}.log", args.join("-")),
-    }
-}
-
 /// Restarts previously stopped processes using `exe` (detached via `setsid`) or `systemctl --user`.
 /// Returns human-readable descriptions of the restarted processes.
+/// Daemon and supervisor processes write structured tracing logs directly to `tchelvis.log`
+/// in `log_dir`, so stdout/stderr are connected to `/dev/null` instead of creating an empty
+/// `daemon.log`.
 pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<String>> {
     if procs.is_empty() {
         return Ok(Vec::new());
@@ -172,6 +164,7 @@ pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<Stri
     let use_systemd = systemd_unit_enabled();
     let mut systemd_restarted = false;
     let mut restarted = Vec::new();
+    let log_path = log_dir.join("tchelvis.log");
 
     for proc_info in procs {
         let args = restart_args(&proc_info.argv);
@@ -193,21 +186,11 @@ pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<Stri
             continue;
         }
 
-        let log_path = log_dir.join(log_filename_for_args(&args));
-        let stdout_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("failed opening log file {}", log_path.display()))?;
-        let stderr_file = stdout_file
-            .try_clone()
-            .with_context(|| format!("failed cloning log file handle {}", log_path.display()))?;
-
         let mut cmd = Command::new(exe);
         cmd.args(&args)
             .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file));
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         // SAFETY: setsid() is async-signal-safe and detaches the restarted daemon into its own session.
         unsafe {
             cmd.pre_exec(|| {
@@ -234,6 +217,7 @@ pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn write_fake_proc(root: &Path, pid: i32, uid: u32, argv: &[&str]) {
@@ -297,5 +281,28 @@ mod tests {
             restart_args(&argv),
             vec!["supervisor".to_string(), "watch".to_string()]
         );
+    }
+
+    #[test]
+    fn restart_does_not_create_empty_daemon_log_and_points_to_tchelvis_log() {
+        let tmp = TempDir::new().unwrap();
+        let log_dir = tmp.path().join("state");
+        let fake_exe = tmp.path().join("fake-tchelvis");
+        fs::write(&fake_exe, "#!/usr/bin/env sh\nexit 0\n").unwrap();
+        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let procs = vec![OurProc {
+            pid: 999999,
+            argv: vec!["tchelvis".into(), "supervisor".into(), "watch".into()],
+        }];
+        let out = restart(&procs, &fake_exe, &log_dir).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("tchelvis.log"),
+            "expected tchelvis.log in output, got: {}",
+            out[0]
+        );
+        assert!(!log_dir.join("daemon.log").exists());
+        assert!(!log_dir.join("supervisor-watch.log").exists());
     }
 }
