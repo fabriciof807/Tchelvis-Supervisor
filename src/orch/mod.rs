@@ -194,6 +194,10 @@ impl DispatchStatus {
             Self::Starting | Self::Dispatched | Self::WaitingForReply
         )
     }
+
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Completed | Self::Superseded)
+    }
 }
 
 impl fmt::Display for DispatchStatus {
@@ -246,6 +250,41 @@ pub struct DispatchContext {
     pub blocked_since_ms: Option<i64>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+pub fn send_to_recovery_hint(disp: &DispatchContext) -> String {
+    if disp.status.is_retryable() {
+        format!(
+            "use `tchelvis orch retry {}` to launch a new attempt",
+            disp.id
+        )
+    } else {
+        let agent_arg = if disp.agent_kind == "attached" {
+            "<agent>"
+        } else {
+            disp.agent_kind.as_str()
+        };
+        if disp.status == DispatchStatus::Completed {
+            format!(
+                "task '{}' already finished; launch a new task instead with `tchelvis orch launch --run {} --agent {} --prompt \"...\"`",
+                disp.task_id, disp.run_id, agent_arg
+            )
+        } else {
+            format!(
+                "this dispatch was superseded by a newer attempt; check `tchelvis orch status --run {}` or launch a new task with `tchelvis orch launch --run {} --agent {} --prompt \"...\"`",
+                disp.run_id, disp.run_id, agent_arg
+            )
+        }
+    }
+}
+
+pub fn send_to_status_error(disp: &DispatchContext) -> String {
+    format!(
+        "cannot send message to dispatch '{}' because its status is '{}'; {}",
+        disp.id,
+        disp.status,
+        send_to_recovery_hint(disp)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

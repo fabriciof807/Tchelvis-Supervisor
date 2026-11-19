@@ -14,10 +14,11 @@ use tchelvis::herdr::{FleetTracker, HcStatus, HcTerminal, HerdrClient};
 use tchelvis::model::{AgentSummaryRow, AttentionState};
 use tchelvis::orch::cli::{
     create_child_worktree, execute_ask, execute_dispatch, execute_launch_with_path,
-    execute_orch_command, execute_retry, execute_send, execute_send_to, execute_stop,
-    map_agent_preset, parse_deps_arg, verify_and_remove_child_worktree, OrchAskArgs, OrchCommands,
-    OrchDispatchArgs, OrchLaunchArgs, OrchLaunchError, OrchRetryArgs, OrchSendArgs, OrchSendToArgs,
-    OrchSleeper, OrchStopArgs,
+    execute_orch_command, execute_release, execute_retry, execute_send, execute_send_to,
+    execute_stop, format_release_output, map_agent_preset, parse_deps_arg,
+    verify_and_remove_child_worktree, OrchAskArgs, OrchCommands, OrchDispatchArgs, OrchLaunchArgs,
+    OrchLaunchError, OrchReleaseArgs, OrchRetryArgs, OrchSendArgs, OrchSendToArgs, OrchSleeper,
+    OrchStopArgs,
 };
 use tchelvis::orch::delivery::OrchDeliveryCoordinator;
 use tchelvis::orch::reconciler::OrchReconciler;
@@ -3018,4 +3019,371 @@ async fn lot_g_send_to_and_attach_on_done_terminal_use_get_recheck_and_plain_sen
             "done terminal must not use --if idle, got: {line}"
         );
     }
+}
+
+#[tokio::test]
+async fn lot_i_b7_send_to_completed_suggests_launch_without_retry_while_stopped_suggests_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           if [ \"$2\" = \"t1\" ]; then\n\
+             echo '{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0}'\n\
+           else\n\
+             echo '{\"address\":\"'$2'\",\"created_ms\":2000,\"state\":\"live\",\"turn\":1}'\n\
+           fi\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_done", vec![]))
+        .unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_stopped", vec![]))
+        .unwrap();
+
+    // 1. Completed dispatch: send --to must state task already finished, suggest launch --run, and NOT mention retry
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_done",
+            "run_1",
+            "task_done",
+            "t1",
+            "t2",
+            2_000,
+            0,
+        ))
+        .unwrap();
+    store
+        .record_worker_done("disp_done", "t2", 2_000, "succeeded", "All done", 2_500)
+        .unwrap();
+
+    let send_completed_err = execute_send_to(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(3_000),
+        OrchSendToArgs {
+            to: "dispatch:disp_done".into(),
+            body: "Do one more thing".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    let msg = send_completed_err.to_string();
+    assert!(
+        !msg.to_ascii_lowercase().contains("retry"),
+        "completed send --to error must not suggest retry, got: {msg}"
+    );
+    assert!(
+        msg.contains("already finished") && msg.contains("orch launch --run run_1"),
+        "completed send --to error must explain task finished and suggest orch launch --run, got: {msg}"
+    );
+
+    // Retry of completed dispatch stays refused
+    let retry_completed_err = execute_retry(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(3_100),
+        OrchRetryArgs {
+            dispatch_id: "disp_done".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        retry_completed_err
+            .to_string()
+            .contains("cannot be retried"),
+        "retry of completed dispatch must stay refused, got: {retry_completed_err}"
+    );
+
+    // 2. Stopped dispatch: send --to keeps the retry hint
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_stopped",
+            "run_1",
+            "task_stopped",
+            "t1",
+            "t3",
+            2_000,
+            0,
+        ))
+        .unwrap();
+    store.stop_dispatch("disp_stopped", 3_200).unwrap();
+
+    let send_stopped_err = execute_send_to(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(3_300),
+        OrchSendToArgs {
+            to: "dispatch:disp_stopped".into(),
+            body: "Resume".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    let stopped_msg = send_stopped_err.to_string();
+    assert!(
+        stopped_msg.contains("tchelvis orch retry disp_stopped"),
+        "stopped send --to error must suggest orch retry, got: {stopped_msg}"
+    );
+
+    // 3. Direct store guard on completed dispatch matches (no retry hint)
+    let store_completed_err = store
+        .record_coordinator_message("disp_done", "t1", 1_000, "extra", false, 1, 3_350)
+        .unwrap_err();
+    let store_msg = store_completed_err.to_string();
+    assert!(
+        !store_msg.to_ascii_lowercase().contains("retry")
+            && store_msg.contains("orch launch --run run_1"),
+        "store record_coordinator_message on completed must match send --to hint, got: {store_msg}"
+    );
+
+    // 4. Superseded dispatch is also non-retryable and does not suggest retry
+    store.supersede_dispatch("disp_stopped", 3_400).unwrap();
+    let send_superseded_err = execute_send_to(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(3_450),
+        OrchSendToArgs {
+            to: "dispatch:disp_stopped".into(),
+            body: "Resume".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    let sup_msg = send_superseded_err.to_string();
+    assert!(
+        !sup_msg.to_ascii_lowercase().contains("retry")
+            && sup_msg.contains("orch launch --run run_1"),
+        "superseded send --to error must not suggest retry, got: {sup_msg}"
+    );
+}
+
+#[tokio::test]
+async fn lot_i_b9_launch_failure_after_dispatch_created_includes_ids_in_json_and_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("false");
+    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 1\n").unwrap();
+    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let get_count_file = tmp.path().join("get_count");
+    fs::write(&get_count_file, "0").unwrap();
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               echo '{{\"address\":\"t5\",\"agent\":\"false\",\"cwd\":\"/tmp\",\"state\":\"live\",\"turn\":0}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               if [ \"$2\" = \"t1\" ]; then\n\
+                 echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"/tmp\"}}'\n\
+                 exit 0\n\
+               fi\n\
+               c=$(cat \"{}\")\n\
+               c=$((c + 1))\n\
+               echo \"$c\" > \"{}\"\n\
+               if [ \"$c\" -eq 1 ]; then\n\
+                 echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+               else\n\
+                 echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"finished\",\"exit_code\":1,\"turn\":0,\"labels\":{{}}}}'\n\
+               fi\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"read\" ]; then\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            get_count_file.display(),
+            get_count_file.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    let err = execute_launch_with_path(
+        &store,
+        &HerdrClient::new(fake_hc.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(10_000),
+        OrchLaunchArgs {
+            agent: "false".into(),
+            prompt: "Run task".into(),
+            title: Some("Failing agent".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap_err();
+
+    let launch_err = err.downcast_ref::<OrchLaunchError>().unwrap();
+    let run_id = launch_err.run_id.as_deref().expect("run_id must be set");
+    let task_id = launch_err.task_id.as_deref().expect("task_id must be set");
+    let dispatch_id = launch_err
+        .dispatch_id
+        .as_deref()
+        .expect("dispatch_id must be set");
+
+    let json_val = serde_json::to_value(launch_err).unwrap();
+    assert_eq!(json_val["run_id"], run_id);
+    assert_eq!(json_val["task_id"], task_id);
+    assert_eq!(json_val["dispatch_id"], dispatch_id);
+
+    let text = launch_err.to_string();
+    assert!(
+        text.contains(run_id) && text.contains(task_id) && text.contains(dispatch_id),
+        "launch failure text must include run_id, task_id, and dispatch_id, got: {text}"
+    );
+    assert!(
+        text.contains(&format!("tchelvis orch retry {dispatch_id}")),
+        "launch failure text must include retry command with dispatch_id, got: {text}"
+    );
+}
+
+#[tokio::test]
+async fn lot_i_b8_release_force_removes_worktree_keeps_branch_and_reports_delete_hint() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    init_temp_git_repo(&repo_dir);
+    let term_ops = tmp.path().join("term_ops.log");
+
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               if [ \"$2\" = \"t1\" ]; then\n\
+                 echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"{}\"}}'\n\
+                 exit 0\n\
+               fi\n\
+               echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"first_message\":{{\"sent\":true}}}}'\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"kill\" ] || [ \"$1\" = \"rm\" ]; then\n\
+               echo \"$1 $2\" >> \"{}\"\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            repo_dir.display(),
+            term_ops.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_wt", vec![]))
+        .unwrap();
+
+    let disp = execute_dispatch(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(10_000),
+        OrchDispatchArgs {
+            run: "run_1".into(),
+            task: "task_wt".into(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some("claude".into()),
+            worktree: "new-child".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let wt_path = std::path::PathBuf::from(disp.dispatch.worktree_path.as_ref().unwrap());
+    fs::write(wt_path.join("feature.txt"), "unmerged work\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "unmerged commit"]] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&wt_path)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed", args);
+    }
+
+    // Without --force, release refuses unmerged branch
+    let refuse_err = execute_release(
+        &store,
+        &herdr,
+        OrchReleaseArgs {
+            dispatch_id: disp.dispatch.id.clone(),
+            force: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(refuse_err.to_string().contains("unmerged worktree branch"));
+
+    // With --force, worktree is removed, branch orch/run_1/task_wt is kept, and output says so
+    let rel_out = execute_release(
+        &store,
+        &herdr,
+        OrchReleaseArgs {
+            dispatch_id: disp.dispatch.id.clone(),
+            force: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(rel_out.worktree_removed);
+    assert!(!wt_path.exists());
+    assert_eq!(rel_out.branch_kept.as_deref(), Some("orch/run_1/task_wt"));
+
+    let branch_check = Command::new("git")
+        .arg("-C")
+        .arg(&repo_dir)
+        .args(["rev-parse", "--verify", "refs/heads/orch/run_1/task_wt"])
+        .output()
+        .unwrap();
+    assert!(
+        branch_check.status.success(),
+        "branch orch/run_1/task_wt must be kept after release --force"
+    );
+
+    let formatted = format_release_output(&rel_out);
+    assert!(
+        formatted.contains("branch kept: orch/run_1/task_wt")
+            && formatted.contains("git branch -D orch/run_1/task_wt"),
+        "release output must mention kept branch and git branch -D hint, got: {formatted}"
+    );
 }

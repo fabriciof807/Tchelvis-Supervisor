@@ -87,8 +87,9 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
 6. **Inspect run status and release finished workers (opt-in)**:
    ```bash
    tchelvis orch status --run <run_id>
-   tchelvis orch release --dispatch-id <dispatch_id>
+   tchelvis orch release --dispatch-id <dispatch_id> [--force]
    ```
+   - `release` closes the worker terminal and removes a `--worktree new-child` checkout (refusing dirty or unmerged worktrees unless `--force` is passed). Even with `--force`, `release` **keeps** the `orch/<run_id>/<task_id>` branch so unmerged commits are preserved; delete it manually with `git branch -D orch/<run_id>/<task_id>` when no longer needed.
 
 ## Recovery Path (`send -> retry -> stop`)
 
@@ -96,14 +97,14 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
 
 1. **`send` (live worker needs a nudge or new instruction)**:
    ```bash
-   tchelvis orch send --to dispatch:<dispatch_id> --body "Finish verification and report worker_done"
+   tchelvis orch send --to dispatch:<dispatch_id> --body "Follow-up instruction"
    ```
-   Delivers immediately when the worker is live and `idle` (via `--if idle`) or `done` (after `hc get` re-check, via plain `hc send`), or queues for delivery when busy, recording a `directive` in `orch.db`. Rejected if the worker terminal is already `finished` (use `retry` next).
-2. **`retry` (worker finished, errored, or stalled)**:
+   Delivers immediately when the worker is live and `idle` (via `--if idle`) or `done` (after `hc get` re-check, via plain `hc send`), or queues for delivery when busy, recording a `directive` in `orch.db`. Rejected if the worker terminal is already `finished` (use `retry` for retryable dispatches such as `stopped`, `failed`, or `needs_review`; if the dispatch already `completed`, launch a new task with `tchelvis orch launch --run <run_id> ...`).
+2. **`retry` (worker stopped, failed, errored, or stalled)**:
    ```bash
    tchelvis orch retry <dispatch_id>
    ```
-   Closes the old terminal if needed, marks the prior attempt `superseded`, cancels open questions, and launches a fresh dispatch for the same task (reusing any existing `--worktree new-child` checkout) while respecting the 3-failure circuit breaker.
+   Closes the old terminal if needed, marks the prior attempt `superseded`, cancels open questions, and launches a fresh dispatch for the same task (reusing any existing `--worktree new-child` checkout) while respecting the 3-failure circuit breaker. `completed` and `superseded` dispatches cannot be retried.
 3. **`stop` (cancel an active or runaway worker cleanly)**:
    ```bash
    tchelvis orch stop <dispatch_id>
@@ -212,6 +213,7 @@ mod tests {
             .to_ascii_lowercase()
             .contains("if no pointer arrives and the user asks for results"));
         assert!(skill.contains("no further turns"));
+        assert!(skill.contains("git branch -D orch/<run_id>/<task_id>"));
     }
 
     #[test]

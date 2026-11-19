@@ -270,7 +270,7 @@ Event-driven parent-child agent orchestration over Herdr (`hc`) terminals, backe
 | `tchelvis orch stop` | Close worker terminal cleanly, mark dispatch stopped, and restore task to retryable without deleting dirty worktrees (`<dispatch_id>`) |
 | `tchelvis orch check` | Read and acknowledge pending inbox messages (`[--run <id>] [--terminal <term>] [--peek]`) |
 | `tchelvis orch status` | Inspect run DAG tasks, dispatches, recorded messages, open questions, and unread counts (`[--run <id>]`) |
-| `tchelvis orch release` | Opt-in cleanup of a finished worker terminal and clean/merged `--worktree new-child` (`--dispatch-id <id> [--force]`) |
+| `tchelvis orch release` | Opt-in cleanup of a finished worker terminal and clean/merged `--worktree new-child` (`--dispatch-id <id> [--force]`; removes worktree only and keeps `orch/<run>/<task>` branch) |
 | `tchelvis orch skill` | Print the self-contained Markdown guide for coordinator and worker agents |
 
 All mutating `tchelvis orch` subcommands also accept `--request-id <id>` (idempotency receipt) and `--json`:

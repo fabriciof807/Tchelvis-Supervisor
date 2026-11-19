@@ -107,6 +107,22 @@ impl fmt::Display for OrchLaunchError {
         if let Some(code) = self.exit_code {
             write!(f, " (exit_code={code})")?;
         }
+        let mut ids = Vec::new();
+        if let Some(ref run_id) = self.run_id {
+            ids.push(format!("run_id={run_id}"));
+        }
+        if let Some(ref task_id) = self.task_id {
+            ids.push(format!("task_id={task_id}"));
+        }
+        if let Some(ref dispatch_id) = self.dispatch_id {
+            ids.push(format!("dispatch_id={dispatch_id}"));
+        }
+        if !ids.is_empty() {
+            write!(f, " [{}]", ids.join(", "))?;
+        }
+        if let Some(ref dispatch_id) = self.dispatch_id {
+            write!(f, "; retry with: `tchelvis orch retry {dispatch_id}`")?;
+        }
         if let Some(ref tail) = self.output_tail {
             if !tail.trim().is_empty() {
                 write!(f, "\n--- last lines ---\n{}", tail.trim())?;
@@ -387,6 +403,12 @@ pub struct OrchStatusOutput {
     pub runs: Vec<RunStatusView>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrchReleaseArgs {
+    pub dispatch_id: String,
+    pub force: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReleaseOutput {
     pub dispatch_id: String,
@@ -395,6 +417,8 @@ pub struct ReleaseOutput {
     pub terminal_released: bool,
     pub worktree_removed: bool,
     pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_kept: Option<String>,
 }
 
 pub fn map_agent_preset(agent: &str) -> String {
@@ -648,8 +672,19 @@ pub async fn verify_and_remove_child_worktree(
     task_id: &str,
     force: bool,
 ) -> Result<()> {
+    verify_and_remove_child_worktree_with_branch(worktree_path, run_id, task_id, force)
+        .await
+        .map(|_| ())
+}
+
+pub async fn verify_and_remove_child_worktree_with_branch(
+    worktree_path: &Path,
+    run_id: &str,
+    task_id: &str,
+    force: bool,
+) -> Result<(bool, Option<String>)> {
     if !worktree_path.exists() {
-        return Ok(());
+        return Ok((false, None));
     }
     let ws = resolve_git_workspace(&worktree_path.to_string_lossy());
     let repo_root = ws
@@ -732,7 +767,25 @@ pub async fn verify_and_remove_child_worktree(
             String::from_utf8_lossy(&rm_out.stderr).trim()
         );
     }
-    Ok(())
+
+    let branch_ref = format!("refs/heads/{branch_name}");
+    let branch_exists = tokio::time::timeout(
+        Duration::from_secs(10),
+        Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["rev-parse", "--verify", "--quiet", &branch_ref])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .is_some_and(|s| s.success());
+
+    Ok((true, branch_exists.then_some(branch_name)))
 }
 
 pub async fn execute_orch_command(
@@ -1164,62 +1217,83 @@ pub async fn execute_orch_command(
             force,
             json,
         } => {
-            let disp = store
-                .get_dispatch(&dispatch_id)?
-                .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
-
-            let mut worktree_removed = false;
-            if disp.worktree_mode == "new-child" {
-                if let Some(ref wt_path) = disp.worktree_path {
-                    verify_and_remove_child_worktree(
-                        Path::new(wt_path),
-                        &disp.run_id,
-                        &disp.task_id,
-                        force,
-                    )
-                    .await?;
-                    worktree_removed = true;
-                }
-            }
-
-            close_worker_terminal(&herdr, &disp.assignee_terminal).await;
-
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let final_status = if matches!(
-                disp.status,
-                DispatchStatus::Completed
-                    | DispatchStatus::Failed
-                    | DispatchStatus::Stopped
-                    | DispatchStatus::Superseded
-            ) {
-                disp.status
-            } else {
-                store.update_dispatch_status(&disp.id, DispatchStatus::Stopped, now_ms)?;
-                DispatchStatus::Stopped
-            };
-
+            let out =
+                execute_release(&store, &herdr, OrchReleaseArgs { dispatch_id, force }).await?;
             notify_daemon_orch_wake(paths).await;
-
-            let out = ReleaseOutput {
-                dispatch_id: disp.id,
-                assignee_terminal: disp.assignee_terminal,
-                status: final_status,
-                terminal_released: true,
-                worktree_removed,
-                worktree_path: disp.worktree_path,
-            };
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                println!(
-                    "Released dispatch {} (terminal={}, status={}, worktree_removed={})",
-                    out.dispatch_id, out.assignee_terminal, out.status, out.worktree_removed
-                );
+                println!("{}", format_release_output(&out));
             }
             Ok(())
         }
     }
+}
+
+pub fn format_release_output(out: &ReleaseOutput) -> String {
+    let mut text = format!(
+        "Released dispatch {} (terminal={}, status={}, worktree_removed={})",
+        out.dispatch_id, out.assignee_terminal, out.status, out.worktree_removed
+    );
+    if let Some(ref branch) = out.branch_kept {
+        text.push_str(&format!(
+            "\nbranch kept: {branch}, delete with git branch -D {branch}"
+        ));
+    }
+    text
+}
+
+pub async fn execute_release(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    args: OrchReleaseArgs,
+) -> Result<ReleaseOutput> {
+    let disp = store
+        .get_dispatch(&args.dispatch_id)?
+        .with_context(|| format!("dispatch '{}' does not exist", args.dispatch_id))?;
+
+    let mut worktree_removed = false;
+    let mut branch_kept = None;
+    if disp.worktree_mode == "new-child" {
+        if let Some(ref wt_path) = disp.worktree_path {
+            let (removed, kept) = verify_and_remove_child_worktree_with_branch(
+                Path::new(wt_path),
+                &disp.run_id,
+                &disp.task_id,
+                args.force,
+            )
+            .await?;
+            worktree_removed = removed;
+            branch_kept = kept;
+        }
+    }
+
+    close_worker_terminal(herdr, &disp.assignee_terminal).await;
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let final_status = if matches!(
+        disp.status,
+        DispatchStatus::Completed
+            | DispatchStatus::Failed
+            | DispatchStatus::Stopped
+            | DispatchStatus::Superseded
+    ) {
+        disp.status
+    } else {
+        store.update_dispatch_status(&disp.id, DispatchStatus::Stopped, now_ms)?;
+        DispatchStatus::Stopped
+    };
+
+    Ok(ReleaseOutput {
+        dispatch_id: disp.id,
+        assignee_terminal: disp.assignee_terminal,
+        status: final_status,
+        terminal_released: true,
+        worktree_removed,
+        worktree_path: disp.worktree_path,
+        branch_kept,
+    })
 }
 
 pub async fn execute_dispatch(
@@ -2104,23 +2178,18 @@ pub async fn execute_send_to(
             | DispatchStatus::Stopped
             | DispatchStatus::Superseded
     ) {
-        bail!(
-            "cannot send message to dispatch '{}' because its status is '{}'; use `tchelvis orch retry {}` to launch a new attempt",
-            disp.id,
-            disp.status,
-            disp.id
-        );
+        bail!("{}", crate::orch::send_to_status_error(&disp));
     }
 
     let worker_term = match fetch_hc_terminal(herdr, &disp.assignee_terminal).await {
         Ok(term) => term,
         Err(err) => {
             bail!(
-                "worker terminal '{}' for dispatch '{}' is unavailable ({}); use `tchelvis orch retry {}` to launch a new attempt",
+                "worker terminal '{}' for dispatch '{}' is unavailable ({}); {}",
                 disp.assignee_terminal,
                 disp.id,
                 err,
-                disp.id
+                crate::orch::send_to_recovery_hint(&disp)
             );
         }
     };
@@ -2130,22 +2199,22 @@ pub async fn execute_send_to(
         .is_some_and(|c| c != disp.terminal_created_ms)
     {
         bail!(
-            "worker terminal '{}' for dispatch '{}' was recreated (expected created_ms={}, got {:?}); use `tchelvis orch retry {}` to launch a new attempt",
+            "worker terminal '{}' for dispatch '{}' was recreated (expected created_ms={}, got {:?}); {}",
             disp.assignee_terminal,
             disp.id,
             disp.terminal_created_ms,
             worker_term.created_ms,
-            disp.id
+            crate::orch::send_to_recovery_hint(&disp)
         );
     }
 
     if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
         bail!(
-            "worker terminal '{}' for dispatch '{}' is '{}' and cannot receive messages; use `tchelvis orch retry {}` to launch a new attempt",
+            "worker terminal '{}' for dispatch '{}' is '{}' and cannot receive messages; {}",
             disp.assignee_terminal,
             disp.id,
             worker_term.state,
-            disp.id
+            crate::orch::send_to_recovery_hint(&disp)
         );
     }
 
@@ -2216,10 +2285,7 @@ pub async fn execute_retry(
         resolved_caller.created_ms,
     )?;
 
-    if matches!(
-        old_disp.status,
-        DispatchStatus::Completed | DispatchStatus::Superseded
-    ) {
+    if !old_disp.status.is_retryable() {
         bail!(
             "dispatch '{}' has status '{}' and cannot be retried",
             old_disp.id,

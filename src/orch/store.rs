@@ -1779,12 +1779,7 @@ impl OrchStore {
                 | DispatchStatus::Stopped
                 | DispatchStatus::Superseded
         ) {
-            bail!(
-                "cannot send message to dispatch '{}' because its status is '{}'; use `tchelvis orch retry {}` to launch a new attempt",
-                disp.id,
-                disp.status,
-                disp.id
-            );
+            bail!("{}", crate::orch::send_to_status_error(&disp));
         }
 
         let (
