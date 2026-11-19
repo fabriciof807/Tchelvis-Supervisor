@@ -1,7 +1,7 @@
 use crate::config::{CockpitConfig, CockpitPaths};
 use crate::correlate::resolve_git_workspace;
 use crate::daemon::query_socket_once;
-use crate::herdr::{HcTerminal, HerdrClient};
+use crate::herdr::{HcRunError, HcTerminal, HerdrClient};
 use crate::model::{IpcOp, IpcRequest};
 use crate::orch::preamble::{build_dispatch_preamble, orchestration_skill_markdown};
 use crate::orch::store::OrchStore;
@@ -14,6 +14,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
+use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -61,6 +63,62 @@ pub struct DispatchOutput {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrchLaunchArgs {
+    pub agent: String,
+    pub prompt: String,
+    pub title: Option<String>,
+    pub run: Option<String>,
+    pub worktree: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchOutput {
+    pub run: OrchRun,
+    pub task: OrchTask,
+    pub dispatch: DispatchContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrchLaunchError {
+    pub failed_stage: String,
+    pub agent: String,
+    pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_id: Option<String>,
+}
+
+impl fmt::Display for OrchLaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "orch launch failed at stage '{}' for agent '{}': {}",
+            self.failed_stage, self.agent, self.detail
+        )?;
+        if let Some(code) = self.exit_code {
+            write!(f, " (exit_code={code})")?;
+        }
+        if let Some(ref tail) = self.output_tail {
+            if !tail.trim().is_empty() {
+                write!(f, "\n--- last lines ---\n{}", tail.trim())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for OrchLaunchError {}
+
+#[derive(Debug, Clone)]
 pub struct OrchDispatchArgs {
     pub run: String,
     pub task: String,
@@ -84,6 +142,60 @@ pub struct OrchSendArgs {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrchSendToArgs {
+    pub to: String,
+    pub body: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendToOutput {
+    pub message: OrchMessage,
+    pub dispatch_id: String,
+    pub dispatch_status: DispatchStatus,
+    pub delivered_immediately: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchRetryArgs {
+    pub dispatch_id: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryOutput {
+    pub previous_dispatch_id: String,
+    pub previous_status: DispatchStatus,
+    #[serde(flatten)]
+    pub dispatch_output: DispatchOutput,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchStopArgs {
+    pub dispatch_id: String,
+    pub request_id: Option<String>,
+    pub caller_terminal: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StopOutput {
+    pub dispatch_id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub assignee_terminal: String,
+    pub dispatch_status: DispatchStatus,
+    pub task_status: TaskStatus,
+    pub terminal_closed: bool,
+    pub worktree_kept: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_note: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct OrchAskArgs {
     pub dispatch_id: String,
     pub question: String,
@@ -93,6 +205,25 @@ pub struct OrchAskArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum OrchCommands {
+    /// Preflight an agent and create a run (optional), task, and dispatch in one command
+    Launch {
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long, default_value = "current")]
+        worktree: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        caller: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a new orchestration run and bind the coordinator terminal
     RunCreate {
         #[arg(long)]
@@ -144,18 +275,40 @@ pub enum OrchCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Send a worker completion, escalation, or status message to the parent coordinator
+    /// Send a worker report (--type) or coordinator directive (--to dispatch:<id>)
     Send {
+        #[arg(long)]
+        to: Option<String>,
         #[arg(long = "type")]
-        msg_type: String,
+        msg_type: Option<String>,
         #[arg(long)]
         outcome: Option<String>,
         #[arg(long)]
-        dispatch_id: String,
+        dispatch_id: Option<String>,
         #[arg(long)]
         task_id: Option<String>,
         #[arg(long)]
         body: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        caller: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Retry a dispatch by launching a new attempt for the same task and superseding the old one
+    Retry {
+        dispatch_id: String,
+        #[arg(long)]
+        request_id: Option<String>,
+        #[arg(long)]
+        caller: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a worker dispatch, close its terminal, and restore its task to a retryable state
+    Stop {
+        dispatch_id: String,
         #[arg(long)]
         request_id: Option<String>,
         #[arg(long)]
@@ -223,6 +376,8 @@ pub struct RunStatusView {
     pub run: OrchRun,
     pub tasks: Vec<OrchTask>,
     pub dispatches: Vec<DispatchContext>,
+    #[serde(default)]
+    pub messages: Vec<OrchMessage>,
     pub open_questions: Vec<QuestionThread>,
     pub unacknowledged_messages: usize,
 }
@@ -457,6 +612,9 @@ pub async fn create_child_worktree(
     let wt_dir = repo_root
         .join(".work")
         .join(format!("orch-{run_id}-{task_id}"));
+    if wt_dir.join(".git").exists() {
+        return Ok(wt_dir);
+    }
     if let Some(parent) = wt_dir.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -592,6 +750,49 @@ pub async fn execute_orch_command(
 
     match cmd {
         OrchCommands::Skill => unreachable!(),
+        OrchCommands::Launch {
+            agent,
+            prompt,
+            title,
+            run,
+            worktree,
+            request_id,
+            caller,
+            json,
+        } => {
+            let _ = crate::daemon::ensure_daemon_running(paths).await;
+            let sleeper = SystemOrchSleeper;
+            match execute_launch(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchLaunchArgs {
+                    agent,
+                    prompt,
+                    title,
+                    run,
+                    worktree,
+                    request_id,
+                    caller_terminal: caller,
+                },
+            )
+            .await
+            {
+                Ok(out) => {
+                    notify_daemon_orch_wake(paths).await;
+                    print_launch(&out, json)?;
+                    Ok(())
+                }
+                Err(err) => {
+                    if json {
+                        if let Some(launch_err) = err.downcast_ref::<OrchLaunchError>() {
+                            println!("{}", serde_json::to_string_pretty(launch_err)?);
+                        }
+                    }
+                    Err(err)
+                }
+            }
+        }
         OrchCommands::RunCreate {
             title,
             coordinator,
@@ -609,45 +810,21 @@ pub async fn execute_orch_command(
             let _ = crate::daemon::ensure_daemon_running(paths).await;
 
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let resolved_coord = resolve_caller_terminal(
+            let run = create_run_record(
+                &store,
                 &herdr,
+                title.as_deref(),
                 coordinator,
-                None,
-                Some(now_ms),
-                false,
                 "coordinator terminal not specified; pass --coordinator <term> or run inside Herdr ($HC_TERMINAL_ID)",
+                now_ms,
             )
             .await?;
-            let coord_term = resolved_coord.terminal;
-            let coordinator_created_ms = resolved_coord.created_ms;
 
-            let run_id = generate_orch_id("run");
-            let run_title = title
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| format!("Orchestration Run {run_id}"));
-
-            let run = OrchRun {
-                id: run_id.clone(),
-                title: run_title,
-                coordinator_terminal: coord_term.clone(),
-                coordinator_created_ms,
-                status: RunStatus::Active,
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-
-            store.create_run(&run)?;
             let resp_json = serde_json::to_string(&run)?;
             if let Some(ref req_id) = request_id {
                 store.save_mutation_receipt(req_id, "run-create", &resp_json, now_ms)?;
             }
 
-            let labels = [
-                ("cockpit.orch.role", "coordinator"),
-                ("cockpit.orch.run", run_id.as_str()),
-            ];
-            let _ = apply_hc_labels(&herdr, &coord_term, &labels).await;
             notify_daemon_orch_wake(paths).await;
 
             print_run_create(&run, json)?;
@@ -731,6 +908,7 @@ pub async fn execute_orch_command(
             Ok(())
         }
         OrchCommands::Send {
+            to,
             msg_type,
             outcome,
             dispatch_id,
@@ -741,6 +919,31 @@ pub async fn execute_orch_command(
             json,
         } => {
             let sleeper = SystemOrchSleeper;
+            if let Some(to_target) = to {
+                if msg_type.is_some() || outcome.is_some() || dispatch_id.is_some() {
+                    bail!("--to cannot be combined with --type, --outcome, or --dispatch-id");
+                }
+                let out = execute_send_to(
+                    &store,
+                    &herdr,
+                    &sleeper,
+                    OrchSendToArgs {
+                        to: to_target,
+                        body,
+                        request_id,
+                        caller_terminal: caller,
+                    },
+                )
+                .await?;
+                notify_daemon_orch_wake(paths).await;
+                print_send_to(&out, json)?;
+                return Ok(());
+            }
+
+            let msg_type =
+                msg_type.context("--type is required unless --to dispatch:<id> is specified")?;
+            let dispatch_id = dispatch_id
+                .context("--dispatch-id is required unless --to dispatch:<id> is specified")?;
             let msg = execute_send(
                 &store,
                 &herdr,
@@ -757,6 +960,51 @@ pub async fn execute_orch_command(
             .await?;
             notify_daemon_orch_wake(paths).await;
             print_message(&msg, json)?;
+            Ok(())
+        }
+        OrchCommands::Retry {
+            dispatch_id,
+            request_id,
+            caller,
+            json,
+        } => {
+            let _ = crate::daemon::ensure_daemon_running(paths).await;
+            let sleeper = SystemOrchSleeper;
+            let out = execute_retry(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchRetryArgs {
+                    dispatch_id,
+                    request_id,
+                    caller_terminal: caller,
+                },
+            )
+            .await?;
+            notify_daemon_orch_wake(paths).await;
+            print_retry(&out, json)?;
+            Ok(())
+        }
+        OrchCommands::Stop {
+            dispatch_id,
+            request_id,
+            caller,
+            json,
+        } => {
+            let sleeper = SystemOrchSleeper;
+            let out = execute_stop(
+                &store,
+                &herdr,
+                &sleeper,
+                OrchStopArgs {
+                    dispatch_id,
+                    request_id,
+                    caller_terminal: caller,
+                },
+            )
+            .await?;
+            notify_daemon_orch_wake(paths).await;
+            print_stop(&out, json)?;
             Ok(())
         }
         OrchCommands::Ask {
@@ -886,6 +1134,7 @@ pub async fn execute_orch_command(
             for r in runs {
                 let tasks = store.list_tasks(&r.id)?;
                 let dispatches = store.list_dispatches_for_run(&r.id)?;
+                let messages = store.list_messages_for_run(&r.id)?;
                 let open_questions = store.list_open_questions_for_run(&r.id)?;
                 let unacknowledged_messages = pending_targets
                     .iter()
@@ -896,6 +1145,7 @@ pub async fn execute_orch_command(
                     run: r,
                     tasks,
                     dispatches,
+                    messages,
                     open_questions,
                     unacknowledged_messages,
                 });
@@ -905,39 +1155,7 @@ pub async fn execute_orch_command(
             if json {
                 println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                for v in &out.runs {
-                    println!(
-                        "Run {} ({}) [status={} coordinator={} unack_msgs={}]",
-                        v.run.id,
-                        v.run.title,
-                        v.run.status,
-                        v.run.coordinator_terminal,
-                        v.unacknowledged_messages
-                    );
-                    for t in &v.tasks {
-                        println!(
-                            "  Task {}: {} [status={} failures={} deps={:?}]",
-                            t.id, t.title, t.status, t.failure_count, t.deps
-                        );
-                    }
-                    for d in &v.dispatches {
-                        println!(
-                            "  Dispatch {}: task={} assignee={} parent={} status={} worktree={}",
-                            d.id,
-                            d.task_id,
-                            d.assignee_terminal,
-                            d.parent_terminal,
-                            d.status,
-                            d.worktree_mode
-                        );
-                    }
-                    for q in &v.open_questions {
-                        println!(
-                            "  Open Question {}: dispatch={} status={}",
-                            q.id, q.dispatch_id, q.status
-                        );
-                    }
-                }
+                print_human_status(&out);
             }
             Ok(())
         }
@@ -969,7 +1187,10 @@ pub async fn execute_orch_command(
             let now_ms = chrono::Utc::now().timestamp_millis();
             let final_status = if matches!(
                 disp.status,
-                DispatchStatus::Completed | DispatchStatus::Failed | DispatchStatus::Stopped
+                DispatchStatus::Completed
+                    | DispatchStatus::Failed
+                    | DispatchStatus::Stopped
+                    | DispatchStatus::Superseded
             ) {
                 disp.status
             } else {
@@ -1167,7 +1388,7 @@ pub async fn execute_dispatch(
                     match cleanup_failed_child_worktree(wt_path, &args.run, &task_row.id).await {
                         Ok(cleaned) | Err(cleaned) => cleaned,
                     };
-                return Err(anyhow!("{err} ({note})"));
+                return Err(anyhow::Error::new(LaunchNoteError { source: err, note }));
             }
             return Err(err);
         }
@@ -1575,6 +1796,574 @@ pub async fn execute_ask(
     Ok((q_thread, msg))
 }
 
+#[derive(Debug)]
+struct LaunchNoteError {
+    source: anyhow::Error,
+    note: String,
+}
+
+impl fmt::Display for LaunchNoteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.source, self.note)
+    }
+}
+
+impl std::error::Error for LaunchNoteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.root_cause())
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_file_path(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file_path(path: &Path) -> bool {
+    path.is_file()
+}
+
+pub fn preflight_agent_with_path(
+    agent: &str,
+    path_override: Option<&OsStr>,
+) -> std::result::Result<String, Box<OrchLaunchError>> {
+    let mapped = map_agent_preset(agent);
+    let Some(program) = mapped.split_whitespace().next() else {
+        return Err(Box::new(OrchLaunchError {
+            failed_stage: "agent_preflight".to_string(),
+            agent: agent.to_string(),
+            detail: "agent command cannot be empty".to_string(),
+            exit_code: None,
+            output_tail: None,
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+        }));
+    };
+
+    let found = if program.contains(std::path::MAIN_SEPARATOR) || program.contains('/') {
+        let p = Path::new(program);
+        is_executable_file_path(p).then(|| p.to_path_buf())
+    } else {
+        let search_path = path_override
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"));
+        search_path.and_then(|pv| {
+            std::env::split_paths(&pv)
+                .map(|dir| dir.join(program))
+                .find(|cand| is_executable_file_path(cand))
+        })
+    };
+
+    match found {
+        Some(resolved) => Ok(resolved.to_string_lossy().to_string()),
+        None => Err(Box::new(OrchLaunchError {
+            failed_stage: "agent_preflight".to_string(),
+            agent: agent.to_string(),
+            detail: format!(
+                "agent executable '{}' (resolved from preset '{}') not found on PATH",
+                program, agent
+            ),
+            exit_code: None,
+            output_tail: None,
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+        })),
+    }
+}
+
+async fn create_run_record(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    title: Option<&str>,
+    coordinator: Option<String>,
+    missing_msg: &str,
+    now_ms: i64,
+) -> Result<OrchRun> {
+    let resolved_coord =
+        resolve_caller_terminal(herdr, coordinator, None, Some(now_ms), false, missing_msg).await?;
+    let coord_term = resolved_coord.terminal;
+    let coordinator_created_ms = resolved_coord.created_ms;
+
+    let run_id = generate_orch_id("run");
+    let run_title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Orchestration Run {run_id}"));
+
+    let run = OrchRun {
+        id: run_id.clone(),
+        title: run_title,
+        coordinator_terminal: coord_term.clone(),
+        coordinator_created_ms,
+        status: RunStatus::Active,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+
+    store.create_run(&run)?;
+    let labels = [
+        ("cockpit.orch.role", "coordinator"),
+        ("cockpit.orch.run", run_id.as_str()),
+    ];
+    let _ = apply_hc_labels(herdr, &coord_term, &labels).await;
+    Ok(run)
+}
+
+pub async fn execute_launch(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchLaunchArgs,
+) -> Result<LaunchOutput> {
+    execute_launch_with_path(store, herdr, sleeper, args, None).await
+}
+
+pub async fn execute_launch_with_path(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchLaunchArgs,
+    path_override: Option<&OsStr>,
+) -> Result<LaunchOutput> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let out: LaunchOutput = serde_json::from_str(&cached)?;
+            return Ok(out);
+        }
+    }
+
+    if !matches!(args.worktree.as_str(), "current" | "new-child") {
+        bail!(
+            "invalid --worktree mode '{}'; expected 'current' or 'new-child'",
+            args.worktree
+        );
+    }
+
+    if let Err(preflight_err) = preflight_agent_with_path(&args.agent, path_override) {
+        return Err(anyhow::Error::new(*preflight_err));
+    }
+
+    let now_ms = sleeper.now_ms();
+    let run = if let Some(ref run_id) = args.run {
+        store
+            .get_run(run_id)?
+            .with_context(|| format!("run '{}' does not exist", run_id))?
+    } else {
+        create_run_record(
+            store,
+            herdr,
+            args.title.as_deref(),
+            args.caller_terminal.clone(),
+            "caller terminal not specified; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+            now_ms,
+        )
+        .await?
+    };
+
+    let task_id = generate_orch_id("task");
+    let dispatch_caller = if args.run.is_some() {
+        args.caller_terminal.clone()
+    } else {
+        Some(run.coordinator_terminal.clone())
+    };
+
+    let disp_out = match execute_dispatch(
+        store,
+        herdr,
+        sleeper,
+        OrchDispatchArgs {
+            run: run.id.clone(),
+            task: task_id.clone(),
+            title: args.title.clone(),
+            prompt: Some(args.prompt.clone()),
+            terminal: None,
+            agent: Some(args.agent.clone()),
+            worktree: args.worktree.clone(),
+            request_id: None,
+            caller_terminal: dispatch_caller,
+        },
+    )
+    .await
+    {
+        Ok(out) => out,
+        Err(err) => {
+            let run_err = err.chain().find_map(|e| e.downcast_ref::<HcRunError>());
+            let exit_code = run_err.and_then(|e| e.exit_code);
+            let output_tail = run_err.and_then(|e| {
+                let raw = if !e.stdout.trim().is_empty() {
+                    e.stdout.trim()
+                } else {
+                    e.stderr.trim()
+                };
+                (!raw.is_empty()).then(|| raw.to_string())
+            });
+            return Err(anyhow::Error::new(OrchLaunchError {
+                failed_stage: "spawn".to_string(),
+                agent: args.agent,
+                detail: err.to_string(),
+                exit_code,
+                output_tail,
+                run_id: Some(run.id),
+                task_id: Some(task_id),
+                dispatch_id: None,
+            }));
+        }
+    };
+
+    if let Some(reason) = disp_out.failure_reason {
+        return Err(anyhow::Error::new(OrchLaunchError {
+            failed_stage: "launch".to_string(),
+            agent: args.agent,
+            detail: reason,
+            exit_code: disp_out.exit_code,
+            output_tail: disp_out.output_tail,
+            run_id: Some(run.id),
+            task_id: Some(disp_out.dispatch.task_id),
+            dispatch_id: Some(disp_out.dispatch.id),
+        }));
+    }
+
+    let task = store
+        .get_task(&run.id, &disp_out.dispatch.task_id)?
+        .context("task missing after dispatch")?;
+
+    let out = LaunchOutput {
+        run,
+        task,
+        dispatch: disp_out.dispatch,
+    };
+
+    let resp_json = serde_json::to_string(&out)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "launch", &resp_json, sleeper.now_ms())?;
+    }
+
+    Ok(out)
+}
+
+pub async fn execute_send_to(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchSendToArgs,
+) -> Result<SendToOutput> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let out: SendToOutput = serde_json::from_str(&cached)?;
+            return Ok(out);
+        }
+    }
+
+    let target_dispatch_id = args
+        .to
+        .trim()
+        .strip_prefix("dispatch:")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .with_context(|| {
+            format!(
+                "invalid --to target '{}'; expected 'dispatch:<id>'",
+                args.to
+            )
+        })?;
+
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        None,
+        None,
+        true,
+        "caller terminal identity could not be established for attempt fencing; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+    )
+    .await?;
+
+    let disp = store.verify_parent_caller(
+        target_dispatch_id,
+        &resolved_caller.terminal,
+        resolved_caller.created_ms,
+    )?;
+
+    if matches!(
+        disp.status,
+        DispatchStatus::Completed
+            | DispatchStatus::Failed
+            | DispatchStatus::Stopped
+            | DispatchStatus::Superseded
+    ) {
+        bail!(
+            "cannot send message to dispatch '{}' because its status is '{}'; use `tchelvis orch retry {}` to launch a new attempt",
+            disp.id,
+            disp.status,
+            disp.id
+        );
+    }
+
+    let worker_term = match fetch_hc_terminal(herdr, &disp.assignee_terminal).await {
+        Ok(term) => term,
+        Err(err) => {
+            bail!(
+                "worker terminal '{}' for dispatch '{}' is unavailable ({}); use `tchelvis orch retry {}` to launch a new attempt",
+                disp.assignee_terminal,
+                disp.id,
+                err,
+                disp.id
+            );
+        }
+    };
+
+    if worker_term
+        .created_ms
+        .is_some_and(|c| c != disp.terminal_created_ms)
+    {
+        bail!(
+            "worker terminal '{}' for dispatch '{}' was recreated (expected created_ms={}, got {:?}); use `tchelvis orch retry {}` to launch a new attempt",
+            disp.assignee_terminal,
+            disp.id,
+            disp.terminal_created_ms,
+            worker_term.created_ms,
+            disp.id
+        );
+    }
+
+    if worker_term.state == "finished" || worker_term.status_name() == Some("error") {
+        bail!(
+            "worker terminal '{}' for dispatch '{}' is '{}' and cannot receive messages; use `tchelvis orch retry {}` to launch a new attempt",
+            disp.assignee_terminal,
+            disp.id,
+            worker_term.state,
+            disp.id
+        );
+    }
+
+    let can_try_immediate = matches!(worker_term.status_name(), Some("idle" | "done" | "") | None)
+        && !args.body.contains('\n')
+        && !args.body.contains('\r')
+        && args.body.len() <= 500;
+
+    let delivered_immediately = if can_try_immediate {
+        herdr
+            .send_guarded_if_idle(&disp.assignee_terminal, &args.body)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let now_ms = sleeper.now_ms();
+    let (message, dispatch_status) = store.record_coordinator_message(
+        &disp.id,
+        &resolved_caller.terminal,
+        resolved_caller.created_ms,
+        &args.body,
+        delivered_immediately,
+        worker_term.turn,
+        now_ms,
+    )?;
+
+    let out = SendToOutput {
+        message,
+        dispatch_id: disp.id,
+        dispatch_status,
+        delivered_immediately,
+    };
+
+    let resp_json = serde_json::to_string(&out)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "send-to", &resp_json, now_ms)?;
+    }
+
+    Ok(out)
+}
+
+pub async fn execute_retry(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchRetryArgs,
+) -> Result<RetryOutput> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let out: RetryOutput = serde_json::from_str(&cached)?;
+            return Ok(out);
+        }
+    }
+
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        None,
+        None,
+        true,
+        "caller terminal identity could not be established for attempt fencing; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+    )
+    .await?;
+
+    let old_disp = store.verify_parent_caller(
+        &args.dispatch_id,
+        &resolved_caller.terminal,
+        resolved_caller.created_ms,
+    )?;
+
+    if matches!(
+        old_disp.status,
+        DispatchStatus::Completed | DispatchStatus::Superseded
+    ) {
+        bail!(
+            "dispatch '{}' has status '{}' and cannot be retried",
+            old_disp.id,
+            old_disp.status
+        );
+    }
+
+    if old_disp.agent_kind == "attached" {
+        bail!(
+            "cannot retry attached dispatch '{}' (no agent command recorded); use `tchelvis orch dispatch --agent <agent>` instead",
+            old_disp.id
+        );
+    }
+
+    let task = store
+        .get_task(&old_disp.run_id, &old_disp.task_id)?
+        .with_context(|| {
+            format!(
+                "task '{}' not found in run '{}'",
+                old_disp.task_id, old_disp.run_id
+            )
+        })?;
+    if task.failure_count >= MAX_DISPATCH_FAILURES || task.status == TaskStatus::CircuitBroken {
+        bail!(
+            "circuit breaker tripped for task '{}' in run '{}' (failure_count = {})",
+            task.id,
+            task.run_id,
+            task.failure_count
+        );
+    }
+
+    close_worker_terminal(herdr, &old_disp.assignee_terminal).await;
+
+    let dispatch_output = execute_dispatch(
+        store,
+        herdr,
+        sleeper,
+        OrchDispatchArgs {
+            run: old_disp.run_id.clone(),
+            task: old_disp.task_id.clone(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some(old_disp.agent_kind.clone()),
+            worktree: old_disp.worktree_mode.clone(),
+            request_id: None,
+            caller_terminal: Some(resolved_caller.terminal),
+        },
+    )
+    .await?;
+
+    let superseded = store.supersede_dispatch(&old_disp.id, sleeper.now_ms())?;
+
+    let out = RetryOutput {
+        previous_dispatch_id: superseded.id,
+        previous_status: superseded.status,
+        dispatch_output,
+    };
+
+    let resp_json = serde_json::to_string(&out)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "retry", &resp_json, sleeper.now_ms())?;
+    }
+
+    Ok(out)
+}
+
+pub async fn execute_stop(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    sleeper: &dyn OrchSleeper,
+    args: OrchStopArgs,
+) -> Result<StopOutput> {
+    if let Some(ref req_id) = args.request_id {
+        if let Some(cached) = store.get_mutation_receipt(req_id)? {
+            let out: StopOutput = serde_json::from_str(&cached)?;
+            return Ok(out);
+        }
+    }
+
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        None,
+        None,
+        true,
+        "caller terminal identity could not be established for attempt fencing; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+    )
+    .await?;
+
+    let disp = store.verify_parent_caller(
+        &args.dispatch_id,
+        &resolved_caller.terminal,
+        resolved_caller.created_ms,
+    )?;
+
+    if matches!(
+        disp.status,
+        DispatchStatus::Completed | DispatchStatus::Superseded
+    ) {
+        bail!(
+            "dispatch '{}' has status '{}' and cannot be stopped",
+            disp.id,
+            disp.status
+        );
+    }
+
+    close_worker_terminal(herdr, &disp.assignee_terminal).await;
+
+    let now_ms = sleeper.now_ms();
+    let (worktree_kept, worktree_note) = if disp.worktree_mode == "new-child" {
+        if let Some(ref wt_path) = disp.worktree_path {
+            match cleanup_failed_child_worktree(wt_path, &disp.run_id, &disp.task_id).await {
+                Ok(cleaned) => {
+                    store.clear_dispatch_worktree_path(&disp.id, now_ms)?;
+                    (false, Some(cleaned))
+                }
+                Err(kept) => (true, Some(kept)),
+            }
+        } else {
+            (false, None)
+        }
+    } else {
+        (false, None)
+    };
+
+    let (stopped_disp, task_status) = store.stop_dispatch(&disp.id, now_ms)?;
+
+    let out = StopOutput {
+        dispatch_id: stopped_disp.id,
+        run_id: stopped_disp.run_id,
+        task_id: stopped_disp.task_id,
+        assignee_terminal: stopped_disp.assignee_terminal,
+        dispatch_status: stopped_disp.status,
+        task_status,
+        terminal_closed: true,
+        worktree_kept,
+        worktree_path: stopped_disp.worktree_path,
+        worktree_note,
+    };
+
+    let resp_json = serde_json::to_string(&out)?;
+    if let Some(ref req_id) = args.request_id {
+        store.save_mutation_receipt(req_id, "stop", &resp_json, now_ms)?;
+    }
+
+    Ok(out)
+}
+
 fn print_run_create(run: &OrchRun, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(run)?);
@@ -1582,6 +2371,26 @@ fn print_run_create(run: &OrchRun, json: bool) -> Result<()> {
         println!(
             "Created orchestration run {} (coordinator={}, title=\"{}\")",
             run.id, run.coordinator_terminal, run.title
+        );
+    }
+    Ok(())
+}
+
+fn print_launch(out: &LaunchOutput, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(out)?);
+    } else {
+        println!(
+            "Launched dispatch {} for task {} in run {} -> worker {} (agent={}, worktree={}, status={}, depth={}/{})",
+            out.dispatch.id,
+            out.task.id,
+            out.run.id,
+            out.dispatch.assignee_terminal,
+            out.dispatch.agent_kind,
+            out.dispatch.worktree_mode,
+            out.dispatch.status,
+            out.dispatch.depth,
+            MAX_ORCH_DEPTH
         );
     }
     Ok(())
@@ -1649,6 +2458,64 @@ fn print_message(msg: &OrchMessage, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_send_to(out: &SendToOutput, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(out)?);
+    } else if out.delivered_immediately {
+        println!(
+            "Delivered directive {} -> worker {} immediately (dispatch={}, status={}, pointer_state={})",
+            out.message.id,
+            out.message.target_terminal,
+            out.dispatch_id,
+            out.dispatch_status,
+            out.message.pointer_state
+        );
+    } else {
+        println!(
+            "Queued directive {} -> worker {} for pointer delivery (dispatch={}, status={}, pointer_state={})",
+            out.message.id,
+            out.message.target_terminal,
+            out.dispatch_id,
+            out.dispatch_status,
+            out.message.pointer_state
+        );
+    }
+    Ok(())
+}
+
+fn print_retry(out: &RetryOutput, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(out)?);
+    } else {
+        println!(
+            "Superseded dispatch {} (status={}); launching retry:",
+            out.previous_dispatch_id, out.previous_status
+        );
+        print_dispatch(&out.dispatch_output, false)?;
+    }
+    Ok(())
+}
+
+fn print_stop(out: &StopOutput, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(out)?);
+    } else {
+        println!(
+            "Stopped dispatch {} (terminal={} closed={}, task={} status={}, worktree_kept={})",
+            out.dispatch_id,
+            out.assignee_terminal,
+            out.terminal_closed,
+            out.task_id,
+            out.task_status,
+            out.worktree_kept
+        );
+        if let Some(ref note) = out.worktree_note {
+            println!("Worktree: {note}");
+        }
+    }
+    Ok(())
+}
+
 fn print_ask(q_thread: &QuestionThread, msg: &OrchMessage, json: bool) -> Result<()> {
     if json {
         println!(
@@ -1690,6 +2557,61 @@ fn print_reply(q_thread: &QuestionThread, msg: &OrchMessage, json: bool) -> Resu
         );
     }
     Ok(())
+}
+
+fn format_human_status(out: &OrchStatusOutput) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    for v in &out.runs {
+        let _ = writeln!(
+            buf,
+            "Run {} ({}) [status={} coordinator={} unack_msgs={}]",
+            v.run.id,
+            v.run.title,
+            v.run.status,
+            v.run.coordinator_terminal,
+            v.unacknowledged_messages
+        );
+        for t in &v.tasks {
+            let _ = writeln!(
+                buf,
+                "  Task {}: {} [status={} failures={} deps={:?}]",
+                t.id, t.title, t.status, t.failure_count, t.deps
+            );
+        }
+        for d in &v.dispatches {
+            let _ = writeln!(
+                buf,
+                "  Dispatch {}: task={} assignee={} parent={} status={} worktree={}",
+                d.id, d.task_id, d.assignee_terminal, d.parent_terminal, d.status, d.worktree_mode
+            );
+        }
+        for m in &v.messages {
+            let _ = writeln!(
+                buf,
+                "  Message {}: [{}] {} -> {} (dispatch={}, pointer={}): {}",
+                m.id,
+                m.msg_type,
+                m.from_handle,
+                m.to_handle,
+                m.dispatch_id.as_deref().unwrap_or("-"),
+                m.pointer_state,
+                m.body
+            );
+        }
+        for q in &v.open_questions {
+            let _ = writeln!(
+                buf,
+                "  Open Question {}: dispatch={} status={}",
+                q.id, q.dispatch_id, q.status
+            );
+        }
+    }
+    buf
+}
+
+fn print_human_status(out: &OrchStatusOutput) {
+    print!("{}", format_human_status(out));
 }
 
 fn print_inbox_check(res: &InboxCheckResult, json: bool) -> Result<()> {
@@ -1742,8 +2664,151 @@ fn print_inbox_check(res: &InboxCheckResult, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Parser)]
+    struct TestOrchCli {
+        #[command(subcommand)]
+        cmd: OrchCommands,
+    }
+
+    #[test]
+    fn test_orch_commands_parse_launch_send_to_retry_stop() {
+        let launch = TestOrchCli::try_parse_from([
+            "orch",
+            "launch",
+            "--agent",
+            "claude",
+            "--prompt",
+            "Do work",
+            "--title",
+            "T",
+            "--worktree",
+            "new-child",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            launch.cmd,
+            OrchCommands::Launch { json: true, .. }
+        ));
+
+        let send_to = TestOrchCli::try_parse_from([
+            "orch",
+            "send",
+            "--to",
+            "dispatch:disp_1",
+            "--body",
+            "Hello worker",
+        ])
+        .unwrap();
+        assert!(matches!(
+            send_to.cmd,
+            OrchCommands::Send {
+                to: Some(_),
+                msg_type: None,
+                ..
+            }
+        ));
+
+        let send_worker = TestOrchCli::try_parse_from([
+            "orch",
+            "send",
+            "--type",
+            "worker_done",
+            "--outcome",
+            "succeeded",
+            "--dispatch-id",
+            "disp_1",
+            "--body",
+            "Done",
+        ])
+        .unwrap();
+        assert!(matches!(
+            send_worker.cmd,
+            OrchCommands::Send {
+                to: None,
+                msg_type: Some(_),
+                dispatch_id: Some(_),
+                ..
+            }
+        ));
+
+        let retry = TestOrchCli::try_parse_from(["orch", "retry", "disp_1", "--json"]).unwrap();
+        assert!(matches!(retry.cmd, OrchCommands::Retry { json: true, .. }));
+
+        let stop = TestOrchCli::try_parse_from(["orch", "stop", "disp_1"]).unwrap();
+        assert!(matches!(stop.cmd, OrchCommands::Stop { json: false, .. }));
+    }
+
+    #[test]
+    fn test_preflight_agent_with_path_checks_executable_bit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        // Missing binary fails agent_preflight
+        let err_missing =
+            preflight_agent_with_path("codex", Some(bin_dir.as_os_str())).unwrap_err();
+        assert_eq!(err_missing.failed_stage, "agent_preflight");
+        assert_eq!(err_missing.agent, "codex");
+
+        // Non-executable file fails agent_preflight
+        let codex_file = bin_dir.join("codex");
+        fs::write(&codex_file, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&codex_file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(preflight_agent_with_path("codex", Some(bin_dir.as_os_str())).is_err());
+
+        // Executable file passes (even for preset with flags like `codex --no-daemon`)
+        fs::set_permissions(&codex_file, fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = preflight_agent_with_path("codex", Some(bin_dir.as_os_str())).unwrap();
+        assert_eq!(resolved, codex_file.to_string_lossy());
+    }
+
+    #[test]
+    fn test_format_human_status_includes_messages() {
+        let out = OrchStatusOutput {
+            runs: vec![RunStatusView {
+                run: OrchRun {
+                    id: "run_1".into(),
+                    title: "Run 1".into(),
+                    coordinator_terminal: "t1".into(),
+                    coordinator_created_ms: 1_000,
+                    status: RunStatus::Active,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                },
+                tasks: vec![],
+                dispatches: vec![],
+                messages: vec![OrchMessage {
+                    id: "msg_1".into(),
+                    run_id: "run_1".into(),
+                    task_id: Some("task_a".into()),
+                    dispatch_id: Some("disp_1".into()),
+                    from_handle: "t1".into(),
+                    to_handle: "t2".into(),
+                    target_terminal: "t2".into(),
+                    msg_type: MessageType::Directive,
+                    outcome: None,
+                    body: "Please add unit tests".into(),
+                    pointer_state: PointerState::Acknowledged,
+                    pointer_terminal: Some("t2".into()),
+                    delivery_attempts: 1,
+                    next_retry_at_ms: None,
+                    delivered_at_ms: Some(1_100),
+                    acknowledged_at_ms: Some(1_100),
+                    created_at_ms: 1_100,
+                }],
+                open_questions: vec![],
+                unacknowledged_messages: 0,
+            }],
+        };
+        let rendered = format_human_status(&out);
+        assert!(rendered.contains("Message msg_1: [directive] t1 -> t2"));
+        assert!(rendered.contains("Please add unit tests"));
+    }
 
     #[tokio::test]
     async fn test_resolve_caller_terminal_strict_fencing_and_non_strict_fallback() {

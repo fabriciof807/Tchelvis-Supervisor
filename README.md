@@ -47,7 +47,7 @@ Manage your fleet from **Herdr Desktop** (`herdr-app`) with the multi-zone `tche
 
 ### 5. Event-driven multi-agent orchestration (`tchelvis orch`)
 A coordinator agent running inside a Herdr terminal can delegate work to parallel child coding agents without polling loops or copy-pasting:
-- Invoke **`/orchestration-tchelvis`** inside Claude Code, OpenCode, Pi, Codex, or Gemini CLI (or run `tchelvis orch skill`) to create runs, define DAG tasks, and dispatch workers in shared or isolated git worktrees (`--worktree current|new-child`).
+- Invoke **`/orchestration-tchelvis`** inside Claude Code, OpenCode, Pi, Codex, or Gemini CLI (or run `tchelvis orch skill`) to launch workers in one command (`tchelvis orch launch`), define DAG tasks, and manage recovery (`send -> retry -> stop`) in shared or isolated git worktrees (`--worktree current|new-child`).
 - `tchelvis daemon` manages `orch.db` (SQLite WAL) and wakes coordinators or workers atomically via `hc send --if idle`—including a `1500 ms` post-turn silent-stop safety net and a `3000 ms` blocked-prompt fallback that work even when the local supervisor LLM is unloaded.
 - Coordinators with active child dispatches surface as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
 
@@ -255,31 +255,40 @@ Event-driven parent-child agent orchestration over Herdr (`hc`) terminals, backe
   - **`1500 ms` post-turn silent-stop safety net**: If a dispatched worker returns to its prompt (`idle` / `done`) for `>= 1500 ms` without calling `worker_done` or `ask`, `tchelvis daemon` captures the last 25 sanitized lines and wakes the coordinator with an `escalation`.
   - **`3000 ms` blocked-prompt fallback**: If a worker stays `blocked` on a prompt for `>= 3000 ms` (for example, when the local supervisor LLM is unloaded or the command is outside the read-only whitelist), `tchelvis daemon` escalates to the coordinator so the worker never stalls silently.
 - **Fleet visibility**: Coordinators waiting on active dispatches render as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
+- **Recovery path (`send -> retry -> stop`)**: Silence is never proof of exit. Nudge live workers with `tchelvis orch send --to dispatch:<id> --body "..."`, re-launch dead/stuck attempts with `tchelvis orch retry <dispatch_id>`, or cancel cleanly with `tchelvis orch stop <dispatch_id>`.
 
 | Subcommand | Purpose & Key Flags |
 | :--- | :--- |
+| `tchelvis orch launch` | One-shot run/task/dispatch launch with `PATH` agent preflight (`--agent <agent\|cmd> --prompt <str> [--title <str>] [--run <id>] [--worktree current\|new-child]`) |
 | `tchelvis orch run-create` | Create a run bound to the coordinator terminal (`[--title <str>] [--coordinator <term>]`) |
 | `tchelvis orch task-create` | Add a DAG task (`--run <id> --id <task> --title <str> --prompt <str> [--deps <csv\|json>]`) |
 | `tchelvis orch dispatch` | Spawn or attach a worker (`--run <id> --task <task> (--agent <claude\|codex\|gemini\|opencode\|pi\|cmd> \| --terminal <term>) [--worktree current\|new-child]`) |
-| `tchelvis orch send` | Worker report to parent (`--type <worker_done\|escalation\|status> [--outcome succeeded\|failed] --dispatch-id <id> --body <str>`) |
+| `tchelvis orch send` | Worker report to parent (`--type <worker_done\|escalation\|status> [--outcome succeeded\|failed] --dispatch-id <id> --body <str>`) or parent directive to worker (`--to dispatch:<id> --body <str>`) |
 | `tchelvis orch ask` | Worker asks a blocking question and ends turn (`--dispatch-id <id> --question <str>`) |
 | `tchelvis orch reply` | Coordinator answers an open question and wakes the worker (`--question-id <id> --body <str>`) |
+| `tchelvis orch retry` | Supersede an attempt and relaunch the same task/agent/worktree mode (`<dispatch_id>`) |
+| `tchelvis orch stop` | Close worker terminal cleanly, mark dispatch stopped, and restore task to retryable without deleting dirty worktrees (`<dispatch_id>`) |
 | `tchelvis orch check` | Read and acknowledge pending inbox messages (`[--run <id>] [--terminal <term>] [--peek]`) |
-| `tchelvis orch status` | Inspect run DAG tasks, dispatches, open questions, and unread counts (`[--run <id>]`) |
+| `tchelvis orch status` | Inspect run DAG tasks, dispatches, recorded messages, open questions, and unread counts (`[--run <id>]`) |
 | `tchelvis orch release` | Opt-in cleanup of a finished worker terminal and clean/merged `--worktree new-child` (`--dispatch-id <id> [--force]`) |
 | `tchelvis orch skill` | Print the self-contained Markdown guide for coordinator and worker agents |
 
 All mutating `tchelvis orch` subcommands also accept `--request-id <id>` (idempotency receipt) and `--json`:
 
 ```bash
-# Coordinator: create a run, dispatch a worker in an isolated git worktree, and end turn
+# Coordinator: quick one-shot launch in an isolated git worktree, then end turn
+tchelvis orch launch --agent claude --title "Implement JWT" \
+  --prompt "Add JWT middleware and run cargo test." --worktree new-child
+
+# Coordinator: or create a DAG explicitly, check inbox, reply, message, retry, or stop
 tchelvis orch run-create --title "Auth refactor"
 tchelvis orch dispatch --run <run_id> --task jwt --title "Implement JWT" \
   --prompt "Add JWT middleware and run cargo test." --agent claude --worktree new-child
-
-# Coordinator: check inbox when woken by [tchelvis] pointer, reply to questions, or release
 tchelvis orch check --run <run_id>
 tchelvis orch reply --question-id <q_id> --body "Default token expiry to 15m."
+tchelvis orch send --to dispatch:<dispatch_id> --body "Also cover token refresh tests."
+tchelvis orch retry <dispatch_id>
+tchelvis orch stop <dispatch_id>
 tchelvis orch status --run <run_id>
 tchelvis orch release --dispatch-id <dispatch_id>
 

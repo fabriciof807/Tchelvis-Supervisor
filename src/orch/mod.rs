@@ -171,6 +171,7 @@ pub enum DispatchStatus {
     Completed,
     Failed,
     Stopped,
+    Superseded,
 }
 
 impl DispatchStatus {
@@ -183,6 +184,7 @@ impl DispatchStatus {
             Self::Completed => "completed",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Superseded => "superseded",
         }
     }
 
@@ -212,6 +214,7 @@ impl FromStr for DispatchStatus {
             "completed" => Ok(Self::Completed),
             "failed" => Ok(Self::Failed),
             "stopped" => Ok(Self::Stopped),
+            "superseded" => Ok(Self::Superseded),
             other => anyhow::bail!("invalid DispatchStatus: '{other}'"),
         }
     }
@@ -251,6 +254,7 @@ pub enum MessageType {
     WorkerDone,
     Question,
     Reply,
+    Directive,
     Escalation,
     Status,
 }
@@ -261,6 +265,7 @@ impl MessageType {
             Self::WorkerDone => "worker_done",
             Self::Question => "question",
             Self::Reply => "reply",
+            Self::Directive => "directive",
             Self::Escalation => "escalation",
             Self::Status => "status",
         }
@@ -281,6 +286,7 @@ impl FromStr for MessageType {
             "worker_done" => Ok(Self::WorkerDone),
             "question" => Ok(Self::Question),
             "reply" => Ok(Self::Reply),
+            "directive" => Ok(Self::Directive),
             "escalation" => Ok(Self::Escalation),
             "status" => Ok(Self::Status),
             other => anyhow::bail!("invalid MessageType: '{other}'"),
@@ -450,13 +456,24 @@ mod tests {
             DispatchStatus::Completed,
             DispatchStatus::Failed,
             DispatchStatus::Stopped,
+            DispatchStatus::Superseded,
         ] {
             assert_eq!(DispatchStatus::from_str(status.as_str()).unwrap(), status);
+            assert_eq!(
+                status.is_active(),
+                matches!(
+                    status,
+                    DispatchStatus::Starting
+                        | DispatchStatus::Dispatched
+                        | DispatchStatus::WaitingForReply
+                )
+            );
         }
         for msg_type in [
             MessageType::WorkerDone,
             MessageType::Question,
             MessageType::Reply,
+            MessageType::Directive,
             MessageType::Escalation,
             MessageType::Status,
         ] {

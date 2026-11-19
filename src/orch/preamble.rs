@@ -60,35 +60,54 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
 
 ## Coordinator Workflow
 
-1. **Create an orchestration run** (binds your current `$HC_TERMINAL_ID` as the coordinator):
+1. **Quick one-shot launch** (creates a run bound to `$HC_TERMINAL_ID` when `--run` is omitted, preflights the agent binary on `PATH`, creates the task, and spawns the worker):
+   ```bash
+   tchelvis orch launch --agent claude --title "Implement JWT" --prompt "Implement X..." --worktree new-child
+   ```
+2. **Or build a multi-task DAG explicitly**:
    ```bash
    tchelvis orch run-create --title "Feature or refactor title"
-   ```
-2. **Define DAG tasks** (optional if dispatching one-off tasks directly):
-   ```bash
    tchelvis orch task-create --run <run_id> --id task_a --title "Step A" --prompt "Implement X..."
    tchelvis orch task-create --run <run_id> --id task_b --title "Step B" --prompt "Verify X..." --deps task_a
-   ```
-3. **Dispatch ready tasks to child workers** (`claude`, `codex`, `gemini`, `opencode`, `pi`, or custom command; optionally in an isolated worktree via `--worktree new-child`):
-   ```bash
    tchelvis orch dispatch --run <run_id> --task task_a --agent claude --worktree current
    ```
-4. **End your turn immediately (Never Poll!)**:
+3. **End your turn immediately (Never Poll!)**:
    - Do **not** run `sleep`, `hc wait`, or `hc read` loops waiting for workers.
    - `tchelvis daemon` monitors child terminals and automatically injects a single-line `[tchelvis] You have N orchestration message(s) in run <run_id>...` pointer via `hc send --if idle` when a worker finishes (`worker_done`), asks a question (`ask`), blocks on a prompt, or stops silently (`1500ms` post-turn safety net).
-5. **Check your inbox when woken**:
+4. **Check your inbox when woken**:
    ```bash
    tchelvis orch check --run <run_id>
    ```
-6. **Reply to worker questions**:
+5. **Reply to worker questions or message a running worker**:
    ```bash
    tchelvis orch reply --question-id <q_id> --body "Your answer here"
+   tchelvis orch send --to dispatch:<dispatch_id> --body "Follow-up directive"
    ```
-7. **Inspect run status and release finished workers (opt-in)**:
+6. **Inspect run status and release finished workers (opt-in)**:
    ```bash
    tchelvis orch status --run <run_id>
    tchelvis orch release --dispatch-id <dispatch_id>
    ```
+
+## Recovery Path (`send -> retry -> stop`)
+
+**Silence is never proof of exit.** A worker terminal returning to an idle prompt without sending `worker_done` may simply be waiting for follow-up input, paused after a partial turn, or dead. Inspect `tchelvis orch status --run <run_id>` and follow this recovery order:
+
+1. **`send` (live worker needs a nudge or new instruction)**:
+   ```bash
+   tchelvis orch send --to dispatch:<dispatch_id> --body "Finish verification and report worker_done"
+   ```
+   Delivers immediately when the worker is live and idle (or queues for delivery when busy) and records a `directive` in `orch.db`. Rejected if the worker terminal is already `finished` (use `retry` next).
+2. **`retry` (worker finished, errored, or stalled)**:
+   ```bash
+   tchelvis orch retry <dispatch_id>
+   ```
+   Closes the old terminal if needed, marks the prior attempt `superseded`, cancels open questions, and launches a fresh dispatch for the same task (reusing any existing `--worktree new-child` checkout) while respecting the 3-failure circuit breaker.
+3. **`stop` (cancel an active or runaway worker cleanly)**:
+   ```bash
+   tchelvis orch stop <dispatch_id>
+   ```
+   Closes the worker terminal, marks the dispatch `stopped`, cancels open questions, and returns the task to a retryable state without incrementing `failure_count` and without deleting dirty or unmerged worktrees.
 
 ## Worker Rules
 
@@ -131,6 +150,7 @@ mod tests {
     fn assert_skill_documents_subcommands(skill: &str) {
         assert!(skill.contains("description:"));
         for subcmd in [
+            "launch",
             "run-create",
             "task-create",
             "dispatch",
@@ -139,6 +159,8 @@ mod tests {
             "status",
             "release",
             "send",
+            "retry",
+            "stop",
             "ask",
         ] {
             assert!(
@@ -146,12 +168,18 @@ mod tests {
                 "skill markdown missing `tchelvis orch {subcmd}`"
             );
         }
+        assert!(skill.contains("tchelvis orch send --to dispatch:"));
+        assert!(skill.contains("send -> retry -> stop"));
+        assert!(skill
+            .to_ascii_lowercase()
+            .contains("silence is never proof of exit"));
     }
 
     #[test]
     fn test_orchestration_skill_markdown_documents_subcommands() {
         let skill = orchestration_skill_markdown();
         for subcmd in [
+            "launch",
             "run-create",
             "task-create",
             "dispatch",
@@ -159,14 +187,21 @@ mod tests {
             "reply",
             "status",
             "release",
+            "retry",
+            "stop",
+            "--to dispatch:",
             "worker_done",
             "ask",
+            "send -> retry -> stop",
         ] {
             assert!(
                 skill.contains(subcmd),
                 "skill markdown missing subcommand {subcmd}"
             );
         }
+        assert!(skill
+            .to_ascii_lowercase()
+            .contains("silence is never proof of exit"));
     }
 
     #[test]

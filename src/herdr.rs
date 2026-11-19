@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -12,6 +13,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 pub const BLOCKED_CLEAR_HYSTERESIS_MS: i64 = 1_500;
+
+#[derive(Debug, Clone)]
+pub struct HcRunError {
+    pub exit_code: Option<i32>,
+    pub stderr: String,
+    pub stdout: String,
+    pub message: String,
+}
+
+impl fmt::Display for HcRunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HcRunError {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct HcForeground {
@@ -912,11 +929,20 @@ impl HerdrClient {
             .context("hc run timed out")??;
 
         if !out.status.success() {
-            bail!(
-                "hc run failed with status {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr.clone()
+            } else {
+                stdout.clone()
+            };
+            let message = format!("hc run failed with status {}: {}", out.status, detail);
+            return Err(anyhow::Error::new(HcRunError {
+                exit_code: out.status.code(),
+                stderr,
+                stdout,
+                message,
+            }));
         }
 
         let val: Value = serde_json::from_slice(&out.stdout)

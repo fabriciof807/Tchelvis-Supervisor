@@ -1687,6 +1687,315 @@ impl OrchStore {
         })
     }
 
+    fn verify_parent_caller_tx(
+        tx: &Transaction<'_>,
+        disp: &DispatchContext,
+        caller_terminal: &str,
+        caller_created_ms: i64,
+    ) -> Result<()> {
+        if disp.parent_terminal != caller_terminal {
+            bail!(
+                "attempt fencing rejected for dispatch '{}': only parent '{}' may act on worker '{}' (got caller '{}')",
+                disp.id,
+                disp.parent_terminal,
+                disp.assignee_terminal,
+                caller_terminal
+            );
+        }
+
+        let coord_created: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT coordinator_terminal, coordinator_created_ms FROM runs WHERE id = ?1",
+                params![disp.run_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((coord_term, coord_ms)) = coord_created {
+            if coord_term == disp.parent_terminal && coord_ms != caller_created_ms {
+                bail!(
+                    "attempt fencing rejected for dispatch '{}': expected parent ({}, {}), got ({}, {})",
+                    disp.id,
+                    disp.parent_terminal,
+                    coord_ms,
+                    caller_terminal,
+                    caller_created_ms
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn verify_parent_caller(
+        &self,
+        dispatch_id: &str,
+        caller_terminal: &str,
+        caller_created_ms: i64,
+    ) -> Result<DispatchContext> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?
+            .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
+        Self::verify_parent_caller_tx(&tx, &disp, caller_terminal, caller_created_ms)?;
+        Ok(disp)
+    }
+
+    pub fn list_messages_for_run(&self, run_id: &str) -> Result<Vec<OrchMessage>> {
+        let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
+                    msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
+                    next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
+             FROM messages
+             WHERE run_id = ?1
+             ORDER BY created_at_ms ASC, id ASC",
+        )?;
+        let rows = stmt
+            .query_map(params![run_id], Self::map_message_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_coordinator_message(
+        &self,
+        dispatch_id: &str,
+        caller_terminal: &str,
+        caller_created_ms: i64,
+        body: &str,
+        delivered_immediately: bool,
+        child_current_turn: u64,
+        now_ms: i64,
+    ) -> Result<(OrchMessage, DispatchStatus)> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?
+            .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
+        Self::verify_parent_caller_tx(&tx, &disp, caller_terminal, caller_created_ms)?;
+
+        if matches!(
+            disp.status,
+            DispatchStatus::Completed
+                | DispatchStatus::Failed
+                | DispatchStatus::Stopped
+                | DispatchStatus::Superseded
+        ) {
+            bail!(
+                "cannot send message to dispatch '{}' because its status is '{}'; use `tchelvis orch retry {}` to launch a new attempt",
+                disp.id,
+                disp.status,
+                disp.id
+            );
+        }
+
+        let (
+            pointer_state,
+            pointer_terminal,
+            delivery_attempts,
+            delivered_at_ms,
+            acknowledged_at_ms,
+        ) = if delivered_immediately {
+            (
+                PointerState::Acknowledged,
+                Some(disp.assignee_terminal.clone()),
+                1,
+                Some(now_ms),
+                Some(now_ms),
+            )
+        } else {
+            (PointerState::Pending, None, 0, None, None)
+        };
+
+        let msg = OrchMessage {
+            id: generate_orch_id("msg"),
+            run_id: disp.run_id.clone(),
+            task_id: Some(disp.task_id.clone()),
+            dispatch_id: Some(disp.id.clone()),
+            from_handle: disp.parent_terminal.clone(),
+            to_handle: disp.assignee_terminal.clone(),
+            target_terminal: disp.assignee_terminal.clone(),
+            msg_type: MessageType::Directive,
+            outcome: None,
+            body: body.to_string(),
+            pointer_state,
+            pointer_terminal,
+            delivery_attempts,
+            next_retry_at_ms: None,
+            delivered_at_ms,
+            acknowledged_at_ms,
+            created_at_ms: now_ms,
+        };
+        Self::insert_message_tx(&tx, &msg)?;
+
+        let new_disp_status = if disp.status == DispatchStatus::WaitingForReply {
+            DispatchStatus::WaitingForReply
+        } else {
+            DispatchStatus::Dispatched
+        };
+        let next_turn = child_current_turn.max(disp.turn_at_dispatch);
+        tx.execute(
+            "UPDATE dispatch_contexts
+             SET status = ?2, turn_at_dispatch = ?3, idle_since_ms = NULL, blocked_since_ms = NULL, updated_at_ms = ?4
+             WHERE id = ?1",
+            params![disp.id, new_disp_status.as_str(), next_turn as i64, now_ms],
+        )?;
+
+        tx.commit()?;
+        Ok((msg, new_disp_status))
+    }
+
+    pub fn supersede_dispatch(&self, dispatch_id: &str, now_ms: i64) -> Result<DispatchContext> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?
+            .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
+        if matches!(
+            disp.status,
+            DispatchStatus::Completed | DispatchStatus::Superseded
+        ) {
+            bail!(
+                "dispatch '{}' has status '{}' and cannot be superseded",
+                disp.id,
+                disp.status
+            );
+        }
+
+        tx.execute(
+            "UPDATE dispatch_contexts
+             SET status = ?2, idle_since_ms = NULL, blocked_since_ms = NULL, updated_at_ms = ?3
+             WHERE id = ?1",
+            params![disp.id, DispatchStatus::Superseded.as_str(), now_ms],
+        )?;
+        tx.execute(
+            "UPDATE question_threads
+             SET status = 'cancelled'
+             WHERE dispatch_id = ?1 AND status = 'open'",
+            params![disp.id],
+        )?;
+
+        let updated = Self::get_dispatch_tx(&tx, &disp.id)?
+            .with_context(|| format!("dispatch '{}' disappeared after update", disp.id))?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    pub fn stop_dispatch(
+        &self,
+        dispatch_id: &str,
+        now_ms: i64,
+    ) -> Result<(DispatchContext, TaskStatus)> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?
+            .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
+        if matches!(
+            disp.status,
+            DispatchStatus::Completed | DispatchStatus::Superseded
+        ) {
+            bail!(
+                "dispatch '{}' has status '{}' and cannot be stopped",
+                disp.id,
+                disp.status
+            );
+        }
+
+        tx.execute(
+            "UPDATE dispatch_contexts
+             SET status = ?2, idle_since_ms = NULL, blocked_since_ms = NULL, updated_at_ms = ?3
+             WHERE id = ?1",
+            params![disp.id, DispatchStatus::Stopped.as_str(), now_ms],
+        )?;
+        tx.execute(
+            "UPDATE question_threads
+             SET status = 'cancelled'
+             WHERE dispatch_id = ?1 AND status = 'open'",
+            params![disp.id],
+        )?;
+
+        let task = tx
+            .query_row(
+                "SELECT run_id, id, title, prompt, deps_json, failure_count, status, result_summary, created_at_ms, updated_at_ms
+                 FROM tasks WHERE run_id = ?1 AND id = ?2",
+                params![disp.run_id, disp.task_id],
+                Self::map_task_row,
+            )
+            .optional()?
+            .with_context(|| format!("task '{}' not found in run '{}'", disp.task_id, disp.run_id))?;
+
+        let next_task_status = if matches!(
+            task.status,
+            TaskStatus::CircuitBroken | TaskStatus::Completed
+        ) {
+            task.status
+        } else {
+            let other_active: Option<i32> = tx
+                .query_row(
+                    "SELECT 1 FROM dispatch_contexts
+                     WHERE run_id = ?1 AND task_id = ?2 AND id != ?3
+                       AND status IN ('starting', 'dispatched', 'waiting_for_reply')
+                     LIMIT 1",
+                    params![disp.run_id, disp.task_id, disp.id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if other_active.is_some() {
+                TaskStatus::Dispatched
+            } else {
+                let mut all_completed = true;
+                let mut any_failed_or_broken = false;
+                for dep_id in &task.deps {
+                    let dep_st_str: Option<String> = tx
+                        .query_row(
+                            "SELECT status FROM tasks WHERE run_id = ?1 AND id = ?2",
+                            params![disp.run_id, dep_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    match dep_st_str.and_then(|s| TaskStatus::from_str(&s).ok()) {
+                        Some(TaskStatus::Completed) => {}
+                        Some(
+                            TaskStatus::Failed | TaskStatus::CircuitBroken | TaskStatus::Blocked,
+                        ) => {
+                            all_completed = false;
+                            any_failed_or_broken = true;
+                        }
+                        _ => {
+                            all_completed = false;
+                        }
+                    }
+                }
+                if any_failed_or_broken {
+                    TaskStatus::Blocked
+                } else if all_completed {
+                    TaskStatus::Ready
+                } else {
+                    TaskStatus::Pending
+                }
+            }
+        };
+
+        tx.execute(
+            "UPDATE tasks SET status = ?3, updated_at_ms = ?4 WHERE run_id = ?1 AND id = ?2",
+            params![disp.run_id, disp.task_id, next_task_status.as_str(), now_ms],
+        )?;
+
+        Self::promote_or_block_dependent_tasks_tx(&tx, &disp.run_id, now_ms)?;
+
+        let updated_disp = Self::get_dispatch_tx(&tx, &disp.id)?
+            .with_context(|| format!("dispatch '{}' disappeared after update", disp.id))?;
+        let final_task_status = tx
+            .query_row(
+                "SELECT status FROM tasks WHERE run_id = ?1 AND id = ?2",
+                params![disp.run_id, disp.task_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|s| TaskStatus::from_str(&s).ok())
+            .unwrap_or(next_task_status);
+
+        tx.commit()?;
+        Ok((updated_disp, final_task_status))
+    }
+
     fn insert_message_tx(tx: &Transaction<'_>, msg: &OrchMessage) -> Result<()> {
         tx.execute(
             "INSERT INTO messages (
@@ -2040,5 +2349,81 @@ mod tests {
         let disp = store.get_dispatch("disp_1").unwrap().unwrap();
         assert_eq!(disp.status, DispatchStatus::Dispatched);
         assert_eq!(disp.turn_at_dispatch, 2);
+    }
+
+    #[test]
+    fn test_coordinator_message_supersede_and_stop_lifecycle() {
+        let store = OrchStore::open_in_memory().unwrap();
+        store.create_run(&sample_run("run_1", "t1")).unwrap();
+        store
+            .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+            .unwrap();
+        store
+            .create_dispatch(&sample_dispatch(
+                "disp_1", "run_1", "task_a", "t1", "t2", 2_000,
+            ))
+            .unwrap();
+
+        // Non-parent or wrong created_ms rejected
+        let err_wrong_term = store
+            .record_coordinator_message("disp_1", "t9", 1_000, "hi", true, 0, 2_100)
+            .unwrap_err();
+        assert!(err_wrong_term
+            .to_string()
+            .contains("attempt fencing rejected"));
+
+        let err_wrong_ms = store
+            .record_coordinator_message("disp_1", "t1", 9_999, "hi", true, 0, 2_150)
+            .unwrap_err();
+        assert!(err_wrong_ms
+            .to_string()
+            .contains("attempt fencing rejected"));
+
+        // Immediate directive recorded as acknowledged
+        let (msg1, st1) = store
+            .record_coordinator_message("disp_1", "t1", 1_000, "Focus on tests", true, 1, 2_200)
+            .unwrap();
+        assert_eq!(msg1.msg_type, MessageType::Directive);
+        assert_eq!(msg1.pointer_state, PointerState::Acknowledged);
+        assert_eq!(msg1.target_terminal, "t2");
+        assert_eq!(st1, DispatchStatus::Dispatched);
+
+        // Deferred directive recorded as pending
+        let (msg2, _) = store
+            .record_coordinator_message("disp_1", "t1", 1_000, "Follow up", false, 1, 2_300)
+            .unwrap();
+        assert_eq!(msg2.pointer_state, PointerState::Pending);
+        assert_eq!(store.list_messages_for_run("run_1").unwrap().len(), 2);
+
+        // Open question cancelled when stopped, task restored to Ready without failure_count increment
+        let (q, _) = store
+            .record_question("disp_1", "t2", 2_000, "Which port?", 2_400)
+            .unwrap();
+        let (stopped_disp, stopped_task_st) = store.stop_dispatch("disp_1", 2_500).unwrap();
+        assert_eq!(stopped_disp.status, DispatchStatus::Stopped);
+        assert_eq!(stopped_task_st, TaskStatus::Ready);
+        assert_eq!(
+            store.get_question_thread(&q.id).unwrap().unwrap().status,
+            "cancelled"
+        );
+        assert_eq!(
+            store
+                .get_task("run_1", "task_a")
+                .unwrap()
+                .unwrap()
+                .failure_count,
+            0
+        );
+
+        // Stopped dispatch cannot receive coordinator messages (suggests orch retry)
+        let err_stopped = store
+            .record_coordinator_message("disp_1", "t1", 1_000, "Too late", true, 1, 2_600)
+            .unwrap_err();
+        assert!(err_stopped.to_string().contains("orch retry"));
+
+        // Supersede marks stopped dispatch as Superseded and rejects repeat supersede
+        let sup = store.supersede_dispatch("disp_1", 2_700).unwrap();
+        assert_eq!(sup.status, DispatchStatus::Superseded);
+        assert!(store.supersede_dispatch("disp_1", 2_800).is_err());
     }
 }
