@@ -312,30 +312,133 @@ fn write_remembered_channel(path: &Path, channel: Channel) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct UpdateCheckReport {
+    pub current_version: String,
+    pub current_commit: Option<String>,
+    pub channel: Option<String>,
+    pub channel_source: String,
+    pub latest_version: String,
+    pub latest_commit: Option<String>,
+    pub update_available: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BuildInfo<'a> {
+    pub version: &'a str,
+    pub channel: Option<&'a str>,
+    pub commit: Option<&'a str>,
+}
+
+pub fn release_url_for(channel: Channel) -> String {
+    match channel {
+        Channel::Stable => format!("https://api.github.com/repos/{REPO}/releases/latest"),
+        Channel::Nightly => format!("https://api.github.com/repos/{REPO}/releases/tags/nightly"),
+    }
+}
+
+pub fn host_arch() -> Result<&'static str> {
+    match std::env::consts::ARCH {
+        "x86_64" => Ok("x86_64"),
+        "aarch64" => Ok("aarch64"),
+        other => bail!("unsupported architecture '{other}' (expected x86_64 or aarch64)"),
+    }
+}
+
+pub fn format_error_json(err: &anyhow::Error) -> String {
+    serde_json::json!({ "error": format!("{err:#}") }).to_string()
+}
+
+pub fn check_update_with<F>(
+    channel_flag: Option<Channel>,
+    channel_path: &Path,
+    arch: &str,
+    build: BuildInfo<'_>,
+    force: bool,
+    fetch_release_json: F,
+) -> Result<UpdateCheckReport>
+where
+    F: FnOnce(Channel, &str) -> Result<Value>,
+{
+    let remembered = read_remembered_channel(channel_path);
+    let check_channel = resolve_channel(channel_flag, remembered);
+    let (channel, channel_source) = match (channel_flag, remembered) {
+        (Some(ch), _) => (Some(ch.as_str().to_string()), "flag".to_string()),
+        (None, Some(ch)) => (Some(ch.as_str().to_string()), "saved".to_string()),
+        (None, None) => (None, "none".to_string()),
+    };
+
+    let url = release_url_for(check_channel);
+    let json = fetch_release_json(check_channel, &url)?;
+    let rel = parse_release(&json, check_channel, arch)?;
+    let update_available = needs_update(
+        check_channel,
+        &rel,
+        build.version,
+        build.channel,
+        build.commit,
+        force,
+    );
+
+    Ok(UpdateCheckReport {
+        current_version: build.version.to_string(),
+        current_commit: build.commit.map(str::to_string),
+        channel,
+        channel_source,
+        latest_version: rel.version,
+        latest_commit: rel.commit,
+        update_available,
+    })
+}
+
 /// Runs `tchelvis update`.
 pub fn run_update(
     channel_flag: Option<Channel>,
     check: bool,
+    json: bool,
     no_setup: bool,
     force: bool,
 ) -> Result<()> {
+    if json && !check {
+        println!(
+            "{}",
+            serde_json::json!({ "error": "--json is only supported with --check" })
+        );
+        std::process::exit(1);
+    }
+
     let cf = channel_file();
+    if check && json {
+        let build = BuildInfo {
+            version: env!("CARGO_PKG_VERSION"),
+            channel: build_channel(),
+            commit: build_commit(),
+        };
+        let agent = http_agent();
+        let res = host_arch().and_then(|arch| {
+            check_update_with(channel_flag, &cf, arch, build, force, |ch, url| {
+                fetch_json(&agent, url, ch)
+            })
+        });
+        match res {
+            Ok(report) => {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+                return Ok(());
+            }
+            Err(err) => {
+                println!("{}", format_error_json(&err));
+                std::process::exit(1);
+            }
+        }
+    }
+
     let channel = resolve_channel(channel_flag, read_remembered_channel(&cf));
-
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => bail!("unsupported architecture '{other}' (expected x86_64 or aarch64)"),
-    };
-
-    let release_url = match channel {
-        Channel::Stable => format!("https://api.github.com/repos/{REPO}/releases/latest"),
-        Channel::Nightly => format!("https://api.github.com/repos/{REPO}/releases/tags/nightly"),
-    };
+    let arch = host_arch()?;
+    let release_url = release_url_for(channel);
 
     let agent = http_agent();
-    let json = fetch_json(&agent, &release_url, channel)?;
-    let rel = parse_release(&json, channel, arch)?;
+    let json_payload = fetch_json(&agent, &release_url, channel)?;
+    let rel = parse_release(&json_payload, channel, arch)?;
 
     let cur_version = env!("CARGO_PKG_VERSION");
     let cur_channel = build_channel();
@@ -641,5 +744,218 @@ mod tests {
     fn http_error_message_names_status() {
         let msg = format_http_error(403, "https://api.github.com/repos/x/y");
         assert_eq!(msg, "HTTP 403 from https://api.github.com/repos/x/y");
+    }
+
+    fn fake_stable_release(ver: &str) -> Value {
+        serde_json::json!({
+            "tag_name": format!("v{ver}"),
+            "body": format!("Release {ver}"),
+            "assets": [
+                {
+                    "name": format!("tchelvis-{ver}-x86_64-unknown-linux-musl.tar.gz"),
+                    "browser_download_url": "https://example.com/stable.tar.gz"
+                },
+                {
+                    "name": format!("tchelvis-{ver}-x86_64-unknown-linux-musl.tar.gz.sha256"),
+                    "browser_download_url": "https://example.com/stable.tar.gz.sha256"
+                }
+            ]
+        })
+    }
+
+    fn fake_nightly_release(sha: &str) -> Value {
+        serde_json::json!({
+            "tag_name": "nightly",
+            "body": format!("Automated nightly\ncommit {sha} · 2026-11-19"),
+            "assets": [
+                {
+                    "name": "tchelvis-nightly-x86_64-unknown-linux-musl.tar.gz",
+                    "browser_download_url": "https://example.com/nightly.tar.gz"
+                },
+                {
+                    "name": "tchelvis-nightly-x86_64-unknown-linux-musl.tar.gz.sha256",
+                    "browser_download_url": "https://example.com/nightly.tar.gz.sha256"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn check_json_saved_stable_channel_shape() {
+        let tmp = TempDir::new().unwrap();
+        let cf = tmp.path().join("update_channel");
+        write_remembered_channel(&cf, Channel::Stable).unwrap();
+
+        let report = check_update_with(
+            None,
+            &cf,
+            "x86_64",
+            BuildInfo {
+                version: "0.2.0",
+                channel: Some("stable"),
+                commit: None,
+            },
+            false,
+            |ch, _url| {
+                assert_eq!(ch, Channel::Stable);
+                Ok(fake_stable_release("0.2.0"))
+            },
+        )
+        .unwrap();
+
+        let val = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "current_version": "0.2.0",
+                "current_commit": null,
+                "channel": "stable",
+                "channel_source": "saved",
+                "latest_version": "0.2.0",
+                "latest_commit": null,
+                "update_available": false
+            })
+        );
+    }
+
+    #[test]
+    fn check_json_saved_nightly_channel_shape() {
+        let tmp = TempDir::new().unwrap();
+        let cf = tmp.path().join("update_channel");
+        write_remembered_channel(&cf, Channel::Nightly).unwrap();
+
+        let report = check_update_with(
+            None,
+            &cf,
+            "x86_64",
+            BuildInfo {
+                version: "0.2.0",
+                channel: Some("nightly"),
+                commit: Some("1111111"),
+            },
+            false,
+            |ch, _url| {
+                assert_eq!(ch, Channel::Nightly);
+                Ok(fake_nightly_release("2222222"))
+            },
+        )
+        .unwrap();
+
+        let val = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "current_version": "0.2.0",
+                "current_commit": "1111111",
+                "channel": "nightly",
+                "channel_source": "saved",
+                "latest_version": "nightly",
+                "latest_commit": "2222222",
+                "update_available": true
+            })
+        );
+    }
+
+    #[test]
+    fn check_json_no_saved_channel_reports_none_and_null() {
+        let tmp = TempDir::new().unwrap();
+        let cf = tmp.path().join("update_channel");
+
+        let report = check_update_with(
+            None,
+            &cf,
+            "x86_64",
+            BuildInfo {
+                version: "0.2.0",
+                channel: Some("stable"),
+                commit: None,
+            },
+            false,
+            |ch, _url| {
+                assert_eq!(ch, Channel::Stable);
+                Ok(fake_stable_release("0.3.0"))
+            },
+        )
+        .unwrap();
+
+        let val = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "current_version": "0.2.0",
+                "current_commit": null,
+                "channel": null,
+                "channel_source": "none",
+                "latest_version": "0.3.0",
+                "latest_commit": null,
+                "update_available": true
+            })
+        );
+    }
+
+    #[test]
+    fn check_json_flag_overrides_saved_channel() {
+        let tmp = TempDir::new().unwrap();
+        let cf = tmp.path().join("update_channel");
+        write_remembered_channel(&cf, Channel::Stable).unwrap();
+
+        let report = check_update_with(
+            Some(Channel::Nightly),
+            &cf,
+            "x86_64",
+            BuildInfo {
+                version: "0.2.0",
+                channel: Some("nightly"),
+                commit: Some("a1b2c3d"),
+            },
+            false,
+            |ch, _url| {
+                assert_eq!(ch, Channel::Nightly);
+                Ok(fake_nightly_release("a1b2c3d"))
+            },
+        )
+        .unwrap();
+
+        let val = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            val,
+            serde_json::json!({
+                "current_version": "0.2.0",
+                "current_commit": "a1b2c3d",
+                "channel": "nightly",
+                "channel_source": "flag",
+                "latest_version": "nightly",
+                "latest_commit": "a1b2c3d",
+                "update_available": false
+            })
+        );
+    }
+
+    #[test]
+    fn check_json_network_error_formats_json_error() {
+        let tmp = TempDir::new().unwrap();
+        let cf = tmp.path().join("update_channel");
+
+        let err = check_update_with(
+            None,
+            &cf,
+            "x86_64",
+            BuildInfo {
+                version: "0.2.0",
+                channel: None,
+                commit: None,
+            },
+            false,
+            |_ch, url| bail!("HTTP request failed for {url}: connection refused"),
+        )
+        .unwrap_err();
+
+        let json_str = format_error_json(&err);
+        let parsed: Value = serde_json::from_str(&json_str).unwrap();
+        assert!(parsed
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("connection refused"));
     }
 }

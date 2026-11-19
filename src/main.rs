@@ -135,6 +135,9 @@ enum Commands {
         /// Check for updates without installing (exits 0 if available, 1 if up to date)
         #[arg(long)]
         check: bool,
+        /// Output JSON (with --check)
+        #[arg(long)]
+        json: bool,
         /// Skip running `tchelvis setup --set-default-layout` after replacing the binary
         #[arg(long)]
         no_setup: bool,
@@ -653,16 +656,32 @@ async fn main() -> Result<()> {
         Commands::Update {
             channel,
             check,
+            json,
             no_setup,
             force,
         } => {
+            if json && !check {
+                println!(
+                    "{}",
+                    serde_json::json!({ "error": "--json is only supported with --check" })
+                );
+                std::process::exit(1);
+            }
             let parsed_channel = match channel {
-                Some(ref raw) => Some(tchelvis::update::Channel::parse(raw).ok_or_else(|| {
-                    anyhow::anyhow!("unknown channel '{raw}' (expected stable or nightly)")
-                })?),
+                Some(ref raw) => match tchelvis::update::Channel::parse(raw) {
+                    Some(ch) => Some(ch),
+                    None => {
+                        let msg = format!("unknown channel '{raw}' (expected stable or nightly)");
+                        if json {
+                            println!("{}", serde_json::json!({ "error": msg }));
+                            std::process::exit(1);
+                        }
+                        bail!("{msg}");
+                    }
+                },
                 None => None,
             };
-            tchelvis::update::run_update(parsed_channel, check, no_setup, force)
+            tchelvis::update::run_update(parsed_channel, check, json, no_setup, force)
         }
         Commands::Logs {
             agent,

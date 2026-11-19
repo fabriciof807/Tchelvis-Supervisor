@@ -692,6 +692,236 @@ export function chatElapsedLabel(startedAtMs, nowMs = Date.now()) {
   return secs >= 1 ? `◌ Gerando… ${secs}s` : "◌ Gerando…";
 }
 
+export function drawerHeaderTitle(view, state = {}) {
+  if (state?.usageOnlyDrawer || view === "usage") {
+    return { icon: "llm", title: "AI Usage", subtitle: null };
+  }
+  if (
+    state?.modelPickerOnlyDrawer ||
+    view === "model" ||
+    view === "modelPicker"
+  ) {
+    return { icon: "llm", title: "Supervisor model", subtitle: null };
+  }
+  switch (view) {
+    case "home":
+      return { icon: "home", title: "Home", subtitle: null };
+    case "doctor": {
+      const rawVer =
+        state?.doctorVersion ||
+        state?.updateCheck?.current_version ||
+        state?.doctorReport?.cockpit_version ||
+        state?.version ||
+        null;
+      const ver = rawVer ? String(rawVer).trim().replace(/^v/, "") : "";
+      const commit = state?.updateCheck?.current_commit
+        ? String(state.updateCheck.current_commit).trim()
+        : "";
+      const subtitle = ver ? (commit ? `v${ver} (${commit})` : `v${ver}`) : null;
+      return { icon: "doctor", title: "Doctor", subtitle };
+    }
+    case "chat":
+      return { icon: "chat", title: "Chat", subtitle: null };
+    case "inspector":
+    default: {
+      const agent = state?.agent ?? null;
+      const name = agent?.name ? String(agent.name).trim() : "";
+      const addr = agent?.address ? String(agent.address).trim() : "";
+      let subtitle = null;
+      if (name && addr && name !== addr) {
+        subtitle = `${name} · ${addr}`;
+      } else if (name || addr) {
+        subtitle = name || addr;
+      }
+      return { icon: "inspector", title: "Inspector", subtitle };
+    }
+  }
+}
+
+export function tailErrorText(
+  stderr = "",
+  stdout = "",
+  code = null,
+  maxChars = 260
+) {
+  const raw = String(stderr || stdout || "").trim();
+  if (!raw) {
+    return code != null
+      ? `Falha ao atualizar (código ${code})`
+      : "Falha ao atualizar";
+  }
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd())
+    .filter(Boolean);
+  const tail = lines.slice(-6).join("\n");
+  if (tail.length <= maxChars) return tail;
+  return "…" + tail.slice(tail.length - (maxChars - 1));
+}
+
+export function parseUpdateNewVersion(stdout = "") {
+  const s = String(stdout ?? "");
+  const m = s.match(/Updated tchelvis:\s*.+?\s*→\s*([^\r\n]+)/);
+  if (m && m[1]) {
+    return m[1].replace(/\s*\(channel:\s*[^)]+\)\s*$/, "").trim();
+  }
+  return null;
+}
+
+export function doctorUpdateCardState({
+  check = null,
+  checking = false,
+  checkError = "",
+  running = false,
+  startedAtMs = 0,
+  nowMs = Date.now(),
+  result = null,
+  error = "",
+  fallbackVersion = "",
+} = {}) {
+  const ver = check?.current_version || fallbackVersion || "";
+  const commit = check?.current_commit || "";
+  const currentLabel = ver ? (commit ? `v${ver} (${commit})` : `v${ver}`) : "—";
+
+  const source = check?.channel_source || (check?.channel ? "saved" : "none");
+  const channel = check?.channel ? String(check.channel) : null;
+  const channelLabel =
+    source === "saved" || source === "flag"
+      ? channel || "—"
+      : check
+        ? "não definido"
+        : checking
+          ? "verificando…"
+          : "—";
+
+  const latestLabel = check?.latest_version
+    ? check.latest_commit
+      ? `${check.latest_version} (${check.latest_commit})`
+      : check.latest_version === "nightly"
+        ? "nightly"
+        : `v${check.latest_version}`
+    : null;
+
+  const elapsedSecs =
+    running && startedAtMs > 0
+      ? Math.max(0, Math.floor((Number(nowMs) - Number(startedAtMs)) / 1000))
+      : 0;
+
+  let buttons = [];
+  if (running) {
+    buttons = [
+      {
+        id: "ck-doc-update-run",
+        label:
+          elapsedSecs >= 1 ? `Atualizando… ${elapsedSecs}s` : "Atualizando…",
+        channel,
+        action: "none",
+        disabled: true,
+        accent: false,
+      },
+    ];
+  } else if (check && (source === "saved" || source === "flag") && channel) {
+    if (check.update_available) {
+      buttons = [
+        {
+          id: "ck-doc-update-run",
+          label: `Atualizar (${channel})`,
+          channel,
+          action: "update",
+          disabled: false,
+          accent: true,
+        },
+      ];
+    } else {
+      buttons = [
+        {
+          id: "ck-doc-update-run",
+          label: "Atualizado",
+          channel,
+          action: "none",
+          disabled: true,
+          accent: false,
+        },
+      ];
+    }
+  } else if (check && source === "none") {
+    buttons = [
+      {
+        id: "ck-doc-update-stable",
+        label: "Stable",
+        channel: "stable",
+        action: "update",
+        disabled: false,
+        accent: true,
+      },
+      {
+        id: "ck-doc-update-nightly",
+        label: "Nightly",
+        channel: "nightly",
+        action: "update",
+        disabled: false,
+        accent: false,
+      },
+    ];
+  } else if (!checking && checkError) {
+    buttons = [
+      {
+        id: "ck-doc-update-retry",
+        label: "Verificar novamente",
+        channel: null,
+        action: "check",
+        disabled: false,
+        accent: false,
+      },
+    ];
+  }
+
+  const errorText = String(error || checkError || "").trim() || null;
+  const successVersion = result?.newVersion || null;
+  const successNote = result
+    ? "Reinicie o Herdr Desktop para carregar o mod novo"
+    : null;
+
+  let badgeText = "VERIFICANDO";
+  let badgeTone = "muted";
+  if (running) {
+    badgeText = "ATUALIZANDO";
+    badgeTone = "working";
+  } else if (errorText) {
+    badgeText = "ERRO";
+    badgeTone = "blocked";
+  } else if (result) {
+    badgeText = "ATUALIZADO";
+    badgeTone = "done";
+  } else if (check) {
+    if (source === "none") {
+      badgeText = "ESCOLHA O CANAL";
+      badgeTone = "accent";
+    } else if (check.update_available) {
+      badgeText = "DISPONÍVEL";
+      badgeTone = "accent";
+    } else {
+      badgeText = "ATUALIZADO";
+      badgeTone = "done";
+    }
+  } else if (!checking) {
+    badgeText = "PRONTO";
+    badgeTone = "muted";
+  }
+
+  return {
+    currentLabel,
+    channelLabel,
+    latestLabel,
+    buttons,
+    errorText,
+    successVersion,
+    successNote,
+    badgeText,
+    badgeTone,
+  };
+}
+
 export const CHAT_STARTERS = [
   "Quem está esperando por mim?",
   "Quais tarefas estão abertas?",
@@ -1709,6 +1939,13 @@ export default class CockpitMod extends View {
     this.benchError = "";
     this.benchStartedAtMs = 0;
     this.benchPollInFlight = false;
+    this.updateCheck = shared("cockpit.updateCheck") ?? null;
+    this.updateChecking = Boolean(shared("cockpit.updateChecking"));
+    this.updateCheckError = String(shared("cockpit.updateCheckError") ?? "");
+    this.updateRunning = Boolean(shared("cockpit.updateRunning"));
+    this.updateStartedAtMs = Number(shared("cockpit.updateStartedAtMs") ?? 0);
+    this.updateError = String(shared("cockpit.updateError") ?? "");
+    this.updateResult = shared("cockpit.updateResult") ?? null;
     const initialViewMode = shared("cockpit.viewMode");
     this.inspectorTab =
       initialViewMode && initialViewMode !== "usage"
@@ -1829,6 +2066,9 @@ export default class CockpitMod extends View {
       this.fetchUsageSnapshot(cx, false, false);
       this.runDoctorCheckSilent(cx);
       this.fetchBenchLast(cx);
+      if ((shared("cockpit.viewMode") || this.inspectorTab) === "doctor") {
+        this.checkForUpdate(cx);
+      }
       if (!shared("supervisor.snapshot")) {
         this.fetchSupervisorStatus(cx);
       }
@@ -2472,6 +2712,133 @@ export default class CockpitMod extends View {
       } finally {
         this.benchRunning = false;
         this.benchProgress = null;
+        cx.notify();
+      }
+    });
+  }
+
+  checkForUpdate(cx) {
+    if (
+      this.updateChecking ||
+      this.updateRunning ||
+      shared("cockpit.updateChecking") ||
+      shared("cockpit.updateRunning")
+    ) {
+      return;
+    }
+    this.updateChecking = true;
+    this.updateCheckError = "";
+    setShared("cockpit.updateChecking", true);
+    setShared("cockpit.updateCheckError", "");
+    cx?.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("tchelvis", ["update", "--check", "--json"], {
+          timeout: 30000,
+        });
+        const stdout = String(res.stdout ?? "").trim();
+        let parsed = null;
+        if (stdout) {
+          try {
+            parsed = JSON.parse(stdout);
+          } catch (_e) {
+            parsed = null;
+          }
+        }
+        if (res.code === 0 && parsed && !parsed.error) {
+          this.updateCheck = parsed;
+          this.updateCheckError = "";
+          setShared("cockpit.updateCheck", parsed);
+          setShared("cockpit.updateCheckError", "");
+        } else {
+          const errMsg =
+            parsed?.error || tailErrorText(res.stderr, res.stdout, res.code);
+          this.updateCheckError = errMsg;
+          setShared("cockpit.updateCheckError", errMsg);
+        }
+      } catch (e) {
+        const errMsg = tailErrorText(String(e), "", null);
+        this.updateCheckError = errMsg;
+        setShared("cockpit.updateCheckError", errMsg);
+      } finally {
+        this.updateChecking = false;
+        setShared("cockpit.updateChecking", false);
+        cx.notify();
+      }
+    });
+  }
+
+  runSelfUpdate(cx, channel = null) {
+    if (this.updateRunning || shared("cockpit.updateRunning")) return;
+    this.updateRunning = true;
+    this.updateStartedAtMs = Date.now();
+    this.updateError = "";
+    this.updateResult = null;
+    setShared("cockpit.updateRunning", true);
+    setShared("cockpit.updateStartedAtMs", this.updateStartedAtMs);
+    setShared("cockpit.updateError", "");
+    setShared("cockpit.updateResult", null);
+    cx?.notify();
+
+    const elapsedTimer = cx?.timer?.every?.(1000, (tickCx) => {
+      if (this.updateRunning || shared("cockpit.updateRunning")) {
+        tickCx?.notify();
+      }
+    });
+
+    const args = channel ? ["update", "--channel", channel] : ["update"];
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec("tchelvis", args, { timeout: 360000 });
+        if (res.code === 0) {
+          let newVersion = parseUpdateNewVersion(res.stdout);
+          try {
+            const checkRes = await exec(
+              "tchelvis",
+              ["update", "--check", "--json"],
+              { timeout: 30000 }
+            );
+            if (checkRes.code === 0 && checkRes.stdout) {
+              const parsed = JSON.parse(checkRes.stdout);
+              if (parsed && !parsed.error) {
+                this.updateCheck = parsed;
+                this.updateCheckError = "";
+                setShared("cockpit.updateCheck", parsed);
+                setShared("cockpit.updateCheckError", "");
+                if (!newVersion && parsed.current_version) {
+                  newVersion = parsed.current_commit
+                    ? `v${parsed.current_version} (${parsed.current_commit})`
+                    : `v${parsed.current_version}`;
+                }
+              }
+            }
+          } catch (_e) {}
+
+          const result = {
+            newVersion: newVersion || channel || "nova versão",
+            channel: channel || this.updateCheck?.channel || null,
+          };
+          this.updateResult = result;
+          this.updateError = "";
+          setShared("cockpit.updateResult", result);
+          setShared("cockpit.updateError", "");
+        } else {
+          const errMsg = tailErrorText(res.stderr, res.stdout, res.code);
+          this.updateError = errMsg;
+          setShared("cockpit.updateError", errMsg);
+        }
+      } catch (e) {
+        const errMsg = tailErrorText(String(e), "", null);
+        this.updateError = errMsg;
+        setShared("cockpit.updateError", errMsg);
+      } finally {
+        elapsedTimer?.cancel?.();
+        this.updateRunning = false;
+        this.updateStartedAtMs = 0;
+        setShared("cockpit.updateRunning", false);
+        setShared("cockpit.updateStartedAtMs", 0);
         cx.notify();
       }
     });
@@ -3247,6 +3614,7 @@ export default class CockpitMod extends View {
     else if (normalizedTab === "doctor") {
       if (!this.doctorReport) this.runDoctorCheck(cx);
       if (!this.benchLast && !this.benchRunning) this.fetchBenchLast(cx);
+      this.checkForUpdate(cx);
     } else if (normalizedTab === "inspector") {
       this.refreshInspector(cx);
     } else if (normalizedTab === "chat") {
@@ -5165,6 +5533,7 @@ export default class CockpitMod extends View {
               )
           )
       )
+      .child(this.renderUpdateCard(cx, t))
       // System Checks
       .child(
         this.sectionTitle(
@@ -5283,6 +5652,166 @@ export default class CockpitMod extends View {
         })
       )
       .child(this.renderBenchCard(cx, t, supSnap));
+  }
+
+  renderUpdateCard(cx, t) {
+    const check = shared("cockpit.updateCheck") ?? this.updateCheck ?? null;
+    const checking = Boolean(
+      shared("cockpit.updateChecking") ?? this.updateChecking
+    );
+    const checkError = String(
+      shared("cockpit.updateCheckError") ?? this.updateCheckError ?? ""
+    );
+    const running = Boolean(
+      shared("cockpit.updateRunning") ?? this.updateRunning
+    );
+    const startedAtMs = Number(
+      shared("cockpit.updateStartedAtMs") ?? this.updateStartedAtMs ?? 0
+    );
+    const result = shared("cockpit.updateResult") ?? this.updateResult ?? null;
+    const error = String(
+      shared("cockpit.updateError") ?? this.updateError ?? ""
+    );
+
+    const card = doctorUpdateCardState({
+      check,
+      checking,
+      checkError,
+      running,
+      startedAtMs,
+      result,
+      error,
+      fallbackVersion: this.doctorReport?.cockpit_version ?? version,
+    });
+
+    const badgeCol = t[card.badgeTone] ?? t.muted;
+
+    return v_flex()
+      .id("ck-doc-update-card")
+      .p(11)
+      .gap(8)
+      .rounded(10)
+      .border(1)
+      .border_color(t.border)
+      .bg(t.surface)
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .justify_between()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(icon("settings", 13, t.accent))
+              .child(
+                div()
+                  .text_size(12.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child("Atualização")
+              )
+          )
+          .child(this.pillBadge(t, card.badgeText, badgeCol))
+      )
+      .child(
+        v_flex()
+          .gap(3)
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(t.muted)
+              .child(
+                `Versão atual: ${card.currentLabel} · Canal: ${card.channelLabel}`
+              )
+          )
+          .when(Boolean(card.latestLabel), (el) =>
+            el.child(
+              div()
+                .text_size(11)
+                .text_color(t.dim)
+                .child(`Última versão: ${card.latestLabel}`)
+            )
+          )
+      )
+      .when(card.buttons.length > 0, (el) =>
+        el.child(
+          h_flex()
+            .gap(6)
+            .flex_wrap()
+            .children(
+              card.buttons.map((btn) =>
+                btn.disabled
+                  ? h_flex()
+                      .id(btn.id)
+                      .h(25)
+                      .px(8)
+                      .gap(5)
+                      .items_center()
+                      .rounded(6)
+                      .border(1)
+                      .border_color(t.border)
+                      .bg(t.raised)
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(btn.label)
+                  : this.actionBtn(
+                      t,
+                      btn.id,
+                      btn.label,
+                      (_e, clickCx) => {
+                        const targetCx = clickCx ?? cx;
+                        if (btn.action === "check") {
+                          this.checkForUpdate(targetCx);
+                        } else if (btn.action === "update") {
+                          this.runSelfUpdate(targetCx, btn.channel);
+                        }
+                      },
+                      btn.accent
+                    )
+              )
+            )
+        )
+      )
+      .when(Boolean(card.successNote), (el) =>
+        el.child(
+          v_flex()
+            .p(7)
+            .gap(2)
+            .rounded(6)
+            .border(1)
+            .border_color(withAlpha(t.done, "66", t.border))
+            .bg(withAlpha(t.done, "18", t.background))
+            .when(Boolean(card.successVersion), (el2) =>
+              el2.child(
+                div()
+                  .text_size(11)
+                  .font_semibold()
+                  .text_color(t.done)
+                  .child(`Atualizado: ${card.successVersion}`)
+              )
+            )
+            .child(
+              div()
+                .text_size(11)
+                .text_color(t.foreground)
+                .child(card.successNote)
+            )
+        )
+      )
+      .when(Boolean(card.errorText), (el) =>
+        el.child(
+          div()
+            .p(7)
+            .rounded(6)
+            .border(1)
+            .border_color(withAlpha(t.blocked, "66", t.border))
+            .bg(withAlpha(t.blocked, "18", t.background))
+            .text_size(11)
+            .text_color(t.blocked)
+            .child(ellipsize(card.errorText, 260))
+        )
+      );
   }
 
   renderBenchCard(cx, t, supSnap) {
@@ -7714,6 +8243,13 @@ export default class CockpitMod extends View {
         .child(this.renderModelPicker(cx, t, true));
     }
 
+    const headerMeta = drawerHeaderTitle(activeView, {
+      agent,
+      doctorReport: this.doctorReport,
+      updateCheck: shared("cockpit.updateCheck") ?? this.updateCheck,
+      version,
+    });
+
     return v_flex()
       .id("ck-inspector-root")
       .size_full()
@@ -7728,43 +8264,81 @@ export default class CockpitMod extends View {
       .child(
         // Top Drawer Header (40px)
         h_flex()
+          .id("ck-drawer-header")
           .h(40)
           .px(12)
-          .gap(6)
+          .gap(8)
           .items_center()
           .border_b(1)
           .border_color(t.border)
           .bg(t.chrome)
-          .child(div().flex_1())
           .child(
-            this.actionBtn(t, "ck-ins-refresh", "↻", (_e, cx) => {
-              this.refreshCockpit(cx, true);
-              this.refreshInspector(cx);
-              this.fetchHomeSnapshot(cx);
-              if (usageOpen) this.fetchUsageSnapshot(cx, true, false);
-              if (modelPickerOpen) this.fetchModelList(cx, null);
-              if (activeView === "doctor") {
-                this.runDoctorCheck(cx);
-                if (!this.benchRunning) this.fetchBenchLast(cx);
-              }
-              if (activeView === "chat") {
-                this.fetchSupervisorStatus(cx);
-              }
-            })
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .overflow_hidden()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .flex_none()
+                  .text_size(12.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(
+                    iconLabel(headerMeta.icon, headerMeta.title, {
+                      size: 13,
+                      color: t.accent,
+                      gap: 6,
+                    })
+                  )
+              )
+              .when(Boolean(headerMeta.subtitle), (el) =>
+                el.child(
+                  div()
+                    .min_w(0)
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .child(ellipsize(headerMeta.subtitle, 28))
+                )
+              )
           )
           .child(
-            this.actionBtn(t, "ck-ins-close", "×", () => {
-              this.usageOpen = false;
-              this.usageOnlyDrawer = false;
-              this.usageMenuOpen = false;
-              this.modelPickerOpen = false;
-              this.modelPickerOnlyDrawer = false;
-              setShared("cockpit.usageOpen", false);
-              setShared("cockpit.usageOnlyDrawer", false);
-              setShared("cockpit.modelPickerOpen", false);
-              setShared("cockpit.modelPickerOnlyDrawer", false);
-              run("layout.hide", { id: "tchelvis-inspector" });
-            })
+            h_flex()
+              .flex_none()
+              .gap(6)
+              .items_center()
+              .child(
+                this.actionBtn(t, "ck-ins-refresh", "↻", (_e, cx) => {
+                  this.refreshCockpit(cx, true);
+                  this.refreshInspector(cx);
+                  this.fetchHomeSnapshot(cx);
+                  if (usageOpen) this.fetchUsageSnapshot(cx, true, false);
+                  if (modelPickerOpen) this.fetchModelList(cx, null);
+                  if (activeView === "doctor") {
+                    this.runDoctorCheck(cx);
+                    if (!this.benchRunning) this.fetchBenchLast(cx);
+                    this.checkForUpdate(cx);
+                  }
+                  if (activeView === "chat") {
+                    this.fetchSupervisorStatus(cx);
+                  }
+                })
+              )
+              .child(
+                this.actionBtn(t, "ck-ins-close", "×", () => {
+                  this.usageOpen = false;
+                  this.usageOnlyDrawer = false;
+                  this.usageMenuOpen = false;
+                  this.modelPickerOpen = false;
+                  this.modelPickerOnlyDrawer = false;
+                  setShared("cockpit.usageOpen", false);
+                  setShared("cockpit.usageOnlyDrawer", false);
+                  setShared("cockpit.modelPickerOpen", false);
+                  setShared("cockpit.modelPickerOnlyDrawer", false);
+                  run("layout.hide", { id: "tchelvis-inspector" });
+                })
+              )
           )
       )
       .when(Boolean(this.note), (el) =>
