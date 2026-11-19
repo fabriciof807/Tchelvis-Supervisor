@@ -277,6 +277,111 @@ export function blockedChildrenBadge(group) {
   return count === 1 ? "1 filho" : `${count} filhos`;
 }
 
+export function isSupervisorRuntimeEvaluating(runtimeStatus) {
+  if (runtimeStatus === "Evaluating") return true;
+  return Boolean(
+    runtimeStatus &&
+      typeof runtimeStatus === "object" &&
+      "Evaluating" in runtimeStatus
+  );
+}
+
+export function extractFleetCardSummary(agent) {
+  const ctx = agent?.context ?? null;
+  const pr = ctx?.pull_request ?? null;
+  const rawOverall = ctx?.ci?.overall_state
+    ? String(ctx.ci.overall_state).trim().toLowerCase()
+    : "";
+  const ciLabel = rawOverall && rawOverall !== "none" ? rawOverall.toUpperCase() : "";
+  const prBadgeText = pr ? `#${pr.number} ${ciLabel}`.trim() : null;
+  const prTone =
+    rawOverall === "failing"
+      ? "blocked"
+      : rawOverall === "pending"
+        ? "working"
+        : "done";
+  const issueKey =
+    ctx?.issue?.key ??
+    ctx?.candidate_issues?.[0] ??
+    agent?.labels?.["cockpit.issue"] ??
+    null;
+  return { pr, prBadgeText, prTone, issueKey };
+}
+
+export function extractInspectorContext(detailed) {
+  const ctx = detailed?.context ?? null;
+  const pr = ctx?.pull_request ?? null;
+  const rawCi = ctx?.ci ?? null;
+  const ci = rawCi
+    ? (() => {
+        const overallState = String(rawCi.overall_state ?? "none")
+          .trim()
+          .toLowerCase();
+        const badgeText = `CI: ${(overallState || "pending").toUpperCase()}`;
+        const tone =
+          overallState === "failing"
+            ? "blocked"
+            : overallState === "pending"
+              ? "working"
+              : overallState === "passing"
+                ? "done"
+                : "muted";
+        const checks = (rawCi.checks ?? []).map((chk) => {
+          const status = chk?.status ?? "unknown";
+          const conclusion = chk?.conclusion ?? null;
+          const normStatus = String(status).toLowerCase();
+          const normConc = conclusion ? String(conclusion).toLowerCase() : null;
+          const displayStatus = normConc || status;
+          const failed =
+            (normStatus === "completed" &&
+              Boolean(normConc) &&
+              !["success", "neutral", "skipped"].includes(normConc)) ||
+            [
+              "failure",
+              "failed",
+              "error",
+              "timed_out",
+              "action_required",
+            ].includes(normStatus);
+          return {
+            name: chk?.name ?? "",
+            status,
+            conclusion,
+            displayStatus,
+            failed,
+            detailsUrl: chk?.details_url ?? null,
+          };
+        });
+        return { overallState, badgeText, tone, checks };
+      })()
+    : null;
+  const issues = ctx?.issue
+    ? [ctx.issue]
+    : Array.isArray(ctx?.issues)
+      ? ctx.issues
+      : [];
+  const candidateIssues = Array.isArray(ctx?.candidate_issues)
+    ? ctx.candidate_issues
+    : [];
+  const slackThreads = Array.isArray(ctx?.slack_threads)
+    ? ctx.slack_threads
+    : [];
+  const runbooks = (ctx?.runbooks ?? []).map((rb) => ({
+    ...rb,
+    matchReason: rb?.matched_reason ?? rb?.match_reason ?? "",
+  }));
+  return {
+    pr,
+    ci,
+    issues,
+    candidateIssues,
+    review: ctx?.review ?? null,
+    deployRelease: ctx?.deploy_release ?? null,
+    slackThreads,
+    runbooks,
+  };
+}
+
 /**
  * Pure ViewModel builder for the Attention Fleet List and Context Inspector Drawer.
  */
@@ -298,6 +403,7 @@ export function buildViewModel(
       sections: { blocked: [], active: [], finished: [] },
       selectedAgent: null,
       inspector: null,
+      inspectorContext: null,
       providers: snapshot?.providers ?? {},
     };
   }
@@ -320,13 +426,15 @@ export function buildViewModel(
     allAgents[0] ??
     null;
 
+  const inspector = inspectDetail?.agent ?? selectedAgent;
   return {
     versionMismatch: false,
     bannerMessage: null,
     summary: snapshot.summary ?? {},
     sections: filteredSections,
     selectedAgent,
-    inspector: inspectDetail?.agent ?? selectedAgent,
+    inspector,
+    inspectorContext: extractInspectorContext(inspector),
     providers: inspectDetail?.providers ?? snapshot.providers ?? {},
   };
 }
@@ -385,11 +493,12 @@ function programIcon(prog, size, color) {
 
 function agentGlyph(kindOrLabel, color) {
   const key = String(kindOrLabel ?? "").trim().toLowerCase();
+  const compact = key.replace(/[_-]+/g, "");
   let glyph = "›_";
   if (key.includes("claude")) glyph = "✦";
   else if (key.includes("codex")) glyph = "◎";
   else if (key === "pi" || key.includes("π")) glyph = "π";
-  else if (key.includes("opencode")) glyph = "</>";
+  else if (compact.includes("opencode")) glyph = "</>";
   else if (key.includes("antigravity") || key.includes("agy")) glyph = "✧";
   return div()
     .text_size(11.5)
@@ -804,8 +913,14 @@ function resolveProgramName(rawProg, labels, enrichedKind) {
     .replace(/^-/, "")
     .toLowerCase();
   if (!firstToken) return "";
+  const compactToken = firstToken.replace(/[_-]+/g, "");
   for (const known of KNOWN_AGENTS) {
-    if (firstToken === known || firstToken.includes(known)) {
+    if (
+      firstToken === known ||
+      firstToken.includes(known) ||
+      compactToken === known ||
+      compactToken.includes(known)
+    ) {
       return known;
     }
   }
@@ -3214,7 +3329,7 @@ export default class CockpitMod extends View {
     const blockedCount = liveMerged.filter((a) => a.status === "blocked").length;
     const evaluating =
       (Boolean(shared("supervisor.evaluating")) ||
-        supSnap?.runtime_status === "Evaluating") &&
+        isSupervisorRuntimeEvaluating(supSnap?.runtime_status)) &&
       (liveMerged.length > 0 || Boolean(shared("supervisor.forceEvaluating")));
     const activeMode = supSnap?.mode ?? "SemiAuto";
     const isPaused = activeMode === "Paused";
@@ -3646,8 +3761,9 @@ export default class CockpitMod extends View {
             : isDone
               ? t.done
               : t.muted;
-      const pr = a.context?.pull_request;
-      const issue = a.context?.issues?.[0]?.key ?? a.labels?.["cockpit.issue"];
+      const cardSummary = extractFleetCardSummary(a);
+      const pr = cardSummary.pr;
+      const issue = cardSummary.issueKey;
       const tier = a.correlation_tier;
       const tierLabel =
         tier === "exact"
@@ -3835,12 +3951,12 @@ export default class CockpitMod extends View {
             .when(Boolean(issue), (el) =>
               el.child(this.pillBadge(t, issue, t.accent))
             )
-            .when(Boolean(pr), (el) =>
+            .when(Boolean(cardSummary.prBadgeText), (el) =>
               el.child(
                 this.pillBadge(
                   t,
-                  `#${pr.number} ${pr.ci_rollup ?? ""}`.trim(),
-                  pr.ci_rollup === "FAILURE" ? t.blocked : t.done
+                  cardSummary.prBadgeText,
+                  t[cardSummary.prTone] ?? t.done
                 )
               )
             )
@@ -7515,10 +7631,13 @@ export default class CockpitMod extends View {
     const sectionTitle = (title, subtitle = null) =>
       this.sectionTitle(t, title, subtitle);
 
-    const pr = detailed?.context?.pull_request;
-    const issues = detailed?.context?.issues ?? [];
-    const slackThreads = detailed?.context?.slack_threads ?? [];
-    const runbooks = detailed?.context?.runbooks ?? [];
+    const inspectorCtx = extractInspectorContext(detailed);
+    const pr = inspectorCtx.pr;
+    const ci = inspectorCtx.ci;
+    const issues = inspectorCtx.issues;
+    const candidateIssues = inspectorCtx.candidateIssues;
+    const slackThreads = inspectorCtx.slackThreads;
+    const runbooks = inspectorCtx.runbooks;
     const labels = agent?.labels ?? {};
 
     const selectedFinished =
@@ -8505,15 +8624,13 @@ export default class CockpitMod extends View {
                                 .child(
                                   this.pillBadge(
                                     t,
-                                    `CI: ${pr.ci_rollup ?? "PENDING"}`,
-                                    pr.ci_rollup === "FAILURE"
-                                      ? t.blocked
-                                      : t.done
+                                    ci?.badgeText ?? "CI: PENDING",
+                                    ci ? (t[ci.tone] ?? t.done) : t.muted
                                   )
                                 )
                             )
                             .children(
-                              (pr.checks ?? []).slice(0, 5).map((chk, idx) =>
+                              (ci?.checks ?? []).slice(0, 5).map((chk, idx) =>
                                 h_flex()
                                   .id(`ck-chk-${idx}`)
                                   .justify_between()
@@ -8524,25 +8641,23 @@ export default class CockpitMod extends View {
                                       .flex_1()
                                       .min_w(0)
                                       .text_color(
-                                        chk.status === "FAILURE"
-                                          ? t.blocked
-                                          : t.muted
+                                        chk.failed ? t.blocked : t.muted
                                       )
                                       .child(
                                         ellipsize(
-                                          `• ${chk.name} (${chk.status})`,
+                                          `• ${chk.name} (${chk.displayStatus})`,
                                           44
                                         )
                                       )
                                   )
-                                  .when(Boolean(chk.details_url), (el3) =>
+                                  .when(Boolean(chk.detailsUrl), (el3) =>
                                     el3.child(
                                       div()
                                         .id(`ck-chk-url-${idx}`)
                                         .cursor_pointer()
                                         .text_color(t.accent)
                                         .on_click(() =>
-                                          openExternalUrl(chk.details_url)
+                                          openExternalUrl(chk.detailsUrl)
                                         )
                                         .child("logs ↗")
                                     )
@@ -8599,6 +8714,32 @@ export default class CockpitMod extends View {
                               )
                             )
                         )
+                      )
+                    )
+                    .when(issues.length === 0 && candidateIssues.length > 0, (el3) =>
+                      el3.child(
+                        h_flex()
+                          .id("ck-iss-candidates")
+                          .p(8)
+                          .gap(6)
+                          .items_center()
+                          .rounded(6)
+                          .border(1)
+                          .border_color(t.border)
+                          .bg(t.background)
+                          .child(
+                            div()
+                              .flex_1()
+                              .min_w(0)
+                              .text_size(11.5)
+                              .text_color(t.muted)
+                              .child(
+                                ellipsize(
+                                  `Candidate issues: ${candidateIssues.join(", ")}`,
+                                  48
+                                )
+                              )
+                          )
                       )
                     )
                     // Slack Threads
@@ -8666,7 +8807,7 @@ export default class CockpitMod extends View {
                                   div()
                                     .text_size(10.5)
                                     .text_color(t.dim)
-                                    .child(rb.match_reason ?? "")
+                                    .child(rb.matchReason ?? "")
                                 )
                             )
                             .child(

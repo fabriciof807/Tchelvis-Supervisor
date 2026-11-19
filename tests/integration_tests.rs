@@ -13,14 +13,21 @@ use tchelvis::herdr::{
 };
 use tchelvis::logging::redact_secrets;
 use tchelvis::model::{
-    sanitize_terminal_text, AgentKind, AttentionState, BlockedKind, CockpitSnapshot,
-    CorrelationTier, FleetSummaryProjection, InspectResponse, IpcOp, IpcRequest, ProviderId,
-    MAX_DOC_SNAPSHOT_BYTES,
+    sanitize_terminal_text, AgentKind, AgentLifecycle, AgentRow, AttentionState, BlockedKind,
+    CiCheckItem, CiSummary, CockpitSnapshot, CorrelatedContext, CorrelationTier, DeployReleaseRef,
+    FleetSummary, FleetSummaryProjection, InspectResponse, IpcOp, IpcRequest, IssueRef,
+    ProviderHealth, ProviderId, ProviderStatus, PullRequestRef, RemoteRepo, ReviewSummary,
+    RunbookRef, SlackThreadRef, WorkspaceInfo, MAX_DOC_SNAPSHOT_BYTES, SNAPSHOT_SCHEMA_VERSION,
 };
 use tchelvis::providers::runbooks::discover_and_match_runbooks;
 use tchelvis::providers::{is_below_quota_reserve_floor, ProviderCoordinator, TokenBucket};
 use tchelvis::setup::{run_setup, run_uninstall, verify_installation, SetupOptions};
 use tchelvis::store::{CacheStore, CachedEntity, QuotaRecord};
+use tchelvis::supervisor::state::{
+    AutoReplyAuditEntry, LifecycleState, PendingOperatorAction, SupervisorMode, Urgency,
+};
+use tchelvis::supervisor::tui::{AgentCardView, DesktopModSnapshot};
+use tchelvis::supervisor::watcher::SupervisorRuntimeStatus;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -342,4 +349,294 @@ async fn test_integration_uds_ipc_and_setup_doctor_rollback() {
     assert!(HERDR_MOD_MAIN_JS.contains("export function mount"));
     assert!(HERDR_LAYOUT_JSON.contains("\"tchelvis\""));
     let _ = std::mem::size_of::<InspectResponse>();
+}
+
+fn write_fixture_if_changed(path: &std::path::Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    if let Ok(existing) = fs::read_to_string(path) {
+        if existing == content {
+            return;
+        }
+    }
+    fs::write(path, content).unwrap();
+}
+
+#[test]
+fn test_contract_fixtures_and_schema_version_match() {
+    let expected_decl = format!("export const schemaVersion = {SNAPSHOT_SCHEMA_VERSION};");
+    assert!(
+        HERDR_MOD_MAIN_JS.contains(&expected_decl),
+        "assets/herdr-app/mods/tchelvis/main.js must export `{expected_decl}`"
+    );
+
+    let mut providers = BTreeMap::new();
+    providers.insert(
+        ProviderId::Github,
+        ProviderHealth {
+            provider: ProviderId::Github,
+            status: ProviderStatus::Ready,
+            detail: Some("Authenticated via gh".into()),
+            quota_remaining: Some(4800),
+            quota_limit: Some(5000),
+            quota_reset_at: Some(1_700_003_600),
+            cooldown_until: None,
+            last_success_at: Some(1_700_000_000),
+        },
+    );
+    providers.insert(
+        ProviderId::Linear,
+        ProviderHealth {
+            provider: ProviderId::Linear,
+            status: ProviderStatus::Ready,
+            detail: Some("API key configured".into()),
+            ..Default::default()
+        },
+    );
+    providers.insert(
+        ProviderId::Slack,
+        ProviderHealth {
+            provider: ProviderId::Slack,
+            status: ProviderStatus::Ready,
+            detail: Some("Token configured".into()),
+            ..Default::default()
+        },
+    );
+    providers.insert(
+        ProviderId::Runbooks,
+        ProviderHealth {
+            provider: ProviderId::Runbooks,
+            status: ProviderStatus::Ready,
+            detail: Some("Local runbooks".into()),
+            ..Default::default()
+        },
+    );
+
+    let t1 = AgentRow {
+        address: "t1".into(),
+        name: "auth-agent".into(),
+        parent: None,
+        agent_kind: AgentKind::ClaudeCode,
+        lifecycle: AgentLifecycle::Live,
+        attention_state: AttentionState::Blocked {
+            kind: BlockedKind::Permission,
+            message: Some("Approve bash command?".into()),
+            since_ms: 1_700_000_000_000,
+        },
+        prompt_destructive: false,
+        blocked_children: Vec::new(),
+        active_children: vec!["t2".into()],
+        turn: 4,
+        reported: true,
+        labels: BTreeMap::from([("cockpit.issue".into(), "ENG-42".into())]),
+        workspace: WorkspaceInfo {
+            cwd: "/workspace/acme-api".into(),
+            repo_root: Some("/workspace/acme-api".into()),
+            worktree_path: None,
+            git_branch: Some("feat/ENG-42-oauth".into()),
+            git_head_sha: Some("abcdef1234567890".into()),
+            commit_subject: Some("Add OAuth callback".into()),
+            remote_repo: Some(RemoteRepo {
+                host: "github.com".into(),
+                owner: "acme".into(),
+                repo: "api".into(),
+            }),
+        },
+        correlation_tier: CorrelationTier::Exact,
+        provenance: Vec::new(),
+        context: CorrelatedContext {
+            pull_request: Some(PullRequestRef {
+                provider: ProviderId::Github,
+                number: 42,
+                title: "Add OAuth callback".into(),
+                state: "open".into(),
+                is_draft: false,
+                url: "https://github.com/acme/api/pull/42".into(),
+                head_branch: "feat/ENG-42-oauth".into(),
+                head_sha: Some("abcdef1234567890".into()),
+                local_ahead: false,
+                body_snippet: Some("Implements ENG-42 OAuth callback".into()),
+            }),
+            candidate_prs: Vec::new(),
+            ci: Some(CiSummary {
+                overall_state: "failing".into(),
+                total: 3,
+                passed: 1,
+                failed: 1,
+                pending: 1,
+                failing_checks: vec!["cargo-test".into()],
+                checks: vec![
+                    CiCheckItem {
+                        name: "cargo-test".into(),
+                        status: "completed".into(),
+                        conclusion: Some("failure".into()),
+                        details_url: Some("https://github.com/acme/api/actions/runs/1".into()),
+                    },
+                    CiCheckItem {
+                        name: "clippy".into(),
+                        status: "completed".into(),
+                        conclusion: Some("success".into()),
+                        details_url: None,
+                    },
+                    CiCheckItem {
+                        name: "e2e".into(),
+                        status: "in_progress".into(),
+                        conclusion: None,
+                        details_url: None,
+                    },
+                ],
+            }),
+            review: Some(ReviewSummary {
+                decision: "changes_requested".into(),
+                approved_count: 1,
+                changes_requested_count: 1,
+                commented_count: 0,
+                reviewers: vec!["alice".into()],
+            }),
+            deploy_release: Some(DeployReleaseRef {
+                environment: Some("staging".into()),
+                deploy_state: Some("success".into()),
+                latest_release_tag: Some("v0.1.0".into()),
+                release_url: Some("https://github.com/acme/api/releases/tag/v0.1.0".into()),
+            }),
+            issue: Some(IssueRef {
+                provider: ProviderId::Linear,
+                key: "ENG-42".into(),
+                title: "Implement OAuth callback".into(),
+                status: "In Progress".into(),
+                assignee: Some("alice".into()),
+                priority: Some("High".into()),
+                url: "https://linear.app/acme/issue/ENG-42".into(),
+            }),
+            candidate_issues: vec!["ENG-42".into()],
+            slack_threads: vec![SlackThreadRef {
+                workspace: "acme".into(),
+                channel_id: "C123".into(),
+                thread_ts: "1700000111.222333".into(),
+                url: "https://acme.slack.com/archives/C123/p1700000111222333".into(),
+                title_snippet: Some("OAuth rollout".into()),
+                reply_count: Some(4),
+                latest_reply_at: Some("1700000222".into()),
+            }],
+            runbooks: vec![RunbookRef {
+                path: "docs/runbooks/auth.md".into(),
+                title: "Auth Troubleshooting".into(),
+                summary: "Verify callback URL".into(),
+                matched_reason: "matched branch keyword auth".into(),
+                tags: vec!["auth".into()],
+                service: Some("api".into()),
+                ci_job: Some("cargo-test".into()),
+            }],
+        },
+        updated_at: 1_700_000_100,
+    };
+
+    let t2 = AgentRow {
+        address: "t2".into(),
+        name: "opencode-worker".into(),
+        parent: Some("t1".into()),
+        agent_kind: AgentKind::OpenCode,
+        lifecycle: AgentLifecycle::Live,
+        attention_state: AttentionState::Working {
+            message: Some("Running test suite".into()),
+        },
+        workspace: WorkspaceInfo {
+            cwd: "/workspace/acme-api".into(),
+            git_branch: Some("feat/ENG-99-tests".into()),
+            ..Default::default()
+        },
+        correlation_tier: CorrelationTier::Inferred,
+        context: CorrelatedContext {
+            candidate_issues: vec!["ENG-99".into()],
+            ..Default::default()
+        },
+        updated_at: 1_700_000_050,
+        ..Default::default()
+    };
+
+    let agents = vec![t1.clone(), t2];
+    let snapshot = CockpitSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        cockpit_version: env!("CARGO_PKG_VERSION").to_string(),
+        generated_at: 1_700_000_100,
+        published_at: 1_700_000_100,
+        daemon_pid: Some(4242),
+        herdr_connected: true,
+        summary: FleetSummary::from_agents(&agents),
+        agents,
+        providers: providers.clone(),
+    };
+
+    let inspect_resp = InspectResponse {
+        agent: t1,
+        providers,
+    };
+
+    let sup_snap = DesktopModSnapshot {
+        pill_text: "Supervisor: Evaluating".into(),
+        runtime_status: SupervisorRuntimeStatus::Evaluating("t1".into()),
+        mode_label: SupervisorMode::SemiAuto.label().to_string(),
+        mode: SupervisorMode::SemiAuto,
+        model_loaded: true,
+        llm_backend: "ollama".into(),
+        llm_host: "http://127.0.0.1:11434".into(),
+        llm_model: "qwen3:1.7b".into(),
+        num_gpu: 99,
+        allow_gpu: true,
+        llm_ram_bytes: Some(256_000_000),
+        llm_vram_bytes: Some(1_200_000_000),
+        llm_connected: true,
+        model_installed: true,
+        llm_status_detail: "Ready".into(),
+        llm_managed: false,
+        llm_runtime: String::new(),
+        llm_container_state: String::new(),
+        gpu_backend: "cuda".into(),
+        gpu_detail: "RTX".into(),
+        fallback_configured: false,
+        fallback_key_present: false,
+        fallback_active: false,
+        fallback_model: String::new(),
+        fallback_host: String::new(),
+        fallback_reason: None,
+        fallback_detail: None,
+        fallback_since: None,
+        agents: vec![AgentCardView {
+            agent_id: "t1".into(),
+            session_name: "auth-agent".into(),
+            lifecycle_state: LifecycleState::WaitingConfirmation,
+            rolling_summary: "Waiting for bash confirmation".into(),
+            audit_badge: Some("Auto-assisted (1/3)".into()),
+            auto_reply_log: vec![AutoReplyAuditEntry {
+                timestamp: 1_700_000_000,
+                payload: "ls".into(),
+                summary: "Listed workspace".into(),
+            }],
+            action_card: Some(PendingOperatorAction {
+                urgency: Urgency::Critical,
+                detected_state: LifecycleState::WaitingConfirmation,
+                reason_for_operator: "Needs confirmation".into(),
+                updated_summary: "Run cargo test?".into(),
+                hc_command_payload: "y".into(),
+                triggered_at: 1_700_000_010,
+            }),
+            last_output_preview: "$ cargo test".into(),
+            eval_error: None,
+        }],
+    };
+
+    let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    write_fixture_if_changed(
+        &fixtures_dir.join("cockpit_snapshot.json"),
+        &(serde_json::to_string_pretty(&snapshot).unwrap() + "\n"),
+    );
+    write_fixture_if_changed(
+        &fixtures_dir.join("inspect_response.json"),
+        &(serde_json::to_string_pretty(&inspect_resp).unwrap() + "\n"),
+    );
+    write_fixture_if_changed(
+        &fixtures_dir.join("desktop_mod_snapshot.json"),
+        &(serde_json::to_string_pretty(&sup_snap).unwrap() + "\n"),
+    );
 }

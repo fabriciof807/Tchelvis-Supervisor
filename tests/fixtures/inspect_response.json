@@ -1,0 +1,181 @@
+{
+  "agent": {
+    "address": "t1",
+    "name": "auth-agent",
+    "parent": null,
+    "agent_kind": "claude_code",
+    "lifecycle": {
+      "state": "live"
+    },
+    "attention_state": {
+      "state": "blocked",
+      "kind": "permission",
+      "message": "Approve bash command?",
+      "since_ms": 1700000000000
+    },
+    "prompt_destructive": false,
+    "blocked_children": [],
+    "active_children": [
+      "t2"
+    ],
+    "turn": 4,
+    "reported": true,
+    "labels": {
+      "cockpit.issue": "ENG-42"
+    },
+    "workspace": {
+      "cwd": "/workspace/acme-api",
+      "repo_root": "/workspace/acme-api",
+      "worktree_path": null,
+      "git_branch": "feat/ENG-42-oauth",
+      "git_head_sha": "abcdef1234567890",
+      "commit_subject": "Add OAuth callback",
+      "remote_repo": {
+        "host": "github.com",
+        "owner": "acme",
+        "repo": "api"
+      }
+    },
+    "correlation_tier": "exact",
+    "provenance": [],
+    "context": {
+      "pull_request": {
+        "provider": "github",
+        "number": 42,
+        "title": "Add OAuth callback",
+        "state": "open",
+        "is_draft": false,
+        "url": "https://github.com/acme/api/pull/42",
+        "head_branch": "feat/ENG-42-oauth",
+        "head_sha": "abcdef1234567890",
+        "local_ahead": false,
+        "body_snippet": "Implements ENG-42 OAuth callback"
+      },
+      "candidate_prs": [],
+      "ci": {
+        "overall_state": "failing",
+        "total": 3,
+        "passed": 1,
+        "failed": 1,
+        "pending": 1,
+        "failing_checks": [
+          "cargo-test"
+        ],
+        "checks": [
+          {
+            "name": "cargo-test",
+            "status": "completed",
+            "conclusion": "failure",
+            "details_url": "https://github.com/acme/api/actions/runs/1"
+          },
+          {
+            "name": "clippy",
+            "status": "completed",
+            "conclusion": "success",
+            "details_url": null
+          },
+          {
+            "name": "e2e",
+            "status": "in_progress",
+            "conclusion": null,
+            "details_url": null
+          }
+        ]
+      },
+      "review": {
+        "decision": "changes_requested",
+        "approved_count": 1,
+        "changes_requested_count": 1,
+        "commented_count": 0,
+        "reviewers": [
+          "alice"
+        ]
+      },
+      "deploy_release": {
+        "environment": "staging",
+        "deploy_state": "success",
+        "latest_release_tag": "v0.1.0",
+        "release_url": "https://github.com/acme/api/releases/tag/v0.1.0"
+      },
+      "issue": {
+        "provider": "linear",
+        "key": "ENG-42",
+        "title": "Implement OAuth callback",
+        "status": "In Progress",
+        "assignee": "alice",
+        "priority": "High",
+        "url": "https://linear.app/acme/issue/ENG-42"
+      },
+      "candidate_issues": [
+        "ENG-42"
+      ],
+      "slack_threads": [
+        {
+          "workspace": "acme",
+          "channel_id": "C123",
+          "thread_ts": "1700000111.222333",
+          "url": "https://acme.slack.com/archives/C123/p1700000111222333",
+          "title_snippet": "OAuth rollout",
+          "reply_count": 4,
+          "latest_reply_at": "1700000222"
+        }
+      ],
+      "runbooks": [
+        {
+          "path": "docs/runbooks/auth.md",
+          "title": "Auth Troubleshooting",
+          "summary": "Verify callback URL",
+          "matched_reason": "matched branch keyword auth",
+          "tags": [
+            "auth"
+          ],
+          "service": "api",
+          "ci_job": "cargo-test"
+        }
+      ]
+    },
+    "updated_at": 1700000100
+  },
+  "providers": {
+    "github": {
+      "provider": "github",
+      "status": "ready",
+      "detail": "Authenticated via gh",
+      "quota_remaining": 4800,
+      "quota_limit": 5000,
+      "quota_reset_at": 1700003600,
+      "cooldown_until": null,
+      "last_success_at": 1700000000
+    },
+    "linear": {
+      "provider": "linear",
+      "status": "ready",
+      "detail": "API key configured",
+      "quota_remaining": null,
+      "quota_limit": null,
+      "quota_reset_at": null,
+      "cooldown_until": null,
+      "last_success_at": null
+    },
+    "slack": {
+      "provider": "slack",
+      "status": "ready",
+      "detail": "Token configured",
+      "quota_remaining": null,
+      "quota_limit": null,
+      "quota_reset_at": null,
+      "cooldown_until": null,
+      "last_success_at": null
+    },
+    "runbooks": {
+      "provider": "runbooks",
+      "status": "ready",
+      "detail": "Local runbooks",
+      "quota_remaining": null,
+      "quota_limit": null,
+      "quota_reset_at": null,
+      "cooldown_until": null,
+      "last_success_at": null
+    }
+  }
+}

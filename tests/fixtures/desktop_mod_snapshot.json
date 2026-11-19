@@ -1,0 +1,58 @@
+{
+  "pill_text": "Supervisor: Evaluating",
+  "runtime_status": {
+    "Evaluating": "t1"
+  },
+  "mode_label": "Semi-Auto (Whitelist)",
+  "mode": "SemiAuto",
+  "model_loaded": true,
+  "llm_backend": "ollama",
+  "llm_host": "http://127.0.0.1:11434",
+  "llm_model": "qwen3:1.7b",
+  "num_gpu": 99,
+  "allow_gpu": true,
+  "llm_ram_bytes": 256000000,
+  "llm_vram_bytes": 1200000000,
+  "llm_connected": true,
+  "model_installed": true,
+  "llm_status_detail": "Ready",
+  "llm_managed": false,
+  "llm_runtime": "",
+  "llm_container_state": "",
+  "gpu_backend": "cuda",
+  "gpu_detail": "RTX",
+  "fallback_configured": false,
+  "fallback_key_present": false,
+  "fallback_active": false,
+  "fallback_model": "",
+  "fallback_host": "",
+  "fallback_reason": null,
+  "fallback_detail": null,
+  "fallback_since": null,
+  "agents": [
+    {
+      "agent_id": "t1",
+      "session_name": "auth-agent",
+      "lifecycle_state": "WAITING_CONFIRMATION",
+      "rolling_summary": "Waiting for bash confirmation",
+      "audit_badge": "Auto-assisted (1/3)",
+      "auto_reply_log": [
+        {
+          "timestamp": 1700000000,
+          "payload": "ls",
+          "summary": "Listed workspace"
+        }
+      ],
+      "action_card": {
+        "urgency": "critical",
+        "detected_state": "WAITING_CONFIRMATION",
+        "reason_for_operator": "Needs confirmation",
+        "updated_summary": "Run cargo test?",
+        "hc_command_payload": "y",
+        "triggered_at": 1700000010
+      },
+      "last_output_preview": "$ cargo test",
+      "eval_error": null
+    }
+  ]
+}
