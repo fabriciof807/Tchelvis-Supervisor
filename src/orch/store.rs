@@ -15,6 +15,13 @@ const DISPATCH_COLUMNS: &str =
     turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status, \
     idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms";
 
+const MESSAGE_SELECT: &str =
+    "SELECT m.id, m.run_id, m.task_id, m.dispatch_id, m.from_handle, m.to_handle, m.target_terminal, \
+     m.msg_type, m.outcome, m.body, m.pointer_state, m.pointer_terminal, m.delivery_attempts, \
+     m.next_retry_at_ms, m.delivered_at_ms, m.acknowledged_at_ms, m.created_at_ms, qt.id \
+     FROM messages m \
+     LEFT JOIN question_threads qt ON qt.question_msg_id = m.id";
+
 #[derive(Clone)]
 pub struct OrchStore {
     conn: Arc<Mutex<Connection>>,
@@ -214,6 +221,7 @@ impl OrchStore {
             delivered_at_ms: r.get(14)?,
             acknowledged_at_ms: r.get(15)?,
             created_at_ms: r.get(16)?,
+            question_id: r.get(17)?,
         })
     }
 
@@ -306,6 +314,43 @@ impl OrchStore {
             .query_map([], Self::map_run_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn find_latest_empty_active_run_for_coordinator(
+        &self,
+        coordinator_terminal: &str,
+        coordinator_created_ms: Option<i64>,
+    ) -> Result<Option<OrchRun>> {
+        let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let row = if let Some(created_ms) = coordinator_created_ms {
+            conn.query_row(
+                "SELECT r.id, r.title, r.coordinator_terminal, r.coordinator_created_ms, r.status, r.created_at_ms, r.updated_at_ms
+                 FROM runs r
+                 WHERE r.coordinator_terminal = ?1
+                   AND r.coordinator_created_ms = ?2
+                   AND r.status = 'active'
+                   AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.run_id = r.id)
+                 ORDER BY r.created_at_ms DESC, r.rowid DESC
+                 LIMIT 1",
+                params![coordinator_terminal, created_ms],
+                Self::map_run_row,
+            )
+            .optional()?
+        } else {
+            conn.query_row(
+                "SELECT r.id, r.title, r.coordinator_terminal, r.coordinator_created_ms, r.status, r.created_at_ms, r.updated_at_ms
+                 FROM runs r
+                 WHERE r.coordinator_terminal = ?1
+                   AND r.status = 'active'
+                   AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.run_id = r.id)
+                 ORDER BY r.created_at_ms DESC, r.rowid DESC
+                 LIMIT 1",
+                params![coordinator_terminal],
+                Self::map_run_row,
+            )
+            .optional()?
+        };
+        Ok(row)
     }
 
     pub fn create_or_update_task(&self, task: &OrchTask) -> Result<OrchTask> {
@@ -1032,6 +1077,7 @@ impl OrchStore {
             delivered_at_ms: None,
             acknowledged_at_ms: None,
             created_at_ms: now_ms,
+            question_id: None,
         };
 
         Self::insert_message_tx(&tx, &msg)?;
@@ -1092,6 +1138,7 @@ impl OrchStore {
             delivered_at_ms: None,
             acknowledged_at_ms,
             created_at_ms: now_ms,
+            question_id: None,
         };
 
         Self::insert_message_tx(&tx, &msg)?;
@@ -1123,6 +1170,7 @@ impl OrchStore {
             params![disp.id, DispatchStatus::WaitingForReply.as_str(), now_ms],
         )?;
 
+        let q_id = generate_orch_id("q");
         let msg = OrchMessage {
             id: generate_orch_id("msg"),
             run_id: disp.run_id.clone(),
@@ -1141,11 +1189,12 @@ impl OrchStore {
             delivered_at_ms: None,
             acknowledged_at_ms: None,
             created_at_ms: now_ms,
+            question_id: Some(q_id.clone()),
         };
         Self::insert_message_tx(&tx, &msg)?;
 
         let q_thread = QuestionThread {
-            id: generate_orch_id("q"),
+            id: q_id,
             run_id: disp.run_id,
             dispatch_id: disp.id,
             question_msg_id: msg.id.clone(),
@@ -1173,6 +1222,92 @@ impl OrchStore {
         Ok((q_thread, msg))
     }
 
+    fn resolve_question_thread_tx(
+        tx: &Transaction<'_>,
+        question_or_msg_id: &str,
+    ) -> Result<QuestionThread> {
+        if let Some(q_thread) = tx
+            .query_row(
+                "SELECT id, run_id, dispatch_id, question_msg_id, reply_msg_id, status, created_at_ms, answered_at_ms
+                 FROM question_threads WHERE id = ?1",
+                params![question_or_msg_id],
+                Self::map_question_row,
+            )
+            .optional()?
+        {
+            return Ok(q_thread);
+        }
+
+        if let Some(q_thread) = tx
+            .query_row(
+                "SELECT id, run_id, dispatch_id, question_msg_id, reply_msg_id, status, created_at_ms, answered_at_ms
+                 FROM question_threads WHERE question_msg_id = ?1",
+                params![question_or_msg_id],
+                Self::map_question_row,
+            )
+            .optional()?
+        {
+            return Ok(q_thread);
+        }
+
+        let msg_row: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT id, dispatch_id, msg_type FROM messages WHERE id = ?1",
+                params![question_or_msg_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+
+        if let Some((msg_id, dispatch_id, msg_type)) = msg_row {
+            let related_q = tx
+                .query_row(
+                    "SELECT id, run_id, dispatch_id, question_msg_id, reply_msg_id, status, created_at_ms, answered_at_ms
+                     FROM question_threads WHERE reply_msg_id = ?1 LIMIT 1",
+                    params![msg_id],
+                    Self::map_question_row,
+                )
+                .optional()?;
+
+            let related_q = match related_q {
+                Some(q) => Some(q),
+                None => match dispatch_id {
+                    Some(ref disp_id) => tx
+                        .query_row(
+                            "SELECT id, run_id, dispatch_id, question_msg_id, reply_msg_id, status, created_at_ms, answered_at_ms
+                             FROM question_threads
+                             WHERE dispatch_id = ?1
+                             ORDER BY CASE WHEN status = 'open' THEN 0 ELSE 1 END, created_at_ms DESC, rowid DESC
+                             LIMIT 1",
+                            params![disp_id],
+                            Self::map_question_row,
+                        )
+                        .optional()?,
+                    None => None,
+                },
+            };
+
+            if let Some(q) = related_q {
+                bail!(
+                    "message '{}' (type={}) is not a question; the question thread for dispatch '{}' is '{}' (status={})",
+                    msg_id,
+                    msg_type,
+                    q.dispatch_id,
+                    q.id,
+                    q.status
+                );
+            }
+            bail!("message '{}' (type={}) is not a question", msg_id, msg_type);
+        }
+
+        bail!("question thread '{}' does not exist", question_or_msg_id)
+    }
+
+    pub fn resolve_question_thread(&self, question_or_msg_id: &str) -> Result<QuestionThread> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        Self::resolve_question_thread_tx(&tx, question_or_msg_id)
+    }
+
     pub fn record_reply(
         &self,
         question_id: &str,
@@ -1183,20 +1318,12 @@ impl OrchStore {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let mut q_thread = tx
-            .query_row(
-                "SELECT id, run_id, dispatch_id, question_msg_id, reply_msg_id, status, created_at_ms, answered_at_ms
-                 FROM question_threads WHERE id = ?1",
-                params![question_id],
-                Self::map_question_row,
-            )
-            .optional()?
-            .with_context(|| format!("question thread '{}' does not exist", question_id))?;
+        let mut q_thread = Self::resolve_question_thread_tx(&tx, question_id)?;
 
         if q_thread.status != "open" {
             bail!(
                 "question thread '{}' is already '{}'",
-                question_id,
+                q_thread.id,
                 q_thread.status
             );
         }
@@ -1222,6 +1349,7 @@ impl OrchStore {
             delivered_at_ms: None,
             acknowledged_at_ms: None,
             created_at_ms: now_ms,
+            question_id: None,
         };
         Self::insert_message_tx(&tx, &msg)?;
 
@@ -1382,14 +1510,8 @@ impl OrchStore {
             return Ok(None);
         }
 
-        let msg = tx.query_row(
-            "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
-                    msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
-                    next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
-             FROM messages WHERE id = ?1",
-            params![msg_id],
-            Self::map_message_row,
-        )?;
+        let query = format!("{MESSAGE_SELECT} WHERE m.id = ?1");
+        let msg = tx.query_row(&query, params![msg_id], Self::map_message_row)?;
         tx.commit()?;
         Ok(Some(msg))
     }
@@ -1456,14 +1578,8 @@ impl OrchStore {
             return Ok(None);
         }
 
-        let msg = tx.query_row(
-            "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
-                    msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
-                    next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
-             FROM messages WHERE id = ?1",
-            params![msg_id],
-            Self::map_message_row,
-        )?;
+        let query = format!("{MESSAGE_SELECT} WHERE m.id = ?1");
+        let msg = tx.query_row(&query, params![msg_id], Self::map_message_row)?;
         tx.commit()?;
         Ok(Some(msg))
     }
@@ -1568,30 +1684,26 @@ impl OrchStore {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let mut messages = if let Some(run_id) = run_id_filter {
-            let mut stmt = tx.prepare(
-                "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
-                        msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
-                        next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
-                 FROM messages
-                 WHERE target_terminal = ?1
-                   AND run_id = ?2
-                   AND pointer_state IN ('pending', 'delivered', 'delivery_stalled')
-                 ORDER BY created_at_ms ASC, id ASC",
-            )?;
+            let query = format!(
+                "{MESSAGE_SELECT}
+                 WHERE m.target_terminal = ?1
+                   AND m.run_id = ?2
+                   AND m.pointer_state IN ('pending', 'delivered', 'delivery_stalled')
+                 ORDER BY m.created_at_ms ASC, m.id ASC"
+            );
+            let mut stmt = tx.prepare(&query)?;
             let rows = stmt
                 .query_map(params![target_terminal, run_id], Self::map_message_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         } else {
-            let mut stmt = tx.prepare(
-                "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
-                        msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
-                        next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
-                 FROM messages
-                 WHERE target_terminal = ?1
-                   AND pointer_state IN ('pending', 'delivered', 'delivery_stalled')
-                 ORDER BY created_at_ms ASC, id ASC",
-            )?;
+            let query = format!(
+                "{MESSAGE_SELECT}
+                 WHERE m.target_terminal = ?1
+                   AND m.pointer_state IN ('pending', 'delivered', 'delivery_stalled')
+                 ORDER BY m.created_at_ms ASC, m.id ASC"
+            );
+            let mut stmt = tx.prepare(&query)?;
             let rows = stmt
                 .query_map(params![target_terminal], Self::map_message_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1741,14 +1853,12 @@ impl OrchStore {
 
     pub fn list_messages_for_run(&self, run_id: &str) -> Result<Vec<OrchMessage>> {
         let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
-                    msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
-                    next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
-             FROM messages
-             WHERE run_id = ?1
-             ORDER BY created_at_ms ASC, id ASC",
-        )?;
+        let query = format!(
+            "{MESSAGE_SELECT}
+             WHERE m.run_id = ?1
+             ORDER BY m.created_at_ms ASC, m.id ASC"
+        );
+        let mut stmt = conn.prepare(&query)?;
         let rows = stmt
             .query_map(params![run_id], Self::map_message_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1818,6 +1928,7 @@ impl OrchStore {
             delivered_at_ms,
             acknowledged_at_ms,
             created_at_ms: now_ms,
+            question_id: None,
         };
         Self::insert_message_tx(&tx, &msg)?;
 

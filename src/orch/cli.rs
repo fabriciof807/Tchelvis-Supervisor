@@ -429,9 +429,22 @@ pub fn map_agent_preset(agent: &str) -> String {
         "opencode" => "opencode".to_string(),
         "pi" => "pi".to_string(),
         "gemini" => "gemini".to_string(),
-        // agy rejects a positional prompt; `-i` starts an interactive session with it.
-        "agy" | "antigravity" => "agy -i".to_string(),
-        other => other.to_string(),
+        other => {
+            let tokens: Vec<&str> = other.split_whitespace().collect();
+            if let Some((&first, rest)) = tokens.split_first() {
+                if matches!(first, "agy" | "antigravity") {
+                    let mut out = Vec::with_capacity(tokens.len() + 1);
+                    out.push("agy");
+                    out.extend_from_slice(rest);
+                    // agy rejects a positional prompt; `-i` starts an interactive session with it.
+                    if !rest.contains(&"-i") {
+                        out.push("-i");
+                    }
+                    return out.join(" ");
+                }
+            }
+            other.to_string()
+        }
     }
 }
 
@@ -1099,9 +1112,7 @@ pub async fn execute_orch_command(
                 }
             }
 
-            let q_existing = store
-                .get_question_thread(&question_id)?
-                .with_context(|| format!("question thread '{}' does not exist", question_id))?;
+            let q_existing = store.resolve_question_thread(&question_id)?;
             let disp = store
                 .get_dispatch(&q_existing.dispatch_id)?
                 .with_context(|| format!("dispatch '{}' does not exist", q_existing.dispatch_id))?;
@@ -1114,7 +1125,7 @@ pub async fn execute_orch_command(
 
             let now_ms = chrono::Utc::now().timestamp_millis();
             let (q_thread, msg) =
-                store.record_reply(&question_id, &body, child_current_turn, now_ms)?;
+                store.record_reply(&q_existing.id, &body, child_current_turn, now_ms)?;
 
             let resp_json = serde_json::to_string(&(&q_thread, &msg))?;
             if let Some(ref req_id) = request_id {
@@ -1958,17 +1969,14 @@ pub fn preflight_agent_with_path(
     }
 }
 
-async fn create_run_record(
+async fn create_run_record_from_resolved(
     store: &OrchStore,
     herdr: &HerdrClient,
+    resolved_coord: &ResolvedCallerTerminal,
     title: Option<&str>,
-    coordinator: Option<String>,
-    missing_msg: &str,
     now_ms: i64,
 ) -> Result<OrchRun> {
-    let resolved_coord =
-        resolve_caller_terminal(herdr, coordinator, None, Some(now_ms), false, missing_msg).await?;
-    let coord_term = resolved_coord.terminal;
+    let coord_term = &resolved_coord.terminal;
     let coordinator_created_ms = resolved_coord.created_ms;
 
     let run_id = generate_orch_id("run");
@@ -1993,8 +2001,21 @@ async fn create_run_record(
         ("cockpit.orch.role", "coordinator"),
         ("cockpit.orch.run", run_id.as_str()),
     ];
-    let _ = apply_hc_labels(herdr, &coord_term, &labels).await;
+    let _ = apply_hc_labels(herdr, coord_term, &labels).await;
     Ok(run)
+}
+
+async fn create_run_record(
+    store: &OrchStore,
+    herdr: &HerdrClient,
+    title: Option<&str>,
+    coordinator: Option<String>,
+    missing_msg: &str,
+    now_ms: i64,
+) -> Result<OrchRun> {
+    let resolved_coord =
+        resolve_caller_terminal(herdr, coordinator, None, Some(now_ms), false, missing_msg).await?;
+    create_run_record_from_resolved(store, herdr, &resolved_coord, title, now_ms).await
 }
 
 pub async fn execute_launch(
@@ -2037,15 +2058,31 @@ pub async fn execute_launch_with_path(
             .get_run(run_id)?
             .with_context(|| format!("run '{}' does not exist", run_id))?
     } else {
-        create_run_record(
-            store,
+        let resolved_coord = resolve_caller_terminal(
             herdr,
-            args.title.as_deref(),
             args.caller_terminal.clone(),
+            None,
+            Some(now_ms),
+            false,
             "caller terminal not specified; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
-            now_ms,
         )
-        .await?
+        .await?;
+        let coord_created_filter = resolved_coord.term_info.as_ref().and_then(|t| t.created_ms);
+        if let Some(existing_run) = store.find_latest_empty_active_run_for_coordinator(
+            &resolved_coord.terminal,
+            coord_created_filter,
+        )? {
+            existing_run
+        } else {
+            create_run_record_from_resolved(
+                store,
+                herdr,
+                &resolved_coord,
+                args.title.as_deref(),
+                now_ms,
+            )
+            .await?
+        }
     };
 
     let task_id = generate_orch_id("task");
@@ -2630,6 +2667,35 @@ fn print_reply(q_thread: &QuestionThread, msg: &OrchMessage, json: bool) -> Resu
     Ok(())
 }
 
+const STATUS_MESSAGE_BODY_MAX_CHARS: usize = 160;
+
+fn format_status_message_body(body: &str) -> String {
+    let mut lines = body.lines();
+    let first_line = lines.next().unwrap_or("");
+    let extra_lines = lines.count();
+    let truncated_chars = first_line.chars().count() > STATUS_MESSAGE_BODY_MAX_CHARS;
+
+    if !truncated_chars && extra_lines == 0 {
+        return first_line.to_string();
+    }
+
+    let preview: String = if truncated_chars {
+        first_line
+            .chars()
+            .take(STATUS_MESSAGE_BODY_MAX_CHARS)
+            .collect()
+    } else {
+        first_line.to_string()
+    };
+
+    if extra_lines > 0 {
+        let unit = if extra_lines == 1 { "line" } else { "lines" };
+        format!("{preview} … (+{extra_lines} {unit}; see --json or check)")
+    } else {
+        format!("{preview} … (see --json or check)")
+    }
+}
+
 fn format_human_status(out: &OrchStatusOutput) -> String {
     use std::fmt::Write;
     let mut buf = String::new();
@@ -2667,7 +2733,7 @@ fn format_human_status(out: &OrchStatusOutput) -> String {
                 m.to_handle,
                 m.dispatch_id.as_deref().unwrap_or("-"),
                 m.pointer_state,
-                m.body
+                format_status_message_body(&m.body)
             );
         }
         for q in &v.open_questions {
@@ -2685,49 +2751,70 @@ fn print_human_status(out: &OrchStatusOutput) {
     print!("{}", format_human_status(out));
 }
 
+fn format_inbox_check(res: &InboxCheckResult) -> String {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let _ = writeln!(
+        buf,
+        "Orchestration Inbox for {} (run_filter={}): {} message(s)",
+        res.target_terminal,
+        res.run_id_filter.as_deref().unwrap_or("*"),
+        res.messages.len()
+    );
+    for m in &res.messages {
+        let outcome = m
+            .outcome
+            .as_deref()
+            .map(|o| format!(" outcome={o}"))
+            .unwrap_or_default();
+        let question_part = m
+            .question_id
+            .as_deref()
+            .map(|q| format!(" question_id={q}"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            buf,
+            "  - [{}] {} from {}{} (task={} dispatch={}{}): {}",
+            m.msg_type,
+            m.id,
+            m.from_handle,
+            outcome,
+            m.task_id.as_deref().unwrap_or("-"),
+            m.dispatch_id.as_deref().unwrap_or("-"),
+            question_part,
+            m.body
+        );
+        if let Some(ref q_id) = m.question_id {
+            let _ = writeln!(
+                buf,
+                "    reply: tchelvis orch reply --question-id {q_id} --body \"...\""
+            );
+        }
+    }
+    if !res.ready_tasks.is_empty() {
+        let ids: Vec<&str> = res.ready_tasks.iter().map(|t| t.id.as_str()).collect();
+        let _ = writeln!(buf, "Ready tasks: {}", ids.join(", "));
+    }
+    if !res.blocked_tasks.is_empty() {
+        let ids: Vec<&str> = res.blocked_tasks.iter().map(|t| t.id.as_str()).collect();
+        let _ = writeln!(buf, "Blocked/Circuit-Broken tasks: {}", ids.join(", "));
+    }
+    if !res.active_dispatches.is_empty() {
+        let summaries: Vec<String> = res
+            .active_dispatches
+            .iter()
+            .map(|d| format!("{}({}:{})", d.id, d.assignee_terminal, d.status))
+            .collect();
+        let _ = writeln!(buf, "Active dispatches: {}", summaries.join(", "));
+    }
+    buf
+}
+
 fn print_inbox_check(res: &InboxCheckResult, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(res)?);
     } else {
-        println!(
-            "Orchestration Inbox for {} (run_filter={}): {} message(s)",
-            res.target_terminal,
-            res.run_id_filter.as_deref().unwrap_or("*"),
-            res.messages.len()
-        );
-        for m in &res.messages {
-            let outcome = m
-                .outcome
-                .as_deref()
-                .map(|o| format!(" outcome={o}"))
-                .unwrap_or_default();
-            println!(
-                "  - [{}] {} from {}{} (task={} dispatch={}): {}",
-                m.msg_type,
-                m.id,
-                m.from_handle,
-                outcome,
-                m.task_id.as_deref().unwrap_or("-"),
-                m.dispatch_id.as_deref().unwrap_or("-"),
-                m.body
-            );
-        }
-        if !res.ready_tasks.is_empty() {
-            let ids: Vec<&str> = res.ready_tasks.iter().map(|t| t.id.as_str()).collect();
-            println!("Ready tasks: {}", ids.join(", "));
-        }
-        if !res.blocked_tasks.is_empty() {
-            let ids: Vec<&str> = res.blocked_tasks.iter().map(|t| t.id.as_str()).collect();
-            println!("Blocked/Circuit-Broken tasks: {}", ids.join(", "));
-        }
-        if !res.active_dispatches.is_empty() {
-            let summaries: Vec<String> = res
-                .active_dispatches
-                .iter()
-                .map(|d| format!("{}({}:{})", d.id, d.assignee_terminal, d.status))
-                .collect();
-            println!("Active dispatches: {}", summaries.join(", "));
-        }
+        print!("{}", format_inbox_check(res));
     }
     Ok(())
 }
@@ -2871,6 +2958,7 @@ mod tests {
                     delivered_at_ms: Some(1_100),
                     acknowledged_at_ms: Some(1_100),
                     created_at_ms: 1_100,
+                    question_id: None,
                 }],
                 open_questions: vec![],
                 unacknowledged_messages: 0,
@@ -2879,6 +2967,192 @@ mod tests {
         let rendered = format_human_status(&out);
         assert!(rendered.contains("Message msg_1: [directive] t1 -> t2"));
         assert!(rendered.contains("Please add unit tests"));
+    }
+
+    #[test]
+    fn lot_k_n1_map_agent_preset_inserts_dash_i_for_agy_with_extra_args() {
+        assert_eq!(map_agent_preset("agy"), "agy -i");
+        assert_eq!(map_agent_preset("antigravity"), "agy -i");
+        assert_eq!(
+            map_agent_preset("agy --model gpt-oss-120b-medium"),
+            "agy --model gpt-oss-120b-medium -i"
+        );
+        assert_eq!(
+            map_agent_preset("antigravity --model gpt-oss-120b-medium"),
+            "agy --model gpt-oss-120b-medium -i"
+        );
+        assert_eq!(
+            map_agent_preset("agy --model gpt-oss-120b-medium -i"),
+            "agy --model gpt-oss-120b-medium -i"
+        );
+        assert_eq!(
+            map_agent_preset("agy -i --model gpt-oss-120b-medium"),
+            "agy -i --model gpt-oss-120b-medium"
+        );
+        assert_eq!(
+            map_agent_preset("antigravity -i --model gpt-oss-120b-medium"),
+            "agy -i --model gpt-oss-120b-medium"
+        );
+        assert_eq!(
+            map_agent_preset("claude --model sonnet"),
+            "claude --model sonnet"
+        );
+        assert_eq!(map_agent_preset("codex --model o3"), "codex --model o3");
+    }
+
+    #[test]
+    fn lot_k_n2_format_inbox_check_shows_question_id_and_reply_hint() {
+        let multiline_tail = "Escalation line 1\n--- last lines ---\ntail line a\ntail line b";
+        let res = InboxCheckResult {
+            target_terminal: "t1".into(),
+            run_id_filter: Some("run_1".into()),
+            messages: vec![
+                OrchMessage {
+                    id: "msg_q_1".into(),
+                    run_id: "run_1".into(),
+                    task_id: Some("task_a".into()),
+                    dispatch_id: Some("disp_1".into()),
+                    from_handle: "t2".into(),
+                    to_handle: "t1".into(),
+                    target_terminal: "t1".into(),
+                    msg_type: MessageType::Question,
+                    outcome: None,
+                    body: "Use 15m or 1h?".into(),
+                    pointer_state: PointerState::Acknowledged,
+                    pointer_terminal: None,
+                    delivery_attempts: 0,
+                    next_retry_at_ms: None,
+                    delivered_at_ms: None,
+                    acknowledged_at_ms: Some(1_100),
+                    created_at_ms: 1_000,
+                    question_id: Some("q_abc".into()),
+                },
+                OrchMessage {
+                    id: "msg_esc_1".into(),
+                    run_id: "run_1".into(),
+                    task_id: Some("task_a".into()),
+                    dispatch_id: Some("disp_1".into()),
+                    from_handle: "t2".into(),
+                    to_handle: "t1".into(),
+                    target_terminal: "t1".into(),
+                    msg_type: MessageType::Escalation,
+                    outcome: None,
+                    body: multiline_tail.into(),
+                    pointer_state: PointerState::Acknowledged,
+                    pointer_terminal: None,
+                    delivery_attempts: 0,
+                    next_retry_at_ms: None,
+                    delivered_at_ms: None,
+                    acknowledged_at_ms: Some(1_200),
+                    created_at_ms: 1_100,
+                    question_id: None,
+                },
+            ],
+            ready_tasks: vec![],
+            blocked_tasks: vec![],
+            active_dispatches: vec![],
+        };
+
+        let rendered = format_inbox_check(&res);
+        assert!(rendered.contains("question_id=q_abc"), "{rendered}");
+        assert!(
+            rendered.contains("reply: tchelvis orch reply --question-id q_abc --body \"...\""),
+            "{rendered}"
+        );
+        // N5: check output must still include full multiline body
+        assert!(rendered.contains("tail line b"), "{rendered}");
+    }
+
+    #[test]
+    fn lot_k_n5_format_human_status_truncates_multiline_and_long_message_bodies() {
+        let multiline_body = "Worker t2 stopped on turn 1 (reason: worker_returned_to_prompt_without_worker_done).\n--- last lines ---\nline 1 of terminal tail\nline 2 of terminal tail\nline 3 of terminal tail";
+        let long_single_line = "x".repeat(220);
+        let out = OrchStatusOutput {
+            runs: vec![RunStatusView {
+                run: OrchRun {
+                    id: "run_1".into(),
+                    title: "Run 1".into(),
+                    coordinator_terminal: "t1".into(),
+                    coordinator_created_ms: 1_000,
+                    status: RunStatus::Active,
+                    created_at_ms: 1_000,
+                    updated_at_ms: 1_000,
+                },
+                tasks: vec![],
+                dispatches: vec![],
+                messages: vec![
+                    OrchMessage {
+                        id: "msg_esc".into(),
+                        run_id: "run_1".into(),
+                        task_id: Some("task_a".into()),
+                        dispatch_id: Some("disp_1".into()),
+                        from_handle: "t2".into(),
+                        to_handle: "t1".into(),
+                        target_terminal: "t1".into(),
+                        msg_type: MessageType::Escalation,
+                        outcome: None,
+                        body: multiline_body.into(),
+                        pointer_state: PointerState::Pending,
+                        pointer_terminal: None,
+                        delivery_attempts: 0,
+                        next_retry_at_ms: None,
+                        delivered_at_ms: None,
+                        acknowledged_at_ms: None,
+                        created_at_ms: 1_100,
+                        question_id: None,
+                    },
+                    OrchMessage {
+                        id: "msg_long".into(),
+                        run_id: "run_1".into(),
+                        task_id: Some("task_a".into()),
+                        dispatch_id: Some("disp_1".into()),
+                        from_handle: "t2".into(),
+                        to_handle: "t1".into(),
+                        target_terminal: "t1".into(),
+                        msg_type: MessageType::Status,
+                        outcome: None,
+                        body: long_single_line.clone(),
+                        pointer_state: PointerState::Acknowledged,
+                        pointer_terminal: None,
+                        delivery_attempts: 0,
+                        next_retry_at_ms: None,
+                        delivered_at_ms: None,
+                        acknowledged_at_ms: Some(1_200),
+                        created_at_ms: 1_200,
+                        question_id: None,
+                    },
+                ],
+                open_questions: vec![],
+                unacknowledged_messages: 1,
+            }],
+        };
+
+        let rendered = format_human_status(&out);
+        assert!(
+            rendered.contains("Worker t2 stopped on turn 1 (reason: worker_returned_to_prompt_without_worker_done)."),
+            "missing first line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("line 1 of terminal tail"),
+            "status must not include terminal tail lines: {rendered}"
+        );
+        assert!(
+            rendered.contains("+4 lines") && rendered.contains("--json") && rendered.contains("check"),
+            "status should include truncation marker with +4 lines and --json/check hint: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&long_single_line),
+            "long single-line body must be truncated: {rendered}"
+        );
+        assert!(
+            rendered.contains(&"x".repeat(160)) && !rendered.contains(&"x".repeat(161)),
+            "long single-line body should be truncated to 160 chars: {rendered}"
+        );
+
+        // JSON status output retains full bodies unchanged
+        let json_str = serde_json::to_string(&out).unwrap();
+        assert!(json_str.contains("line 3 of terminal tail"));
+        assert!(json_str.contains(&long_single_line));
     }
 
     #[tokio::test]

@@ -3387,3 +3387,339 @@ async fn lot_i_b8_release_force_removes_worktree_keeps_branch_and_reports_delete
         "release output must mention kept branch and git branch -D hint, got: {formatted}"
     );
 }
+
+#[tokio::test]
+async fn lot_k_n1_launch_agy_with_model_flag_preflights_agy_and_places_dash_i_before_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agy = bin_dir.join("agy");
+    fs::write(&fake_agy, "#!/usr/bin/env sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_args_log = tmp.path().join("hc_run_args.log");
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               if [ \"$2\" = \"t1\" ]; then\n\
+                 echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"/tmp\"}}'\n\
+               else\n\
+                 echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+               fi\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               printf '%s\\0' \"$@\" > \"{}\"\n\
+               echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"first_message\":{{\"sent\":true}}}}'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            run_args_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    let out = execute_launch_with_path(
+        &store,
+        &HerdrClient::new(fake_hc.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(10_000),
+        OrchLaunchArgs {
+            agent: "agy --model gpt-oss-120b-medium".into(),
+            prompt: "Do task".into(),
+            title: Some("Agy model test".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.dispatch.agent_kind, "agy --model gpt-oss-120b-medium");
+
+    let raw_bytes = fs::read(&run_args_log).unwrap();
+    let args: Vec<String> = raw_bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let agy_pos = args
+        .iter()
+        .position(|a| a == "agy")
+        .expect("hc run should pass agy");
+    assert_eq!(
+        &args[agy_pos..agy_pos + 4],
+        &["agy", "--model", "gpt-oss-120b-medium", "-i"]
+    );
+    assert!(
+        args.get(agy_pos + 4)
+            .is_some_and(|p| p.contains("[TASK PROMPT]\nDo task")),
+        "prompt must follow -i, got: {args:?}"
+    );
+}
+
+#[tokio::test]
+async fn lot_k_n2_check_includes_question_id_and_reply_accepts_opening_msg_id_or_errors_clearly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = make_paths(tmp.path());
+    let cfg = CockpitConfig::default();
+    let store = OrchStore::open(&paths.orch_db_file()).unwrap();
+
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_b", vec![]))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_q", "run_1", "task_a", "t1", "t2", 2_000, 0,
+        ))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_other",
+            "run_1",
+            "task_b",
+            "t1",
+            "t3",
+            3_000,
+            0,
+        ))
+        .unwrap();
+
+    let (q, q_msg) = store
+        .record_question("disp_q", "t2", 2_000, "Use 15m or 1h?", 2_100)
+        .unwrap();
+    let status_msg = store
+        .record_worker_message(
+            "disp_q",
+            "t2",
+            2_000,
+            MessageType::Status,
+            "still working",
+            2_200,
+        )
+        .unwrap();
+    let done_msg = store
+        .record_worker_done("disp_other", "t3", 3_000, "succeeded", "task b done", 2_300)
+        .unwrap();
+
+    // 1. JSON inbox check includes question_id for question message (additive)
+    let peek = store
+        .claim_inbox_messages("t1", Some("run_1"), true, 2_400)
+        .unwrap();
+    let val = serde_json::to_value(&peek).unwrap();
+    let q_json = val["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == q_msg.id)
+        .expect("question message should be in inbox");
+    assert_eq!(q_json["question_id"], q.id);
+
+    // 2. Non-question message on a dispatch with an open question errors naming the correct q_...
+    let err_on_q_disp = execute_orch_command(
+        OrchCommands::Reply {
+            question_id: status_msg.id.clone(),
+            body: "answer".into(),
+            request_id: None,
+            json: false,
+        },
+        &cfg,
+        &paths,
+    )
+    .await
+    .unwrap_err();
+    let err_q_txt = err_on_q_disp.to_string();
+    assert!(
+        err_q_txt.contains(&q.id) && err_q_txt.contains("not a question"),
+        "expected error naming {} and saying not a question, got: {err_q_txt}",
+        q.id
+    );
+
+    // 3. Non-question message on a dispatch without any question says message is not a question
+    let err_non_q = execute_orch_command(
+        OrchCommands::Reply {
+            question_id: done_msg.id.clone(),
+            body: "answer".into(),
+            request_id: None,
+            json: false,
+        },
+        &cfg,
+        &paths,
+    )
+    .await
+    .unwrap_err();
+    let err_non_q_txt = err_non_q.to_string();
+    assert!(
+        err_non_q_txt.contains("not a question") && !err_non_q_txt.contains(&q.id),
+        "expected error saying not a question without unrelated q_id, got: {err_non_q_txt}"
+    );
+
+    // 4. Reply using the opening question message id (msg_...) resolves to q_... and succeeds
+    execute_orch_command(
+        OrchCommands::Reply {
+            question_id: q_msg.id.clone(),
+            body: "Use 15m".into(),
+            request_id: None,
+            json: false,
+        },
+        &cfg,
+        &paths,
+    )
+    .await
+    .unwrap();
+
+    let updated_q = store.get_question_thread(&q.id).unwrap().unwrap();
+    assert_eq!(updated_q.status, "answered");
+    let child_inbox = store
+        .claim_inbox_messages("t2", Some("run_1"), true, 2_500)
+        .unwrap();
+    assert_eq!(child_inbox.messages.len(), 1);
+    assert_eq!(child_inbox.messages[0].body, "Use 15m");
+}
+
+#[tokio::test]
+async fn lot_k_n4_launch_without_run_reuses_latest_empty_active_run_for_caller() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agent = bin_dir.join("claude");
+    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           if [ \"$2\" = \"t1\" ]; then\n\
+             echo '{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"/tmp\"}'\n\
+           else\n\
+             echo '{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{}}'\n\
+           fi\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"run\" ]; then\n\
+           echo '{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"first_message\":{\"sent\":true}}'\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+
+    // Create two empty active runs for t1 (run_older and run_latest), plus an empty run for t9 and a completed run for t1
+    let mut run_older = sample_run("run_older", "t1");
+    run_older.created_at_ms = 1_000;
+    store.create_run(&run_older).unwrap();
+
+    let mut run_latest = sample_run("run_latest", "t1");
+    run_latest.created_at_ms = 2_000;
+    store.create_run(&run_latest).unwrap();
+
+    let mut run_other_coord = sample_run("run_other", "t9");
+    run_other_coord.created_at_ms = 3_000;
+    store.create_run(&run_other_coord).unwrap();
+
+    let mut run_completed = sample_run("run_completed", "t1");
+    run_completed.created_at_ms = 4_000;
+    run_completed.status = RunStatus::Completed;
+    store.create_run(&run_completed).unwrap();
+
+    // First launch without --run reuses run_latest (most recent active empty run for t1)
+    let out1 = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(10_000),
+        OrchLaunchArgs {
+            agent: "claude".into(),
+            prompt: "Task 1".into(),
+            title: Some("Task 1".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: Some("req_n4_1".into()),
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out1.run.id, "run_latest");
+    assert_eq!(store.list_runs().unwrap().len(), 4);
+
+    // Request-id idempotency still returns the same launch output
+    let out1_dup = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(10_100),
+        OrchLaunchArgs {
+            agent: "claude".into(),
+            prompt: "Task 1".into(),
+            title: Some("Task 1".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: Some("req_n4_1".into()),
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out1_dup.run.id, "run_latest");
+    assert_eq!(out1_dup.dispatch.id, out1.dispatch.id);
+
+    // Note: run_older is still empty so a 2nd launch without --run reuses run_older;
+    // once no empty active run remains for t1, a 3rd launch creates a new run.
+    let out2 = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(11_000),
+        OrchLaunchArgs {
+            agent: "claude".into(),
+            prompt: "Task 2".into(),
+            title: Some("Task 2".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out2.run.id, "run_older");
+
+    let out3 = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(12_000),
+        OrchLaunchArgs {
+            agent: "claude".into(),
+            prompt: "Task 3".into(),
+            title: Some("Task 3".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_ne!(out3.run.id, "run_latest");
+    assert_ne!(out3.run.id, "run_older");
+    assert_ne!(out3.run.id, "run_other");
+    assert_ne!(out3.run.id, "run_completed");
+    assert_eq!(store.list_runs().unwrap().len(), 5);
+}

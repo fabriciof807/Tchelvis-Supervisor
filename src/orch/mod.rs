@@ -408,6 +408,8 @@ pub struct OrchMessage {
     pub delivered_at_ms: Option<i64>,
     pub acknowledged_at_ms: Option<i64>,
     pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
