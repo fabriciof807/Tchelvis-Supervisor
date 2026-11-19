@@ -339,6 +339,21 @@ enum SupervisorCommands {
         #[arg(long)]
         progress: bool,
     },
+    /// Show the durable supervisor activity log (newest first)
+    Log {
+        /// Output JSON array
+        #[arg(long)]
+        json: bool,
+        /// Maximum number of events to return
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Filter by event kind (comma-separated or repeated: auto_reply, auto_reply_blocked, alert, evaluation, eval_error, mode_change, llm_load, llm_unload, gpu_toggle, respond)
+        #[arg(long)]
+        kind: Vec<String>,
+        /// Filter by agent / terminal ID
+        #[arg(long)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1090,6 +1105,44 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&res)?);
                 } else {
                     println!("{}", tchelvis::supervisor::bench::format_bench_table(&res));
+                }
+                Ok(())
+            }
+            SupervisorCommands::Log {
+                json,
+                limit,
+                kind,
+                agent,
+            } => {
+                let mut kinds = Vec::new();
+                for item in kind {
+                    for part in item.split(',') {
+                        let trimmed = part.trim();
+                        if !trimmed.is_empty() {
+                            kinds.push(tchelvis::supervisor::events::SupervisorEventKind::parse(
+                                trimmed,
+                            )?);
+                        }
+                    }
+                }
+                let query = tchelvis::supervisor::events::EventLogQuery {
+                    limit,
+                    kinds,
+                    agent_id: agent,
+                };
+                let events = tokio::task::spawn_blocking(move || {
+                    tchelvis::supervisor::read_supervisor_log(&query)
+                })
+                .await
+                .context("supervisor log task panicked")??;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&events)?);
+                } else if events.is_empty() {
+                    println!("(nenhum evento registrado)");
+                } else {
+                    for ev in &events {
+                        println!("{}", tchelvis::supervisor::events::format_event_line(ev));
+                    }
                 }
                 Ok(())
             }

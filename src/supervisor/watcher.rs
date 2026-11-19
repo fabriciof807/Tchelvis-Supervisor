@@ -1,4 +1,5 @@
 use super::config::SupervisorConfig;
+use super::events::{extract_block_reason, SupervisorEvent};
 use super::fallback::{
     apply_health_probe, primary_stopped, FallbackProvider, FallbackState, NoFallback, ProbeCtx,
 };
@@ -9,12 +10,14 @@ use super::guardrails::{
 use super::hc::{HcBackend, HcSession};
 use super::ollama::{CognitiveBackend, CognitiveEvaluation, SupervisorDecision};
 use super::state::{
-    compute_sha256, AgentDurableState, AutoReplyAuditEntry, AutoReplySource, DurableAutoReplyEntry,
-    DurableStateStore, LifecycleState, PendingOperatorAction, SupervisorMode, Urgency,
+    compute_sha256, unix_now_ms, AgentDurableState, AutoReplyAuditEntry, AutoReplySource,
+    DurableAutoReplyEntry, DurableStateStore, LifecycleState, PendingOperatorAction,
+    SupervisorMode, Urgency,
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use std::time::Instant;
 
 /// Runtime status of the deterministic watcher for the Top-Bar Status Pill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +116,17 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                     let _ = self.cognitive.unload_model();
                     self.model_loaded = false;
                     outcome.model_unloaded = true;
+                    let model_label = Some(self.cognitive.model_label()).filter(|m| !m.is_empty());
+                    self.store
+                        .record_supervisor_event(&SupervisorEvent::llm_unload(
+                            unix_now_ms(),
+                            model_label.as_deref(),
+                            "LLM descarregado por inatividade (0 sessões ativas)",
+                            Some(&format!(
+                                "idle_unload_secs={}",
+                                self.config.idle_unload_secs
+                            )),
+                        ));
                     if let Ok(updated) = self.fallback.update_state(&mut primary_stopped) {
                         fb = updated;
                     }
@@ -334,10 +348,16 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             let state_snapshot = state.clone();
             self.runtime_status = SupervisorRuntimeStatus::Evaluating(session.agent_id.clone());
 
+            let eval_started = Instant::now();
+            let eval_model = fb_backend
+                .as_ref()
+                .map(|b| b.model_label())
+                .unwrap_or_else(|| self.cognitive.model_label());
             let eval_result = match &fb_backend {
                 Some(b) => b.evaluate(&state_snapshot, &output),
                 None => self.cognitive.evaluate(&state_snapshot, &output),
             };
+            let latency_ms = eval_started.elapsed().as_millis() as u64;
             drop(slot_guard);
             let raw_eval = match eval_result {
                 Ok(eval) => eval,
@@ -349,21 +369,24 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                         "LLM evaluation failed"
                     );
                     if let Some(state) = self.store.agents.get_mut(&session.agent_id) {
-                        state.last_eval_error = Some(msg);
+                        state.last_eval_error = Some(msg.clone());
                         state.last_eval_error_at = Some(now);
                     }
+                    self.store
+                        .record_supervisor_event(&SupervisorEvent::eval_error(
+                            unix_now_ms(),
+                            Some(&session.agent_id),
+                            Some(&session.session_name),
+                            Some(&eval_model),
+                            &msg,
+                        ));
                     continue;
                 }
             };
             if fb_backend.is_none() {
                 self.model_loaded = true;
             }
-            self.last_eval_model = Some(
-                fb_backend
-                    .as_ref()
-                    .map(|b| b.model_label())
-                    .unwrap_or_else(|| self.cognitive.model_label()),
-            );
+            self.last_eval_model = Some(eval_model.clone());
             let llm_decision = raw_eval.decision;
             let mut eval = validate_evaluation(&state_snapshot, self.store.mode, raw_eval);
             eval = enforce_blocked_policy_with_msg(
@@ -385,10 +408,22 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 state.last_eval_error = None;
                 state.last_eval_error_at = None;
             }
+            self.store
+                .record_supervisor_event(&SupervisorEvent::evaluation(
+                    unix_now_ms(),
+                    &session.agent_id,
+                    &session.session_name,
+                    eval.decision,
+                    llm_decision,
+                    latency_ms,
+                    Some(&eval_model),
+                    &eval.updated_summary,
+                ));
             self.apply_decision(
                 session,
                 &current_hash,
                 eval,
+                llm_decision,
                 AutoReplySource::Llm,
                 now,
                 &mut outcome,
@@ -471,6 +506,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             session,
             current_hash,
             eval,
+            SupervisorDecision::AutoReply,
             AutoReplySource::FixedRule,
             now,
             outcome,
@@ -480,17 +516,37 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
     /// Records an evaluation (LLM or fixed rule) for a session and performs its side effects:
     /// AUTO_REPLY types the payload, ALERT_OPERATOR raises an Action Card, then hc labels are set.
+    #[allow(clippy::too_many_arguments)]
     fn apply_decision(
         &mut self,
         session: &HcSession,
         current_hash: &str,
         eval: CognitiveEvaluation,
+        raw_decision: SupervisorDecision,
         source: AutoReplySource,
         now: u64,
         outcome: &mut TickOutcome,
     ) {
         let mut decision_label = eval.decision.as_str();
         let mut audit_entry: Option<DurableAutoReplyEntry> = None;
+        let mut log_events: Vec<SupervisorEvent> = Vec::new();
+        let model_opt = match source {
+            AutoReplySource::Llm => self.last_eval_model.clone().filter(|m| !m.is_empty()),
+            AutoReplySource::FixedRule => None,
+        };
+
+        if raw_decision == SupervisorDecision::AutoReply
+            && eval.decision != SupervisorDecision::AutoReply
+        {
+            let reason = extract_block_reason(&eval.reason_for_operator, eval.decision);
+            log_events.push(SupervisorEvent::auto_reply_blocked(
+                unix_now_ms(),
+                &session.agent_id,
+                &session.session_name,
+                &reason,
+                Some(&eval.reason_for_operator),
+            ));
+        }
 
         let lifecycle_state_str = {
             let state = self
@@ -535,13 +591,17 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                                 payload: eval.hc_command_payload.clone(),
                                 source,
                                 summary: eval.updated_summary.clone(),
-                                model: match source {
-                                    AutoReplySource::Llm => {
-                                        self.last_eval_model.clone().filter(|m| !m.is_empty())
-                                    }
-                                    AutoReplySource::FixedRule => None,
-                                },
+                                model: model_opt.clone(),
                             });
+                            log_events.push(SupervisorEvent::auto_reply(
+                                unix_now_ms(),
+                                &session.agent_id,
+                                &session.session_name,
+                                source.as_str(),
+                                &eval.hc_command_payload,
+                                model_opt.as_deref(),
+                                &eval.updated_summary,
+                            ));
                             outcome.auto_replied_agents.push(session.agent_id.clone());
                         }
                         Err(e) => {
@@ -551,9 +611,17 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                                 error = %err_msg,
                                 "hc send_input failed"
                             );
-                            state.last_eval_error = Some(format!("hc send falhou: {err_msg}"));
+                            let full_err = format!("hc send falhou: {err_msg}");
+                            state.last_eval_error = Some(full_err.clone());
                             state.last_eval_error_at = Some(now);
                             decision_label = "AUTO_REPLY_FAILED";
+                            log_events.push(SupervisorEvent::eval_error(
+                                unix_now_ms(),
+                                Some(&session.agent_id),
+                                Some(&session.session_name),
+                                model_opt.as_deref(),
+                                &full_err,
+                            ));
                         }
                     }
                 }
@@ -567,6 +635,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                         triggered_at: now,
                     });
                     outcome.alerted_agents.push(session.agent_id.clone());
+                    log_events.push(SupervisorEvent::alert(
+                        unix_now_ms(),
+                        &session.agent_id,
+                        &session.session_name,
+                        eval.urgency,
+                        &eval.reason_for_operator,
+                        &eval.updated_summary,
+                    ));
                     if self.config.enable_desktop_notifications
                         && matches!(eval.urgency, Urgency::Normal | Urgency::Critical)
                     {
@@ -586,6 +662,10 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                     "Failed to append auto-reply audit log"
                 );
             }
+        }
+
+        for ev in &log_events {
+            self.store.record_supervisor_event(ev);
         }
 
         let _ = self.hc.set_labels(
@@ -617,11 +697,32 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 ("cockpit.msg", ""),
             ],
         );
+        let session_name = self
+            .store
+            .agents
+            .get(agent_id)
+            .map(|a| a.session_name.clone());
         if let Some(agent) = self.store.agents.get_mut(agent_id) {
             agent.reset_operator_counter();
             agent.last_change_timestamp = now;
         }
         self.store.save()?;
+        let key_opt = (!command_payload.trim().is_empty()).then_some(command_payload);
+        let summary = if let Some(k) = key_opt {
+            format!("Operador aprovou e enviou '{k}' para {agent_id}")
+        } else {
+            format!("Operador aprovou alerta de {agent_id}")
+        };
+        self.store
+            .record_supervisor_event(&SupervisorEvent::respond(
+                unix_now_ms(),
+                agent_id,
+                session_name.as_deref(),
+                "approve",
+                key_opt,
+                &summary,
+                key_opt,
+            ));
         Ok(())
     }
 
@@ -635,24 +736,60 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 ("cockpit.msg", ""),
             ],
         );
+        let session_name = self
+            .store
+            .agents
+            .get(agent_id)
+            .map(|a| a.session_name.clone());
         if let Some(agent) = self.store.agents.get_mut(agent_id) {
             agent.ignore_alert();
         }
         self.store.save()?;
+        self.store
+            .record_supervisor_event(&SupervisorEvent::respond(
+                unix_now_ms(),
+                agent_id,
+                session_name.as_deref(),
+                "ignore",
+                None,
+                &format!("Operador ignorou alerta de {agent_id}"),
+                None,
+            ));
         Ok(())
     }
 
     /// Cycles supervisor operating mode (`SemiAuto` -> `AlertOnly` -> `Paused`) and persists.
     pub fn cycle_mode(&mut self) -> Result<SupervisorMode> {
-        self.store.mode = self.store.mode.next();
+        let prev = self.store.mode;
+        let next = prev.next();
+        self.store.mode = next;
         self.store.save()?;
+        if prev != next {
+            self.store
+                .record_supervisor_event(&SupervisorEvent::mode_change(
+                    unix_now_ms(),
+                    prev.as_str(),
+                    next.as_str(),
+                    next.label(),
+                ));
+        }
         Ok(self.store.mode)
     }
 
     /// Sets supervisor operating mode explicitly and persists.
     pub fn set_mode(&mut self, mode: SupervisorMode) -> Result<()> {
+        let prev = self.store.mode;
         self.store.mode = mode;
         self.store.save()?;
+        if prev != mode {
+            self.store
+                .record_supervisor_event(&SupervisorEvent::mode_change(
+                    unix_now_ms(),
+                    prev.as_str(),
+                    mode.as_str(),
+                    mode.label(),
+                ));
+        }
         Ok(())
     }
 
@@ -664,6 +801,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         self.store.zero_active_since = self.zero_active_since;
         self.store.model_loaded = self.model_loaded;
         let _ = self.store.save();
+        let model_label = Some(self.cognitive.model_label()).filter(|m| !m.is_empty());
+        self.store
+            .record_supervisor_event(&SupervisorEvent::llm_unload(
+                unix_now_ms(),
+                model_label.as_deref(),
+                "LLM descarregado ao encerrar o supervisor",
+                None,
+            ));
         Ok(())
     }
 }
@@ -2036,5 +2181,143 @@ mod tests {
             assert_eq!(card.urgency, expected_urgency, "{screen}");
             assert_eq!(card.hc_command_payload, expected_payload, "{screen}");
         }
+    }
+
+    #[test]
+    fn activity_log_records_all_watcher_event_kinds() {
+        use crate::supervisor::events::{read_events, EventLogQuery, SupervisorEventKind};
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let eval_calls = std::sync::Arc::new(Mutex::new(0));
+        let cognitive = SharedFakeCognitive {
+            eval_calls,
+            model: "qwen2.5:1.5b".to_string(),
+            next_eval: auto_reply_eval(),
+            next_error: None,
+        };
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+        // 1. Fixed-rule auto_reply
+        engine.tick(1000).unwrap();
+
+        // 2. LLM evaluation + LLM auto_reply
+        *engine.hc.outputs.lock().unwrap() =
+            VecDeque::from(vec!["Run cargo test?\nProceed? [y/N]".to_string()]);
+        engine.tick(1010).unwrap();
+
+        // 3. Guardrail block: after two auto-replies the loop breaker stops a third,
+        //    downgrading it to a normal alert -> auto_reply_blocked + alert + evaluation
+        *engine.hc.outputs.lock().unwrap() =
+            VecDeque::from(vec!["frobnicate --all\nAllow? [y/N]".to_string()]);
+        engine.tick(1020).unwrap();
+
+        // 4. Operator approve -> respond
+        engine.approve_operator_action("t1", "y", 1025).unwrap();
+
+        // 5. Critical destructive prompt -> alert critical
+        *engine.hc.outputs.lock().unwrap() =
+            VecDeque::from(vec!["rm -rf /tmp/x\nAllow? [y/N]".to_string()]);
+        engine.tick(1030).unwrap();
+
+        // 6. Operator ignore -> respond
+        engine.ignore_operator_action("t1").unwrap();
+
+        // 7. LLM eval error -> eval_error
+        engine.cognitive.next_error = Some("kv cache full".to_string());
+        *engine.hc.outputs.lock().unwrap() =
+            VecDeque::from(vec!["custom prompt?\n[y/N]".to_string()]);
+        engine.tick(1040).unwrap();
+
+        // 8. Mode changes -> mode_change
+        engine.cycle_mode().unwrap();
+        engine.set_mode(SupervisorMode::Paused).unwrap();
+
+        // 9. Idle unload + shutdown unload -> llm_unload
+        engine.model_loaded = true;
+        engine.hc.sessions.lock().unwrap().clear();
+        engine.tick(1100).unwrap();
+        engine.tick(1100 + engine.config.idle_unload_secs).unwrap();
+        engine.shutdown_unload().unwrap();
+
+        let log_path = dir.path().join("supervisor_events.jsonl");
+        let events = read_events(
+            &log_path,
+            &EventLogQuery {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let has = |k: SupervisorEventKind| events.iter().any(|e| e.kind == k);
+        assert!(has(SupervisorEventKind::AutoReply));
+        assert!(has(SupervisorEventKind::AutoReplyBlocked));
+        assert!(has(SupervisorEventKind::Alert));
+        assert!(has(SupervisorEventKind::Evaluation));
+        assert!(has(SupervisorEventKind::EvalError));
+        assert!(has(SupervisorEventKind::ModeChange));
+        assert!(has(SupervisorEventKind::LlmUnload));
+        assert!(has(SupervisorEventKind::Respond));
+
+        let llm_reply = events
+            .iter()
+            .find(|e| {
+                e.kind == SupervisorEventKind::AutoReply && e.source.as_deref() == Some("llm")
+            })
+            .expect("llm auto_reply event");
+        assert_eq!(llm_reply.model.as_deref(), Some("qwen2.5:1.5b"));
+        assert_eq!(llm_reply.key.as_deref(), Some("y"));
+
+        let blocked = events
+            .iter()
+            .find(|e| {
+                e.kind == SupervisorEventKind::AutoReplyBlocked
+                    && e.summary.contains("comando destrutivo detectado")
+            })
+            .expect("auto_reply_blocked event with destructive-command reason");
+        assert_eq!(blocked.agent_id.as_deref(), Some("t1"));
+
+        let limit_blocked = events
+            .iter()
+            .find(|e| {
+                e.kind == SupervisorEventKind::AutoReplyBlocked
+                    && e.summary.contains("limite de auto-resposta atingido")
+            })
+            .expect("auto_reply_blocked event with loop-breaker reason");
+        assert!(limit_blocked
+            .summary
+            .contains("limite de auto-resposta atingido"));
+
+        let critical_alert = events
+            .iter()
+            .find(|e| e.kind == SupervisorEventKind::Alert && e.urgency == Some(Urgency::Critical))
+            .expect("critical alert event");
+        assert_eq!(critical_alert.agent_id.as_deref(), Some("t1"));
+
+        let eval_ev = events
+            .iter()
+            .find(|e| e.kind == SupervisorEventKind::Evaluation)
+            .expect("evaluation event");
+        assert_eq!(eval_ev.model.as_deref(), Some("qwen2.5:1.5b"));
+        assert!(eval_ev.latency_ms.is_some());
+    }
+
+    #[test]
+    fn activity_log_write_failure_does_not_fail_tick() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        // Make supervisor_events.jsonl a directory so appending fails.
+        std::fs::create_dir_all(dir.path().join("supervisor_events.jsonl")).unwrap();
+
+        let hc = MockHc::new(vec![test_session("t1")], vec![SAFE_LS]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()));
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t1"]);
+        assert_eq!(engine.store.agents["t1"].consecutive_auto_replies, 1);
     }
 }

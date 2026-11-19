@@ -20,7 +20,7 @@ test("main.js has no emoji left", () => {
 
 test("every icon in the map has a file", () => {
   const keys = Object.keys(ICONS);
-  assert.equal(keys.length, 16);
+  assert.equal(keys.length, 17);
   for (const key of keys) {
     const rel = iconPath(key);
     assert.ok(rel, `iconPath(${key}) should return a path`);

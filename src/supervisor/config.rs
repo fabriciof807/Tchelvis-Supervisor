@@ -166,20 +166,25 @@ fn resolve_allow_gpu_from_env() -> Option<bool> {
     None
 }
 
+pub(crate) fn supervisor_state_dir_in(home: &Path) -> PathBuf {
+    let state_base = env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local").join("state"));
+    state_base.join("tchelvis")
+}
+
 /// Path of the persisted GPU-offload toggle written by `tchelvis supervisor gpu <on|off>`.
 pub fn gpu_override_path() -> PathBuf {
-    gpu_override_path_in(&home_or_fallback_dir())
+    supervisor_state_dir_in(&home_or_fallback_dir()).join("supervisor_gpu")
 }
 
 pub(crate) fn gpu_override_path_in(home: &Path) -> PathBuf {
-    home.join(".local")
-        .join("state")
-        .join("tchelvis")
-        .join("supervisor_gpu")
+    supervisor_state_dir_in(home).join("supervisor_gpu")
 }
 
 pub(crate) fn try_gpu_override_path() -> anyhow::Result<PathBuf> {
-    Ok(gpu_override_path_in(&require_home_dir()?))
+    Ok(supervisor_state_dir_in(&require_home_dir()?).join("supervisor_gpu"))
 }
 
 /// Path of the persisted last-working container runtime (`~/.local/state/tchelvis/container_runtime`).
@@ -259,12 +264,7 @@ impl Default for SupervisorConfig {
         let home = home_or_fallback_dir();
         let default_state_path = env::var("HERDR_SUPERVISOR_STATE_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                home.join(".local")
-                    .join("state")
-                    .join("tchelvis")
-                    .join("supervisor_state.json")
-            });
+            .unwrap_or_else(|_| supervisor_state_dir_in(&home).join("supervisor_state.json"));
 
         let llm_backend = resolve_llm_backend_from_env().unwrap_or_default();
         let ollama_host =

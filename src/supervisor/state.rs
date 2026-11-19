@@ -76,6 +76,14 @@ impl SupervisorMode {
         }
     }
 
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SemiAuto => "SemiAuto",
+            Self::AlertOnly => "AlertOnly",
+            Self::Paused => "Paused",
+        }
+    }
+
     pub fn next(&self) -> Self {
         match self {
             Self::SemiAuto => Self::AlertOnly,
@@ -99,6 +107,15 @@ pub struct AutoReplyAuditEntry {
 pub enum AutoReplySource {
     FixedRule,
     Llm,
+}
+
+impl AutoReplySource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FixedRule => "fixed_rule",
+            Self::Llm => "llm",
+        }
+    }
 }
 
 /// Durable append-only JSONL audit record written to `auto_replies.jsonl`.
@@ -288,14 +305,16 @@ impl DurableStateStore {
         &self.file_path
     }
 
+    pub fn sibling_log_path(&self, filename: &str) -> Option<PathBuf> {
+        sibling_path(&self.file_path, filename)
+    }
+
     pub fn auto_replies_log_path(&self) -> Option<PathBuf> {
-        if self.file_path.as_os_str().is_empty() {
-            return None;
-        }
-        Some(match self.file_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join("auto_replies.jsonl"),
-            _ => PathBuf::from("auto_replies.jsonl"),
-        })
+        self.sibling_log_path("auto_replies.jsonl")
+    }
+
+    pub fn supervisor_events_log_path(&self) -> Option<PathBuf> {
+        self.sibling_log_path("supervisor_events.jsonl")
     }
 
     /// Appends one JSON line to `auto_replies.jsonl` in the state file's directory.
@@ -304,26 +323,79 @@ impl DurableStateStore {
         let Some(log_path) = self.auto_replies_log_path() else {
             return Ok(());
         };
-        if let Some(parent) = log_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("Failed to create audit log directory {:?}", parent)
-                })?;
+        append_jsonl_record(&log_path, entry, None)
+    }
+
+    /// Appends one JSON line to `supervisor_events.jsonl` in the state file's directory
+    /// with a 2 MiB size cap and single `.1` rotation. No-op when `file_path` is empty.
+    pub fn append_supervisor_event(&self, event: &super::events::SupervisorEvent) -> Result<()> {
+        let Some(log_path) = self.supervisor_events_log_path() else {
+            return Ok(());
+        };
+        append_jsonl_record(
+            &log_path,
+            event,
+            Some(super::events::MAX_SUPERVISOR_EVENTS_BYTES),
+        )
+    }
+
+    /// Best-effort append to `supervisor_events.jsonl`; errors are traced and ignored
+    /// so writing the activity log never breaks a supervisor tick or command.
+    pub fn record_supervisor_event(&self, event: &super::events::SupervisorEvent) {
+        if let Err(err) = self.append_supervisor_event(event) {
+            tracing::warn!(
+                kind = event.kind.as_str(),
+                agent_id = event.agent_id.as_deref().unwrap_or(""),
+                error = %format!("{err:#}"),
+                "Failed to append supervisor event log"
+            );
+        }
+    }
+}
+
+/// Resolves a sibling file in `base_file`'s parent directory, returning `None` if `base_file` is empty.
+pub fn sibling_path(base_file: &Path, filename: &str) -> Option<PathBuf> {
+    if base_file.as_os_str().is_empty() {
+        return None;
+    }
+    Some(match base_file.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(filename),
+        _ => PathBuf::from(filename),
+    })
+}
+
+/// Appends one serialized JSON line to `log_path`, optionally rotating to `<path>.1`
+/// when `log_path` meets or exceeds `rotate_max_bytes`.
+pub fn append_jsonl_record<T: Serialize>(
+    log_path: &Path,
+    entry: &T,
+    rotate_max_bytes: Option<u64>,
+) -> Result<()> {
+    if let Some(parent) = log_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create audit log directory {:?}", parent))?;
+        }
+    }
+    if let Some(max_bytes) = rotate_max_bytes {
+        if let Ok(meta) = fs::metadata(log_path) {
+            if meta.len() >= max_bytes {
+                let rotated = super::events::rotated_events_path(log_path);
+                let _ = fs::rename(log_path, rotated);
             }
         }
-        let mut line =
-            serde_json::to_string(entry).context("Failed to serialize DurableAutoReplyEntry")?;
-        line.push('\n');
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-            .with_context(|| format!("Failed to open audit log {:?}", log_path))?;
-        use std::io::Write;
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("Failed to write audit log {:?}", log_path))?;
-        Ok(())
     }
+    let mut line = serde_json::to_string(entry).context("Failed to serialize JSONL entry")?;
+    line.push('\n');
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("Failed to open audit log {:?}", log_path))?;
+    use std::io::Write;
+    file.write_all(line.as_bytes())
+        .with_context(|| format!("Failed to write audit log {:?}", log_path))?;
+    Ok(())
 }
 
 /// Computes the hex-encoded SHA-256 hash of a string.
@@ -344,6 +416,14 @@ pub fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Helper returning current Unix epoch timestamp in milliseconds.
+pub fn unix_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 

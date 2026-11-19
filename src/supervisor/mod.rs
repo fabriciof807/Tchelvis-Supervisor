@@ -3,6 +3,7 @@ pub mod chat;
 pub mod config;
 pub mod config_write;
 pub mod container;
+pub mod events;
 pub mod fallback;
 pub mod gguf;
 pub mod guardrails;
@@ -19,13 +20,41 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use config::SupervisorConfig;
+use events::{read_events, EventLogQuery, SupervisorEvent};
 use hc::{HcBackend, HcCliAdapter};
 use ollama::{CognitiveBackend, OllamaClient};
-use state::{unix_now_secs, DurableStateStore, SupervisorMode};
-use std::path::PathBuf;
+use state::{unix_now_ms, unix_now_secs, DurableStateStore, SupervisorMode};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tui::{build_desktop_mod_snapshot, enrich_snapshot_with_llm_health, DesktopModSnapshot};
 use watcher::{SupervisorRuntimeStatus, TickOutcome, WatcherEngine};
+
+/// Resolves the path to `supervisor_events.jsonl` in the active state directory.
+pub fn events_log_path() -> PathBuf {
+    let cfg = SupervisorConfig::load();
+    events_log_path_for_state(&cfg.state_file_path)
+}
+
+/// Resolves the `supervisor_events.jsonl` path adjacent to a given `state_file_path`.
+pub fn events_log_path_for_state(state_file_path: &Path) -> PathBuf {
+    state::sibling_path(state_file_path, "supervisor_events.jsonl").unwrap_or_else(|| {
+        config::supervisor_state_dir_in(&config::home_or_fallback_dir())
+            .join("supervisor_events.jsonl")
+    })
+}
+
+/// Reads supervisor activity events newest-first from the active state directory.
+pub fn read_supervisor_log(query: &EventLogQuery) -> Result<Vec<SupervisorEvent>> {
+    read_events(&events_log_path(), query)
+}
+
+/// Reads supervisor activity events newest-first from the state directory of `state_file_path`.
+pub fn read_supervisor_log_from(
+    state_file_path: &Path,
+    query: &EventLogQuery,
+) -> Result<Vec<SupervisorEvent>> {
+    read_events(&events_log_path_for_state(state_file_path), query)
+}
 
 /// Combined output for single-tick / `--once` supervisor invocations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +106,14 @@ pub fn run_tick_once() -> Result<OnceOutput> {
             engine.model_loaded = false;
             engine.store.model_loaded = false;
             let _ = engine.store.save();
+            engine
+                .store
+                .record_supervisor_event(&SupervisorEvent::llm_unload(
+                    unix_now_ms(),
+                    Some(&engine.config.ollama_model),
+                    "LLM descarregado por inatividade (0 sessões ativas)",
+                    None,
+                ));
             snapshot.model_loaded = false;
             tick_outcome.model_unloaded = true;
             enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
@@ -166,22 +203,31 @@ pub fn set_or_cycle_mode(mode: Option<SupervisorMode>) -> Result<DesktopModSnaps
 /// Explicitly starts/loads the managed `llama.cpp` container (or warms Ollama) and waits until healthy.
 pub fn load_model() -> Result<DesktopModSnapshot> {
     let config = SupervisorConfig::load();
+    let loaded_model: String;
+    let load_detail: String;
     if config.container_mode_active() {
         fallback::mark_primary_starting(&fallback::fallback_state_path(), unix_now_secs());
+        let ollama_roots = container::default_ollama_roots();
+        let eff_model = models::effective_model(&config, &ollama_roots);
+        loaded_model = eff_model
+            .as_ref()
+            .map(|m| m.display_name.clone())
+            .unwrap_or_else(|| config.ollama_model.clone());
+        load_detail = format!(
+            "backend=llama-cpp; gpu={}",
+            if config.allow_gpu { "on" } else { "off" }
+        );
         let start_res = (|| -> Result<()> {
             let candidates = config.runtime_candidates();
             if candidates.is_empty() {
                 anyhow::bail!("Nenhum runtime de container encontrado (kiri/podman/docker)");
             }
-            let ollama_roots = container::default_ollama_roots();
             let model = container::resolve_model_source(
                 &config.llm_container,
                 &config.ollama_model,
                 &ollama_roots,
             )?;
-            let model_id = models::effective_model(&config, &ollama_roots)
-                .map(|m| m.id)
-                .unwrap_or_default();
+            let model_id = eff_model.map(|m| m.id).unwrap_or_default();
             let host = config.effective_primary_host();
             let pref_path = config::runtime_pref_path();
             let (gpu, _) = container::resolve_gpu_backend(&config.llm_container);
@@ -209,6 +255,12 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
         };
         fallback::finish_primary_start(&provider, start_res, unix_now_secs())?;
     } else {
+        loaded_model = config.ollama_model.clone();
+        load_detail = format!(
+            "backend={}; gpu={}",
+            config.effective_backend().as_str(),
+            if config.allow_gpu { "on" } else { "off" }
+        );
         let client = OllamaClient::new(config.clone());
         client.warm_model()?;
     }
@@ -219,6 +271,13 @@ pub fn load_model() -> Result<DesktopModSnapshot> {
     engine.store.model_loaded = true;
     engine.store.zero_active_since = None;
     let _ = engine.store.save();
+    engine
+        .store
+        .record_supervisor_event(&SupervisorEvent::llm_load(
+            unix_now_ms(),
+            Some(&loaded_model),
+            Some(&load_detail),
+        ));
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
@@ -238,6 +297,15 @@ pub fn unload_model() -> Result<DesktopModSnapshot> {
     engine.model_loaded = false;
     engine.store.model_loaded = false;
     let _ = engine.store.save();
+    let unloaded_model = Some(engine.cognitive.model_label()).filter(|m| !m.is_empty());
+    engine
+        .store
+        .record_supervisor_event(&SupervisorEvent::llm_unload(
+            unix_now_ms(),
+            unloaded_model.as_deref(),
+            "LLM descarregado pelo operador",
+            None,
+        ));
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
@@ -248,6 +316,7 @@ pub fn unload_model() -> Result<DesktopModSnapshot> {
 /// - In container mode: if Running, recreates with the new `-ngl` and waits healthy (or stops if `--no-warm`); if stopped, only persists.
 /// - Outside container mode: unloads the Ollama model (`keep_alive: 0`) and optionally warm-loads it.
 pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
+    let prev_allow_gpu = SupervisorConfig::load().allow_gpu;
     config::write_gpu_override(&config::try_gpu_override_path()?, allow_gpu)?;
     let mut config = SupervisorConfig::load();
     config.allow_gpu = allow_gpu;
@@ -310,6 +379,14 @@ pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
     engine.model_loaded = loaded_after;
     engine.store.model_loaded = loaded_after;
     let _ = engine.store.save();
+    engine
+        .store
+        .record_supervisor_event(&SupervisorEvent::gpu_toggle(
+            unix_now_ms(),
+            prev_allow_gpu,
+            allow_gpu,
+            Some(&format!("warm={warm}; loaded={loaded_after}")),
+        ));
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);
@@ -719,11 +796,7 @@ pub fn reset_model() -> Result<DesktopModSnapshot> {
 pub fn run_supervisor_daemon() -> Result<()> {
     let mut engine = build_default_engine()?;
     let home = config::require_home_dir()?;
-    let snap_path = home
-        .join(".local")
-        .join("state")
-        .join("tchelvis")
-        .join("supervisor_mod_snapshot.json");
+    let snap_path = config::supervisor_state_dir_in(&home).join("supervisor_mod_snapshot.json");
     if let Some(parent) = snap_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -757,6 +830,13 @@ impl RespondAction {
             other => anyhow::bail!("Invalid respond action '{other}'; expected approve or deny"),
         }
     }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// Maps a pending-prompt response action to the `hc keys` key name.
@@ -788,9 +868,11 @@ pub fn validate_respond_guard(
     Ok(respond_keys(action))
 }
 
-/// Sends a deterministic Enter/Esc response to a blocked terminal after server-side guardrail checks.
-pub fn respond_pending_prompt(terminal: &str, action: RespondAction) -> Result<DesktopModSnapshot> {
-    let mut engine = build_default_engine()?;
+pub(crate) fn respond_pending_prompt_with<H: HcBackend, C: CognitiveBackend>(
+    engine: &mut WatcherEngine<H, C>,
+    terminal: &str,
+    action: RespondAction,
+) -> Result<()> {
     let (is_blocked, pending_msg) = engine.hc.pending_prompt_info(terminal)?;
     let recent_output = if action == RespondAction::Approve {
         engine.hc.capture_output(terminal, 25).unwrap_or_default()
@@ -807,10 +889,39 @@ pub fn respond_pending_prompt(terminal: &str, action: RespondAction) -> Result<D
             ("cockpit.msg", ""),
         ],
     );
+    let session_name = engine
+        .store
+        .agents
+        .get(terminal)
+        .map(|a| a.session_name.clone());
     if let Some(agent) = engine.store.agents.get_mut(terminal) {
         agent.pending_operator_action = None;
         let _ = engine.store.save();
     }
+    let verb = match action {
+        RespondAction::Approve => "aprovou",
+        RespondAction::Deny => "negou",
+    };
+    let summary = format!("Operador {verb} prompt em {terminal} (tecla {key})");
+    let detail = (!pending_msg.trim().is_empty()).then_some(pending_msg.as_str());
+    engine
+        .store
+        .record_supervisor_event(&SupervisorEvent::respond(
+            unix_now_ms(),
+            terminal,
+            session_name.as_deref(),
+            action.as_str(),
+            Some(key),
+            &summary,
+            detail,
+        ));
+    Ok(())
+}
+
+/// Sends a deterministic Enter/Esc response to a blocked terminal after server-side guardrail checks.
+pub fn respond_pending_prompt(terminal: &str, action: RespondAction) -> Result<DesktopModSnapshot> {
+    let mut engine = build_default_engine()?;
+    respond_pending_prompt_with(&mut engine, terminal, action)?;
     sync_runtime_status(&mut engine);
     let mut snapshot = build_desktop_mod_snapshot(&engine);
     enrich_snapshot_with_llm_health(&mut snapshot, &engine.config);

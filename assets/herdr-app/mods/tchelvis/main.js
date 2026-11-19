@@ -51,6 +51,7 @@ export const ICONS = {
   timer: "timer",
   antigravity: "sparkles",
   deepseek: "fish",
+  log: "clipboard-list",
 };
 
 export function iconPath(name) {
@@ -692,6 +693,106 @@ export function chatElapsedLabel(startedAtMs, nowMs = Date.now()) {
   return secs >= 1 ? `◌ Gerando… ${secs}s` : "◌ Gerando…";
 }
 
+// --- Supervisor activity log: pure mapping + filters (Node-tested) ---
+
+export const LOG_FILTERS = [
+  { key: "all", label: "Tudo", kinds: null },
+  {
+    key: "actions",
+    label: "Ações",
+    kinds: ["auto_reply", "auto_reply_blocked", "respond"],
+  },
+  { key: "alerts", label: "Alertas", kinds: ["alert"] },
+  { key: "evaluations", label: "Avaliações", kinds: ["evaluation"] },
+  { key: "errors", label: "Erros", kinds: ["eval_error"] },
+];
+
+export const LOG_KIND_LABELS = {
+  auto_reply: "Auto-resposta",
+  auto_reply_blocked: "Bloqueada",
+  alert: "Alerta",
+  evaluation: "Avaliação",
+  eval_error: "Erro",
+  mode_change: "Modo",
+  llm_load: "LLM carregado",
+  llm_unload: "LLM descarregado",
+  gpu_toggle: "GPU",
+  respond: "Operador",
+};
+
+export function logKindTone(kind, urgency = null) {
+  switch (kind) {
+    case "auto_reply":
+      return "done";
+    case "auto_reply_blocked":
+      return "working";
+    case "alert":
+      return urgency === "critical" ? "blocked" : "working";
+    case "eval_error":
+      return "blocked";
+    case "respond":
+      return "accent";
+    default:
+      return "muted";
+  }
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function sameLocalDay(a, b) {
+  return (
+    a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate()
+  );
+}
+
+export function logEventTimeLabel(tsMs, nowMs = Date.now()) {
+  const ms = Number(tsMs);
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const d = new Date(ms);
+  if (Number.isNaN(d.getTime())) return "";
+  const clock = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(
+    d.getSeconds()
+  )}`;
+  if (sameLocalDay(d, new Date(nowMs))) return clock;
+  return `${pad2(d.getDate())}/${pad2(d.getMonth() + 1)} ${clock}`;
+}
+
+export function logEventRow(ev, nowMs = Date.now()) {
+  const kind = String(ev?.kind ?? "").trim();
+  const agent = String(ev?.agent_id ?? "").trim();
+  const session = String(ev?.session_name ?? "").trim();
+  const urgency = ev?.urgency ?? null;
+  const summary = String(ev?.summary ?? "").trim();
+  const detail = String(ev?.detail ?? "").trim();
+  return {
+    ts_ms: Number(ev?.ts_ms ?? 0),
+    time: logEventTimeLabel(ev?.ts_ms, nowMs),
+    kind,
+    kindLabel: LOG_KIND_LABELS[kind] ?? kind,
+    tone: logKindTone(kind, urgency),
+    urgency,
+    agent,
+    session,
+    nameLabel:
+      agent && session && session !== agent
+        ? `${session} (${agent})`
+        : agent || session || "",
+    summary,
+    detail: detail || null,
+  };
+}
+
+export function logFilterEvents(events, filterKey = "all") {
+  const list = Array.isArray(events) ? events : [];
+  const chip = LOG_FILTERS.find((f) => f.key === filterKey) ?? LOG_FILTERS[0];
+  if (!chip.kinds) return list;
+  return list.filter((e) => chip.kinds.includes(e?.kind));
+}
+
 export function drawerHeaderTitle(view, state = {}) {
   if (state?.usageOnlyDrawer || view === "usage") {
     return { icon: "llm", title: "AI Usage", subtitle: null };
@@ -722,6 +823,8 @@ export function drawerHeaderTitle(view, state = {}) {
     }
     case "chat":
       return { icon: "chat", title: "Chat", subtitle: null };
+    case "log":
+      return { icon: "log", title: "Log do supervisor", subtitle: null };
     case "inspector":
     default: {
       const agent = state?.agent ?? null;
@@ -1958,6 +2061,12 @@ export default class CockpitMod extends View {
     this.chatCopiedTimer = null;
     this.wasChatVisible = false;
     this.chatScroll = base.ScrollHandle?.new?.() ?? null;
+    this.logEvents = [];
+    this.logFilter = "all";
+    this.logPolling = false;
+    this.logFetchedAtMs = 0;
+    this.logError = "";
+    this.logExpandedIdx = null;
     this.handle = cx.focus_handle();
 
     const taskInput = TextareaState.new({
@@ -2076,6 +2185,17 @@ export default class CockpitMod extends View {
         if (this.benchRunning) this.pollBenchProgress(cx);
       });
       cx.timer.every(6000, (cx) => this.refreshInspector(cx));
+      cx.timer.every(5000, (cx) => {
+        const inspectorHidden = Boolean(
+          findNode(layout(), "tchelvis-inspector")?.hidden
+        );
+        if (
+          !inspectorHidden &&
+          (shared("cockpit.viewMode") || this.inspectorTab) === "log"
+        ) {
+          this.fetchSupervisorLog(cx);
+        }
+      });
       cx.timer.every(60000, (cx) => {
         const inspectorHidden = Boolean(
           findNode(layout(), "tchelvis-inspector")?.hidden
@@ -2231,6 +2351,56 @@ export default class CockpitMod extends View {
         cx.notify();
       }
     });
+  }
+
+  fetchSupervisorLog(cx) {
+    if (this.logPolling) return;
+    this.logPolling = true;
+    cx.spawn(async (cx) => {
+      try {
+        const res = await exec(
+          "tchelvis",
+          ["supervisor", "log", "--json", "--limit", "200"],
+          { timeout: 8000 }
+        );
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          if (Array.isArray(parsed)) {
+            this.logEvents = parsed;
+            this.logFetchedAtMs = Date.now();
+            this.logError = "";
+          }
+        } else if (res.stderr) {
+          this.logError = res.stderr.trim();
+        }
+      } catch (e) {
+        this.logError = String(e);
+      } finally {
+        this.logPolling = false;
+        cx.notify();
+      }
+    });
+  }
+
+  selectLogAgent(cx, agentId) {
+    if (!agentId) return;
+    const merged = mergeFleetRows(
+      agents(),
+      terminals(),
+      shared("cockpit.snapshot"),
+      shared("supervisor.snapshot")
+    );
+    const live = merged.some((r) => r.address === agentId && !isRowFinished(r));
+    if (!live) return;
+    setShared("cockpit.selected", agentId);
+    setShared("cockpit.viewMode", "inspector");
+    setShared("cockpit.usageOnlyDrawer", false);
+    this.inspectorTab = "inspector";
+    if (findNode(layout(), "tchelvis-inspector")?.hidden) {
+      run("layout.toggle", { id: "tchelvis-inspector" });
+    }
+    this.refreshInspector(cx);
+    cx?.notify();
   }
 
   tickSupervisor(cx, force = false) {
@@ -3623,6 +3793,8 @@ export default class CockpitMod extends View {
         this.scrollChatToBottom();
         this.focusField("chat");
       }
+    } else if (normalizedTab === "log") {
+      this.fetchSupervisorLog(cx);
     }
     if (inspectorHidden) {
       run("layout.toggle", { id: "tchelvis-inspector" });
@@ -4045,6 +4217,22 @@ export default class CockpitMod extends View {
                     }),
                     active,
                     (_e, cx) => this.openDrawerView(cx, "chat", true)
+                  );
+                })()
+              )
+              .child(
+                (() => {
+                  const active =
+                    rightView === "log" && !inspectorHidden && !onlyUsage;
+                  return this.segmentBtn(
+                    t,
+                    "ck-pill-view-log",
+                    iconLabel("log", "Log", {
+                      size: 11,
+                      color: active ? t.accent : t.muted,
+                    }),
+                    active,
+                    (_e, cx) => this.openDrawerView(cx, "log", true)
                   );
                 })()
               )
@@ -6557,6 +6745,179 @@ export default class CockpitMod extends View {
       );
   }
 
+  renderLogBody(cx, themeArg = null) {
+    const t = themeArg ?? theme();
+    const events = this.logEvents ?? [];
+    const merged = mergeFleetRows(
+      agents(),
+      terminals(),
+      shared("cockpit.snapshot"),
+      shared("supervisor.snapshot")
+    );
+    const liveAddrs = new Set(
+      merged.filter((r) => !isRowFinished(r)).map((r) => r.address)
+    );
+    const rows = logFilterEvents(events, this.logFilter).map((ev) =>
+      logEventRow(ev, Date.now())
+    );
+    const toneColor = {
+      done: t.done,
+      working: t.working,
+      accent: t.accent,
+      blocked: t.blocked,
+      muted: t.muted,
+    };
+
+    return v_flex()
+      .flex_1()
+      .min_h(0)
+      .p(12)
+      .gap(8)
+      .child(
+        h_flex()
+          .gap(6)
+          .items_center()
+          .children(
+            LOG_FILTERS.map((chip) =>
+              this.segmentBtn(
+                t,
+                `ck-log-filter-${chip.key}`,
+                chip.label,
+                this.logFilter === chip.key,
+                (_e, cx) => {
+                  this.logFilter = chip.key;
+                  this.logExpandedIdx = null;
+                  cx.notify();
+                }
+              )
+            )
+          )
+      )
+      .when(Boolean(this.logError), (el) =>
+        el.child(
+          this.cardBox(t)
+            .text_size(11.5)
+            .text_color(t.blocked)
+            .child(this.logError)
+        )
+      )
+      .when(events.length === 0 && !this.logError, (el) =>
+        el.child(
+          this.cardBox(t)
+            .rounded(10)
+            .gap(8)
+            .child(
+              div()
+                .text_size(12)
+                .text_color(t.muted)
+                .child(
+                  "Nenhum evento registrado ainda. As ações do supervisor aparecem aqui."
+                )
+            )
+        )
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .min_h(0)
+          .overflow_y_scrollbar()
+          .gap(6)
+          .children(
+            rows.map((row, idx) => {
+              const badgeColor = toneColor[row.tone] ?? t.muted;
+              const isLive = row.agent ? liveAddrs.has(row.agent) : false;
+              const expanded = this.logExpandedIdx === idx && Boolean(row.detail);
+              return v_flex()
+                .id(`ck-log-row-${idx}`)
+                .w_full()
+                .gap(4)
+                .child(
+                  h_flex()
+                    .w_full()
+                    .px(10)
+                    .py(6)
+                    .rounded(6)
+                    .border(1)
+                    .border_color(t.border)
+                    .bg(t.raised)
+                    .cursor_pointer()
+                    .hover((s) =>
+                      s
+                        .bg(t.hover)
+                        .border_color(withAlpha(t.accent, "66", t.border))
+                    )
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .on_click((_e, cx) => {
+                      this.logExpandedIdx = expanded ? null : idx;
+                      cx.notify();
+                    })
+                    .items_start()
+                    .gap(8)
+                    .child(
+                      div()
+                        .flex_none()
+                        .text_size(10.5)
+                        .font_mono()
+                        .text_color(t.muted)
+                        .child(row.time || "—")
+                    )
+                    .child(this.pillBadge(t, row.kindLabel, badgeColor))
+                    .child(
+                      v_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(2)
+                        .child(
+                          row.nameLabel
+                            ? div()
+                                .text_size(10.5)
+                                .font_semibold()
+                                .text_color(isLive ? t.accent : t.muted)
+                                .cursor_pointer()
+                                .on_mouse_down("left", (_e, cx) =>
+                                  cx.stop_propagation()
+                                )
+                                .on_click((_e, cx) => {
+                                  if (isLive) this.selectLogAgent(cx, row.agent);
+                                })
+                                .child(ellipsize(row.nameLabel, 34))
+                            : div()
+                        )
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .text_color(t.foreground)
+                            .child(ellipsize(row.summary || "—", 96))
+                        )
+                    )
+                    .child(
+                      div()
+                        .flex_none()
+                        .text_size(10)
+                        .text_color(t.muted)
+                        .child(row.detail ? (expanded ? "▾" : "▸") : "")
+                    )
+                )
+                .when(expanded, (el) =>
+                  el.child(
+                    div()
+                      .mx(10)
+                      .px(10)
+                      .py(7)
+                      .rounded(6)
+                      .border(1)
+                      .border_color(t.border)
+                      .bg(t.background)
+                      .text_size(11)
+                      .text_color(t.foreground)
+                      .child(row.detail)
+                  )
+                );
+            })
+          )
+      );
+  }
+
   renderModelPicker(cx, themeArg = null, standalone = true) {
     const t = themeArg ?? theme();
     const supSnap = shared("supervisor.snapshot") ?? null;
@@ -8323,6 +8684,9 @@ export default class CockpitMod extends View {
                   if (activeView === "chat") {
                     this.fetchSupervisorStatus(cx);
                   }
+                  if (activeView === "log") {
+                    this.fetchSupervisorLog(cx);
+                  }
                 })
               )
               .child(
@@ -8383,6 +8747,9 @@ export default class CockpitMod extends View {
       )
       .when(activeView === "chat", (el) =>
         el.child(this.renderChatBody(cx, t))
+      )
+      .when(activeView === "log", (el) =>
+        el.child(this.renderLogBody(cx, t))
       )
       .when(activeView === "inspector", (el) =>
         el.child(
