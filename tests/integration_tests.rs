@@ -640,3 +640,58 @@ fn test_contract_fixtures_and_schema_version_match() {
         &(serde_json::to_string_pretty(&sup_snap).unwrap() + "\n"),
     );
 }
+
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+#[test]
+fn test_agent_classification_fixture_and_no_hardcoded_home_ubuntu() {
+    use tchelvis::agents::{KNOWN_AGENTS, PLAIN_SHELLS, SUPERVISOR_PROGRAMS};
+    use tchelvis::supervisor::config::SupervisorConfig;
+
+    let fixture = serde_json::json!({
+        "known_agents": KNOWN_AGENTS,
+        "plain_shells": PLAIN_SHELLS,
+        "supervisor_programs": SUPERVISOR_PROGRAMS,
+    });
+    let fixtures_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    write_fixture_if_changed(
+        &fixtures_dir.join("agent_classification.json"),
+        &(serde_json::to_string_pretty(&fixture).unwrap() + "\n"),
+    );
+
+    assert_eq!(
+        HerdrClient::default().hc_bin(),
+        SupervisorConfig::default().hc.hc_bin,
+        "HerdrClient and SupervisorConfig must share default_hc_bin()"
+    );
+
+    let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut rs_files = Vec::new();
+    collect_rs_files(&src_dir, &mut rs_files);
+    assert!(!rs_files.is_empty());
+
+    let mut violations = Vec::new();
+    for path in rs_files {
+        let content = fs::read_to_string(&path).unwrap();
+        let non_test = content.split("\n#[cfg(test)]").next().unwrap_or(&content);
+        for (idx, line) in non_test.lines().enumerate() {
+            if line.contains("/home/ubuntu") {
+                violations.push(format!("{}:{}: {}", path.display(), idx + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Hardcoded /home/ubuntu found in src/ outside tests:\n{}",
+        violations.join("\n")
+    );
+}

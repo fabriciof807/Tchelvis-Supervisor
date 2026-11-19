@@ -23,78 +23,7 @@ static SLACK_URL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Classify `AgentKind` from explicit `cockpit.agent` label or foreground/launch process names.
 pub fn classify_agent_kind(term: &HcTerminal) -> AgentKind {
-    if term.state != "finished" && term.is_plain_shell_foreground() {
-        return AgentKind::PlainShell;
-    }
-
-    if let Some(lbl) = term.labels.get("cockpit.agent") {
-        let lower = lbl.trim().to_ascii_lowercase();
-        return match lower.as_str() {
-            "claude" | "claude-code" | "claudecode" => AgentKind::ClaudeCode,
-            "opencode" => AgentKind::OpenCode,
-            "pi" => AgentKind::Pi,
-            "codex" => AgentKind::Codex,
-            "antigravity" | "agy" => AgentKind::Antigravity,
-            "shell" | "" => AgentKind::PlainShell,
-            _ => AgentKind::CustomAgent,
-        };
-    }
-
-    let mut candidates: Vec<&str> = Vec::new();
-    if let Some(fg) = &term.foreground {
-        if let Some(name) = fg.name.as_deref() {
-            candidates.push(name);
-        }
-        for arg in &fg.argv {
-            candidates.push(arg.as_str());
-        }
-    }
-    if let Some(agent) = term.agent.as_deref() {
-        candidates.push(agent);
-    }
-    for arg in &term.argv {
-        candidates.push(arg.as_str());
-    }
-    if let Some(st) = &term.status {
-        if let Some(app) = st.app.as_deref() {
-            candidates.push(app);
-        }
-    }
-
-    for cand in candidates {
-        let base = Path::new(cand)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(cand)
-            .to_ascii_lowercase();
-        match base.as_str() {
-            "claude" | "claude-code" => return AgentKind::ClaudeCode,
-            "opencode" => return AgentKind::OpenCode,
-            "pi" => return AgentKind::Pi,
-            "codex" => return AgentKind::Codex,
-            "antigravity" | "agy" => return AgentKind::Antigravity,
-            "aider" | "goose" | "cursor-agent" | "amp" => return AgentKind::CustomAgent,
-            _ => {}
-        }
-    }
-
-    if term.name.as_deref().is_some_and(|n| n.contains("π -")) {
-        return AgentKind::Pi;
-    }
-
-    AgentKind::PlainShell
-}
-
-fn is_plain_shell_name(name: &str) -> bool {
-    let base = Path::new(name)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or(name)
-        .to_ascii_lowercase();
-    matches!(
-        base.as_str(),
-        "zsh" | "bash" | "fish" | "sh" | "nu" | "dash" | "tmux" | "screen"
-    )
+    crate::agents::classify_agent_kind(term)
 }
 
 /// Returns `true` if the terminal should be included in the fleet view (`include_all` bypasses the plain-shell exclusion filter).
@@ -140,11 +69,11 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
     if let Some(st) = &term.status {
         let state = st.state.trim().to_ascii_lowercase();
         let active_state = matches!(state.as_str(), "working" | "blocked" | "done" | "error");
-        let non_shell_app = st
-            .app
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|app| !app.is_empty() && !is_plain_shell_name(app));
+        let non_shell_app = st.app.as_deref().map(str::trim).is_some_and(|app| {
+            !app.is_empty()
+                && !crate::agents::is_plain_shell(app)
+                && !crate::agents::is_supervisor_program(app)
+        });
         if active_state && non_shell_app {
             return true;
         }

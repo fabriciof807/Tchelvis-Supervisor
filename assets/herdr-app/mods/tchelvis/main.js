@@ -883,47 +883,89 @@ function extractRepoName(cwd, fallback = "") {
   return base || fallback;
 }
 
-const KNOWN_AGENTS = new Set([
+export const KNOWN_AGENTS = new Set([
   "claude",
-  "codex",
-  "pi",
+  "claude-code",
+  "claudecode",
   "opencode",
+  "pi",
+  "codex",
   "antigravity",
   "agy",
+  "gemini",
   "aider",
   "goose",
   "cursor",
+  "cursor-agent",
   "amp",
 ]);
 
-function resolveProgramName(rawProg, labels, enrichedKind) {
-  const labelAgent = String(labels?.["cockpit.agent"] ?? "")
+export const PLAIN_SHELLS = new Set([
+  "zsh",
+  "bash",
+  "fish",
+  "sh",
+  "nu",
+  "nushell",
+  "dash",
+  "ksh",
+  "csh",
+  "tcsh",
+  "tmux",
+  "screen",
+  "login",
+  "herdr-core",
+  "hc",
+]);
+
+export const SUPERVISOR_PROGRAMS = new Set([
+  "herdr-supervisor",
+  "tchelvis-supervisor",
+  "tchelvis",
+]);
+
+const AGENT_KIND_WIRE_LABELS = {
+  claude_code: "claude",
+  open_code: "opencode",
+  pi: "pi",
+  codex: "codex",
+  antigravity: "antigravity",
+  custom_agent: "custom",
+  plain_shell: "shell",
+};
+
+export function normProgToken(val) {
+  return String(val ?? "")
     .trim()
-    .toLowerCase();
-  const rawCandidate =
-    labelAgent ||
-    (typeof rawProg === "string"
-      ? rawProg
-      : rawProg?.name ?? rawProg?.command ?? enrichedKind ?? "");
-  const firstToken = String(rawCandidate ?? "")
-    .trim()
-    .split(/\s+/)[0]
+    .replace(/[\\/]+$/, "")
     .split(/[\\/]/)
     .pop()
     .replace(/^-/, "")
     .toLowerCase();
+}
+
+export function isKnownAgent(token) {
+  return KNOWN_AGENTS.has(normProgToken(token));
+}
+
+export function isPlainShell(token) {
+  return PLAIN_SHELLS.has(normProgToken(token));
+}
+
+export function resolveProgramName(rawProg, labels, enrichedKind) {
+  const labelAgent = String(labels?.["cockpit.agent"] ?? "").trim();
+  const progCandidate =
+    typeof rawProg === "string"
+      ? rawProg
+      : rawProg?.name ?? rawProg?.command ?? "";
+  const wireKind = enrichedKind
+    ? AGENT_KIND_WIRE_LABELS[String(enrichedKind).trim().toLowerCase()] ??
+      enrichedKind
+    : "";
+  const rawCandidate = labelAgent || progCandidate || wireKind;
+  const firstWord = String(rawCandidate ?? "").trim().split(/\s+/)[0];
+  const firstToken = normProgToken(firstWord);
   if (!firstToken) return "";
-  const compactToken = firstToken.replace(/[_-]+/g, "");
-  for (const known of KNOWN_AGENTS) {
-    if (
-      firstToken === known ||
-      firstToken.includes(known) ||
-      compactToken === known ||
-      compactToken.includes(known)
-    ) {
-      return known;
-    }
-  }
   return firstToken;
 }
 
@@ -1070,16 +1112,7 @@ export function buildProjectsList(
   return list;
 }
 
-function normProgToken(val) {
-  return String(val ?? "")
-    .trim()
-    .toLowerCase()
-    .split(/[\\/]/)
-    .pop()
-    .replace(/^-/, "");
-}
-
-function extractAttachTargetFromArgs(args, fallbackProgram = null) {
+export function extractAttachTargetFromArgs(args, fallbackProgram = null) {
   if (!Array.isArray(args) || args.length === 0) return null;
   const first = normProgToken(args[0]);
   const fb = normProgToken(fallbackProgram);
@@ -1094,7 +1127,7 @@ function extractAttachTargetFromArgs(args, fallbackProgram = null) {
   for (let i = 0; i < args.length; i += 1) {
     const raw = String(args[i] ?? "").trim();
     if (raw === "--") break;
-    if (normProgToken(raw) === "attach") {
+    if (raw === "attach") {
       attachIdx = i;
       break;
     }
@@ -1119,65 +1152,35 @@ function extractAttachTargetFromTerminal(term, programName = null) {
   return extractAttachTargetFromArgs(term?.argv, term?.program ?? programName);
 }
 
-function isPlainShellRow(name, programName, labels, term = null) {
-  const norm = normProgToken;
+function isPlainShellOrSupervisor(token) {
+  const norm = normProgToken(token);
+  return PLAIN_SHELLS.has(norm) || SUPERVISOR_PROGRAMS.has(norm);
+}
+
+export function isPlainShellRow(_name, programName, labels, term = null) {
   if (extractAttachTargetFromTerminal(term, programName) !== null) {
     return true;
   }
-  const plainShells = new Set([
-    "zsh",
-    "bash",
-    "fish",
-    "sh",
-    "nu",
-    "nushell",
-    "dash",
-    "tmux",
-    "tchelvis",
-    "herdr-supervisor",
-    "tchelvis-supervisor",
-    "herdr-core",
-    "hc",
-  ]);
-  const fgShells = new Set([
-    "zsh",
-    "bash",
-    "fish",
-    "sh",
-    "nu",
-    "nushell",
-    "dash",
-    "herdr-core",
-    "hc",
-  ]);
-  const knownAgents = new Set([
-    "claude",
-    "claude-code",
-    "claudecode",
-    "opencode",
-    "pi",
-    "codex",
-    "antigravity",
-    "agy",
-    "aider",
-    "goose",
-    "cursor",
-    "cursor-agent",
-    "amp",
-  ]);
 
-  const fgName = norm(term?.foreground?.name);
-  if (fgName && fgShells.has(fgName)) {
+  const fgName = normProgToken(term?.foreground?.name);
+  if (fgName && SUPERVISOR_PROGRAMS.has(fgName)) {
+    return true;
+  }
+  if (fgName && PLAIN_SHELLS.has(fgName)) {
     const fgArgv = Array.isArray(term?.foreground?.argv)
       ? term.foreground.argv
       : [];
-    const hasKnownAgentArg = fgArgv.some((arg) => knownAgents.has(norm(arg)));
-    const stState = String(term?.status?.state ?? "").trim().toLowerCase();
-    const stApp = norm(term?.status?.app);
+    const hasKnownAgentArg = fgArgv.some((arg) =>
+      KNOWN_AGENTS.has(normProgToken(arg))
+    );
+    const stState = String(term?.status?.state ?? "")
+      .trim()
+      .toLowerCase();
+    const stApp = normProgToken(term?.status?.app);
     const hasActiveNonShellStatus =
-      ["working", "blocked", "done", "error"].includes(stState) &&
+      ["working", "blocked", "done", "error", "waiting"].includes(stState) &&
       Boolean(stApp) &&
-      !plainShells.has(stApp);
+      !isPlainShellOrSupervisor(stApp);
     if (!hasKnownAgentArg && !hasActiveNonShellStatus) {
       return true;
     }
@@ -1189,11 +1192,11 @@ function isPlainShellRow(name, programName, labels, term = null) {
   if (agentLabel && agentLabel !== "shell") {
     return false;
   }
-  const baseProg = norm(programName);
-  if (baseProg && plainShells.has(baseProg)) {
+  const baseProg = normProgToken(programName);
+  if (baseProg && isPlainShellOrSupervisor(baseProg)) {
     return true;
   }
-  return /\((zsh|bash|fish|sh|nu|dash|tmux)\)$/i.test(String(name ?? "").trim());
+  return false;
 }
 
 // Attach by the core terminal address (e.g. `t11g`): it is unique and always

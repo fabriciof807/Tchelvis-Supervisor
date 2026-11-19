@@ -15,7 +15,7 @@ use super::state::{unix_now_secs, AgentDurableState};
 /// Fixed ~20-line sample agent output used for reproducible supervisor benchmarks.
 pub const SAMPLE_OUTPUT: &str = "\
 $ cargo test --quiet
-   Compiling tchelvis v0.1.0 (/home/ubuntu/workspace/cockpit)
+   Compiling tchelvis v0.1.0 (/workspace/cockpit)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 4.12s
      Running unittests src/lib.rs (target/debug/deps/tchelvis-123456)
 running 42 tests
@@ -80,8 +80,7 @@ impl Drop for LockGuard {
 }
 
 pub fn bench_state_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
+    super::config::home_or_fallback_dir()
         .join(".local")
         .join("state")
         .join("tchelvis")

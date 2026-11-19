@@ -103,8 +103,7 @@ pub fn resolve_primary_key(
 }
 
 pub fn fallback_key_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
+    super::config::home_or_fallback_dir()
         .join(".config")
         .join("tchelvis")
         .join("fallback_api_key")
@@ -153,8 +152,7 @@ pub fn redact_key(text: &str, key: &str) -> String {
 }
 
 pub fn fallback_state_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
+    super::config::home_or_fallback_dir()
         .join(".local")
         .join("state")
         .join("tchelvis")

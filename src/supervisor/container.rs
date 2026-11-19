@@ -495,8 +495,7 @@ pub fn default_ollama_roots() -> Vec<PathBuf> {
 
 /// Default cache directory mounted into `/root/.cache/llama.cpp` for `-hf` downloads.
 pub fn default_hf_cache_dir() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
+    super::config::home_or_fallback_dir()
         .join(".cache")
         .join("tchelvis")
         .join("llama.cpp")

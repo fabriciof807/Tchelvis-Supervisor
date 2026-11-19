@@ -1,0 +1,40 @@
+{
+  "known_agents": [
+    "claude",
+    "claude-code",
+    "claudecode",
+    "opencode",
+    "pi",
+    "codex",
+    "antigravity",
+    "agy",
+    "gemini",
+    "aider",
+    "goose",
+    "cursor",
+    "cursor-agent",
+    "amp"
+  ],
+  "plain_shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "sh",
+    "nu",
+    "nushell",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "tmux",
+    "screen",
+    "login",
+    "herdr-core",
+    "hc"
+  ],
+  "supervisor_programs": [
+    "herdr-supervisor",
+    "tchelvis-supervisor",
+    "tchelvis"
+  ]
+}

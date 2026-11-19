@@ -132,7 +132,7 @@ pub trait HcBackend: Send + Sync {
     fn set_labels(&self, agent_id: &str, labels: &[(&str, &str)]) -> Result<()>;
 }
 
-/// Production `hc` CLI adapter bound to `/home/ubuntu/.local/bin/hc` or `hc`.
+/// Production `hc` CLI adapter bound to the resolved `hc_bin` (via `default_hc_bin`).
 #[derive(Debug, Clone)]
 pub struct HcCliAdapter {
     pub config: HcAdapterConfig,
@@ -343,80 +343,6 @@ impl HcBackend for HcCliAdapter {
     }
 }
 
-fn normalize_program_token(raw: &str) -> String {
-    let base = raw.trim().rsplit(['/', '\\']).next().unwrap_or(raw).trim();
-    base.to_ascii_lowercase()
-}
-
-fn is_known_coding_agent(token: &str) -> bool {
-    let norm = normalize_program_token(token);
-    matches!(
-        norm.as_str(),
-        "claude"
-            | "claude-code"
-            | "claudecode"
-            | "opencode"
-            | "pi"
-            | "codex"
-            | "antigravity"
-            | "agy"
-            | "aider"
-            | "goose"
-            | "cursor"
-            | "cursor-agent"
-            | "amp"
-    )
-}
-
-fn is_plain_shell_program(token: &str) -> bool {
-    let norm = normalize_program_token(token);
-    matches!(
-        norm.as_str(),
-        "zsh"
-            | "-zsh"
-            | "bash"
-            | "-bash"
-            | "sh"
-            | "-sh"
-            | "fish"
-            | "-fish"
-            | "nu"
-            | "nushell"
-            | "dash"
-            | "ksh"
-            | "csh"
-            | "tcsh"
-            | "tmux"
-            | "screen"
-            | "login"
-            | "herdr-core"
-            | "hc"
-    )
-}
-
-fn is_attach_client_invocation(program: Option<&str>, args: &[String]) -> bool {
-    let prog_matches = program
-        .map(normalize_program_token)
-        .is_some_and(|p| p == "herdr-core" || p == "hc");
-    let argv0_matches = args
-        .first()
-        .map(|s| normalize_program_token(s))
-        .is_some_and(|p| p == "herdr-core" || p == "hc");
-    (prog_matches || argv0_matches)
-        && args
-            .iter()
-            .take_while(|arg| arg.as_str() != "--")
-            .any(|arg| normalize_program_token(arg) == "attach")
-}
-
-fn is_supervisor_or_tchelvis_name(token: &str) -> bool {
-    let norm = normalize_program_token(token);
-    matches!(
-        norm.as_str(),
-        "herdr-supervisor" | "tchelvis-supervisor" | "tchelvis"
-    )
-}
-
 fn extract_status_fields(status: Option<&serde_json::Value>) -> (Option<String>, Option<String>) {
     let Some(val) = status else {
         return (None, None);
@@ -457,15 +383,17 @@ pub fn is_coding_agent_terminal(
     labels: &BTreeMap<String, String>,
 ) -> bool {
     let fg_name = foreground.and_then(|f| f.name.as_deref());
-    if agent.is_some_and(is_supervisor_or_tchelvis_name)
-        || name.is_some_and(is_supervisor_or_tchelvis_name)
-        || fg_name.is_some_and(is_supervisor_or_tchelvis_name)
+    if agent.is_some_and(crate::agents::is_supervisor_program)
+        || name.is_some_and(crate::agents::is_supervisor_program)
+        || fg_name.is_some_and(crate::agents::is_supervisor_program)
     {
         return false;
     }
 
     let fg_argv = foreground.map(|f| f.argv.as_slice()).unwrap_or(&[]);
-    if is_attach_client_invocation(fg_name, fg_argv) || is_attach_client_invocation(None, argv) {
+    if crate::agents::is_attach_client_invocation(fg_name, fg_argv)
+        || crate::agents::is_attach_client_invocation(None, argv)
+    {
         return false;
     }
 
@@ -491,7 +419,7 @@ pub fn is_coding_agent_terminal(
         candidates.push(app);
     }
 
-    if candidates.into_iter().any(is_known_coding_agent) {
+    if candidates.into_iter().any(crate::agents::is_known_agent) {
         return true;
     }
 
@@ -502,7 +430,7 @@ pub fn is_coding_agent_terminal(
         );
     if has_active_status {
         let primary = fg_name.or(agent);
-        if !primary.is_some_and(is_plain_shell_program) {
+        if !primary.is_some_and(crate::agents::is_plain_shell) {
             return true;
         }
     }
@@ -549,17 +477,19 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
         }
 
         let (raw_status_state, status_app) = extract_status_fields(term.status.as_ref());
-        let fg_is_plain_shell = term.foreground.as_ref().is_some_and(|fg| {
-            fg.name.as_deref().is_some_and(is_plain_shell_program)
-                && !fg.argv.iter().any(|a| is_known_coding_agent(a))
-        });
-        let has_active_non_shell_osc = matches!(
-            raw_status_state.as_deref(),
-            Some("working") | Some("blocked") | Some("done") | Some("error") | Some("waiting")
-        ) && status_app
-            .as_deref()
-            .is_some_and(|app| !is_plain_shell_program(app));
-        if fg_is_plain_shell && !has_active_non_shell_osc {
+        let (fg_name, fg_argv) = match &term.foreground {
+            Some(fg) => (fg.name.as_deref(), fg.argv.as_slice()),
+            None => (None, &[][..]),
+        };
+        if term.foreground.is_some()
+            && crate::agents::is_plain_shell_foreground_parts(
+                &term.argv,
+                fg_name,
+                fg_argv,
+                raw_status_state.as_deref(),
+                status_app.as_deref(),
+            )
+        {
             continue;
         }
         let status_state = match raw_status_state.as_deref() {
@@ -572,10 +502,10 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
                 .or(raw_status_state),
         };
 
-        let title_indicates_pi = term.title.as_deref().is_some_and(|t| {
-            let trimmed = t.trim();
-            trimmed.starts_with("π ") || trimmed.starts_with("π-") || trimmed.contains("π -")
-        });
+        let title_indicates_pi = term
+            .title
+            .as_deref()
+            .is_some_and(crate::agents::is_pi_title);
         let mut effective_labels = term.labels.clone();
         if !effective_labels.contains_key("cockpit.agent") && title_indicates_pi {
             effective_labels.insert("cockpit.agent".to_string(), "pi".to_string());
@@ -615,11 +545,19 @@ pub fn parse_hc_ls_json(raw_json: &str, self_terminal_id: Option<&str>) -> Resul
                 term.foreground
                     .as_ref()
                     .and_then(|f| f.name.clone())
-                    .filter(|n| !is_plain_shell_program(n))
+                    .filter(|n| !crate::agents::is_plain_shell(n))
             })
-            .or_else(|| term.agent.clone().filter(|n| !is_plain_shell_program(n)))
             .or_else(|| {
-                if term.title.as_deref().is_some_and(|t| t.contains("π -")) {
+                term.agent
+                    .clone()
+                    .filter(|n| !crate::agents::is_plain_shell(n))
+            })
+            .or_else(|| {
+                if term
+                    .title
+                    .as_deref()
+                    .is_some_and(crate::agents::is_pi_title)
+                {
                     Some("pi".to_string())
                 } else {
                     None

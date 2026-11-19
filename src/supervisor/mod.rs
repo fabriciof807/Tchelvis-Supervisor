@@ -248,7 +248,7 @@ pub fn unload_model() -> Result<DesktopModSnapshot> {
 /// - In container mode: if Running, recreates with the new `-ngl` and waits healthy (or stops if `--no-warm`); if stopped, only persists.
 /// - Outside container mode: unloads the Ollama model (`keep_alive: 0`) and optionally warm-loads it.
 pub fn set_gpu(allow_gpu: bool, warm: bool) -> Result<DesktopModSnapshot> {
-    config::write_gpu_override(&config::gpu_override_path(), allow_gpu)?;
+    config::write_gpu_override(&config::try_gpu_override_path()?, allow_gpu)?;
     let mut config = SupervisorConfig::load();
     config.allow_gpu = allow_gpu;
     let mut loaded_after = false;
@@ -718,8 +718,8 @@ pub fn reset_model() -> Result<DesktopModSnapshot> {
 /// to `~/.local/state/tchelvis/supervisor_mod_snapshot.json` on each tick.
 pub fn run_supervisor_daemon() -> Result<()> {
     let mut engine = build_default_engine()?;
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    let snap_path = PathBuf::from(home)
+    let home = config::require_home_dir()?;
+    let snap_path = home
         .join(".local")
         .join("state")
         .join("tchelvis")

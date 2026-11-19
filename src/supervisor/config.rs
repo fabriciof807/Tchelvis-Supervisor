@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HcAdapterConfig {
-    /// Path or binary name for `hc` (default: `/home/ubuntu/.local/bin/hc` or `hc`).
+    /// Path or binary name for `hc` (resolved via `HC_BIN`, `$HOME/.local/bin/hc`, `$HOME/.cargo/bin/hc`, or `hc`).
     pub hc_bin: String,
     /// Template for listing active sessions (e.g., `hc ls --json`).
     pub list_sessions_cmd: String,
@@ -26,12 +26,8 @@ pub struct HcAdapterConfig {
 
 impl Default for HcAdapterConfig {
     fn default() -> Self {
-        let default_bin = resolve_default_hc_bin();
         Self {
-            hc_bin: env::var("HC_BIN")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(default_bin),
+            hc_bin: crate::herdr::default_hc_bin(),
             list_sessions_cmd: "hc ls --json".to_string(),
             capture_output_cmd: "hc read {agent_id} --lines {lines} --json".to_string(),
             send_input_cmd: "hc send {agent_id} {payload}".to_string(),
@@ -40,23 +36,21 @@ impl Default for HcAdapterConfig {
     }
 }
 
-fn resolve_default_hc_bin() -> String {
-    if let Ok(home) = env::var("HOME") {
-        let home_path = PathBuf::from(home);
-        for candidate in [
-            home_path.join(".local/bin/hc"),
-            home_path.join(".cargo/bin/hc"),
-        ] {
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
-            }
-        }
-    }
-    let ubuntu_hc = PathBuf::from("/home/ubuntu/.local/bin/hc");
-    if ubuntu_hc.exists() {
-        return "/home/ubuntu/.local/bin/hc".to_string();
-    }
-    "hc".to_string()
+pub(crate) fn resolve_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+pub(crate) fn require_home_dir() -> anyhow::Result<PathBuf> {
+    resolve_home_dir().ok_or_else(|| anyhow::anyhow!("HOME environment variable is not set"))
+}
+
+pub(crate) fn home_or_fallback_dir() -> PathBuf {
+    resolve_home_dir().unwrap_or_else(|| {
+        let euid = unsafe { libc::geteuid() };
+        env::temp_dir().join(format!("tchelvis-{euid}"))
+    })
 }
 
 /// Supported LLM inference backends for the Cockpit Durable Supervisor.
@@ -174,19 +168,27 @@ fn resolve_allow_gpu_from_env() -> Option<bool> {
 
 /// Path of the persisted GPU-offload toggle written by `tchelvis supervisor gpu <on|off>`.
 pub fn gpu_override_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
-        .join(".local")
+    gpu_override_path_in(&home_or_fallback_dir())
+}
+
+pub(crate) fn gpu_override_path_in(home: &Path) -> PathBuf {
+    home.join(".local")
         .join("state")
         .join("tchelvis")
         .join("supervisor_gpu")
 }
 
+pub(crate) fn try_gpu_override_path() -> anyhow::Result<PathBuf> {
+    Ok(gpu_override_path_in(&require_home_dir()?))
+}
+
 /// Path of the persisted last-working container runtime (`~/.local/state/tchelvis/container_runtime`).
 pub fn runtime_pref_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    PathBuf::from(home)
-        .join(".local")
+    runtime_pref_path_in(&home_or_fallback_dir())
+}
+
+pub(crate) fn runtime_pref_path_in(home: &Path) -> PathBuf {
+    home.join(".local")
         .join("state")
         .join("tchelvis")
         .join("container_runtime")
@@ -254,12 +256,11 @@ fn resolve_gpu_backend_from_env() -> Option<String> {
 
 impl Default for SupervisorConfig {
     fn default() -> Self {
-        let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
+        let home = home_or_fallback_dir();
         let default_state_path = env::var("HERDR_SUPERVISOR_STATE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
-                PathBuf::from(&home)
-                    .join(".local")
+                home.join(".local")
                     .join("state")
                     .join("tchelvis")
                     .join("supervisor_state.json")
@@ -332,15 +333,13 @@ pub fn supervisor_config_path_in(home: &Path) -> PathBuf {
 
 /// Returns the active `supervisor.toml` path for the current user's `$HOME`.
 pub fn supervisor_config_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-    supervisor_config_path_in(Path::new(&home))
+    supervisor_config_path_in(&home_or_fallback_dir())
 }
 
 impl SupervisorConfig {
     /// Returns the legacy Herdr state file path (`~/.local/share/herdr/supervisor_state.json`).
     pub fn legacy_state_file_path() -> PathBuf {
-        let home = env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".to_string());
-        PathBuf::from(&home)
+        home_or_fallback_dir()
             .join(".local")
             .join("share")
             .join("herdr")
@@ -350,35 +349,41 @@ impl SupervisorConfig {
     /// Load configuration from `~/.config/tchelvis/supervisor.toml` (or legacy `~/.config/herdr/supervisor.toml`),
     /// merged with environment variable overrides.
     pub fn load() -> Self {
-        let config_path = supervisor_config_path();
+        let home = resolve_home_dir();
         let mut cfg = Self::default();
-        if config_path.exists() {
-            match fs::read_to_string(&config_path) {
-                Ok(raw) => match toml::from_str::<SupervisorConfig>(&raw) {
-                    Ok(parsed) => {
-                        cfg = parsed;
-                        cfg.apply_env_overrides();
-                    }
+        if let Some(config_path) = home.as_deref().map(supervisor_config_path_in) {
+            if config_path.exists() {
+                match fs::read_to_string(&config_path) {
+                    Ok(raw) => match toml::from_str::<SupervisorConfig>(&raw) {
+                        Ok(parsed) => {
+                            cfg = parsed;
+                            cfg.apply_env_overrides();
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %config_path.display(),
+                                error = %err,
+                                "Failed to parse supervisor config; using defaults"
+                            );
+                        }
+                    },
                     Err(err) => {
                         tracing::warn!(
                             path = %config_path.display(),
                             error = %err,
-                            "Failed to parse supervisor config; using defaults"
+                            "Failed to read supervisor config; using defaults"
                         );
                     }
-                },
-                Err(err) => {
-                    tracing::warn!(
-                        path = %config_path.display(),
-                        error = %err,
-                        "Failed to read supervisor config; using defaults"
-                    );
                 }
             }
         }
         // Persisted `tchelvis supervisor gpu on|off` wins over the TOML file, but env vars win over it.
         if resolve_allow_gpu_from_env().is_none() {
-            if let Some(allow) = read_gpu_override(&gpu_override_path()) {
+            if let Some(allow) = home
+                .as_deref()
+                .map(gpu_override_path_in)
+                .and_then(|p| read_gpu_override(&p))
+            {
                 cfg.allow_gpu = allow;
             }
         }
@@ -408,7 +413,9 @@ impl SupervisorConfig {
             self.state_file_path = PathBuf::from(state_path);
         }
         if let Ok(hc_bin) = env::var("HC_BIN") {
-            self.hc.hc_bin = hc_bin;
+            if !hc_bin.trim().is_empty() {
+                self.hc.hc_bin = hc_bin;
+            }
         }
         if let Some(mode) = resolve_container_mode_from_env() {
             self.llm_container.mode = mode;
@@ -423,20 +430,14 @@ impl SupervisorConfig {
 
     /// Detects the configured container runtime (`remembered` -> `kiri` -> `podman` -> `docker`), respecting overrides.
     pub fn detected_container_runtime(&self) -> Option<ContainerRuntime> {
-        detect_runtime_with_pref(
-            &self.llm_container.runtime,
-            read_runtime_pref(&runtime_pref_path()),
-            binary_on_path,
-        )
+        let pref = resolve_home_dir().and_then(|h| read_runtime_pref(&runtime_pref_path_in(&h)));
+        detect_runtime_with_pref(&self.llm_container.runtime, pref, binary_on_path)
     }
 
     /// Returns ordered candidate container runtimes for `load_model` fallback.
     pub fn runtime_candidates(&self) -> Vec<ContainerRuntime> {
-        detect_runtime_candidates(
-            &self.llm_container.runtime,
-            read_runtime_pref(&runtime_pref_path()),
-            binary_on_path,
-        )
+        let pref = resolve_home_dir().and_then(|h| read_runtime_pref(&runtime_pref_path_in(&h)));
+        detect_runtime_candidates(&self.llm_container.runtime, pref, binary_on_path)
     }
 
     /// Returns `true` when the Supervisor's LLM runs as a managed `llama.cpp` container.

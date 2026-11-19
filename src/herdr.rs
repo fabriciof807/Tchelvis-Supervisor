@@ -149,85 +149,21 @@ impl HcTerminal {
     }
 
     pub fn is_plain_shell_foreground(&self) -> bool {
-        let normalize = |raw: &str| -> String {
-            let trimmed = raw.trim();
-            let base = std::path::Path::new(trimmed)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(trimmed);
-            base.trim_start_matches('-').to_ascii_lowercase()
+        let (fg_name, fg_argv) = match &self.foreground {
+            Some(fg) => (fg.name.as_deref(), fg.argv.as_slice()),
+            None => (None, &[][..]),
         };
-        let is_attach_argv = |argv: &[String]| -> bool {
-            argv.first()
-                .is_some_and(|arg| matches!(normalize(arg).as_str(), "herdr-core" | "hc"))
-                && argv.iter().any(|arg| arg == "attach")
+        let (status_state, status_app) = match &self.status {
+            Some(st) => (Some(st.state.as_str()), st.app.as_deref()),
+            None => (None, None),
         };
-        if is_attach_argv(&self.argv) {
-            return true;
-        }
-        let Some(fg) = &self.foreground else {
-            return false;
-        };
-        let is_plain_shell = |name: &str| -> bool {
-            matches!(
-                normalize(name).as_str(),
-                "zsh"
-                    | "bash"
-                    | "fish"
-                    | "sh"
-                    | "nu"
-                    | "nushell"
-                    | "dash"
-                    | "ksh"
-                    | "csh"
-                    | "tcsh"
-                    | "tmux"
-                    | "screen"
-                    | "login"
-                    | "herdr-core"
-                    | "hc"
-            )
-        };
-        let is_known_agent = |name: &str| -> bool {
-            matches!(
-                normalize(name).as_str(),
-                "claude"
-                    | "claude-code"
-                    | "claudecode"
-                    | "opencode"
-                    | "pi"
-                    | "codex"
-                    | "antigravity"
-                    | "agy"
-                    | "aider"
-                    | "goose"
-                    | "cursor"
-                    | "cursor-agent"
-                    | "amp"
-            )
-        };
-
-        let fg_name = fg.name.as_deref().unwrap_or("");
-        if matches!(normalize(fg_name).as_str(), "herdr-core" | "hc")
-            && fg.argv.iter().any(|arg| arg == "attach")
-        {
-            return true;
-        }
-        if is_plain_shell(fg_name) && !fg.argv.iter().any(|arg| is_known_agent(arg)) {
-            if let Some(st) = &self.status {
-                if matches!(st.state.as_str(), "working" | "blocked" | "done" | "error")
-                    && st
-                        .app
-                        .as_deref()
-                        .map(str::trim)
-                        .is_some_and(|app| !app.is_empty() && !is_plain_shell(app))
-                {
-                    return false;
-                }
-            }
-            return true;
-        }
-        false
+        crate::agents::is_plain_shell_foreground_parts(
+            &self.argv,
+            fg_name,
+            fg_argv,
+            status_state,
+            status_app,
+        )
     }
 
     pub fn raw_attention_state(&self, now_ms: i64) -> AttentionState {
@@ -762,33 +698,38 @@ pub struct HerdrClient {
     hc_bin: String,
 }
 
-fn resolve_default_hc_bin() -> String {
-    if let Ok(bin) = std::env::var("HC_BIN") {
+pub fn default_hc_bin() -> String {
+    default_hc_bin_with(|k| std::env::var(k).ok(), |p| p.exists())
+}
+
+pub(crate) fn default_hc_bin_with(
+    get_env: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&Path) -> bool,
+) -> String {
+    if let Some(bin) = get_env("HC_BIN") {
         if !bin.trim().is_empty() {
             return bin;
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = std::path::PathBuf::from(home);
-        for candidate in [
-            home_path.join(".local/bin/hc"),
-            home_path.join(".cargo/bin/hc"),
-        ] {
-            if candidate.exists() {
-                return candidate.to_string_lossy().into_owned();
+    if let Some(home) = get_env("HOME") {
+        if !home.trim().is_empty() {
+            let home_path = std::path::PathBuf::from(home);
+            for candidate in [
+                home_path.join(".local/bin/hc"),
+                home_path.join(".cargo/bin/hc"),
+            ] {
+                if exists(&candidate) {
+                    return candidate.to_string_lossy().into_owned();
+                }
             }
         }
-    }
-    let ubuntu_hc = std::path::PathBuf::from("/home/ubuntu/.local/bin/hc");
-    if ubuntu_hc.exists() {
-        return "/home/ubuntu/.local/bin/hc".to_string();
     }
     "hc".to_string()
 }
 
 impl Default for HerdrClient {
     fn default() -> Self {
-        Self::new(resolve_default_hc_bin())
+        Self::new(default_hc_bin())
     }
 }
 
@@ -1475,5 +1416,45 @@ mod tests {
         assert!(!tracker
             .active_children_map(&empty_orch, 11_800)
             .contains_key("t1"));
+    }
+
+    #[test]
+    fn test_default_hc_bin_precedence_and_no_home_fallback() {
+        let local_hc = std::path::PathBuf::from("/home/alice/.local/bin/hc");
+        let cargo_hc = std::path::PathBuf::from("/home/alice/.cargo/bin/hc");
+
+        // 1. HC_BIN wins over everything
+        assert_eq!(
+            default_hc_bin_with(
+                |k| match k {
+                    "HC_BIN" => Some("/custom/hc".to_string()),
+                    "HOME" => Some("/home/alice".to_string()),
+                    _ => None,
+                },
+                |_| true,
+            ),
+            "/custom/hc"
+        );
+
+        // 2. $HOME/.local/bin/hc wins over $HOME/.cargo/bin/hc
+        assert_eq!(
+            default_hc_bin_with(
+                |k| (k == "HOME").then(|| "/home/alice".to_string()),
+                |p| p == local_hc || p == cargo_hc,
+            ),
+            "/home/alice/.local/bin/hc"
+        );
+
+        // 3. $HOME/.cargo/bin/hc used when .local/bin/hc absent
+        assert_eq!(
+            default_hc_bin_with(
+                |k| (k == "HOME").then(|| "/home/alice".to_string()),
+                |p| p == cargo_hc,
+            ),
+            "/home/alice/.cargo/bin/hc"
+        );
+
+        // 4. Unknown HOME skips home candidates and falls back to "hc" on PATH
+        assert_eq!(default_hc_bin_with(|_| None, |_| true), "hc");
     }
 }
