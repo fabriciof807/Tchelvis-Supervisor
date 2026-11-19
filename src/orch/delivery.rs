@@ -6,21 +6,31 @@ use anyhow::Result;
 
 pub struct OrchDeliveryCoordinator;
 
+pub fn pointer_deferral_reason(
+    tracker: &FleetTracker,
+    target_terminal: &str,
+    now_ms: i64,
+) -> Option<&'static str> {
+    let Some(term) = tracker.terminals.get(target_terminal) else {
+        return Some("terminal_missing_from_tracker");
+    };
+    if term.state == "finished" {
+        return Some("terminal_finished");
+    }
+    match tracker.effective_attention(target_terminal, now_ms) {
+        AttentionState::Idle | AttentionState::Done { .. } => None,
+        AttentionState::Working { .. } => Some("terminal_working"),
+        AttentionState::Blocked { .. } => Some("terminal_blocked"),
+        AttentionState::Error { .. } => Some("terminal_error"),
+    }
+}
+
 pub fn is_terminal_safe_for_pointer(
     tracker: &FleetTracker,
     target_terminal: &str,
     now_ms: i64,
 ) -> bool {
-    let Some(term) = tracker.terminals.get(target_terminal) else {
-        return false;
-    };
-    if term.state == "finished" {
-        return false;
-    }
-    matches!(
-        tracker.effective_attention(target_terminal, now_ms),
-        AttentionState::Idle | AttentionState::Done { .. }
-    )
+    pointer_deferral_reason(tracker, target_terminal, now_ms).is_none()
 }
 
 pub fn format_pointer_line(run_id: &str, count: usize) -> String {
@@ -48,41 +58,88 @@ impl OrchDeliveryCoordinator {
         tracker: &FleetTracker,
         now_ms: i64,
     ) -> Result<DeliveryOutcome> {
-        let pending_before: usize = store
-            .pending_pointer_targets(now_ms)?
-            .iter()
-            .map(|t| t.pending_count)
-            .sum();
-        let expired_changed = store.requeue_expired_pointers(now_ms)?;
+        let (requeued, stalled) = store.requeue_expired_pointers_detailed(now_ms)?;
+        if requeued > 0 || stalled > 0 {
+            tracing::info!(requeued, stalled, "requeued expired orchestration pointers");
+        }
+
         let targets = store.pending_pointer_targets(now_ms)?;
-        let pending_after: usize = targets.iter().map(|t| t.pending_count).sum();
-        let requeued = pending_after.saturating_sub(pending_before);
 
         let mut outcome = DeliveryOutcome {
             delivered_count: 0,
             deferred_count: 0,
-            stalled_count: expired_changed.saturating_sub(requeued),
+            stalled_count: stalled,
         };
 
         for target in targets {
-            if !target.has_active_unexpired_pointer && target.pending_count > 0 {
-                if !is_terminal_safe_for_pointer(tracker, &target.target_terminal, now_ms) {
-                    outcome.deferred_count += 1;
-                    continue;
-                }
-                let pointer = format_pointer_line(&target.run_id, target.pending_count);
-                if herdr
-                    .send_guarded_if_idle(&target.target_terminal, &pointer)
-                    .await?
-                {
+            if target.pending_count == 0 {
+                continue;
+            }
+            if target.has_active_unexpired_pointer {
+                tracing::info!(
+                    target_terminal = %target.target_terminal,
+                    run = %target.run_id,
+                    pending_count = target.pending_count,
+                    outcome = "deferred",
+                    reason = "active_unexpired_pointer",
+                    "orch pointer delivery deferred"
+                );
+                continue;
+            }
+            if let Some(reason) = pointer_deferral_reason(tracker, &target.target_terminal, now_ms)
+            {
+                outcome.deferred_count += 1;
+                tracing::info!(
+                    target_terminal = %target.target_terminal,
+                    run = %target.run_id,
+                    pending_count = target.pending_count,
+                    outcome = "deferred",
+                    reason,
+                    "orch pointer delivery deferred"
+                );
+                continue;
+            }
+            let pointer = format_pointer_line(&target.run_id, target.pending_count);
+            match herdr
+                .send_guarded_if_idle(&target.target_terminal, &pointer)
+                .await
+            {
+                Ok(true) => {
                     store.mark_pointer_delivered(
                         &target.target_terminal,
                         &target.run_id,
                         now_ms,
                     )?;
                     outcome.delivered_count += 1;
-                } else {
+                    tracing::info!(
+                        target_terminal = %target.target_terminal,
+                        run = %target.run_id,
+                        pending_count = target.pending_count,
+                        outcome = "sent",
+                        "orch pointer delivered"
+                    );
+                }
+                Ok(false) => {
                     outcome.deferred_count += 1;
+                    tracing::info!(
+                        target_terminal = %target.target_terminal,
+                        run = %target.run_id,
+                        pending_count = target.pending_count,
+                        outcome = "deferred",
+                        reason = "hc_send_guard_refused",
+                        "orch pointer delivery deferred"
+                    );
+                }
+                Err(err) => {
+                    outcome.deferred_count += 1;
+                    tracing::info!(
+                        target_terminal = %target.target_terminal,
+                        run = %target.run_id,
+                        pending_count = target.pending_count,
+                        outcome = "error",
+                        error = %err,
+                        "orch pointer delivery failed; deferred for retry"
+                    );
                 }
             }
         }
@@ -159,8 +216,11 @@ mod tests {
         assert!(is_terminal_safe_for_pointer(&tracker, "t_block", 2_700));
     }
 
+    static DELIVERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn test_deliver_pending_pointers_coalescing_deferral_and_stalling() {
+        let _test_guard = DELIVERY_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let exit_code_file = tmp.path().join("exit_code");
         let log_file = tmp.path().join("hc_send.log");
@@ -340,5 +400,152 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.pointer_state == PointerState::DeliveryStalled));
+    }
+
+    #[tokio::test]
+    async fn test_deliver_pending_pointers_emits_info_logs() {
+        let _test_guard = DELIVERY_TEST_LOCK.lock().await;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let exit_code_file = tmp.path().join("exit_code");
+        fs::write(&exit_code_file, "1").unwrap();
+        let fake_hc = tmp.path().join("fake-hc");
+        fs::write(
+            &fake_hc,
+            format!(
+                "#!/usr/bin/env bash\n\
+                 if [ \"$1\" = \"send\" ]; then\n\
+                   exit $(cat \"{}\")\n\
+                 fi\n\
+                 exit 0\n",
+                exit_code_file.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+        let store = OrchStore::open_in_memory().unwrap();
+        store
+            .create_run(&OrchRun {
+                id: "run_log".into(),
+                title: "Log Run".into(),
+                coordinator_terminal: "t1".into(),
+                coordinator_created_ms: 1_000,
+                status: RunStatus::Active,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        store
+            .create_or_update_task(&OrchTask {
+                id: "task_a".into(),
+                run_id: "run_log".into(),
+                title: "Task A".into(),
+                prompt: "Do A".into(),
+                deps: vec![],
+                failure_count: 0,
+                status: TaskStatus::Ready,
+                result_summary: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        store
+            .create_dispatch(&DispatchContext {
+                id: "disp_a".into(),
+                run_id: "run_log".into(),
+                task_id: "task_a".into(),
+                parent_terminal: "t1".into(),
+                assignee_terminal: "t2".into(),
+                terminal_created_ms: 2_000,
+                turn_at_dispatch: 0,
+                agent_kind: "claude".into(),
+                worktree_mode: "current".into(),
+                worktree_path: None,
+                depth: 1,
+                status: DispatchStatus::Dispatched,
+                idle_since_ms: None,
+                blocked_since_ms: None,
+                created_at_ms: 1_100,
+                updated_at_ms: 1_100,
+            })
+            .unwrap();
+        store
+            .record_worker_done("disp_a", "t2", 2_000, "succeeded", "Done", 1_200)
+            .unwrap();
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(buf.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut tracker = FleetTracker::new();
+        tracker.apply_snapshot(vec![make_terminal("t1", "live", "working")], 1_300);
+        let out1 =
+            OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 1_300)
+                .await
+                .unwrap();
+        assert_eq!((out1.delivered_count, out1.deferred_count), (0, 1));
+
+        tracker.apply_snapshot(vec![make_terminal("t1", "live", "idle")], 1_400);
+        let out2 =
+            OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 1_400)
+                .await
+                .unwrap();
+        assert_eq!((out2.delivered_count, out2.deferred_count), (0, 1));
+
+        fs::write(&exit_code_file, "0").unwrap();
+        let out3 =
+            OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 1_500)
+                .await
+                .unwrap();
+        assert_eq!((out3.delivered_count, out3.deferred_count), (1, 0));
+
+        drop(_guard);
+
+        let logs = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("INFO")
+                && logs.contains("target_terminal=t1")
+                && logs.contains("run=run_log"),
+            "unexpected logs:\n{logs}"
+        );
+        assert!(logs.contains("pending_count=1"), "unexpected logs:\n{logs}");
+        assert!(
+            logs.contains("outcome=\"deferred\"") && logs.contains("reason=\"terminal_working\""),
+            "unexpected logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("outcome=\"error\""),
+            "unexpected logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("outcome=\"sent\""),
+            "unexpected logs:\n{logs}"
+        );
     }
 }

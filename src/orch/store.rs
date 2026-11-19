@@ -10,6 +10,11 @@ use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
+const DISPATCH_COLUMNS: &str =
+    "id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms, \
+    turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status, \
+    idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms";
+
 #[derive(Clone)]
 pub struct OrchStore {
     conn: Arc<Mutex<Connection>>,
@@ -628,12 +633,12 @@ impl OrchStore {
             );
         }
 
+        let insert_sql = format!(
+            "INSERT INTO dispatch_contexts ({DISPATCH_COLUMNS})
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+        );
         tx.execute(
-            "INSERT INTO dispatch_contexts (
-                id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            &insert_sql,
             params![
                 disp.id,
                 disp.run_id,
@@ -668,31 +673,32 @@ impl OrchStore {
         Ok(())
     }
 
+    fn get_dispatch_tx(tx: &Transaction<'_>, dispatch_id: &str) -> Result<Option<DispatchContext>> {
+        let sql = format!("SELECT {DISPATCH_COLUMNS} FROM dispatch_contexts WHERE id = ?1");
+        let row = tx
+            .query_row(&sql, params![dispatch_id], Self::map_dispatch_row)
+            .optional()?;
+        Ok(row)
+    }
+
     pub fn get_dispatch(&self, dispatch_id: &str) -> Result<Option<DispatchContext>> {
         let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let sql = format!("SELECT {DISPATCH_COLUMNS} FROM dispatch_contexts WHERE id = ?1");
         let row = conn
-            .query_row(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-                 FROM dispatch_contexts WHERE id = ?1",
-                params![dispatch_id],
-                Self::map_dispatch_row,
-            )
+            .query_row(&sql, params![dispatch_id], Self::map_dispatch_row)
             .optional()?;
         Ok(row)
     }
 
     pub fn list_active_dispatches(&self) -> Result<Vec<DispatchContext>> {
         let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                    turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                    idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
+        let sql = format!(
+            "SELECT {DISPATCH_COLUMNS}
              FROM dispatch_contexts
              WHERE status IN ('starting', 'dispatched', 'waiting_for_reply')
-             ORDER BY created_at_ms ASC, id ASC",
-        )?;
+             ORDER BY created_at_ms ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map([], Self::map_dispatch_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -701,14 +707,13 @@ impl OrchStore {
 
     pub fn list_dispatches_for_run(&self, run_id: &str) -> Result<Vec<DispatchContext>> {
         let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                    turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                    idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
+        let sql = format!(
+            "SELECT {DISPATCH_COLUMNS}
              FROM dispatch_contexts
              WHERE run_id = ?1
-             ORDER BY created_at_ms ASC, id ASC",
-        )?;
+             ORDER BY created_at_ms ASC, id ASC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![run_id], Self::map_dispatch_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -778,6 +783,17 @@ impl OrchStore {
         tx.execute(
             "UPDATE dispatch_contexts SET status = ?2, updated_at_ms = ?3 WHERE id = ?1",
             params![dispatch_id, status.as_str(), now_ms],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn clear_dispatch_worktree_path(&self, dispatch_id: &str, now_ms: i64) -> Result<()> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE dispatch_contexts SET worktree_path = NULL, updated_at_ms = ?2 WHERE id = ?1",
+            params![dispatch_id, now_ms],
         )?;
         tx.commit()?;
         Ok(())
@@ -887,16 +903,7 @@ impl OrchStore {
         caller_terminal: &str,
         caller_created_ms: i64,
     ) -> Result<DispatchContext> {
-        let disp = tx
-            .query_row(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-                 FROM dispatch_contexts WHERE id = ?1",
-                params![dispatch_id],
-                Self::map_dispatch_row,
-            )
-            .optional()?
+        let disp = Self::get_dispatch_tx(tx, dispatch_id)?
             .with_context(|| format!("dispatch '{}' does not exist", dispatch_id))?;
 
         if disp.assignee_terminal != caller_terminal
@@ -937,6 +944,32 @@ impl OrchStore {
             caller_terminal,
             caller_created_ms,
         )?;
+
+        if matches!(
+            disp.status,
+            DispatchStatus::Completed | DispatchStatus::Failed | DispatchStatus::Stopped
+        ) {
+            bail!(
+                "worker_done already recorded for dispatch '{}' (status={}): worker_done may only be reported once per dispatch",
+                dispatch_id,
+                disp.status
+            );
+        }
+
+        let already_has_worker_done: Option<String> = tx
+            .query_row(
+                "SELECT id FROM messages WHERE dispatch_id = ?1 AND msg_type = ?2 LIMIT 1",
+                params![dispatch_id, MessageType::WorkerDone.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(existing_msg_id) = already_has_worker_done {
+            bail!(
+                "worker_done already recorded for dispatch '{}' (message={}): worker_done may only be reported once per dispatch",
+                dispatch_id,
+                existing_msg_id
+            );
+        }
 
         let (disp_status, task_status) = if outcome == "succeeded" {
             (DispatchStatus::Completed, TaskStatus::Completed)
@@ -1168,16 +1201,7 @@ impl OrchStore {
             );
         }
 
-        let disp = tx
-            .query_row(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-                 FROM dispatch_contexts WHERE id = ?1",
-                params![q_thread.dispatch_id],
-                Self::map_dispatch_row,
-            )
-            .optional()?
+        let disp = Self::get_dispatch_tx(&tx, &q_thread.dispatch_id)?
             .with_context(|| format!("dispatch '{}' not found", q_thread.dispatch_id))?;
 
         let msg = OrchMessage {
@@ -1290,16 +1314,7 @@ impl OrchStore {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let disp = tx
-            .query_row(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-                 FROM dispatch_contexts WHERE id = ?1",
-                params![dispatch_id],
-                Self::map_dispatch_row,
-            )
-            .optional()?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?;
         let Some(disp) = disp else {
             return Ok(None);
         };
@@ -1390,16 +1405,7 @@ impl OrchStore {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        let disp = tx
-            .query_row(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
-                 FROM dispatch_contexts WHERE id = ?1",
-                params![dispatch_id],
-                Self::map_dispatch_row,
-            )
-            .optional()?;
+        let disp = Self::get_dispatch_tx(&tx, dispatch_id)?;
         let Some(disp) = disp else {
             return Ok(None);
         };
@@ -1462,7 +1468,7 @@ impl OrchStore {
         Ok(Some(msg))
     }
 
-    pub fn requeue_expired_pointers(&self, now_ms: i64) -> Result<usize> {
+    pub fn requeue_expired_pointers_detailed(&self, now_ms: i64) -> Result<(usize, usize)> {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -1487,7 +1493,12 @@ impl OrchStore {
         )?;
 
         tx.commit()?;
-        Ok(stalled + requeued)
+        Ok((requeued, stalled))
+    }
+
+    pub fn requeue_expired_pointers(&self, now_ms: i64) -> Result<usize> {
+        let (requeued, stalled) = self.requeue_expired_pointers_detailed(now_ms)?;
+        Ok(requeued + stalled)
     }
 
     pub fn pending_pointer_targets(&self, now_ms: i64) -> Result<Vec<PendingPointerTarget>> {
@@ -1652,14 +1663,13 @@ impl OrchStore {
                 }
             }
 
-            let mut disp_stmt = tx.prepare(
-                "SELECT id, run_id, task_id, parent_terminal, assignee_terminal, terminal_created_ms,
-                        turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status,
-                        idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms
+            let disp_sql = format!(
+                "SELECT {DISPATCH_COLUMNS}
                  FROM dispatch_contexts
                  WHERE run_id = ?1 AND status IN ('starting', 'dispatched', 'waiting_for_reply', 'needs_review')
-                 ORDER BY created_at_ms ASC, id ASC",
-            )?;
+                 ORDER BY created_at_ms ASC, id ASC"
+            );
+            let mut disp_stmt = tx.prepare(&disp_sql)?;
             let disps = disp_stmt
                 .query_map(params![r_id], Self::map_dispatch_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

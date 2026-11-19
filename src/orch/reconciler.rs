@@ -1,8 +1,10 @@
-use crate::herdr::{FleetTracker, HerdrClient};
+use crate::herdr::{FleetTracker, HcTerminal, HerdrClient};
 use crate::model::AttentionState;
+use crate::orch::cli::fetch_hc_terminal;
 use crate::orch::store::OrchStore;
 use crate::orch::{
-    DispatchStatus, ReconcileOutcome, BLOCKED_SUPERVISOR_GRACE_MS, WORKER_DONE_QUIET_MS,
+    DispatchStatus, ReconcileOutcome, BLOCKED_SUPERVISOR_GRACE_MS, TERMINAL_APPEAR_GRACE_MS,
+    WORKER_DONE_QUIET_MS,
 };
 use anyhow::Result;
 
@@ -23,20 +25,31 @@ impl OrchReconciler {
                 continue;
             }
 
-            let term = tracker.terminals.get(&disp.assignee_terminal);
+            let tracked = tracker.terminals.get(&disp.assignee_terminal);
+            let mut probed: Option<HcTerminal> = None;
+            let term = match tracked {
+                Some(t) => Some(t),
+                None => {
+                    if now_ms.saturating_sub(disp.created_at_ms) < TERMINAL_APPEAR_GRACE_MS {
+                        continue;
+                    }
+                    if let Ok(live) = fetch_hc_terminal(herdr, &disp.assignee_terminal).await {
+                        probed = Some(live);
+                    }
+                    probed.as_ref()
+                }
+            };
+
+            let recreated =
+                term.is_some_and(|t| t.created_ms.is_some_and(|c| c != disp.terminal_created_ms));
             let exited_or_errored = match term {
                 None => true,
-                Some(t) => {
-                    t.created_ms != Some(disp.terminal_created_ms)
-                        || t.state == "finished"
-                        || t.status_name() == Some("error")
-                }
+                Some(t) => recreated || t.state == "finished" || t.status_name() == Some("error"),
             };
 
             if exited_or_errored {
                 let turn = term.map(|t| t.turn).unwrap_or(disp.turn_at_dispatch);
-                let same_instance =
-                    term.is_some_and(|t| t.created_ms == Some(disp.terminal_created_ms));
+                let same_instance = !recreated && term.is_some();
                 let tail = if same_instance {
                     herdr
                         .read_tail_lines(&disp.assignee_terminal, 20)
@@ -46,7 +59,7 @@ impl OrchReconciler {
                     String::new()
                 };
                 let reason = match term {
-                    Some(t) if t.created_ms != Some(disp.terminal_created_ms) => {
+                    Some(_) if recreated => {
                         "worker_exited_or_errored (terminal_recreated)".to_string()
                     }
                     Some(t) => {
@@ -80,7 +93,9 @@ impl OrchReconciler {
                 continue;
             }
 
-            let Some(term) = term else {
+            // If the terminal was absent from FleetTracker and only confirmed alive via `hc get`,
+            // wait for the tracker stream to catch up before evaluating turn/attention heuristics.
+            let Some(term) = tracked else {
                 continue;
             };
             let att = tracker.effective_attention(&disp.assignee_terminal, now_ms);

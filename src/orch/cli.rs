@@ -10,7 +10,7 @@ use crate::orch::{
     OrchRun, OrchTask, PointerState, QuestionThread, RunStatus, TaskStatus, MAX_DISPATCH_FAILURES,
     MAX_ORCH_DEPTH,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -56,6 +56,8 @@ pub struct DispatchOutput {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_cleanup: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +140,8 @@ pub enum OrchCommands {
         #[arg(long)]
         request_id: Option<String>,
         #[arg(long)]
+        caller: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// Send a worker completion, escalation, or status message to the parent coordinator
@@ -155,6 +159,8 @@ pub enum OrchCommands {
         #[arg(long)]
         request_id: Option<String>,
         #[arg(long)]
+        caller: Option<String>,
+        #[arg(long)]
         json: bool,
     },
     /// Ask a blocking question to the parent coordinator and wait for reply wakeup
@@ -165,6 +171,8 @@ pub enum OrchCommands {
         question: String,
         #[arg(long)]
         request_id: Option<String>,
+        #[arg(long)]
+        caller: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -268,7 +276,7 @@ pub fn parse_deps_arg(deps: Option<&str>) -> Result<Vec<String>> {
         .collect())
 }
 
-async fn fetch_hc_terminal(herdr: &HerdrClient, terminal: &str) -> Result<HcTerminal> {
+pub(crate) async fn fetch_hc_terminal(herdr: &HerdrClient, terminal: &str) -> Result<HcTerminal> {
     let out = tokio::time::timeout(
         Duration::from_secs(5),
         Command::new(herdr.hc_bin())
@@ -291,6 +299,122 @@ async fn fetch_hc_terminal(herdr: &HerdrClient, terminal: &str) -> Result<HcTerm
 
     let mut rpc = None;
     herdr.get_terminal(&mut rpc, terminal).await
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedCallerTerminal {
+    terminal: String,
+    created_ms: i64,
+    term_info: Option<HcTerminal>,
+}
+
+fn non_empty_trimmed(val: Option<String>) -> Option<String> {
+    val.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn env_hc_terminal_id() -> Option<String> {
+    non_empty_trimmed(std::env::var("HC_TERMINAL_ID").ok())
+}
+
+async fn resolve_caller_terminal_with_env(
+    herdr: &HerdrClient,
+    explicit: Option<String>,
+    env_val: Option<String>,
+    fallback_terminal: Option<&str>,
+    fallback_created_ms: Option<i64>,
+    strict_fencing: bool,
+    missing_msg: &str,
+) -> Result<ResolvedCallerTerminal> {
+    let explicit_or_env = non_empty_trimmed(explicit).or_else(|| non_empty_trimmed(env_val));
+    let terminal = match explicit_or_env {
+        Some(t) => t,
+        None if !strict_fencing => fallback_terminal
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .with_context(|| missing_msg.to_string())?,
+        None => bail!("{missing_msg}"),
+    };
+
+    match fetch_hc_terminal(herdr, &terminal).await {
+        Ok(info) => {
+            let created_ms = match info.created_ms {
+                Some(ms) => ms,
+                None if !strict_fencing => fallback_created_ms.with_context(|| {
+                    format!("hc lookup for terminal '{terminal}' omitted created_ms")
+                })?,
+                None => bail!(
+                    "attempt fencing identity check failed: hc lookup for terminal '{}' did not include created_ms",
+                    terminal
+                ),
+            };
+            Ok(ResolvedCallerTerminal {
+                terminal,
+                created_ms,
+                term_info: Some(info),
+            })
+        }
+        Err(err) => {
+            if strict_fencing {
+                bail!(
+                    "attempt fencing identity check failed: unable to resolve terminal '{}' via hc ({})",
+                    terminal,
+                    err
+                );
+            }
+            let created_ms = fallback_created_ms.with_context(|| {
+                format!("unable to resolve created_ms for terminal '{terminal}' via hc: {err}")
+            })?;
+            Ok(ResolvedCallerTerminal {
+                terminal,
+                created_ms,
+                term_info: None,
+            })
+        }
+    }
+}
+
+async fn resolve_caller_terminal(
+    herdr: &HerdrClient,
+    explicit: Option<String>,
+    fallback_terminal: Option<&str>,
+    fallback_created_ms: Option<i64>,
+    strict_fencing: bool,
+    missing_msg: &str,
+) -> Result<ResolvedCallerTerminal> {
+    resolve_caller_terminal_with_env(
+        herdr,
+        explicit,
+        std::env::var("HC_TERMINAL_ID").ok(),
+        fallback_terminal,
+        fallback_created_ms,
+        strict_fencing,
+        missing_msg,
+    )
+    .await
+}
+
+async fn close_worker_terminal(herdr: &HerdrClient, terminal: &str) {
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(herdr.hc_bin())
+            .args(["kill", terminal])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(herdr.hc_bin())
+            .args(["rm", terminal])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await;
 }
 
 async fn apply_hc_labels(
@@ -484,17 +608,18 @@ pub async fn execute_orch_command(
 
             let _ = crate::daemon::ensure_daemon_running(paths).await;
 
-            let coord_term = coordinator
-                .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .context(
-                    "coordinator terminal not specified; pass --coordinator <term> or run inside Herdr ($HC_TERMINAL_ID)",
-                )?;
-
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let term_info = fetch_hc_terminal(&herdr, &coord_term).await.ok();
-            let coordinator_created_ms = term_info.and_then(|t| t.created_ms).unwrap_or(now_ms);
+            let resolved_coord = resolve_caller_terminal(
+                &herdr,
+                coordinator,
+                None,
+                Some(now_ms),
+                false,
+                "coordinator terminal not specified; pass --coordinator <term> or run inside Herdr ($HC_TERMINAL_ID)",
+            )
+            .await?;
+            let coord_term = resolved_coord.terminal;
+            let coordinator_created_ms = resolved_coord.created_ms;
 
             let run_id = generate_orch_id("run");
             let run_title = title
@@ -579,6 +704,7 @@ pub async fn execute_orch_command(
             agent,
             worktree,
             request_id,
+            caller,
             json,
         } => {
             let _ = crate::daemon::ensure_daemon_running(paths).await;
@@ -596,7 +722,7 @@ pub async fn execute_orch_command(
                     agent,
                     worktree,
                     request_id,
-                    caller_terminal: None,
+                    caller_terminal: caller,
                 },
             )
             .await?;
@@ -611,6 +737,7 @@ pub async fn execute_orch_command(
             task_id: _,
             body,
             request_id,
+            caller,
             json,
         } => {
             let sleeper = SystemOrchSleeper;
@@ -624,7 +751,7 @@ pub async fn execute_orch_command(
                     dispatch_id,
                     body,
                     request_id,
-                    caller_terminal: None,
+                    caller_terminal: caller,
                 },
             )
             .await?;
@@ -636,6 +763,7 @@ pub async fn execute_orch_command(
             dispatch_id,
             question,
             request_id,
+            caller,
             json,
         } => {
             let sleeper = SystemOrchSleeper;
@@ -647,7 +775,7 @@ pub async fn execute_orch_command(
                     dispatch_id,
                     question,
                     request_id,
-                    caller_terminal: None,
+                    caller_terminal: caller,
                 },
             )
             .await?;
@@ -702,10 +830,7 @@ pub async fn execute_orch_command(
             peek,
             json,
         } => {
-            let env_term = std::env::var("HC_TERMINAL_ID")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
+            let env_term = env_hc_terminal_id();
 
             let target_terminal = match (env_term, terminal) {
                 (Some(caller), Some(override_term)) => {
@@ -839,26 +964,7 @@ pub async fn execute_orch_command(
                 }
             }
 
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                Command::new(herdr.hc_bin())
-                    .args(["kill", &disp.assignee_terminal])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status(),
-            )
-            .await;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                Command::new(herdr.hc_bin())
-                    .args(["rm", &disp.assignee_terminal])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status(),
-            )
-            .await;
+            close_worker_terminal(&herdr, &disp.assignee_terminal).await;
 
             let now_ms = chrono::Utc::now().timestamp_millis();
             let final_status = if matches!(
@@ -920,18 +1026,18 @@ pub async fn execute_dispatch(
         .get_run(&args.run)?
         .with_context(|| format!("run '{}' does not exist", args.run))?;
 
-    let caller_terminal = args
-        .caller_terminal
-        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| run_row.coordinator_terminal.clone());
-
-    let caller_term_info = fetch_hc_terminal(herdr, &caller_terminal).await.ok();
-    let caller_created_ms = caller_term_info
-        .as_ref()
-        .and_then(|t| t.created_ms)
-        .unwrap_or(run_row.coordinator_created_ms);
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        Some(&run_row.coordinator_terminal),
+        Some(run_row.coordinator_created_ms),
+        false,
+        "caller terminal could not be resolved",
+    )
+    .await?;
+    let caller_terminal = resolved_caller.terminal;
+    let caller_created_ms = resolved_caller.created_ms;
+    let caller_term_info = resolved_caller.term_info;
 
     let depth = store.caller_orchestration_depth(&caller_terminal, caller_created_ms)?;
     if depth > MAX_ORCH_DEPTH {
@@ -1027,14 +1133,18 @@ pub async fn execute_dispatch(
     ];
 
     let is_attached = args.terminal.is_some();
-    let (agent_kind_str, mut worker_term) = if let Some(ref existing_term) = args.terminal {
-        let fetched = fetch_hc_terminal(herdr, existing_term).await?;
-        let _ = apply_hc_labels(herdr, existing_term, &labels).await;
-        ("attached".to_string(), fetched)
+    let launch_res: Result<(String, HcTerminal)> = if let Some(ref existing_term) = args.terminal {
+        match fetch_hc_terminal(herdr, existing_term).await {
+            Ok(fetched) => {
+                let _ = apply_hc_labels(herdr, existing_term, &labels).await;
+                Ok(("attached".to_string(), fetched))
+            }
+            Err(err) => Err(err),
+        }
     } else {
         let raw_agent = args.agent.unwrap_or_else(|| "claude".to_string());
         let agent_cmd = map_agent_preset(&raw_agent);
-        let spawned = herdr
+        match herdr
             .run_worker(
                 &caller_terminal,
                 &dispatch_cwd,
@@ -1042,8 +1152,25 @@ pub async fn execute_dispatch(
                 &agent_cmd,
                 &preamble,
             )
-            .await?;
-        (raw_agent, spawned)
+            .await
+        {
+            Ok(spawned) => Ok((raw_agent, spawned)),
+            Err(err) => Err(err),
+        }
+    };
+
+    let (agent_kind_str, mut worker_term) = match launch_res {
+        Ok(pair) => pair,
+        Err(err) => {
+            if let Some(ref wt_path) = worktree_path_opt {
+                let note =
+                    match cleanup_failed_child_worktree(wt_path, &args.run, &task_row.id).await {
+                        Ok(cleaned) | Err(cleaned) => cleaned,
+                    };
+                return Err(anyhow!("{err} ({note})"));
+            }
+            return Err(err);
+        }
     };
 
     let worker_created_ms = worker_term.created_ms.unwrap_or(now_ms);
@@ -1056,8 +1183,8 @@ pub async fn execute_dispatch(
         terminal_created_ms: worker_created_ms,
         turn_at_dispatch: worker_term.turn,
         agent_kind: agent_kind_str,
-        worktree_mode: args.worktree,
-        worktree_path: worktree_path_opt,
+        worktree_mode: args.worktree.clone(),
+        worktree_path: worktree_path_opt.clone(),
         depth,
         status: DispatchStatus::Dispatched,
         idle_since_ms: None,
@@ -1066,7 +1193,18 @@ pub async fn execute_dispatch(
         updated_at_ms: now_ms,
     };
 
-    store.create_dispatch(&disp)?;
+    if let Err(err) = store.create_dispatch(&disp) {
+        if !is_attached {
+            close_worker_terminal(herdr, &worker_term.address).await;
+        }
+        if let Some(ref wt_path) = worktree_path_opt {
+            let note = match cleanup_failed_child_worktree(wt_path, &args.run, &task_row.id).await {
+                Ok(cleaned) | Err(cleaned) => cleaned,
+            };
+            return Err(anyhow!("{err} ({note})"));
+        }
+        return Err(err);
+    }
 
     let attach_send_failed = if let Some(ref existing_term) = args.terminal {
         !herdr
@@ -1190,8 +1328,30 @@ pub async fn execute_dispatch(
         None
     };
 
-    let (failure_reason, exit_code, output_tail) = match failure_info {
-        Some((reason, code, tail)) => {
+    let (failure_reason, exit_code, output_tail, worktree_cleanup) = match failure_info {
+        Some((mut reason, code, tail)) => {
+            if !is_attached {
+                close_worker_terminal(herdr, &worker_term.address).await;
+            }
+            let wt_cleanup = if args.worktree == "new-child" {
+                if let Some(ref wt_path) = disp.worktree_path.clone() {
+                    match cleanup_failed_child_worktree(wt_path, &args.run, &task_row.id).await {
+                        Ok(cleaned) => {
+                            store.clear_dispatch_worktree_path(&dispatch_id, sleeper.now_ms())?;
+                            Some(cleaned)
+                        }
+                        Err(kept) => {
+                            reason.push_str(&format!("\n{kept}"));
+                            Some(kept)
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             store.record_task_failure(
                 &args.run,
                 &task_row.id,
@@ -1202,9 +1362,9 @@ pub async fn execute_dispatch(
             if let Some(updated) = store.get_dispatch(&dispatch_id)? {
                 disp = updated;
             }
-            (Some(reason), code, tail)
+            (Some(reason), code, tail, wt_cleanup)
         }
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
 
     let out = DispatchOutput {
@@ -1212,6 +1372,7 @@ pub async fn execute_dispatch(
         failure_reason,
         exit_code,
         output_tail,
+        worktree_cleanup,
     };
 
     let resp_json = serde_json::to_string(&out)?;
@@ -1220,6 +1381,20 @@ pub async fn execute_dispatch(
     }
 
     Ok(out)
+}
+
+async fn cleanup_failed_child_worktree(
+    wt_path: &str,
+    run_id: &str,
+    task_id: &str,
+) -> std::result::Result<String, String> {
+    match verify_and_remove_child_worktree(Path::new(wt_path), run_id, task_id, false).await {
+        Ok(()) => Ok(format!("removed clean child worktree '{}'", wt_path)),
+        Err(wt_err) => Err(format!(
+            "kept child worktree '{}' because it is dirty or unmerged ({})",
+            wt_path, wt_err
+        )),
+    }
 }
 
 fn format_launch_failure_reason(
@@ -1296,7 +1471,7 @@ pub async fn execute_send(
         );
     }
 
-    let disp = wait_for_dispatch(
+    let _disp = wait_for_dispatch(
         store,
         &args.dispatch_id,
         DISPATCH_WAIT_TIMEOUT,
@@ -1305,18 +1480,17 @@ pub async fn execute_send(
     )
     .await?;
 
-    let caller_terminal = args
-        .caller_terminal
-        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| disp.assignee_terminal.clone());
-
-    let caller_created_ms = fetch_hc_terminal(herdr, &caller_terminal)
-        .await
-        .ok()
-        .and_then(|t| t.created_ms)
-        .unwrap_or(disp.terminal_created_ms);
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        None,
+        None,
+        true,
+        "caller terminal identity could not be established for attempt fencing; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+    )
+    .await?;
+    let caller_terminal = resolved_caller.terminal;
+    let caller_created_ms = resolved_caller.created_ms;
 
     let now_ms = sleeper.now_ms();
     let msg = match parsed_type {
@@ -1363,7 +1537,7 @@ pub async fn execute_ask(
         }
     }
 
-    let disp = wait_for_dispatch(
+    let _disp = wait_for_dispatch(
         store,
         &args.dispatch_id,
         DISPATCH_WAIT_TIMEOUT,
@@ -1372,18 +1546,17 @@ pub async fn execute_ask(
     )
     .await?;
 
-    let caller_terminal = args
-        .caller_terminal
-        .or_else(|| std::env::var("HC_TERMINAL_ID").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| disp.assignee_terminal.clone());
-
-    let caller_created_ms = fetch_hc_terminal(herdr, &caller_terminal)
-        .await
-        .ok()
-        .and_then(|t| t.created_ms)
-        .unwrap_or(disp.terminal_created_ms);
+    let resolved_caller = resolve_caller_terminal(
+        herdr,
+        args.caller_terminal,
+        None,
+        None,
+        true,
+        "caller terminal identity could not be established for attempt fencing; pass --caller <term> or run inside Herdr ($HC_TERMINAL_ID)",
+    )
+    .await?;
+    let caller_terminal = resolved_caller.terminal;
+    let caller_created_ms = resolved_caller.created_ms;
 
     let now_ms = sleeper.now_ms();
     let (q_thread, msg) = store.record_question(
@@ -1446,6 +1619,9 @@ fn print_dispatch(out: &DispatchOutput, json: bool) -> Result<()> {
             MAX_ORCH_DEPTH,
             reason
         );
+        if let Some(ref wt_note) = out.worktree_cleanup {
+            println!("Worktree cleanup: {wt_note}");
+        }
     } else {
         println!(
             "Dispatched {} for task {} in run {} -> worker {} (status={}, depth={}/{})",
@@ -1561,4 +1737,121 @@ fn print_inbox_check(res: &InboxCheckResult, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn test_resolve_caller_terminal_strict_fencing_and_non_strict_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_hc_ok = tmp.path().join("hc-ok");
+        fs::write(
+            &fake_hc_ok,
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               echo '{\"address\":\"t2\",\"created_ms\":2000,\"state\":\"live\"}'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_hc_ok, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_hc_no_created = tmp.path().join("hc-no-created");
+        fs::write(
+            &fake_hc_no_created,
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               echo '{\"address\":\"t2\",\"state\":\"live\"}'\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_hc_no_created, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake_hc_fail = tmp.path().join("hc-fail");
+        fs::write(&fake_hc_fail, "#!/usr/bin/env bash\nexit 1\n").unwrap();
+        fs::set_permissions(&fake_hc_fail, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ok_client = HerdrClient::new(fake_hc_ok.to_string_lossy().to_string());
+        let no_created_client = HerdrClient::new(fake_hc_no_created.to_string_lossy().to_string());
+        let fail_client = HerdrClient::new(fake_hc_fail.to_string_lossy().to_string());
+
+        // Strict mode rejects missing explicit & env regardless of fallback values
+        let err_missing = resolve_caller_terminal_with_env(
+            &ok_client,
+            None,
+            None,
+            Some("t2"),
+            Some(2_000),
+            true,
+            "missing caller",
+        )
+        .await
+        .unwrap_err();
+        assert!(err_missing.to_string().contains("missing caller"));
+
+        // Strict mode rejects when hc omits created_ms
+        let err_omitted = resolve_caller_terminal_with_env(
+            &no_created_client,
+            None,
+            Some("t2".into()),
+            None,
+            Some(2_000),
+            true,
+            "missing caller",
+        )
+        .await
+        .unwrap_err();
+        assert!(err_omitted.to_string().contains("created_ms"));
+
+        // Strict mode rejects when hc lookup fails
+        let err_fail = resolve_caller_terminal_with_env(
+            &fail_client,
+            Some("t2".into()),
+            None,
+            None,
+            Some(2_000),
+            true,
+            "missing caller",
+        )
+        .await
+        .unwrap_err();
+        assert!(err_fail.to_string().contains("attempt fencing"));
+
+        // Strict mode succeeds when env or explicit provides terminal and hc returns created_ms
+        let ok = resolve_caller_terminal_with_env(
+            &ok_client,
+            None,
+            Some(" t2 ".into()),
+            None,
+            None,
+            true,
+            "missing caller",
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok.terminal, "t2");
+        assert_eq!(ok.created_ms, 2_000);
+
+        // Non-strict mode uses fallback terminal and fallback created_ms when hc is unavailable
+        let fb = resolve_caller_terminal_with_env(
+            &fail_client,
+            None,
+            None,
+            Some("t1"),
+            Some(1_000),
+            false,
+            "missing caller",
+        )
+        .await
+        .unwrap();
+        assert_eq!(fb.terminal, "t1");
+        assert_eq!(fb.created_ms, 1_000);
+    }
 }

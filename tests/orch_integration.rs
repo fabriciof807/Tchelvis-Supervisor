@@ -1363,3 +1363,810 @@ async fn task_b_dispatch_failed_read_tail_does_not_fail_failure_recording() {
         .unwrap_or("")
         .contains("exit_code=3"));
 }
+
+fn init_temp_git_repo(repo_dir: &std::path::Path) {
+    fs::create_dir_all(repo_dir).unwrap();
+    for args in [
+        vec!["init"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["config", "user.name", "Test"],
+    ] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed", args);
+    }
+    fs::write(repo_dir.join("README.md"), "init\n").unwrap();
+    for args in [vec!["add", "."], vec!["commit", "-m", "initial"]] {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {:?} failed", args);
+    }
+}
+
+#[tokio::test]
+async fn lot_d_failed_dispatch_new_child_cleans_up_clean_worktree_and_closes_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    init_temp_git_repo(&repo_dir);
+
+    // Case A: liveness re-check detects worker exited with code 2
+    let get_count_file = tmp.path().join("get_count_a");
+    let term_ops_log = tmp.path().join("term_ops_a.log");
+    fs::write(&get_count_file, "0").unwrap();
+    let fake_hc_a = tmp.path().join("fake-hc-a");
+    let script_a = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"run\" ]; then\n\
+           echo '{{\"address\":\"t5\",\"agent\":\"agy\",\"cwd\":\"/tmp\",\"state\":\"live\",\"turn\":0}}'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           if [ \"$2\" = \"t1\" ]; then\n\
+             echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"{}\"}}'\n\
+             exit 0\n\
+           fi\n\
+           c=$(cat \"{}\")\n\
+           c=$((c + 1))\n\
+           echo \"$c\" > \"{}\"\n\
+           if [ \"$c\" -eq 1 ]; then\n\
+             echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+           else\n\
+             echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"finished\",\"exit_code\":2,\"turn\":0,\"labels\":{{}}}}'\n\
+           fi\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"kill\" ] || [ \"$1\" = \"rm\" ]; then\n\
+           echo \"$1 $2\" >> \"{}\"\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"read\" ]; then\n\
+           echo \"Error: failed\"\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+        repo_dir.display(),
+        get_count_file.display(),
+        get_count_file.display(),
+        term_ops_log.display(),
+    );
+    fs::write(&fake_hc_a, script_a).unwrap();
+    fs::set_permissions(&fake_hc_a, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = OrchStore::open(&tmp.path().join("orch_a.db")).unwrap();
+    store.create_run(&sample_run("run_a", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_a", "task_a", vec![]))
+        .unwrap();
+
+    let out_a = execute_dispatch(
+        &store,
+        &HerdrClient::new(fake_hc_a.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(10_000),
+        OrchDispatchArgs {
+            run: "run_a".into(),
+            task: "task_a".into(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some("agy".into()),
+            worktree: "new-child".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_a.dispatch.status, DispatchStatus::NeedsReview);
+    let wt_a = repo_dir.join(".work/orch-run_a-task_a");
+    assert!(
+        !wt_a.exists(),
+        "clean child worktree should be removed on failed launch"
+    );
+    let ops_a = fs::read_to_string(&term_ops_log).unwrap_or_default();
+    assert!(
+        ops_a.contains("kill t5"),
+        "expected hc kill t5, got: {ops_a}"
+    );
+    assert!(ops_a.contains("rm t5"), "expected hc rm t5, got: {ops_a}");
+
+    // Case B: first_message.sent == false (trust dialog)
+    let term_ops_b = tmp.path().join("term_ops_b.log");
+    let fake_hc_b = tmp.path().join("fake-hc-b");
+    let script_b = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"run\" ]; then\n\
+           echo '{{\"address\":\"t6\",\"created_ms\":6000,\"state\":\"live\",\"turn\":0,\"first_message\":{{\"sent\":false,\"reason\":\"trust_dialog\"}}}}'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"{}\"}}'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"kill\" ] || [ \"$1\" = \"rm\" ]; then\n\
+           echo \"$1 $2\" >> \"{}\"\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+        repo_dir.display(),
+        term_ops_b.display(),
+    );
+    fs::write(&fake_hc_b, script_b).unwrap();
+    fs::set_permissions(&fake_hc_b, fs::Permissions::from_mode(0o755)).unwrap();
+
+    store
+        .create_or_update_task(&sample_task("run_a", "task_b", vec![]))
+        .unwrap();
+    let out_b = execute_dispatch(
+        &store,
+        &HerdrClient::new(fake_hc_b.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(20_000),
+        OrchDispatchArgs {
+            run: "run_a".into(),
+            task: "task_b".into(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some("claude".into()),
+            worktree: "new-child".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(out_b.dispatch.status, DispatchStatus::NeedsReview);
+    assert!(!repo_dir.join(".work/orch-run_a-task_b").exists());
+    let ops_b = fs::read_to_string(&term_ops_b).unwrap_or_default();
+    assert!(
+        ops_b.contains("kill t6"),
+        "expected hc kill t6, got: {ops_b}"
+    );
+    assert!(ops_b.contains("rm t6"), "expected hc rm t6, got: {ops_b}");
+
+    // Case C: run_worker errors after create_child_worktree
+    let fake_hc_c = tmp.path().join("fake-hc-c");
+    let script_c = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"{}\"}}'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"run\" ]; then\n\
+           echo 'agent binary not found' >&2\n\
+           exit 1\n\
+         fi\n\
+         exit 1\n",
+        repo_dir.display(),
+    );
+    fs::write(&fake_hc_c, script_c).unwrap();
+    fs::set_permissions(&fake_hc_c, fs::Permissions::from_mode(0o755)).unwrap();
+
+    store
+        .create_or_update_task(&sample_task("run_a", "task_c", vec![]))
+        .unwrap();
+    let err_c = execute_dispatch(
+        &store,
+        &HerdrClient::new(fake_hc_c.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(30_000),
+        OrchDispatchArgs {
+            run: "run_a".into(),
+            task: "task_c".into(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some("claude".into()),
+            worktree: "new-child".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(err_c.to_string().contains("hc run failed"));
+    assert!(
+        !repo_dir.join(".work/orch-run_a-task_c").exists(),
+        "clean worktree must be removed even when run_worker errors"
+    );
+}
+
+#[tokio::test]
+async fn lot_d_failed_dispatch_new_child_keeps_dirty_worktree_and_reports_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_dir = tmp.path().join("repo");
+    init_temp_git_repo(&repo_dir);
+
+    let fake_hc = tmp.path().join("fake-hc");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"{}\"}}'\n\
+           exit 0\n\
+         fi\n\
+         if [ \"$1\" = \"run\" ]; then\n\
+           cwd=\"\"\n\
+           while [ \"$#\" -gt 0 ]; do\n\
+             if [ \"$1\" = \"--cwd\" ]; then cwd=\"$2\"; shift 2; continue; fi\n\
+             shift\n\
+           done\n\
+           echo 'partial work' > \"$cwd/wip.txt\"\n\
+           echo '{{\"address\":\"t7\",\"created_ms\":7000,\"state\":\"finished\",\"exit_code\":1,\"turn\":0,\"first_message\":{{\"sent\":true}}}}'\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+        repo_dir.display(),
+    );
+    fs::write(&fake_hc, script).unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    store.create_run(&sample_run("run_d", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_d", "task_dirty", vec![]))
+        .unwrap();
+
+    let out = execute_dispatch(
+        &store,
+        &HerdrClient::new(fake_hc.to_string_lossy().to_string()),
+        &FakeOrchSleeper::new(10_000),
+        OrchDispatchArgs {
+            run: "run_d".into(),
+            task: "task_dirty".into(),
+            title: None,
+            prompt: None,
+            terminal: None,
+            agent: Some("claude".into()),
+            worktree: "new-child".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let wt = repo_dir.join(".work/orch-run_d-task_dirty");
+    assert!(wt.exists(), "dirty worktree must never be force-deleted");
+    assert!(wt.join("wip.txt").exists());
+    let reason = out.failure_reason.as_deref().unwrap_or("");
+    assert!(
+        reason.contains("worktree") && reason.contains("dirty"),
+        "failure_reason should explain why dirty worktree was kept: {reason}"
+    );
+}
+
+#[tokio::test]
+async fn lot_d_send_and_ask_reject_missing_caller_identity_or_hc_lookup_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let failing_hc = tmp.path().join("failing-hc");
+    fs::write(&failing_hc, "#!/usr/bin/env bash\nexit 1\n").unwrap();
+    fs::set_permissions(&failing_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let failing_herdr = HerdrClient::new(failing_hc.to_string_lossy().to_string());
+
+    let working_hc = tmp.path().join("working-hc");
+    fs::write(
+        &working_hc,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{\"address\":\"t2\",\"created_ms\":2000,\"state\":\"live\",\"turn\":0,\"labels\":{}}'\n\
+           exit 0\n\
+         fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&working_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let working_herdr = HerdrClient::new(working_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_1", "run_1", "task_a", "t1", "t2", 2_000, 0,
+        ))
+        .unwrap();
+
+    // Missing caller identity on send (no --caller and no HC_TERMINAL_ID) must error, not borrow disp.assignee_terminal
+    if std::env::var_os("HC_TERMINAL_ID").is_none() {
+        let send_no_caller = execute_send(
+            &store,
+            &working_herdr,
+            &FakeOrchSleeper::new(10_000),
+            OrchSendArgs {
+                msg_type: "worker_done".into(),
+                outcome: Some("succeeded".into()),
+                dispatch_id: "disp_1".into(),
+                body: "done".into(),
+                request_id: None,
+                caller_terminal: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            send_no_caller.to_string().contains("caller")
+                || send_no_caller.to_string().contains("HC_TERMINAL_ID"),
+            "unexpected error: {send_no_caller}"
+        );
+
+        let ask_no_caller = execute_ask(
+            &store,
+            &working_herdr,
+            &FakeOrchSleeper::new(10_000),
+            OrchAskArgs {
+                dispatch_id: "disp_1".into(),
+                question: "hi?".into(),
+                request_id: None,
+                caller_terminal: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            ask_no_caller.to_string().contains("caller")
+                || ask_no_caller.to_string().contains("HC_TERMINAL_ID"),
+            "unexpected error: {ask_no_caller}"
+        );
+    }
+
+    // hc lookup failure on send/ask must error, not borrow disp.terminal_created_ms
+    let send_hc_fail = execute_send(
+        &store,
+        &failing_herdr,
+        &FakeOrchSleeper::new(10_000),
+        OrchSendArgs {
+            msg_type: "worker_done".into(),
+            outcome: Some("succeeded".into()),
+            dispatch_id: "disp_1".into(),
+            body: "done".into(),
+            request_id: None,
+            caller_terminal: Some("t2".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        send_hc_fail.to_string().contains("fencing") || send_hc_fail.to_string().contains("hc"),
+        "unexpected error: {send_hc_fail}"
+    );
+
+    let ask_hc_fail = execute_ask(
+        &store,
+        &failing_herdr,
+        &FakeOrchSleeper::new(10_000),
+        OrchAskArgs {
+            dispatch_id: "disp_1".into(),
+            question: "hi?".into(),
+            request_id: None,
+            caller_terminal: Some("t2".into()),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        ask_hc_fail.to_string().contains("fencing") || ask_hc_fail.to_string().contains("hc"),
+        "unexpected error: {ask_hc_fail}"
+    );
+
+    // Dispatch must still be untouched
+    assert_eq!(
+        store.get_dispatch("disp_1").unwrap().unwrap().status,
+        DispatchStatus::Dispatched
+    );
+}
+
+#[tokio::test]
+async fn lot_d_delivery_error_on_first_target_defers_and_still_delivers_to_second_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sent_log = tmp.path().join("sent.log");
+    let fake_hc = tmp.path().join("fake-hc");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"send\" ]; then\n\
+           # args: send --if idle <terminal> <text> --json\n\
+           target=\"$4\"\n\
+           if [ \"$target\" = \"t1\" ]; then\n\
+             echo \"broken pipe\" >&2\n\
+             exit 1\n\
+           fi\n\
+           echo \"$target: $5\" >> \"{}\"\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+        sent_log.display()
+    );
+    fs::write(&fake_hc, script).unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open_in_memory().unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store.create_run(&sample_run("run_2", "t9")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    store
+        .create_or_update_task(&sample_task("run_2", "task_b", vec![]))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_1", "run_1", "task_a", "t1", "t2", 2_000, 0,
+        ))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_2", "run_2", "task_b", "t9", "t3", 3_000, 0,
+        ))
+        .unwrap();
+    store
+        .record_worker_done("disp_1", "t2", 2_000, "succeeded", "Done 1", 4_000)
+        .unwrap();
+    store
+        .record_worker_done("disp_2", "t3", 3_000, "succeeded", "Done 2", 4_100)
+        .unwrap();
+
+    let mut tracker = FleetTracker::new();
+    tracker.apply_snapshot(
+        vec![
+            HcTerminal {
+                address: "t1".into(),
+                state: "live".into(),
+                status: Some(HcStatus {
+                    state: "idle".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            HcTerminal {
+                address: "t9".into(),
+                state: "live".into(),
+                status: Some(HcStatus {
+                    state: "idle".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ],
+        4_200,
+    );
+
+    let out = OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 4_200)
+        .await
+        .unwrap();
+    assert_eq!(out.delivered_count, 1);
+    assert_eq!(out.deferred_count, 1);
+
+    let sent = fs::read_to_string(&sent_log).unwrap();
+    assert!(
+        sent.contains("t9:"),
+        "expected t9 pointer sent, got: {sent}"
+    );
+
+    // t1 remains pending for retry while t9 is delivered
+    let t1_msg = store
+        .claim_inbox_messages("t1", Some("run_1"), true, 4_300)
+        .unwrap();
+    assert_eq!(t1_msg.messages[0].pointer_state, PointerState::Pending);
+    let t9_msg = store
+        .claim_inbox_messages("t9", Some("run_2"), true, 4_300)
+        .unwrap();
+    assert_eq!(t9_msg.messages[0].pointer_state, PointerState::Delivered);
+}
+
+#[tokio::test]
+async fn lot_d_reconciler_does_not_false_escalate_missing_terminal_within_grace_or_missing_created_ms(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let get_mode = tmp.path().join("get_mode");
+    fs::write(&get_mode, "missing").unwrap();
+    let fake_hc = tmp.path().join("fake-hc");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           mode=$(cat \"{}\")\n\
+           if [ \"$mode\" = \"live\" ]; then\n\
+             echo '{{\"address\":\"t2\",\"created_ms\":2000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+             exit 0\n\
+           fi\n\
+           exit 1\n\
+         fi\n\
+         exit 0\n",
+        get_mode.display()
+    );
+    fs::write(&fake_hc, script).unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open_in_memory().unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    let mut disp = sample_dispatch("disp_fresh", "run_1", "task_a", "t1", "t2", 2_000, 0);
+    disp.created_at_ms = 10_000;
+    store.create_dispatch(&disp).unwrap();
+
+    // 1. Right after dispatch (now=10_500), t2 is not yet in FleetTracker -> must NOT false-escalate
+    let mut tracker = FleetTracker::new();
+    let out1 = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &tracker, 10_500)
+        .await
+        .unwrap();
+    assert_eq!(out1.stop_escalations, 0);
+    assert_eq!(
+        store.get_dispatch("disp_fresh").unwrap().unwrap().status,
+        DispatchStatus::Dispatched
+    );
+
+    // 2. Partial event creates t2 in FleetTracker with created_ms: None -> must NOT count as recreated
+    let ev = tchelvis::herdr::parse_hc_event_line(
+        r#"{"jsonrpc":"2.0","method":"event","params":{"data":{"state":"working"},"seq":1,"terminal":"t2","type":"status"}}"#,
+    )
+    .unwrap();
+    tracker.apply_stream_item(ev, 10_800);
+    assert_eq!(tracker.terminals.get("t2").unwrap().created_ms, None);
+
+    let out2 = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &tracker, 12_000)
+        .await
+        .unwrap();
+    assert_eq!(out2.stop_escalations, 0);
+    assert_eq!(
+        store.get_dispatch("disp_fresh").unwrap().unwrap().status,
+        DispatchStatus::Dispatched
+    );
+
+    // 3. Even after grace window (now=20_000), if t2 is missing from tracker but `hc get` says live -> do NOT escalate
+    let empty_tracker = FleetTracker::new();
+    fs::write(&get_mode, "live").unwrap();
+    let out3 = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &empty_tracker, 20_000)
+        .await
+        .unwrap();
+    assert_eq!(out3.stop_escalations, 0);
+
+    // 4. After grace window when `hc get` confirms missing -> escalate as terminal_missing
+    fs::write(&get_mode, "missing").unwrap();
+    let out4 = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &empty_tracker, 20_000)
+        .await
+        .unwrap();
+    assert_eq!(out4.stop_escalations, 1);
+    assert!(store.has_message("msg_stop_disp_fresh_0").unwrap());
+}
+
+#[tokio::test]
+async fn lot_d_duplicate_worker_done_is_rejected_and_preserves_single_inbox_message() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"get\" ]; then\n\
+           echo '{\"address\":\"t2\",\"created_ms\":2000,\"state\":\"live\",\"turn\":1,\"labels\":{}}'\n\
+           exit 0\n\
+         fi\n\
+         exit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open_in_memory().unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_b", vec![]))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_ok", "run_1", "task_a", "t1", "t2", 2_000, 0,
+        ))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_fail",
+            "run_1",
+            "task_b",
+            "t1",
+            "t2",
+            2_000,
+            0,
+        ))
+        .unwrap();
+
+    // First worker_done via execute_send with request_id succeeds
+    let first = execute_send(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(5_000),
+        OrchSendArgs {
+            msg_type: "worker_done".into(),
+            outcome: Some("succeeded".into()),
+            dispatch_id: "disp_ok".into(),
+            body: "first report".into(),
+            request_id: Some("req_wd_1".into()),
+            caller_terminal: Some("t2".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.body, "first report");
+
+    // Retry with same request_id returns cached receipt
+    let retry = execute_send(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(5_100),
+        OrchSendArgs {
+            msg_type: "worker_done".into(),
+            outcome: Some("succeeded".into()),
+            dispatch_id: "disp_ok".into(),
+            body: "first report".into(),
+            request_id: Some("req_wd_1".into()),
+            caller_terminal: Some("t2".into()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(retry.id, first.id);
+
+    // Second worker_done without same request_id is rejected
+    let dup_err = store
+        .record_worker_done("disp_ok", "t2", 2_000, "succeeded", "second report", 5_200)
+        .unwrap_err();
+    assert!(
+        dup_err.to_string().contains("already") || dup_err.to_string().contains("once"),
+        "expected clear duplicate rejection error, got: {dup_err}"
+    );
+
+    // Failed dispatch: second worker_done must not increment failure_count a second time
+    store
+        .record_worker_done("disp_fail", "t2", 2_000, "failed", "fail 1", 6_000)
+        .unwrap();
+    let dup_fail_err = store
+        .record_worker_done("disp_fail", "t2", 2_000, "failed", "fail 2", 6_100)
+        .unwrap_err();
+    assert!(
+        dup_fail_err.to_string().contains("already") || dup_fail_err.to_string().contains("once")
+    );
+    assert_eq!(
+        store
+            .get_task("run_1", "task_b")
+            .unwrap()
+            .unwrap()
+            .failure_count,
+        1
+    );
+
+    // Inbox for t1 has exactly 2 messages (one per dispatch), not 4
+    let inbox = store
+        .claim_inbox_messages("t1", Some("run_1"), true, 6_200)
+        .unwrap();
+    assert_eq!(inbox.messages.len(), 2);
+
+    // Worker preamble instructs reporting worker_done once
+    let preamble = tchelvis::orch::preamble::build_dispatch_preamble(
+        "run_1", "task_a", "disp_ok", "t1", 1, "Do work",
+    );
+    assert!(
+        preamble.to_ascii_lowercase().contains("once"),
+        "preamble should instruct reporting worker_done once: {preamble}"
+    );
+}
+
+#[tokio::test]
+async fn lot_d_coordinator_claude_done_receives_worker_done_pointer_after_deferral_and_earlier_pointer(
+) {
+    let tmp = tempfile::tempdir().unwrap();
+    let send_log = tmp.path().join("hc_send.log");
+    let fake_hc = tmp.path().join("fake-hc");
+    let script = format!(
+        "#!/usr/bin/env bash\n\
+         if [ \"$1\" = \"send\" ]; then\n\
+           echo \"$*\" >> \"{}\"\n\
+           exit 0\n\
+         fi\n\
+         exit 0\n",
+        send_log.display()
+    );
+    fs::write(&fake_hc, script).unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    let store = OrchStore::open_in_memory().unwrap();
+    store.create_run(&sample_run("run_1", "t1")).unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_a", vec![]))
+        .unwrap();
+    store
+        .create_or_update_task(&sample_task("run_1", "task_b", vec![]))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_a", "run_1", "task_a", "t1", "t2", 2_000, 0,
+        ))
+        .unwrap();
+    store
+        .create_dispatch(&sample_dispatch(
+            "disp_b", "run_1", "task_b", "t1", "t3", 3_000, 0,
+        ))
+        .unwrap();
+
+    // Coordinator t1 (Claude Code) is currently Working when an escalation occurs on disp_a
+    let mut tracker = FleetTracker::new();
+    tracker.apply_snapshot(
+        vec![HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            status: Some(HcStatus {
+                state: "working".into(),
+                app: Some("claude".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        5_000,
+    );
+    store
+        .record_turn_stop_escalation("disp_a", 0, "worker_exited_or_errored", "", 5_000)
+        .unwrap();
+
+    // Tick 1 while Working -> deferred
+    let d1 = OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 5_100)
+        .await
+        .unwrap();
+    assert_eq!(d1.delivered_count, 0);
+    assert_eq!(d1.deferred_count, 1);
+
+    // Claude Code Stop hook fires: state=done, app=claude -> pointer is delivered
+    tracker.apply_snapshot(
+        vec![HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            status: Some(HcStatus {
+                state: "done".into(),
+                app: Some("claude".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        6_000,
+    );
+    let d2 = OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 6_000)
+        .await
+        .unwrap();
+    assert_eq!(d2.delivered_count, 1);
+
+    // Later (t=10_000), worker_done arrives for disp_b while msg_1 pointer is unexpired (until 36_000)
+    store
+        .record_worker_done("disp_b", "t3", 3_000, "succeeded", "Done B", 10_000)
+        .unwrap();
+    let d3 = OrchDeliveryCoordinator::deliver_pending_pointers(&store, &herdr, &tracker, 10_000)
+        .await
+        .unwrap();
+    assert_eq!(d3.delivered_count, 0);
+
+    // Once backoff expires at 36_000, has_active_unexpired_pointer clears and both messages are delivered
+    let d4 = OrchDeliveryCoordinator::deliver_pending_pointers(
+        &store,
+        &herdr,
+        &tracker,
+        6_000 + POINTER_RETRY_BACKOFF_MS,
+    )
+    .await
+    .unwrap();
+    assert_eq!(d4.delivered_count, 1);
+
+    let log_text = fs::read_to_string(&send_log).unwrap();
+    assert!(
+        log_text.contains("You have 2 orchestration message(s) in run run_1"),
+        "expected coalesced pointer with 2 messages once unexpired pointer expired: {log_text}"
+    );
+}

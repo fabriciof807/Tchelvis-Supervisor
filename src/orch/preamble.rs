@@ -11,13 +11,14 @@ pub fn build_dispatch_preamble(
          Run ID: {run_id} | Task ID: {task_id} | Dispatch ID: {dispatch_id} | Parent: {parent_terminal} | Depth: {depth}/2\n\
          \n\
          Mandatory Rules:\n\
-         1. When your task is complete, report back before ending your turn:\n\
-            tchelvis orch send --type worker_done --outcome succeeded --dispatch-id {dispatch_id} --body \"<concise summary of changes and verification>\"\n\
-         2. If you fail or cannot complete the task, report failure:\n\
-            tchelvis orch send --type worker_done --outcome failed --dispatch-id {dispatch_id} --body \"<failure reason>\"\n\
-         3. If you need clarification from the coordinator, ask and then end your turn immediately (never poll or sleep):\n\
+         1. Report `worker_done` exactly once per dispatch, only after all implementation and verification are complete (never send a preliminary `worker_done` followed by another):\n\
+            - When your task is complete, report back before ending your turn:\n\
+              tchelvis orch send --type worker_done --outcome succeeded --dispatch-id {dispatch_id} --body \"<concise summary of changes and verification>\"\n\
+            - If you fail or cannot complete the task, report failure:\n\
+              tchelvis orch send --type worker_done --outcome failed --dispatch-id {dispatch_id} --body \"<failure reason>\"\n\
+         2. If you need clarification from the coordinator, ask and then end your turn immediately (never poll or sleep):\n\
             tchelvis orch ask --dispatch-id {dispatch_id} --question \"<question>\"\n\
-         4. If you receive a `[tchelvis] You have N orchestration message(s)...` pointer, run:\n\
+         3. If you receive a `[tchelvis] You have N orchestration message(s)...` pointer, run:\n\
             tchelvis orch check --run {run_id}\n\
          \n\
          [TASK PROMPT]\n\

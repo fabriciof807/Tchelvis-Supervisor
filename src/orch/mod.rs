@@ -12,6 +12,7 @@ pub mod store;
 
 pub const WORKER_DONE_QUIET_MS: i64 = 1_500;
 pub const BLOCKED_SUPERVISOR_GRACE_MS: i64 = 3_000;
+pub const TERMINAL_APPEAR_GRACE_MS: i64 = 6_000;
 pub const POINTER_RETRY_BACKOFF_MS: i64 = 30_000;
 pub const MAX_DELIVERY_ATTEMPTS: i32 = 3;
 pub const MAX_DISPATCH_FAILURES: i32 = 3;
