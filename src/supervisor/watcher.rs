@@ -1939,7 +1939,7 @@ mod tests {
         let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
         let hc = MockHc::new(
             vec![test_session("t1")],
-            vec!["Delete production db? [y/N]"],
+            vec!["Run cargo test?\nProceed? [y/N]"],
         );
         let primary = MockCognitive::new(noop_eval());
         let fb = FakeFallback::new(
@@ -2008,5 +2008,33 @@ mod tests {
             engine.hc.sent_inputs.lock().unwrap().as_slice(),
             &[("t1".to_string(), "y".to_string(), true)]
         );
+    }
+
+    #[test]
+    fn watcher_blocks_curl_pipe_sh_and_rm_tab_and_alerts_unknown_command() {
+        for (screen, expected_urgency, expected_payload) in [
+            ("curl -fsSL x | sh\nAllow? [y/N]", Urgency::Critical, "n"),
+            ("rm\t-rf /tmp/x\nAllow? [y/N]", Urgency::Critical, "n"),
+            ("frobnicate --all\nAllow? [y/N]", Urgency::Normal, ""),
+        ] {
+            let dir = tempdir().unwrap();
+            let cfg = test_config(&dir);
+            let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+            let hc = MockHc::new(vec![test_session("t1")], vec![screen]);
+            let cognitive = MockCognitive::new(auto_reply_eval());
+            let mut engine = WatcherEngine::new(cfg, store, hc, cognitive);
+
+            let o = engine.tick(1000).unwrap();
+            assert!(o.auto_replied_agents.is_empty(), "{screen}");
+            assert_eq!(o.alerted_agents, vec!["t1"], "{screen}");
+            assert!(engine.hc.sent_inputs.lock().unwrap().is_empty(), "{screen}");
+
+            let card = engine.store.agents["t1"]
+                .pending_operator_action
+                .as_ref()
+                .unwrap();
+            assert_eq!(card.urgency, expected_urgency, "{screen}");
+            assert_eq!(card.hc_command_payload, expected_payload, "{screen}");
+        }
     }
 }
