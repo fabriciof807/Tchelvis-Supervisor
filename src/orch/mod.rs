@@ -259,10 +259,11 @@ pub fn send_to_recovery_hint(disp: &DispatchContext) -> String {
             disp.id
         )
     } else {
-        let agent_arg = if disp.agent_kind == "attached" {
-            "<agent>"
+        let agent_arg: std::borrow::Cow<'_, str> = if disp.agent_kind == "attached" {
+            std::borrow::Cow::Borrowed("<agent>")
         } else {
-            disp.agent_kind.as_str()
+            shlex::try_quote(&disp.agent_kind)
+                .unwrap_or(std::borrow::Cow::Borrowed(disp.agent_kind.as_str()))
         };
         if disp.status == DispatchStatus::Completed {
             format!(
@@ -528,5 +529,49 @@ mod tests {
         ] {
             assert_eq!(PointerState::from_str(p_state.as_str()).unwrap(), p_state);
         }
+    }
+
+    #[test]
+    fn lot_l_send_to_recovery_hint_quotes_spaced_agent_for_round_trip() {
+        let base_disp = DispatchContext {
+            id: "disp_1".into(),
+            run_id: "run_1".into(),
+            task_id: "task_1".into(),
+            parent_terminal: "t1".into(),
+            assignee_terminal: "t2".into(),
+            terminal_created_ms: 1000,
+            turn_at_dispatch: 0,
+            agent_kind: "agy --model 'GPT-OSS 120B (Medium)'".into(),
+            worktree_mode: "current".into(),
+            worktree_path: None,
+            depth: 1,
+            status: DispatchStatus::Completed,
+            idle_since_ms: None,
+            blocked_since_ms: None,
+            created_at_ms: 1000,
+            updated_at_ms: 1000,
+        };
+
+        for status in [DispatchStatus::Completed, DispatchStatus::Superseded] {
+            let mut disp = base_disp.clone();
+            disp.status = status;
+            let hint = send_to_recovery_hint(&disp);
+            let cmd = hint
+                .split('`')
+                .find(|s| s.starts_with("tchelvis orch launch"))
+                .expect("hint should contain backticked launch command");
+            let parsed = shlex::split(cmd).expect("launch command in hint should be valid shell");
+            let agent_pos = parsed
+                .iter()
+                .position(|t| t == "--agent")
+                .expect("launch command must contain --agent");
+            assert_eq!(parsed[agent_pos + 1], disp.agent_kind);
+        }
+
+        // Single safe token remains unquoted
+        let mut simple = base_disp;
+        simple.agent_kind = "claude".into();
+        let simple_hint = send_to_recovery_hint(&simple);
+        assert!(simple_hint.contains("--agent claude --prompt"));
     }
 }

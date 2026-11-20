@@ -64,6 +64,7 @@ Tchelvis provides event-driven parent-child agent orchestration over Herdr (`hc`
    ```bash
    tchelvis orch launch --agent claude --title "Implement JWT" --prompt "Implement X..." --worktree new-child
    ```
+   `--agent` takes a preset or a full command, split with shell quoting: `--agent "agy --model 'GPT-OSS 120B (Medium)'"`. `agy`/`antigravity` get `-i` added so the prompt is read; a wrapper script with another name does not.
 2. **Or build a multi-task DAG explicitly**:
    ```bash
    tchelvis orch run-create --title "Feature or refactor title"

@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fmt;
 use std::path::Path;
 use std::process::Stdio;
@@ -1204,37 +1205,50 @@ impl HerdrClient {
         }
     }
 
+    pub fn build_run_worker_args(
+        parent_terminal: &str,
+        cwd: &Path,
+        labels: &[(&str, &str)],
+        agent_argv: &[String],
+        first_message: &str,
+    ) -> Result<Vec<OsString>> {
+        if agent_argv.is_empty() || agent_argv[0].is_empty() {
+            bail!("agent_cmd cannot be empty");
+        }
+        let mut args: Vec<OsString> = vec![
+            "run".into(),
+            "--bg".into(),
+            "--no-notify".into(),
+            "--outlive-parent".into(),
+            "--parent".into(),
+            parent_terminal.into(),
+            "--cwd".into(),
+            cwd.as_os_str().to_os_string(),
+        ];
+        for (k, v) in labels {
+            args.push("--label".into());
+            args.push(format!("{k}={v}").into());
+        }
+        args.push("--json".into());
+        for tok in agent_argv {
+            args.push(tok.into());
+        }
+        args.push(first_message.into());
+        Ok(args)
+    }
+
     pub async fn run_worker(
         &self,
         parent_terminal: &str,
         cwd: &Path,
         labels: &[(&str, &str)],
-        agent_cmd: &str,
+        agent_argv: &[String],
         first_message: &str,
     ) -> Result<HcTerminal> {
+        let args =
+            Self::build_run_worker_args(parent_terminal, cwd, labels, agent_argv, first_message)?;
         let mut cmd = Command::new(&self.hc_bin);
-        cmd.args([
-            "run",
-            "--bg",
-            "--no-notify",
-            "--outlive-parent",
-            "--parent",
-            parent_terminal,
-            "--cwd",
-        ]);
-        cmd.arg(cwd);
-        for (k, v) in labels {
-            cmd.arg("--label").arg(format!("{k}={v}"));
-        }
-        cmd.arg("--json");
-        let cmd_tokens: Vec<&str> = agent_cmd.split_whitespace().collect();
-        if cmd_tokens.is_empty() {
-            bail!("agent_cmd cannot be empty");
-        }
-        for tok in cmd_tokens {
-            cmd.arg(tok);
-        }
-        cmd.arg(first_message);
+        cmd.args(&args);
         cmd.stdin(Stdio::null());
 
         let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
@@ -1611,14 +1625,9 @@ mod tests {
             ("cockpit.orch.role", "worker"),
             ("cockpit.orch.run", "run_1"),
         ];
+        let agent_argv = vec!["codex".to_string(), "--no-daemon".to_string()];
         let term = client
-            .run_worker(
-                "t1",
-                tmp.path(),
-                &labels,
-                "codex --no-daemon",
-                "[TCHELVIS] Do task",
-            )
+            .run_worker("t1", tmp.path(), &labels, &agent_argv, "[TCHELVIS] Do task")
             .await
             .unwrap();
         assert_eq!(term.address, "t12");
@@ -1662,12 +1671,58 @@ mod tests {
         fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
 
         let client = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+        let agent_argv = vec!["pi".to_string()];
         let term = client
-            .run_worker("t1", tmp.path(), &[], "pi", "[TCHELVIS] Do task")
+            .run_worker("t1", tmp.path(), &[], &agent_argv, "[TCHELVIS] Do task")
             .await
             .unwrap();
         assert_eq!(term.address, "t4");
         assert_eq!(term.created_ms, Some(1795046353550));
+    }
+
+    #[test]
+    fn lot_l_build_run_worker_args_keeps_spaced_model_as_single_argv_entry() {
+        let agent_argv = vec![
+            "agy".to_string(),
+            "--model".to_string(),
+            "GPT-OSS 120B (Medium)".to_string(),
+            "-i".to_string(),
+        ];
+        let args = HerdrClient::build_run_worker_args(
+            "t1",
+            Path::new("/tmp/wt"),
+            &[("cockpit.orch.role", "worker")],
+            &agent_argv,
+            "[TCHELVIS] Do task",
+        )
+        .unwrap();
+        let str_args: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let agy_pos = str_args
+            .iter()
+            .position(|a| a == "agy")
+            .expect("agy should be present");
+        assert_eq!(
+            &str_args[agy_pos..],
+            &[
+                "agy",
+                "--model",
+                "GPT-OSS 120B (Medium)",
+                "-i",
+                "[TCHELVIS] Do task",
+            ]
+        );
+
+        assert!(HerdrClient::build_run_worker_args(
+            "t1",
+            Path::new("/tmp/wt"),
+            &[],
+            &[],
+            "[TCHELVIS] Do task",
+        )
+        .is_err());
     }
 
     #[test]

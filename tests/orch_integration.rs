@@ -798,11 +798,14 @@ async fn test_cli_execute_orch_commands_and_worktree_release_guard() {
     );
 
     // 3. Test helper functions and git worktree creation + release safety guard
-    assert_eq!(map_agent_preset("codex"), "codex --no-daemon");
-    assert_eq!(map_agent_preset("claude"), "claude");
+    assert_eq!(
+        map_agent_preset("codex").unwrap(),
+        vec!["codex", "--no-daemon"]
+    );
+    assert_eq!(map_agent_preset("claude").unwrap(), vec!["claude"]);
     // agy rejects a positional prompt; it reads the first prompt only via -i.
-    assert_eq!(map_agent_preset("agy"), "agy -i");
-    assert_eq!(map_agent_preset("antigravity"), "agy -i");
+    assert_eq!(map_agent_preset("agy").unwrap(), vec!["agy", "-i"]);
+    assert_eq!(map_agent_preset("antigravity").unwrap(), vec!["agy", "-i"]);
     assert_eq!(
         parse_deps_arg(Some("a, b ,c")).unwrap(),
         vec!["a", "b", "c"]
@@ -3722,4 +3725,114 @@ async fn lot_k_n4_launch_without_run_reuses_latest_empty_active_run_for_caller()
     assert_ne!(out3.run.id, "run_other");
     assert_ne!(out3.run.id, "run_completed");
     assert_eq!(store.list_runs().unwrap().len(), 5);
+}
+
+#[tokio::test]
+async fn lot_l_launch_agy_with_quoted_model_and_unbalanced_quote_preflight() {
+    let tmp = tempfile::tempdir().unwrap();
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    let fake_agy = bin_dir.join("agy");
+    fs::write(&fake_agy, "#!/usr/bin/env sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run_args_log = tmp.path().join("hc_run_args.log");
+    let fake_hc = tmp.path().join("fake-hc");
+    fs::write(
+        &fake_hc,
+        format!(
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = \"get\" ]; then\n\
+               if [ \"$2\" = \"t1\" ]; then\n\
+                 echo '{{\"address\":\"t1\",\"created_ms\":1000,\"state\":\"live\",\"turn\":0,\"cwd\":\"/tmp\"}}'\n\
+               else\n\
+                 echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"labels\":{{}}}}'\n\
+               fi\n\
+               exit 0\n\
+             fi\n\
+             if [ \"$1\" = \"run\" ]; then\n\
+               printf '%s\\0' \"$@\" > \"{}\"\n\
+               echo '{{\"address\":\"t5\",\"created_ms\":5000,\"state\":\"live\",\"turn\":0,\"first_message\":{{\"sent\":true}}}}'\n\
+               exit 0\n\
+             fi\n\
+             exit 0\n",
+            run_args_log.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+    let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+    // 1. Unbalanced quote fails agent_preflight cleanly with OrchLaunchError
+    let err = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(9_000),
+        OrchLaunchArgs {
+            agent: "agy --model 'GPT-OSS".into(),
+            prompt: "Do task".into(),
+            title: Some("Bad quote".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap_err();
+    let launch_err = err
+        .downcast_ref::<OrchLaunchError>()
+        .expect("unbalanced quotes must surface OrchLaunchError");
+    assert_eq!(launch_err.failed_stage, "agent_preflight");
+    assert!(
+        launch_err.detail.contains("unbalanced quotes"),
+        "expected unbalanced quotes detail, got: {}",
+        launch_err.detail
+    );
+
+    // 2. Quoted model name with spaces reaches hc run as a single argv entry
+    let out = execute_launch_with_path(
+        &store,
+        &herdr,
+        &FakeOrchSleeper::new(10_000),
+        OrchLaunchArgs {
+            agent: "agy --model 'GPT-OSS 120B (Medium)'".into(),
+            prompt: "Do task".into(),
+            title: Some("Agy spaced model test".into()),
+            run: None,
+            worktree: "current".into(),
+            request_id: None,
+            caller_terminal: Some("t1".into()),
+        },
+        Some(bin_dir.as_os_str()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        out.dispatch.agent_kind,
+        "agy --model 'GPT-OSS 120B (Medium)'"
+    );
+
+    let raw_bytes = fs::read(&run_args_log).unwrap();
+    let args: Vec<String> = raw_bytes
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let agy_pos = args
+        .iter()
+        .position(|a| a == "agy")
+        .expect("hc run should pass agy");
+    assert_eq!(
+        &args[agy_pos..agy_pos + 4],
+        &["agy", "--model", "GPT-OSS 120B (Medium)", "-i"]
+    );
+    assert!(
+        args.get(agy_pos + 4)
+            .is_some_and(|p| p.contains("[TASK PROMPT]\nDo task")),
+        "prompt must follow -i, got: {args:?}"
+    );
 }

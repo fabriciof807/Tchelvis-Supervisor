@@ -421,31 +421,39 @@ pub struct ReleaseOutput {
     pub branch_kept: Option<String>,
 }
 
-pub fn map_agent_preset(agent: &str) -> String {
+pub fn map_agent_preset(agent: &str) -> Result<Vec<String>> {
     let trimmed = agent.trim();
-    match trimmed {
-        "codex" => "codex --no-daemon".to_string(),
-        "claude" | "claude-code" => "claude".to_string(),
-        "opencode" => "opencode".to_string(),
-        "pi" => "pi".to_string(),
-        "gemini" => "gemini".to_string(),
-        other => {
-            let tokens: Vec<&str> = other.split_whitespace().collect();
-            if let Some((&first, rest)) = tokens.split_first() {
-                if matches!(first, "agy" | "antigravity") {
-                    let mut out = Vec::with_capacity(tokens.len() + 1);
-                    out.push("agy");
-                    out.extend_from_slice(rest);
-                    // agy rejects a positional prompt; `-i` starts an interactive session with it.
-                    if !rest.contains(&"-i") {
-                        out.push("-i");
-                    }
-                    return out.join(" ");
-                }
-            }
-            other.to_string()
-        }
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
     }
+    let Some(tokens) = shlex::split(trimmed) else {
+        bail!("invalid --agent: unbalanced quotes");
+    };
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    if tokens.len() == 1 {
+        return Ok(match tokens[0].as_str() {
+            "codex" => vec!["codex".to_string(), "--no-daemon".to_string()],
+            "claude" | "claude-code" => vec!["claude".to_string()],
+            "opencode" => vec!["opencode".to_string()],
+            "pi" => vec!["pi".to_string()],
+            "gemini" => vec!["gemini".to_string()],
+            "agy" | "antigravity" => vec!["agy".to_string(), "-i".to_string()],
+            _ => tokens,
+        });
+    }
+    if matches!(tokens[0].as_str(), "agy" | "antigravity") {
+        let mut out = Vec::with_capacity(tokens.len() + 1);
+        out.push("agy".to_string());
+        out.extend(tokens.into_iter().skip(1));
+        // agy rejects a positional prompt; `-i` starts an interactive session with it.
+        if !out[1..].iter().any(|t| t == "-i") {
+            out.push("-i".to_string());
+        }
+        return Ok(out);
+    }
+    Ok(tokens)
 }
 
 pub fn parse_deps_arg(deps: Option<&str>) -> Result<Vec<String>> {
@@ -1449,19 +1457,32 @@ pub async fn execute_dispatch(
         }
     } else {
         let raw_agent = args.agent.unwrap_or_else(|| "claude".to_string());
-        let agent_cmd = map_agent_preset(&raw_agent);
-        match herdr
-            .run_worker(
-                &caller_terminal,
-                &dispatch_cwd,
-                &labels,
-                &agent_cmd,
-                &preamble,
-            )
-            .await
-        {
-            Ok(spawned) => Ok((raw_agent, spawned)),
-            Err(err) => Err(err),
+        match map_agent_preset(&raw_agent) {
+            Ok(agent_argv) => {
+                match herdr
+                    .run_worker(
+                        &caller_terminal,
+                        &dispatch_cwd,
+                        &labels,
+                        &agent_argv,
+                        &preamble,
+                    )
+                    .await
+                {
+                    Ok(spawned) => Ok((raw_agent, spawned)),
+                    Err(err) => Err(err),
+                }
+            }
+            Err(err) => Err(anyhow::Error::new(OrchLaunchError {
+                failed_stage: "agent_preflight".to_string(),
+                agent: raw_agent,
+                detail: err.to_string(),
+                exit_code: None,
+                output_tail: None,
+                run_id: Some(args.run.clone()),
+                task_id: Some(task_row.id.clone()),
+                dispatch_id: None,
+            })),
         }
     };
 
@@ -1923,8 +1944,19 @@ pub fn preflight_agent_with_path(
     agent: &str,
     path_override: Option<&OsStr>,
 ) -> std::result::Result<String, Box<OrchLaunchError>> {
-    let mapped = map_agent_preset(agent);
-    let Some(program) = mapped.split_whitespace().next() else {
+    let argv = map_agent_preset(agent).map_err(|err| {
+        Box::new(OrchLaunchError {
+            failed_stage: "agent_preflight".to_string(),
+            agent: agent.to_string(),
+            detail: err.to_string(),
+            exit_code: None,
+            output_tail: None,
+            run_id: None,
+            task_id: None,
+            dispatch_id: None,
+        })
+    })?;
+    let Some(program) = argv.first().map(String::as_str).filter(|s| !s.is_empty()) else {
         return Err(Box::new(OrchLaunchError {
             failed_stage: "agent_preflight".to_string(),
             agent: agent.to_string(),
@@ -2971,33 +3003,89 @@ mod tests {
 
     #[test]
     fn lot_k_n1_map_agent_preset_inserts_dash_i_for_agy_with_extra_args() {
-        assert_eq!(map_agent_preset("agy"), "agy -i");
-        assert_eq!(map_agent_preset("antigravity"), "agy -i");
+        assert_eq!(map_agent_preset("agy").unwrap(), vec!["agy", "-i"]);
+        assert_eq!(map_agent_preset("antigravity").unwrap(), vec!["agy", "-i"]);
         assert_eq!(
-            map_agent_preset("agy --model gpt-oss-120b-medium"),
-            "agy --model gpt-oss-120b-medium -i"
+            map_agent_preset("agy --model gpt-oss-120b-medium").unwrap(),
+            vec!["agy", "--model", "gpt-oss-120b-medium", "-i"]
         );
         assert_eq!(
-            map_agent_preset("antigravity --model gpt-oss-120b-medium"),
-            "agy --model gpt-oss-120b-medium -i"
+            map_agent_preset("antigravity --model gpt-oss-120b-medium").unwrap(),
+            vec!["agy", "--model", "gpt-oss-120b-medium", "-i"]
         );
         assert_eq!(
-            map_agent_preset("agy --model gpt-oss-120b-medium -i"),
-            "agy --model gpt-oss-120b-medium -i"
+            map_agent_preset("agy --model gpt-oss-120b-medium -i").unwrap(),
+            vec!["agy", "--model", "gpt-oss-120b-medium", "-i"]
         );
         assert_eq!(
-            map_agent_preset("agy -i --model gpt-oss-120b-medium"),
-            "agy -i --model gpt-oss-120b-medium"
+            map_agent_preset("agy -i --model gpt-oss-120b-medium").unwrap(),
+            vec!["agy", "-i", "--model", "gpt-oss-120b-medium"]
         );
         assert_eq!(
-            map_agent_preset("antigravity -i --model gpt-oss-120b-medium"),
-            "agy -i --model gpt-oss-120b-medium"
+            map_agent_preset("antigravity -i --model gpt-oss-120b-medium").unwrap(),
+            vec!["agy", "-i", "--model", "gpt-oss-120b-medium"]
         );
         assert_eq!(
-            map_agent_preset("claude --model sonnet"),
-            "claude --model sonnet"
+            map_agent_preset("claude --model sonnet").unwrap(),
+            vec!["claude", "--model", "sonnet"]
         );
-        assert_eq!(map_agent_preset("codex --model o3"), "codex --model o3");
+        assert_eq!(
+            map_agent_preset("codex --model o3").unwrap(),
+            vec!["codex", "--model", "o3"]
+        );
+    }
+
+    #[test]
+    fn lot_l_map_agent_preset_shell_quoting_and_errors() {
+        // Quoted spaced model names preserve a single argv entry
+        assert_eq!(
+            map_agent_preset("agy --model 'GPT-OSS 120B (Medium)'").unwrap(),
+            vec!["agy", "--model", "GPT-OSS 120B (Medium)", "-i"]
+        );
+        assert_eq!(
+            map_agent_preset(r#"antigravity --model "GPT-OSS 120B (Medium)" -i"#).unwrap(),
+            vec!["agy", "--model", "GPT-OSS 120B (Medium)", "-i"]
+        );
+
+        // Whole-token `-i` check happens after unquoting
+        assert_eq!(
+            map_agent_preset("agy --model 'foo -i bar'").unwrap(),
+            vec!["agy", "--model", "foo -i bar", "-i"]
+        );
+        assert_eq!(
+            map_agent_preset("agy --model foo '-i'").unwrap(),
+            vec!["agy", "--model", "foo", "-i"]
+        );
+
+        // All existing single-token presets & custom commands
+        assert_eq!(
+            map_agent_preset("codex").unwrap(),
+            vec!["codex", "--no-daemon"]
+        );
+        assert_eq!(map_agent_preset("claude").unwrap(), vec!["claude"]);
+        assert_eq!(map_agent_preset("claude-code").unwrap(), vec!["claude"]);
+        assert_eq!(map_agent_preset("opencode").unwrap(), vec!["opencode"]);
+        assert_eq!(map_agent_preset("pi").unwrap(), vec!["pi"]);
+        assert_eq!(map_agent_preset("gemini").unwrap(), vec!["gemini"]);
+        assert_eq!(
+            map_agent_preset(r#"custom-agent --name "my agent""#).unwrap(),
+            vec!["custom-agent", "--name", "my agent"]
+        );
+        assert!(map_agent_preset("   ").unwrap().is_empty());
+
+        // Unbalanced quotes return a clear error
+        for bad in [
+            "agy --model 'GPT-OSS",
+            r#"agy --model "GPT-OSS"#,
+            "agy --model \\",
+        ] {
+            let err = map_agent_preset(bad).unwrap_err();
+            assert_eq!(err.to_string(), "invalid --agent: unbalanced quotes");
+
+            let preflight_err = preflight_agent_with_path(bad, None).unwrap_err();
+            assert_eq!(preflight_err.failed_stage, "agent_preflight");
+            assert_eq!(preflight_err.detail, "invalid --agent: unbalanced quotes");
+        }
     }
 
     #[test]
