@@ -262,7 +262,7 @@ Event-driven parent-child agent orchestration over Herdr (`hc`) terminals, backe
 | `tchelvis orch launch` | One-shot run/task/dispatch launch with `PATH` agent preflight (`--agent <agent\|cmd> --prompt <str> [--title <str>] [--run <id>] [--worktree current\|new-child]`) |
 | `tchelvis orch run-create` | Create a run bound to the coordinator terminal (`[--title <str>] [--coordinator <term>]`) |
 | `tchelvis orch task-create` | Add a DAG task (`--run <id> --id <task> --title <str> --prompt <str> [--deps <csv\|json>]`) |
-| `tchelvis orch dispatch` | Spawn or attach a worker (`--run <id> --task <task> (--agent <claude\|codex\|gemini\|opencode\|pi\|cmd> \| --terminal <term>) [--worktree current\|new-child]`) |
+| `tchelvis orch dispatch` | Spawn or attach a worker (`--run <id> --task <task> (--agent <claude\|codex\|gemini\|opencode\|pi\|agy\|cmd> \| --terminal <term>) [--worktree current\|new-child]`) |
 | `tchelvis orch send` | Worker report to parent (`--type <worker_done\|escalation\|status> [--outcome succeeded\|failed] --dispatch-id <id> --body <str>`) or parent directive to worker (`--to dispatch:<id> --body <str>`) |
 | `tchelvis orch ask` | Worker asks a blocking question and ends turn (`--dispatch-id <id> --question <str>`) |
 | `tchelvis orch reply` | Coordinator answers an open question and wakes the worker (`--question-id <id> --body <str>`) |
@@ -272,6 +272,14 @@ Event-driven parent-child agent orchestration over Herdr (`hc`) terminals, backe
 | `tchelvis orch status` | Inspect run DAG tasks, dispatches, recorded messages, open questions, and unread counts (`[--run <id>]`) |
 | `tchelvis orch release` | Opt-in cleanup of a finished worker terminal and clean/merged `--worktree new-child` (`--dispatch-id <id> [--force]`; removes worktree only and keeps `orch/<run>/<task>` branch) |
 | `tchelvis orch skill` | Print the self-contained Markdown guide for coordinator and worker agents |
+
+`--agent` takes a preset (`claude`, `claude-code`, `codex`, `gemini`, `opencode`, `pi`, `agy`/`antigravity`) or a full command, split once with POSIX shell quoting. Extra flags go inside the same string, so a model name with spaces stays one argument:
+
+```bash
+tchelvis orch launch --agent "agy --model 'GPT-OSS 120B (Medium)'" --prompt "..."
+```
+
+`agy`/`antigravity` get `-i` appended when it is missing, because agy only reads the prompt through `-i`. Any other command, including a wrapper script with its own name, receives the worker prompt as its last positional argument.
 
 All mutating `tchelvis orch` subcommands also accept `--request-id <id>` (idempotency receipt) and `--json`:
 
