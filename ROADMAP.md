@@ -40,7 +40,7 @@ with the UI track.
 | M7 | Kanban board mod: daily tasks grouped by project tag | Daily-tasks tags | Idea (not planned) |
 | M8 | Supervisor chat + Pi Durable ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`, `238191a`, `6c472d3`); **Phase B: adopt Pi Durable** |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
-| M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Next** — design approved 2026-11-23 |
+| M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Implemented**; host validation pending |
 | M11 | Declarative multi-agent loops (`tchelvis loop`) | M10 | Proposed (spec to be revised after M10) |
 
 ### M0 — Container validation & config hardening
@@ -164,7 +164,7 @@ Herdr's shipped `tabs` mod; changing it would mean forking it with `mod.clone`).
   the created terminal id (else find yazi by foreground program among the tab's terminals), and
   `herdr-app check` / `herdr-app shot` for the visual check.
 
-### M10 — User-configurable supervisor `[guardrails]` (next)
+### M10 — User-configurable supervisor `[guardrails]` (implemented; host validation pending)
 A `[guardrails]` table in `~/.config/tchelvis/supervisor.toml`: one deterministic `allow_commands`
 list (exact by default, trailing `*` for arguments), `deny_commands` / `deny_paths` that always win,
 a closed `allow_tools` list, and `tchelvis supervisor rules [test]` for dry runs. The built-in floor

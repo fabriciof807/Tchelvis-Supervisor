@@ -1,6 +1,6 @@
 # Regras configuráveis do supervisor (`[guardrails]`) — design
 
-**Data:** 2026-11-22, revisado em 2026-11-23 · **Status:** abordagem A escolhida pelo usuário; aprovado em 2026-11-23 · **Tamanho:** projeto (M10)
+**Data:** 2026-11-22, revisado em 2026-11-23 · **Status:** abordagem A escolhida pelo usuário; aprovado e implementado em 2026-11-23; validação no host pendente · **Tamanho:** projeto (M10)
 
 ## Intenção
 
@@ -78,6 +78,7 @@ Sem a seção, o comportamento é o de hoje.
 ### `deny_commands`
 - O `msg`, o comando identificado e todas as linhas da área pendente são divididos em tokens (espaços, aspas e `; | & ( )` separam). A entrada casa se seus tokens aparecem em sequência em qualquer ponto: pega `cd x && cargo publish` e `bash -c "cargo publish"`.
 - Não aceita `*`. Sem diferenciar maiúsculas.
+- Aspas e `\` são lidas das duas formas (separando palavras e sumindo dentro delas), então `cargo pub''lish` também casa. Vale para `deny_paths`.
 - Falso positivo só gera alerta. Limite conhecido: `npm --silent publish` não casa com `npm publish`.
 
 ### `deny_paths`

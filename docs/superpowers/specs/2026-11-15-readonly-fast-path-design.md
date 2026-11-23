@@ -8,6 +8,8 @@
 
 **Update (2026-11-23, hardening):** see `is_safe_readonly_command` in `guardrails.rs` for the full refusal list (it supersedes the character list below). A command header needs exactly one command line; a permission menu without a readable `msg` also needs the whole request on screen. `[y/N]` screens without a header still use the nearest line.
 
+**Update (2026-11-23, M10 `[guardrails]`):** the fixed decision path is now [`decide_fixed`](../../../src/supervisor/guardrails.rs) and supports user-configured `allow_commands`, `deny_commands`, `deny_paths`, `allow_tools`, and built-in toggles on top of the immutable floor (`floor_violation`). See [the configurable `[guardrails]` design](2026-11-22-supervisor-guardrails-config-design.md).
+
 ## Intent
 Test 5: Semi-Auto approved only 1 of 4 trivial read-only requests (`ls`, `cat`, `git status`) —
 the 1.7B model alerts too often and takes 40–245 s. Approve the trivial ones with a fixed rule,

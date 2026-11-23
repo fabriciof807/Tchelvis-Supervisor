@@ -424,7 +424,7 @@ pub fn load_default_guardrail_rules() -> GuardrailRules {
 
 /// Anything at the current path wins, even when unreadable: rules must not fall back to the legacy
 /// file (or to none) because the current one is broken.
-fn load_guardrail_rules_in(home: &std::path::Path) -> GuardrailRules {
+pub fn load_guardrail_rules_in(home: &std::path::Path) -> GuardrailRules {
     let config = home.join(".config");
     let current = config.join("tchelvis").join("supervisor.toml");
     match std::fs::symlink_metadata(&current) {

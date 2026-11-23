@@ -240,6 +240,8 @@ tchelvis supervisor fallback set [--host <url>] [--model <name>]
 tchelvis supervisor fallback models [--json] [--filter <text>]
 tchelvis supervisor fallback off              # try returning to the primary local model
 tchelvis supervisor fallback clear            # remove [fallback] and deactivate
+tchelvis supervisor rules [--json]            # show effective [guardrails] rules, sources, and warnings
+tchelvis supervisor rules test "just test"    # dry-run fixed guardrail rules (never sends anything)
 
 # Self-update
 tchelvis update [--channel stable|nightly] [--check] [--no-setup] [--force]
@@ -359,6 +361,52 @@ extra_args = []
 ```
 
 > **Note:** Partial `supervisor.toml` files are supported; any omitted keys fall back to their defaults.
+
+#### Guardrails (`[guardrails]`)
+
+Add an optional `[guardrails]` table to `~/.config/tchelvis/supervisor.toml` to allow or deny commands deterministically without weakening the built-in safety floor:
+
+```toml
+[guardrails]
+# Exact command. "*" at the end accepts additional arguments.
+allow_commands = ["just test", "cargo test *", "uv run pytest *", "git branch"]
+
+# Beats everything above. Matched anywhere in the pending request.
+deny_commands = ["cargo publish", "npm publish", "docker rm", "git commit"]
+
+# Matched by path segment, case-insensitive.
+deny_paths = [".kube", ".aws", "prod/secrets"]
+
+# Default: ["Read"]. [] disables. Only Read is supported for now; other names are ignored with a warning.
+allow_tools = ["Read"]
+
+builtin_read_only  = true   # ls, cat, rg, git status...
+builtin_build_test = true   # cargo test, pytest... (only on [y/N] answered by the LLM)
+llm_auto_reply     = true   # false: the LLM only summarizes and alerts
+```
+
+Decision order on every tick (from highest priority to lowest):
+
+1. **Immutable safety floor:** `FORBIDDEN_TOKENS`, `curl | sh`, `wget | sh`, `> /`, shell metacharacters and brace/variable expansions, dot-segment globs (`cat .e*`), sensitive paths, dangerous `rg`/`git` options, `kind=question`, single-key replies only, and never "always allow" / "auto mode". Nothing below can override the floor.
+2. **`deny_commands` / `deny_paths`:** beat every allow rule, including built-ins and LLM replies.
+3. **Fixed rules:** built-in read-only (`builtin_read_only`), `allow_commands`, and `allow_tools`.
+4. **LLM:** subject to steps 1, 2, and `llm_auto_reply`. `AlertOnly`, `Paused`, and `max_auto_replies` still apply.
+
+> **Important:**
+> - **An allowed command really runs.** Approving a command via `allow_commands` sends the approval key to the agent and runs whatever that command executes (for example, `just test` runs whatever the `justfile` says). `[guardrails]` is not a sandbox.
+> - **An invalid `[guardrails]` stops all automatic replies** (both fixed rules and LLM auto-replies) until you fix it, while keeping the rest of `supervisor.toml` active. Unknown keys, wrong types, invalid `deny_*` entries, broken TOML, or an unreadable file mark `[guardrails]` invalid and fail `tchelvis doctor`. Invalid `allow_*` entries are ignored with a warning.
+
+Dry-run and inspect rules locally (never sends anything to any terminal):
+
+```bash
+tchelvis supervisor rules                     # effective rules, origin, warnings, and status
+tchelvis supervisor rules --json
+tchelvis supervisor rules test "just test"    # exit 0 = approved, 1 = not approved, 2 = usage error
+tchelvis supervisor rules test "src/main.rs" --tool Read
+tchelvis supervisor rules test --screen screen.txt --msg "approve Bash: just test" --kind permission
+```
+
+`rules test` covers the fixed rules only: `requires_llm` means no fixed rule approves the request, and the LLM never answers permission requests. `deny_*` entries match text, so they cannot see through globs, scripts or variables resolved at run time.
 
 | Environment variable | Description | Default |
 | :--- | :--- | :--- |

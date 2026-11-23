@@ -323,6 +323,14 @@ pub async fn run_doctor(
         detail: sup_detail,
     });
 
+    // 6b. Check supervisor [guardrails] rules
+    let guardrail_rules = crate::supervisor::rules::load_guardrail_rules_in(&paths.home_dir);
+    let guardrails_check = doctor_guardrails_check(&guardrail_rules);
+    if guardrails_check.status == "fail" {
+        has_fail = true;
+    }
+    checks.push(guardrails_check);
+
     let report = DoctorReport {
         overall_status: if has_fail {
             "degraded".into()
@@ -344,6 +352,46 @@ pub async fn run_doctor(
     }
 
     Ok(report)
+}
+
+pub fn doctor_guardrails_check(rules: &crate::supervisor::rules::GuardrailRules) -> DoctorCheck {
+    if let Some(reason) = &rules.invalid {
+        return DoctorCheck {
+            name: "guardrails".into(),
+            status: "fail".into(),
+            detail: format!("invalid [guardrails] (auto-replies disabled): {reason}"),
+        };
+    }
+    if !rules.warnings.is_empty() {
+        let summary = rules
+            .warnings
+            .iter()
+            .map(|w| format!("{} '{}' ({})", w.key, w.entry, w.reason))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return DoctorCheck {
+            name: "guardrails".into(),
+            status: "warn".into(),
+            detail: format!(
+                "{} warning(s) in [guardrails]: {summary}",
+                rules.warnings.len()
+            ),
+        };
+    }
+    DoctorCheck {
+        name: "guardrails".into(),
+        status: "ok".into(),
+        detail: format!(
+            "allow_commands={}, deny_commands={}, deny_paths={}, allow_read_tool={}, builtin_read_only={}, builtin_build_test={}, llm_auto_reply={}",
+            rules.allow_commands.len(),
+            rules.deny_commands.len(),
+            rules.deny_paths.len(),
+            rules.allow_read_tool,
+            rules.builtin_read_only,
+            rules.builtin_build_test,
+            rules.llm_auto_reply,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +491,60 @@ mod tests {
             orch_skill.detail,
             "0/1 /orchestration-tchelvis skill files match; run `tchelvis setup --only skills`"
         );
+    }
+
+    #[test]
+    fn doctor_guardrails_ok_status() {
+        let rules = crate::supervisor::rules::GuardrailRules::default();
+        let check = doctor_guardrails_check(&rules);
+        assert_eq!(check.name, "guardrails");
+        assert_eq!(check.status, "ok");
+    }
+
+    #[test]
+    fn doctor_guardrails_warn_status() {
+        let rules = crate::supervisor::rules::parse_guardrails(
+            "[guardrails]\nallow_commands = [\"rm -rf x\", \"just test\"]\n",
+        );
+        let check = doctor_guardrails_check(&rules);
+        assert_eq!(check.name, "guardrails");
+        assert_eq!(check.status, "warn");
+    }
+
+    #[test]
+    fn doctor_guardrails_fail_status() {
+        let rules = crate::supervisor::rules::GuardrailRules::invalid("bad toml");
+        let check = doctor_guardrails_check(&rules);
+        assert_eq!(check.name, "guardrails");
+        assert_eq!(check.status, "fail");
+    }
+
+    #[tokio::test]
+    async fn run_doctor_marks_degraded_when_guardrails_invalid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        };
+        paths.ensure_dirs().unwrap();
+        fs::write(
+            paths.config_dir.join("supervisor.toml"),
+            "[guardrails]\ndeny_command = [\"x\"]\n",
+        )
+        .unwrap();
+
+        let cfg = CockpitConfig::default();
+        let report = run_doctor(&cfg, &paths, None).await.unwrap();
+        let guardrails = report
+            .checks
+            .iter()
+            .find(|c| c.name == "guardrails")
+            .expect("guardrails check present");
+        assert_eq!(guardrails.status, "fail");
+        assert_eq!(report.overall_status, "degraded");
     }
 }

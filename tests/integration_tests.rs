@@ -695,3 +695,108 @@ fn test_agent_classification_fixture_and_no_hardcoded_home_ubuntu() {
         violations.join("\n")
     );
 }
+
+#[test]
+fn test_supervisor_rules_cli_and_exit_codes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_tchelvis"))
+            .args(args)
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+
+    let ok = run(&["supervisor", "rules", "test", "ls"]);
+    assert_eq!(ok.status.code(), Some(0), "{ok:?}");
+    let ok_stdout = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        ok_stdout.starts_with("APROVADO (builtin_read_only)"),
+        "{ok_stdout}"
+    );
+
+    let denied = run(&["supervisor", "rules", "test", "rm -rf x"]);
+    assert_eq!(denied.status.code(), Some(1), "{denied:?}");
+    let denied_stdout = String::from_utf8_lossy(&denied.stdout);
+    assert!(
+        denied_stdout.starts_with("NÃO APROVADO (floor:destructive)"),
+        "{denied_stdout}"
+    );
+
+    let no_args = run(&["supervisor", "rules", "test"]);
+    assert_eq!(no_args.status.code(), Some(2), "{no_args:?}");
+
+    let missing_screen = run(&[
+        "supervisor",
+        "rules",
+        "test",
+        "--screen",
+        home.join("missing-screen.txt").to_str().unwrap(),
+    ]);
+    assert_eq!(missing_screen.status.code(), Some(2), "{missing_screen:?}");
+
+    let rules_default = run(&["supervisor", "rules", "--json"]);
+    assert_eq!(rules_default.status.code(), Some(0), "{rules_default:?}");
+    let default_stdout = String::from_utf8_lossy(&rules_default.stdout);
+    assert!(
+        default_stdout.contains("\"invalid\":null"),
+        "{default_stdout}"
+    );
+
+    let cfg_dir = home.join(".config/tchelvis");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("supervisor.toml"),
+        "[guardrails]\nallow_commands = [\"just test\"]\n",
+    )
+    .unwrap();
+    let allowed = run(&["supervisor", "rules", "test", "just test", "--json"]);
+    assert_eq!(allowed.status.code(), Some(0), "{allowed:?}");
+    let allowed_json: serde_json::Value = serde_json::from_slice(&allowed.stdout).unwrap();
+    assert_eq!(allowed_json["approved"], true);
+    assert_eq!(allowed_json["rule_id"], "allow_command:just test");
+
+    let screen_file = home.join("screen.txt");
+    fs::write(&screen_file, "Do you want to proceed?\n❯ 1. Yes\n  2. No\n").unwrap();
+    let screen_ok = run(&[
+        "supervisor",
+        "rules",
+        "test",
+        "--screen",
+        screen_file.to_str().unwrap(),
+        "--msg",
+        "approve Bash: just test",
+        "--kind",
+        "permission",
+    ]);
+    assert_eq!(screen_ok.status.code(), Some(0), "{screen_ok:?}");
+
+    let read_ok = run(&[
+        "supervisor",
+        "rules",
+        "test",
+        "src/main.rs",
+        "--tool",
+        "Read",
+    ]);
+    assert_eq!(read_ok.status.code(), Some(0), "{read_ok:?}");
+
+    fs::write(
+        cfg_dir.join("supervisor.toml"),
+        "[guardrails]\ndeny_command = [\"x\"]\n",
+    )
+    .unwrap();
+    let rules_invalid = run(&["supervisor", "rules", "--json"]);
+    assert_eq!(rules_invalid.status.code(), Some(0), "{rules_invalid:?}");
+    let invalid_json: serde_json::Value = serde_json::from_slice(&rules_invalid.stdout).unwrap();
+    assert!(
+        invalid_json["invalid"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{invalid_json}"
+    );
+}

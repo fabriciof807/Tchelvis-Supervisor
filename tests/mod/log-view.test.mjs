@@ -142,3 +142,14 @@ test("mod source calls no element methods missing from gpui-kit", async () => {
     assert.ok(!src.includes(`.${method}(`), `main.js calls unknown method .${method}()`);
   }
 });
+
+test("logEventRow shows the rule that decided", () => {
+  const row = (ev) => logEventRow({ ts_ms: 1, kind: "auto_reply", summary: "s", ...ev });
+  assert.equal(
+    row({ detail: "d", rule_id: "allow_command:just test" }).detail,
+    "d\nRegra: allow_command:just test"
+  );
+  assert.equal(row({ rule_id: "builtin_read_only" }).detail, "Regra: builtin_read_only");
+  assert.equal(row({ detail: "d" }).detail, "d");
+  assert.equal(row({}).detail, null);
+});

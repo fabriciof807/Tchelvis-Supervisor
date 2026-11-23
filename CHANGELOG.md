@@ -8,6 +8,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Configurable supervisor `[guardrails]` (M10).**
+  - Optional `[guardrails]` table in `~/.config/tchelvis/supervisor.toml` (`allow_commands`, `deny_commands`, `deny_paths`, `allow_tools`, `builtin_read_only`, `builtin_build_test`, `llm_auto_reply`), reloaded on every watcher tick and parsed independently from other settings.
+  - Fixed decision order (`floor` → `deny_*` → built-ins / `allow_*` → LLM) with an immutable safety floor (also refusing dot-segment globs such as `cat .e*`).
+  - Invalid `[guardrails]` tables (unknown keys, wrong types, invalid `deny_*` entries, unreadable files, broken TOML) stop all automatic replies; invalid `allow_*` entries are ignored with warnings.
+  - **CLI & Doctor:** `tchelvis supervisor rules [--json]` and dry-run `tchelvis supervisor rules test` (`<command> [--tool <name>]` or `--screen <file> [--msg <text>] [--kind <kind>]`, exit codes `0`/`1`/`2`), plus a `guardrails` check in `tchelvis doctor`.
+  - **Observability:** deciding `rule_id` is recorded in `supervisor_events.jsonl` and displayed in the Herdr Desktop mod's **Log** view (`Regra: <rule_id>`).
 - **Multi-line daily tasks & external editor.**
   - **CLI:** `tchelvis task add --edit` opens `$VISUAL` / `$EDITOR` (falling back to `nvi` then `vi`) pre-filled with any positional draft; empty saved text cancels cleanly. Human list output (`task list`, `home`) displays the first line plus `…(+N linhas)`, while `--json` keeps full titles.
   - **Herdr mod:** the task input wraps across lines (`Shift+Enter` inserts a newline, `Enter` saves), a `✎` button opens `tchelvis task add --edit` in a new terminal tab and clears the draft once the task appears, and task rows render full multi-line titles and full project tags without truncation.

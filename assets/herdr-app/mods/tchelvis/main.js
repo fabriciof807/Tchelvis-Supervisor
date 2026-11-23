@@ -767,7 +767,12 @@ export function logEventRow(ev, nowMs = Date.now()) {
   const session = String(ev?.session_name ?? "").trim();
   const urgency = ev?.urgency ?? null;
   const summary = String(ev?.summary ?? "").trim();
-  const detail = String(ev?.detail ?? "").trim();
+  const baseDetail = String(ev?.detail ?? "").trim();
+  const ruleId = String(ev?.rule_id ?? "").trim();
+  const detailParts = [];
+  if (baseDetail) detailParts.push(baseDetail);
+  if (ruleId) detailParts.push(`Regra: ${ruleId}`);
+  const detail = detailParts.join("\n");
   return {
     ts_ms: Number(ev?.ts_ms ?? 0),
     time: logEventTimeLabel(ev?.ts_ms, nowMs),

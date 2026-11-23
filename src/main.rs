@@ -354,6 +354,43 @@ enum SupervisorCommands {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Inspect effective [guardrails] rules or dry-run a command/screen against them
+    Rules {
+        /// Output JSON
+        #[arg(long)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<RulesCommand>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RulesCommand {
+    /// Dry-run fixed guardrail rules against a command or captured screen (never sends anything)
+    Test {
+        /// Command to test (mutually exclusive with --screen)
+        #[arg(
+            value_name = "COMMAND",
+            required_unless_present = "screen",
+            conflicts_with = "screen"
+        )]
+        command: Option<String>,
+        /// Tool name when testing a command (default: Bash)
+        #[arg(long, requires = "command", conflicts_with = "screen")]
+        tool: Option<String>,
+        /// Path to captured terminal screen file (mutually exclusive with <COMMAND>)
+        #[arg(long, value_name = "FILE", conflicts_with = "command")]
+        screen: Option<PathBuf>,
+        /// Simulated hc status message (only with --screen)
+        #[arg(long, requires = "screen", conflicts_with = "command")]
+        msg: Option<String>,
+        /// Simulated hc status kind (only with --screen)
+        #[arg(long, requires = "screen", conflicts_with = "command")]
+        kind: Option<String>,
+        /// Output RuleTestReport JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1146,6 +1183,68 @@ async fn main() -> Result<()> {
                 }
                 Ok(())
             }
+            SupervisorCommands::Rules {
+                json: rules_json,
+                action,
+            } => {
+                use tchelvis::supervisor::rules::load_default_guardrail_rules;
+                use tchelvis::supervisor::rules_cli::{
+                    format_rules_human, format_rules_test_human, test_command, test_screen,
+                    RulesReport,
+                };
+                match action {
+                    None => {
+                        let rules = load_default_guardrail_rules();
+                        if rules_json {
+                            let report = RulesReport::from_rules(&rules);
+                            println!("{}", serde_json::to_string(&report)?);
+                        } else {
+                            print!("{}", format_rules_human(&rules));
+                        }
+                        Ok(())
+                    }
+                    Some(RulesCommand::Test {
+                        command,
+                        tool,
+                        screen,
+                        msg,
+                        kind,
+                        json: test_json,
+                    }) => {
+                        let use_json = rules_json || test_json;
+                        let rules = load_default_guardrail_rules();
+                        let report = match (command, screen) {
+                            (Some(cmd), None) => test_command(&rules, &cmd, tool.as_deref()),
+                            (None, Some(path)) => {
+                                let screen_text = match std::fs::read_to_string(&path) {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        eprintln!(
+                                            "Erro ao ler arquivo de tela {}: {err}",
+                                            path.display()
+                                        );
+                                        std::process::exit(2);
+                                    }
+                                };
+                                test_screen(&rules, &screen_text, msg.as_deref(), kind.as_deref())
+                            }
+                            _ => {
+                                eprintln!("Informe <COMMAND> ou --screen <FILE>.");
+                                std::process::exit(2);
+                            }
+                        };
+                        if use_json {
+                            println!("{}", serde_json::to_string_pretty(&report)?);
+                        } else {
+                            print!("{}", format_rules_test_human(&report));
+                        }
+                        if !report.approved {
+                            std::process::exit(1);
+                        }
+                        Ok(())
+                    }
+                }
+            }
         },
         Commands::Chat { action } => {
             match action {
@@ -1824,5 +1923,82 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn supervisor_rules_test_enforces_flag_exclusivity() {
+        assert!(Cli::try_parse_from(["tchelvis", "supervisor", "rules"]).is_ok());
+        assert!(Cli::try_parse_from(["tchelvis", "supervisor", "rules", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["tchelvis", "supervisor", "rules", "test", "ls"]).is_ok());
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "a.rs",
+            "--tool",
+            "Read"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "--screen",
+            "s.txt",
+            "--msg",
+            "approve Bash: ls",
+            "--kind",
+            "permission"
+        ])
+        .is_ok());
+
+        // Missing both command and --screen
+        assert!(Cli::try_parse_from(["tchelvis", "supervisor", "rules", "test"]).is_err());
+        // Command and --screen are mutually exclusive
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "ls",
+            "--screen",
+            "s.txt"
+        ])
+        .is_err());
+        // --tool only with command
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "--screen",
+            "s.txt",
+            "--tool",
+            "Bash"
+        ])
+        .is_err());
+        // --msg and --kind only with --screen
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "ls",
+            "--msg",
+            "x"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "tchelvis",
+            "supervisor",
+            "rules",
+            "test",
+            "ls",
+            "--kind",
+            "permission"
+        ])
+        .is_err());
     }
 }
