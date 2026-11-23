@@ -4,7 +4,7 @@ Direction, milestone order, and dependencies. Behavior details and acceptance cr
 milestone belong in its own spec/plan when the milestone starts. Session-level status lives in
 [`HANDOFF.md`](HANDOFF.md).
 
-_Last updated: 2026-11-17_
+_Last updated: 2026-11-23_
 
 ## Dependency graph
 
@@ -31,15 +31,17 @@ with the UI track.
 | M1b | Fallback model when the chosen one stops working ([design](docs/superpowers/specs/2026-11-16-m1b-fallback-model-design.md)) | M1 | **Implemented**; host validation pending |
 | M1c | Hide/delete models ([design](docs/superpowers/specs/2026-11-15-model-hide-delete-design.md)) | M1 | **Implemented**; host validation pending |
 | M1d | Decision-quality benchmark per model | M1 | Planned |
-| M2 | Icon system replacing emojis | — | Planned |
+| M2 | Icon system replacing emojis | — | **Done** (`98b709a`); host visual check pending |
 | M3 | Compact layout & simpler tools | M2 | Planned |
 | M4 | Inspector multi-terminal view | M3 | Planned |
 | M5a | Rename to `tchelvis` + release pipeline | M0 | **Done** — `v0.2.0` published 2026-11-16 |
 | M5b | Distribution: AUR, Homebrew (Linux) | M5a | Planned |
 | M6 | Delegator mode: multi-agent orchestration (`tchelvis orch`, [design](docs/designs/m6-orchestration.md)) | — | **Implemented** |
 | M7 | Kanban board mod: daily tasks grouped by project tag | Daily-tasks tags | Idea (not planned) |
-| M8 | Supervisor chat ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`); host validation pending; phase B idea |
+| M8 | Supervisor chat + Pi Durable ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`, `238191a`, `6c472d3`); **Phase B: adopt Pi Durable** |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
+| M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Next** — design approved 2026-11-23 |
+| M11 | Declarative multi-agent loops (`tchelvis loop`) | M10 | Proposed (spec to be revised after M10) |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -128,14 +130,24 @@ A separate mod that reads the daily tasks (`tchelvis task list --json`) and show
 one column per project tag (plus Geral). Tasks stay general; the tag is the only grouping key
 (decision 2026-11-16, see `docs/superpowers/specs/2026-11-16-daily-tasks-input-design.md`).
 
-### M8 — Supervisor chat
+### M8 — Supervisor chat + Pi Durable
 Read-only chat (`tchelvis chat ask` + a Chat tab in the drawer) about active agents and Daily Tasks,
 using the supervisor's effective model. Container mode only; shares the local model slot with the
 supervisor through `llm_slot.lock` (evaluations defer instead of timing out).
-- **Phase A (done):** answer questions only. [Design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md),
+- **Phase A (done):** answer questions only via `tchelvis chat ask`. [Design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md),
   [plan](docs/superpowers/plans/2026-11-17-supervisor-chat.md).
-- **Phase B (idea):** act on tasks (create, complete, retag) — the model proposes, the user confirms
-  with a click, like the supervisor's Action Cards. Small models need the confirmation.
+- **Phase B (planned — adopt Pi Durable `@earendil-works/pi-durable`):** evolve the chat into an
+  action-capable, durable assistant backed by Pi Durable (optional Node/Bun worker managed by
+  `tchelvis`):
+  - **Why Pi Durable:** persistent conversation history across Herdr Desktop restarts (SQLite/JSONL),
+    replay-safe tool execution (*effect sandwiches*) for acting on Daily Tasks, `tchelvis orch`, and
+    agent prompts (with confirmation cards for small models / destructive actions), background
+    context compaction (replacing fixed character budgets), multi-client steering shared across the
+    Herdr mod / CLI / TUI, and parallel/forked threads per project or orchestration run.
+  - **Integration constraints:** model requests route through `tchelvis daemon` (or an internal local
+    proxy) so local `llama.cpp` calls still honor `llm_slot.lock` and `[fallback]` routing; Phase A's
+    zero-dependency Rust path remains available for offline/lightweight 350M–1.7B setups without a
+    Node/Bun runtime.
 
 ### M9 — `files-yazi` mod (design agreed 2026-11-17, not planned)
 A new mod, separate from `tchelvis`, instead of replacing Herdr's Files (that button lives in
@@ -151,6 +163,19 @@ Herdr's shipped `tabs` mod; changing it would mean forking it with `mod.clone`).
   `~/.config/herdr-app/AGENTS.md`): the `place` value for "right", whether a mod's `run()` returns
   the created terminal id (else find yazi by foreground program among the tab's terminals), and
   `herdr-app check` / `herdr-app shot` for the visual check.
+
+### M10 — User-configurable supervisor `[guardrails]` (next)
+A `[guardrails]` table in `~/.config/tchelvis/supervisor.toml`: one deterministic `allow_commands`
+list (exact by default, trailing `*` for arguments), `deny_commands` / `deny_paths` that always win,
+a closed `allow_tools` list, and `tchelvis supervisor rules [test]` for dry runs. The built-in floor
+stays immutable and an invalid table turns automatic replies off.
+Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md).
+
+### M11 — Declarative multi-agent loops (proposed, after M10)
+`tchelvis loop`: a fixed engine runs worker/reviewer/critic stages in clean headless sessions inside a
+worktree, exchanging files. Agreed 2026-11-23: the caller ends its turn and `tchelvis` watches the
+loop, waking it once when the loop finishes, stalls or needs a human. Stages run in a sandbox (Incus
+or another tool, not ai-jail). Workflow format (TOML recommended) still open.
 
 ### M6 — Delegator mode & multi-agent orchestration (implemented)
 Event-driven parent-child agent orchestration (`tchelvis orch`) over Herdr (`hc`) terminals. Design: [M6 spec](docs/designs/m6-orchestration.md).
