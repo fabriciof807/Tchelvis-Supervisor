@@ -3247,7 +3247,7 @@ mod tests {
     async fn test_resolve_caller_terminal_strict_fencing_and_non_strict_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         let fake_hc_ok = tmp.path().join("hc-ok");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc_ok,
             "#!/usr/bin/env bash\n\
              if [ \"$1\" = \"get\" ]; then\n\
@@ -3255,12 +3255,10 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc_ok, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let fake_hc_no_created = tmp.path().join("hc-no-created");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc_no_created,
             "#!/usr/bin/env bash\n\
              if [ \"$1\" = \"get\" ]; then\n\
@@ -3268,13 +3266,10 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 1\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc_no_created, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let fake_hc_fail = tmp.path().join("hc-fail");
-        fs::write(&fake_hc_fail, "#!/usr/bin/env bash\nexit 1\n").unwrap();
-        fs::set_permissions(&fake_hc_fail, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc_fail, "#!/usr/bin/env bash\nexit 1\n");
 
         let ok_client = HerdrClient::new(fake_hc_ok.to_string_lossy().to_string());
         let no_created_client = HerdrClient::new(fake_hc_no_created.to_string_lossy().to_string());

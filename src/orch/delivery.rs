@@ -456,7 +456,6 @@ mod tests {
         POINTER_RETRY_BACKOFF_MS,
     };
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn make_terminal(address: &str, state: &str, status_state: &str) -> HcTerminal {
         HcTerminal {
@@ -537,8 +536,7 @@ mod tests {
             log_file.display(),
             exit_code_file.display()
         );
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
 
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let store = OrchStore::open_in_memory().unwrap();
@@ -729,7 +727,7 @@ mod tests {
         let exit_code_file = tmp.path().join("exit_code");
         fs::write(&exit_code_file, "1").unwrap();
         let fake_hc = tmp.path().join("fake-hc");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc,
             format!(
                 "#!/usr/bin/env bash\n\
@@ -739,9 +737,7 @@ mod tests {
                  exit 0\n",
                 exit_code_file.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
         let store = OrchStore::open_in_memory().unwrap();
@@ -943,7 +939,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let calls_log = tmp.path().join("calls.log");
         let fake_hc = tmp.path().join("fake-hc");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc,
             format!(
                 "#!/usr/bin/env bash\n\
@@ -959,9 +955,7 @@ mod tests {
                  exit 0\n",
                 calls_log.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let store = seed_pending_delivery_store("t1b3");
@@ -1007,7 +1001,7 @@ mod tests {
         let mode_file = tmp.path().join("mode");
         fs::write(&mode_file, "mismatch").unwrap();
         let fake_hc = tmp.path().join("fake-hc");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc,
             format!(
                 "#!/usr/bin/env bash\n\
@@ -1029,9 +1023,7 @@ mod tests {
                 calls_log.display(),
                 mode_file.display()
             ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let store = seed_pending_delivery_store("t1b3");
@@ -1108,7 +1100,7 @@ mod tests {
         let _test_guard = DELIVERY_TEST_LOCK.lock().await;
         let tmp = tempfile::tempdir().unwrap();
         let fake_hc = tmp.path().join("fake-hc");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc,
             "#!/usr/bin/env bash\n\
              if [ \"$1\" = \"send\" ]; then\n\
@@ -1116,9 +1108,7 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 0\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let store = seed_pending_delivery_store("t1");

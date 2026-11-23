@@ -748,13 +748,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // editor string carries an argument, like `code -w`
         let script = dir.path().join("ed.sh");
-        std::fs::write(
+        crate::test_support::write_executable(
             &script,
             "#!/bin/sh\n# $1 = flag, $2 = file\nprintf 'linha 1\\nlinha 2\\n' > \"$2\"\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let editor = format!("{} --wait", script.display());
         let out = edit_text_with_editor(&editor, "rascunho", dir.path()).unwrap();
         assert_eq!(out.as_deref(), Some("linha 1\nlinha 2"));

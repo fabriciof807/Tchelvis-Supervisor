@@ -217,7 +217,6 @@ pub fn restart(procs: &[OurProc], exe: &Path, log_dir: &Path) -> Result<Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
 
     fn write_fake_proc(root: &Path, pid: i32, uid: u32, argv: &[&str]) {
@@ -288,8 +287,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let log_dir = tmp.path().join("state");
         let fake_exe = tmp.path().join("fake-tchelvis");
-        fs::write(&fake_exe, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_exe, "#!/usr/bin/env sh\nexit 0\n");
 
         let procs = vec![OurProc {
             pid: 999999,

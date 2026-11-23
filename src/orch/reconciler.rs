@@ -185,7 +185,6 @@ mod tests {
     use crate::herdr::{HcStatus, HcTerminal};
     use crate::orch::{DispatchContext, OrchRun, OrchTask, RunStatus, TaskStatus};
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     fn setup_store_with_dispatch(disp_id: &str, assignee: &str, created_ms: i64) -> OrchStore {
         let store = OrchStore::open_in_memory().unwrap();
@@ -241,12 +240,10 @@ mod tests {
     async fn test_reconciler_1500ms_idle_turn_stop_and_working_reset() {
         let tmp = tempfile::tempdir().unwrap();
         let fake_hc = tmp.path().join("fake-hc");
-        fs::write(
+        crate::test_support::write_executable(
             &fake_hc,
             "#!/usr/bin/env bash\nif [ \"$1\" = \"read\" ]; then\n  echo \"worker finished output\"\nfi\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
         let store = setup_store_with_dispatch("disp_1", "t2", 2_000);
@@ -358,8 +355,7 @@ mod tests {
             read_count_file.display(),
             read_count_file.display()
         );
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
         let store = setup_store_with_dispatch("disp_1", "t2", 2_000);
@@ -464,8 +460,7 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 1\n";
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
         let store = setup_store_with_dispatch("disp_1", "t2", 2_000);
@@ -522,8 +517,7 @@ mod tests {
                exit 1\n\
              fi\n\
              exit 1\n";
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
         let store = setup_store_with_dispatch("disp_1", "t2", 2_000);

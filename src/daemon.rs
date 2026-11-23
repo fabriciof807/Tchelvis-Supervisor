@@ -1120,8 +1120,7 @@ mod tests {
         let paths = make_test_paths(tmp.path());
 
         let fake_exe = tmp.path().join("fake-tchelvis");
-        fs::write(&fake_exe, "#!/usr/bin/env bash\nexit 0\n").unwrap();
-        fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_exe, "#!/usr/bin/env bash\nexit 0\n");
 
         let err = ensure_daemon_running_with_exe(&paths, &fake_exe, Duration::from_millis(2), 3)
             .await
@@ -1133,9 +1132,45 @@ mod tests {
         );
 
         // Also verify a stale non-listening socket file on disk does NOT falsely return Ok.
+        // Bind SOCK_STREAM without listen() so a concurrent fork() in another test thread
+        // inheriting the fd before exec() can never make UnixStream::connect() succeed.
         let sock_path = paths.socket_file();
         {
-            let _stale_listener = UnixListener::bind(&sock_path).unwrap();
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            let c_path = CString::new(sock_path.as_os_str().as_bytes()).unwrap();
+            let bytes = c_path.as_bytes_with_nul();
+            // SAFETY: zeroed sockaddr_un is valid; sun_path bounds are checked below.
+            let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            assert!(
+                bytes.len() <= addr.sun_path.len(),
+                "socket path too long: {}",
+                sock_path.display()
+            );
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (dst, &src) in addr.sun_path.iter_mut().zip(bytes.iter()) {
+                *dst = src as libc::c_char;
+            }
+            // SAFETY: valid AF_UNIX/SOCK_STREAM socket args and sockaddr_un pointer/length.
+            let fd =
+                unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+            assert!(
+                fd >= 0,
+                "socket() failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len())
+                as libc::socklen_t;
+            let rc = unsafe {
+                libc::bind(
+                    fd,
+                    (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                    len,
+                )
+            };
+            let bind_err = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            assert_eq!(rc, 0, "bind() failed: {bind_err}");
         }
         assert!(sock_path.exists());
         let err_stale =

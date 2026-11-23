@@ -1,7 +1,8 @@
+mod common;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -277,8 +278,7 @@ async fn scenario_4_atomic_guarded_pointer_delivery_coalescing_deferral_and_retr
         send_log.display(),
         exit_code_file.display()
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
 
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
     let store = OrchStore::open_in_memory().unwrap();
@@ -475,8 +475,7 @@ async fn scenario_6_reconciler_1500ms_turn_stop_and_3000ms_unloaded_llm_blocked_
         read_counter.display(),
         read_counter.display()
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open_in_memory().unwrap();
@@ -938,8 +937,7 @@ async fn task_a_send_waits_for_delayed_dispatch_row_and_enforces_fencing() {
            exit 0\n\
          fi\n\
          exit 1\n";
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let db_path = tmp.path().join("orch.db");
@@ -1039,8 +1037,7 @@ async fn task_a_ask_waits_for_delayed_dispatch_row() {
            exit 0\n\
          fi\n\
          exit 1\n";
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1126,8 +1123,7 @@ async fn task_b_dispatch_rechecks_liveness_and_reports_launch_failure_with_exit_
         get_count_file.display(),
         get_count_file.display(),
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1209,8 +1205,7 @@ async fn task_b_dispatch_does_not_overwrite_fast_completed_worker_as_failed() {
            exit 0\n\
          fi\n\
          exit 0\n";
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1276,8 +1271,7 @@ async fn task_b_dispatch_healthy_worker_stays_dispatched_after_2s_recheck() {
            exit 0\n\
          fi\n\
          exit 0\n";
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1330,8 +1324,7 @@ async fn task_b_dispatch_failed_read_tail_does_not_fail_failure_recording() {
            exit 1\n\
          fi\n\
          exit 0\n";
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1443,8 +1436,7 @@ async fn lot_d_failed_dispatch_new_child_cleans_up_clean_worktree_and_closes_ter
         get_count_file.display(),
         term_ops_log.display(),
     );
-    fs::write(&fake_hc_a, script_a).unwrap();
-    fs::set_permissions(&fake_hc_a, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc_a, script_a);
 
     let store = OrchStore::open(&tmp.path().join("orch_a.db")).unwrap();
     store.create_run(&sample_run("run_a", "t1")).unwrap();
@@ -1504,8 +1496,7 @@ async fn lot_d_failed_dispatch_new_child_cleans_up_clean_worktree_and_closes_ter
         repo_dir.display(),
         term_ops_b.display(),
     );
-    fs::write(&fake_hc_b, script_b).unwrap();
-    fs::set_permissions(&fake_hc_b, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc_b, script_b);
 
     store
         .create_or_update_task(&sample_task("run_a", "task_b", vec![]))
@@ -1552,8 +1543,7 @@ async fn lot_d_failed_dispatch_new_child_cleans_up_clean_worktree_and_closes_ter
          exit 1\n",
         repo_dir.display(),
     );
-    fs::write(&fake_hc_c, script_c).unwrap();
-    fs::set_permissions(&fake_hc_c, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc_c, script_c);
 
     store
         .create_or_update_task(&sample_task("run_a", "task_c", vec![]))
@@ -1609,8 +1599,7 @@ async fn lot_d_failed_dispatch_new_child_keeps_dirty_worktree_and_reports_it() {
          exit 0\n",
         repo_dir.display(),
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
     store.create_run(&sample_run("run_d", "t1")).unwrap();
@@ -1651,12 +1640,11 @@ async fn lot_d_failed_dispatch_new_child_keeps_dirty_worktree_and_reports_it() {
 async fn lot_d_send_and_ask_reject_missing_caller_identity_or_hc_lookup_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let failing_hc = tmp.path().join("failing-hc");
-    fs::write(&failing_hc, "#!/usr/bin/env bash\nexit 1\n").unwrap();
-    fs::set_permissions(&failing_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&failing_hc, "#!/usr/bin/env bash\nexit 1\n");
     let failing_herdr = HerdrClient::new(failing_hc.to_string_lossy().to_string());
 
     let working_hc = tmp.path().join("working-hc");
-    fs::write(
+    common::write_executable(
         &working_hc,
         "#!/usr/bin/env bash\n\
          if [ \"$1\" = \"get\" ]; then\n\
@@ -1664,9 +1652,7 @@ async fn lot_d_send_and_ask_reject_missing_caller_identity_or_hc_lookup_failure(
            exit 0\n\
          fi\n\
          exit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&working_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let working_herdr = HerdrClient::new(working_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -1789,8 +1775,7 @@ async fn lot_d_delivery_error_on_first_target_defers_and_still_delivers_to_secon
          exit 0\n",
         sent_log.display()
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open_in_memory().unwrap();
@@ -1887,8 +1872,7 @@ async fn lot_d_reconciler_does_not_false_escalate_missing_terminal_within_grace_
          exit 0\n",
         get_mode.display()
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open_in_memory().unwrap();
@@ -1949,7 +1933,7 @@ async fn lot_d_reconciler_does_not_false_escalate_missing_terminal_within_grace_
 async fn lot_d_duplicate_worker_done_is_rejected_and_preserves_single_inbox_message() {
     let tmp = tempfile::tempdir().unwrap();
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         "#!/usr/bin/env bash\n\
          if [ \"$1\" = \"get\" ]; then\n\
@@ -1957,9 +1941,7 @@ async fn lot_d_duplicate_worker_done_is_rejected_and_preserves_single_inbox_mess
            exit 0\n\
          fi\n\
          exit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open_in_memory().unwrap();
@@ -2086,8 +2068,7 @@ async fn lot_d_coordinator_claude_done_receives_worker_done_pointer_after_deferr
          exit 0\n",
         send_log.display()
     );
-    fs::write(&fake_hc, script).unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_hc, script);
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open_in_memory().unwrap();
@@ -2188,7 +2169,7 @@ async fn lot_f_launch_missing_agent_fails_agent_preflight_and_creates_no_dispatc
     fs::create_dir_all(&empty_bin).unwrap();
     let hc_log = tmp.path().join("hc_calls.log");
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2200,9 +2181,7 @@ async fn lot_f_launch_missing_agent_fails_agent_preflight_and_creates_no_dispatc
              exit 0\n",
             hc_log.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -2253,14 +2232,13 @@ async fn lot_f_launch_happy_path_creates_run_task_dispatch_and_reuses_existing_r
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agent = bin_dir.join("claude");
-    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agent, "#!/usr/bin/env sh\nexit 0\n");
 
     let repo_dir = tmp.path().join("repo");
     init_temp_git_repo(&repo_dir);
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2279,9 +2257,7 @@ async fn lot_f_launch_happy_path_creates_run_task_dispatch_and_reuses_existing_r
              exit 0\n",
             repo_dir.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
 
@@ -2372,14 +2348,13 @@ async fn lot_f_launch_spawn_and_liveness_failures_report_failed_stage_exit_code_
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agent = bin_dir.join("agy");
-    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agent, "#!/usr/bin/env sh\nexit 0\n");
 
     // Case A: liveness re-check detects worker died with exit_code=2 and output tail
     let get_count_file = tmp.path().join("get_count");
     fs::write(&get_count_file, "0").unwrap();
     let fake_hc_liveness = tmp.path().join("fake-hc-live");
-    fs::write(
+    common::write_executable(
         &fake_hc_liveness,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2410,9 +2385,7 @@ async fn lot_f_launch_spawn_and_liveness_failures_report_failed_stage_exit_code_
             get_count_file.display(),
             get_count_file.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc_liveness, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let store = OrchStore::open(&tmp.path().join("orch_live.db")).unwrap();
     let err_launch = execute_launch_with_path(
@@ -2444,7 +2417,7 @@ async fn lot_f_launch_spawn_and_liveness_failures_report_failed_stage_exit_code_
 
     // Case B: hc run fails immediately -> failed_stage = "spawn"
     let fake_hc_spawn = tmp.path().join("fake-hc-spawn");
-    fs::write(
+    common::write_executable(
         &fake_hc_spawn,
         "#!/usr/bin/env bash\n\
          if [ \"$1\" = \"get\" ]; then\n\
@@ -2456,9 +2429,7 @@ async fn lot_f_launch_spawn_and_liveness_failures_report_failed_stage_exit_code_
            exit 7\n\
          fi\n\
          exit 1\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc_spawn, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let store_b = OrchStore::open(&tmp.path().join("orch_spawn.db")).unwrap();
     let err_spawn = execute_launch_with_path(
@@ -2495,7 +2466,7 @@ async fn lot_f_send_to_worker_fencing_live_busy_and_finished_errors() {
     fs::write(&worker_status, "idle").unwrap();
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2525,9 +2496,7 @@ async fn lot_f_send_to_worker_fencing_live_busy_and_finished_errors() {
             worker_status.display(),
             send_log.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -2672,7 +2641,7 @@ async fn lot_f_retry_creates_new_dispatch_supersedes_old_and_respects_circuit_br
     fs::write(&spawn_count, "0").unwrap();
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2702,9 +2671,7 @@ async fn lot_f_retry_creates_new_dispatch_supersedes_old_and_respects_circuit_br
             spawn_count.display(),
             term_ops.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -2841,7 +2808,7 @@ async fn lot_f_stop_closes_terminal_marks_stopped_restores_task_and_preserves_di
     let term_ops = tmp.path().join("term_ops.log");
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2865,9 +2832,7 @@ async fn lot_f_stop_closes_terminal_marks_stopped_restores_task_and_preserves_di
             repo_dir.display(),
             term_ops.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -2937,7 +2902,7 @@ async fn lot_g_send_to_and_attach_on_done_terminal_use_get_recheck_and_plain_sen
     let tmp = tempfile::tempdir().unwrap();
     let hc_log = tmp.path().join("hc_calls.log");
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -2957,9 +2922,7 @@ async fn lot_g_send_to_and_attach_on_done_terminal_use_get_recheck_and_plain_sen
              exit 0\n",
             hc_log.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -3028,7 +2991,7 @@ async fn lot_g_send_to_and_attach_on_done_terminal_use_get_recheck_and_plain_sen
 async fn lot_i_b7_send_to_completed_suggests_launch_without_retry_while_stopped_suggests_retry() {
     let tmp = tempfile::tempdir().unwrap();
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         "#!/usr/bin/env bash\n\
          if [ \"$1\" = \"get\" ]; then\n\
@@ -3040,9 +3003,7 @@ async fn lot_i_b7_send_to_completed_suggests_launch_without_retry_while_stopped_
            exit 0\n\
          fi\n\
          exit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -3186,13 +3147,12 @@ async fn lot_i_b9_launch_failure_after_dispatch_created_includes_ids_in_json_and
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agent = bin_dir.join("false");
-    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 1\n").unwrap();
-    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agent, "#!/usr/bin/env sh\nexit 1\n");
 
     let get_count_file = tmp.path().join("get_count");
     fs::write(&get_count_file, "0").unwrap();
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -3222,9 +3182,7 @@ async fn lot_i_b9_launch_failure_after_dispatch_created_includes_ids_in_json_and
             get_count_file.display(),
             get_count_file.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
     let err = execute_launch_with_path(
@@ -3277,7 +3235,7 @@ async fn lot_i_b8_release_force_removes_worktree_keeps_branch_and_reports_delete
     let term_ops = tmp.path().join("term_ops.log");
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -3301,9 +3259,7 @@ async fn lot_i_b8_release_force_removes_worktree_keeps_branch_and_reports_delete
             repo_dir.display(),
             term_ops.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
@@ -3397,12 +3353,11 @@ async fn lot_k_n1_launch_agy_with_model_flag_preflights_agy_and_places_dash_i_be
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agy = bin_dir.join("agy");
-    fs::write(&fake_agy, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agy, "#!/usr/bin/env sh\nexit 0\n");
 
     let run_args_log = tmp.path().join("hc_run_args.log");
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -3422,9 +3377,7 @@ async fn lot_k_n1_launch_agy_with_model_flag_preflights_agy_and_places_dash_i_be
              exit 0\n",
             run_args_log.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
     let out = execute_launch_with_path(
@@ -3596,11 +3549,10 @@ async fn lot_k_n4_launch_without_run_reuses_latest_empty_active_run_for_caller()
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agent = bin_dir.join("claude");
-    fs::write(&fake_agent, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_agent, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agent, "#!/usr/bin/env sh\nexit 0\n");
 
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         "#!/usr/bin/env bash\n\
          if [ \"$1\" = \"get\" ]; then\n\
@@ -3616,9 +3568,7 @@ async fn lot_k_n4_launch_without_run_reuses_latest_empty_active_run_for_caller()
            exit 0\n\
          fi\n\
          exit 0\n",
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
 
@@ -3733,12 +3683,11 @@ async fn lot_l_launch_agy_with_quoted_model_and_unbalanced_quote_preflight() {
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_agy = bin_dir.join("agy");
-    fs::write(&fake_agy, "#!/usr/bin/env sh\nexit 0\n").unwrap();
-    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+    common::write_executable(&fake_agy, "#!/usr/bin/env sh\nexit 0\n");
 
     let run_args_log = tmp.path().join("hc_run_args.log");
     let fake_hc = tmp.path().join("fake-hc");
-    fs::write(
+    common::write_executable(
         &fake_hc,
         format!(
             "#!/usr/bin/env bash\n\
@@ -3758,9 +3707,7 @@ async fn lot_l_launch_agy_with_quoted_model_and_unbalanced_quote_preflight() {
              exit 0\n",
             run_args_log.display()
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
     let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());

@@ -1598,7 +1598,6 @@ mod tests {
     #[tokio::test]
     async fn test_run_worker_and_read_tail_lines() {
         use std::fs;
-        use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
         let fake_hc = tmp.path().join("fake-hc");
@@ -1617,8 +1616,7 @@ mod tests {
              exit 1\n",
             args_file.display()
         );
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
 
         let client = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let labels = [
@@ -1652,9 +1650,6 @@ mod tests {
     /// fencing compares against that value, so it must not be left empty.
     #[tokio::test]
     async fn test_run_worker_fetches_created_ms_when_run_output_lacks_it() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let fake_hc = tmp.path().join("fake-hc");
         let script = "#!/usr/bin/env bash\n\
@@ -1667,8 +1662,7 @@ mod tests {
                exit 0\n\
              fi\n\
              exit 1\n";
-        fs::write(&fake_hc, script).unwrap();
-        fs::set_permissions(&fake_hc, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
 
         let client = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let agent_argv = vec!["pi".to_string()];
@@ -1926,8 +1920,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_guarded_by_status_recheck_and_timeout() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().unwrap();
         let calls_log = tmp.path().join("calls.log");
         let get_state_file = tmp.path().join("get_state");
@@ -1961,8 +1953,7 @@ mod tests {
             get_state_file.display(),
             send_mode_file.display(),
         );
-        std::fs::write(&fake_hc, script).unwrap();
-        std::fs::set_permissions(&fake_hc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&fake_hc, script);
 
         let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
         let make = |status: &str| HcTerminal {

@@ -18,3 +18,7 @@ pub mod supervisor;
 pub mod update;
 pub mod usage;
 pub mod version;
+
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+pub(crate) mod test_support;
