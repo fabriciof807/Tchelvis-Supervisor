@@ -93,6 +93,8 @@ pub struct SupervisorEvent {
     pub to: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_id: Option<String>,
 }
 
 fn cap_chars(input: &str, max_chars: usize) -> String {
@@ -150,10 +152,12 @@ fn empty_base(ts_ms: u64, kind: SupervisorEventKind, summary: String) -> Supervi
         from: None,
         to: None,
         action: None,
+        rule_id: None,
     }
 }
 
 impl SupervisorEvent {
+    #[allow(clippy::too_many_arguments)]
     pub fn auto_reply(
         ts_ms: u64,
         agent_id: &str,
@@ -162,6 +166,7 @@ impl SupervisorEvent {
         key: &str,
         model: Option<&str>,
         eval_summary: &str,
+        rule_id: Option<&str>,
     ) -> Self {
         let key_disp = if key.is_empty() { "Enter" } else { key };
         let origin = if source == "fixed_rule" {
@@ -186,6 +191,7 @@ impl SupervisorEvent {
         ev.key = Some(key.to_string());
         ev.model = opt_non_empty(model);
         ev.detail = sanitize_detail(Some(eval_summary));
+        ev.rule_id = opt_non_empty(rule_id);
         ev
     }
 
@@ -195,6 +201,7 @@ impl SupervisorEvent {
         session_name: &str,
         reason: &str,
         detail: Option<&str>,
+        rule_id: Option<&str>,
     ) -> Self {
         let clean_reason = sanitize_summary(reason);
         let summary = if clean_reason.is_empty() {
@@ -206,6 +213,7 @@ impl SupervisorEvent {
         ev.agent_id = opt_non_empty(Some(agent_id));
         ev.session_name = opt_non_empty(Some(session_name));
         ev.detail = sanitize_detail(detail);
+        ev.rule_id = opt_non_empty(rule_id);
         ev
     }
 
@@ -539,6 +547,7 @@ mod tests {
                     "y",
                     None,
                     "read-only",
+                    None,
                 ),
                 "auto_reply",
             ),
@@ -548,6 +557,7 @@ mod tests {
                     "t1",
                     "auth",
                     "comando fora da lista permitida",
+                    None,
                     None,
                 ),
                 "auto_reply_blocked",
@@ -668,7 +678,7 @@ mod tests {
         let log_path = dir.path().join("supervisor_events.jsonl");
 
         let events = vec![
-            SupervisorEvent::auto_reply(1000, "t1", "api", "fixed_rule", "y", None, "ls"),
+            SupervisorEvent::auto_reply(1000, "t1", "api", "fixed_rule", "y", None, "ls", None),
             SupervisorEvent::alert(2000, "t2", "ui", Urgency::Critical, "rm -rf", "perigo"),
             SupervisorEvent::evaluation(
                 2000,
@@ -735,5 +745,14 @@ mod tests {
             ),
             "modo somente alerta ativo"
         );
+    }
+
+    #[test]
+    fn old_lines_without_rule_id_still_parse() {
+        let old = r#"{"ts_ms":1000,"kind":"auto_reply","agent_id":"t1","session_name":"auth","summary":"s","source":"fixed_rule","key":"y"}"#;
+        let ev: SupervisorEvent = serde_json::from_str(old).unwrap();
+        assert_eq!(ev.rule_id, None);
+        let serialized = serde_json::to_string(&ev).unwrap();
+        assert!(!serialized.contains("rule_id"));
     }
 }

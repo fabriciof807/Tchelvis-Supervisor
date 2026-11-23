@@ -1,4 +1,5 @@
 use super::ollama::{CognitiveEvaluation, SupervisorDecision};
+use super::rules::GuardrailRules;
 use super::state::{AgentDurableState, SupervisorMode, Urgency};
 use regex::Regex;
 use std::collections::HashMap;
@@ -683,23 +684,37 @@ fn is_safe_readonly_command(cmd: &str) -> bool {
     floor_violation(cmd).is_none() && allow.is_match(cmd)
 }
 
-fn is_safe_read_target(target: &str) -> bool {
+fn read_target_floor_violation(target: &str) -> Option<&'static str> {
     let target = target.trim();
-    if target.is_empty()
-        || target.contains(char::is_whitespace)
-        || has_readonly_disallowed_metachar(target)
-        || is_truncated_command(target)
-    {
-        return false;
+    if target.is_empty() {
+        return Some("empty");
+    }
+    if contains_forbidden_payload(target).is_some() {
+        return Some("forbidden");
+    }
+    if has_readonly_disallowed_metachar(target) {
+        return Some("metachar");
+    }
+    if is_truncated_command(target) {
+        return Some("truncated");
+    }
+    if target.contains(char::is_whitespace) {
+        return Some("unparsable");
     }
     let Some(tokens) = shlex::split(target) else {
-        return false;
+        return Some("unparsable");
     };
     if tokens.len() != 1 || tokens[0].is_empty() {
-        return false;
+        return Some("unparsable");
+    }
+    if has_dot_segment_glob(&tokens[0]) {
+        return Some("glob");
     }
     let [_, _, _, _, sensitive] = fast_path_regexes();
-    !sensitive.is_match(target) && !sensitive.is_match(&tokens[0])
+    if sensitive.is_match(target) || sensitive.is_match(&tokens[0]) {
+        return Some("sensitive");
+    }
+    None
 }
 
 fn classify_tool_request(tool: &str, target: &str, exact_read: bool) -> IdentifiedCommand {
@@ -838,19 +853,87 @@ fn extract_identifiable_commands(area: &str, msg: Option<&str>) -> Vec<Identifie
     cmds
 }
 
-fn is_allowlisted_command(cmd: &IdentifiedCommand) -> bool {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedDecision {
+    pub approval: Option<FixedApproval>,
+    pub rule_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixedApproval {
+    pub payload: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SanitizedReply {
+    pub eval: CognitiveEvaluation,
+    pub rule_id: Option<String>,
+}
+
+struct DenyHit {
+    rule_id: String,
+    key_name: &'static str,
+    entry: String,
+}
+
+fn check_deny(rules: &GuardrailRules, texts: &[&str]) -> Option<DenyHit> {
+    for &text in texts {
+        if let Some(entry) = rules.match_deny_command(text) {
+            return Some(DenyHit {
+                rule_id: format!("deny_command:{entry}"),
+                key_name: "deny_commands",
+                entry: entry.to_string(),
+            });
+        }
+    }
+    for &text in texts {
+        if let Some(entry) = rules.match_deny_path(text) {
+            return Some(DenyHit {
+                rule_id: format!("deny_path:{entry}"),
+                key_name: "deny_paths",
+                entry: entry.to_string(),
+            });
+        }
+    }
+    None
+}
+
+fn check_command_allowlist(
+    cmd: &IdentifiedCommand,
+    rules: &GuardrailRules,
+) -> std::result::Result<Option<String>, Option<&'static str>> {
     match cmd {
-        IdentifiedCommand::ReadToolTarget(target) => is_safe_read_target(target),
-        IdentifiedCommand::OtherTool => false,
+        IdentifiedCommand::ReadToolTarget(target) => {
+            if let Some(reason) = read_target_floor_violation(target) {
+                Err(Some(reason))
+            } else if rules.allow_read_tool {
+                Ok(Some("builtin_tool:Read".to_string()))
+            } else {
+                Err(None)
+            }
+        }
+        IdentifiedCommand::OtherTool => Err(None),
         IdentifiedCommand::Shell(raw_cmd) => {
             let cmd = raw_cmd.trim();
-            if cmd.is_empty() {
-                return false;
+            // The build/test list has its own metacharacter check; the read-only floor (sensitive
+            // words such as `auth_token`, `$`) never applied to it.
+            if rules.builtin_build_test
+                && !build_test_metachar_regex().is_match(cmd)
+                && build_test_allowlist_regex().is_match(cmd)
+            {
+                return Ok(None);
             }
-            let passes_readonly = is_safe_readonly_command(cmd);
-            let passes_build_test = !build_test_metachar_regex().is_match(cmd)
-                && build_test_allowlist_regex().is_match(cmd);
-            passes_readonly || passes_build_test
+            if let Some(reason) = floor_violation(cmd) {
+                return Err(Some(reason));
+            }
+            if rules.builtin_read_only && is_safe_readonly_command(cmd) {
+                return Ok(Some("builtin_read_only".to_string()));
+            }
+            if let Some(entry) = rules.match_allow(cmd) {
+                return Ok(Some(format!("allow_command:{entry}")));
+            }
+            Err(None)
         }
     }
 }
@@ -859,24 +942,50 @@ fn is_allowlisted_command(cmd: &IdentifiedCommand) -> bool {
 /// menu choice, or Enter (empty). Anything else — text copied from the screen, free-form
 /// instructions — is never typed; the evaluation becomes an operator alert without payload.
 ///
-/// An LLM `AUTO_REPLY` on a permission request (`kind == "permission"`, a menu with `1. Yes`, or
-/// an hc status `msg` naming a tool) is never sent; only the deterministic read-only fast path may
-/// approve those. On any numbered menu, `y`/`yes`/`n`/`no` and empty Enter are rejected; only digit
-/// keys may be used. When the prompt area or `msg` names an identifiable shell command, an
-/// affirmative reply (`y`/`yes`/Enter) is allowed only if the command passes the read-only
-/// allowlist or the build/test allowlist (without chaining/redirection metacharacters); otherwise it
-/// becomes an operator alert. Prompts with no identifiable command, numbered menus, and negative
-/// replies (`n`) keep their behaviour. A prompt whose hc status kind is `question` is never
-/// auto-answered. Must run after `enforce_blocked_policy`.
-pub fn sanitize_auto_reply(
+/// Invalid `[guardrails]` or `llm_auto_reply = false` refuse every reply, and a user `deny_*` rule
+/// refuses any reply but `n`. An LLM `AUTO_REPLY` on a permission request (`kind == "permission"`,
+/// a menu with `1. Yes`, or an hc status `msg` naming a tool) is never sent; only [`decide_fixed`]
+/// may approve those. On any numbered menu, `y`/`yes`/`n`/`no` and empty Enter are rejected; only
+/// digit keys may be used. When the prompt area or `msg` names an identifiable shell command, an
+/// affirmative reply (`y`/`yes`/Enter) is allowed only if the command passes the read-only, the
+/// build/test or the user `allow_commands` list; otherwise it becomes an operator alert. Prompts
+/// with no identifiable command, numbered menus, and negative replies (`n`) keep their behaviour.
+/// A prompt whose hc status kind is `question` is never auto-answered. Must run after
+/// `enforce_blocked_policy`.
+pub fn sanitize_auto_reply_with_rules(
     output: &str,
     kind: Option<&str>,
     msg: Option<&str>,
+    rules: &GuardrailRules,
     mut eval: CognitiveEvaluation,
-) -> CognitiveEvaluation {
+) -> SanitizedReply {
     if eval.decision != SupervisorDecision::AutoReply {
-        return eval;
+        return SanitizedReply {
+            eval,
+            rule_id: None,
+        };
     }
+
+    if rules.invalid.is_some() {
+        return SanitizedReply {
+            eval: reject_auto_reply(
+                eval,
+                "[Resposta automática bloqueada: [guardrails] inválido no supervisor.toml]",
+            ),
+            rule_id: Some("guardrails_invalid".to_string()),
+        };
+    }
+
+    if !rules.llm_auto_reply {
+        return SanitizedReply {
+            eval: reject_auto_reply(
+                eval,
+                "[Resposta automática bloqueada: llm_auto_reply desativado]",
+            ),
+            rule_id: Some("llm_auto_reply_off".to_string()),
+        };
+    }
+
     let raw = eval.hc_command_payload.trim().to_string();
     let p = raw.to_lowercase();
     let area = pending_prompt_area(output);
@@ -885,20 +994,54 @@ pub fn sanitize_auto_reply(
 
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
         let shown: String = raw.chars().take(60).collect();
-        return reject_auto_reply(
-            eval,
-            &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
-        );
+        return SanitizedReply {
+            eval: reject_auto_reply(
+                eval,
+                &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
+            ),
+            rule_id: Some("floor:question".to_string()),
+        };
+    }
+
+    let cmds = extract_identifiable_commands(&area, msg);
+    if !matches!(p.as_str(), "n" | "no") {
+        let mut deny_texts: Vec<&str> = Vec::with_capacity(2 + cmds.len());
+        deny_texts.push(&area);
+        if let Some(m) = msg {
+            deny_texts.push(m);
+        }
+        for cmd in &cmds {
+            match cmd {
+                IdentifiedCommand::Shell(c) => deny_texts.push(c),
+                IdentifiedCommand::ReadToolTarget(t) => deny_texts.push(t),
+                IdentifiedCommand::OtherTool => {}
+            }
+        }
+        if let Some(hit) = check_deny(rules, &deny_texts) {
+            return SanitizedReply {
+                eval: reject_auto_reply(
+                    eval,
+                    &format!(
+                        r#"[Resposta automática bloqueada: regra {} "{}"]"#,
+                        hit.key_name, hit.entry
+                    ),
+                ),
+                rule_id: Some(hit.rule_id),
+            };
+        }
     }
 
     let is_permission_request = kind.is_some_and(|k| k.eq_ignore_ascii_case("permission"))
         || area_lines.iter().any(|l| menu_yes.is_match(l))
         || msg.is_some_and(|m| status_msg_regex().is_match(m.trim()));
     if is_permission_request {
-        return reject_auto_reply(
-            eval,
-            "[Resposta automática bloqueada: pedido de permissão fora da lista de leitura]",
-        );
+        return SanitizedReply {
+            eval: reject_auto_reply(
+                eval,
+                "[Resposta automática bloqueada: pedido de permissão fora da lista de leitura]",
+            ),
+            rule_id: None,
+        };
     }
 
     let has_menu_item = area_lines.iter().any(|l| menu_item.is_match(l));
@@ -922,27 +1065,57 @@ pub fn sanitize_auto_reply(
     };
     match normalized {
         Some(key) => {
+            let mut matched_rule_id = None;
             let is_affirmative = key == "y" || key.is_empty();
             if is_affirmative {
-                let cmds = extract_identifiable_commands(&area, msg);
-                if cmds.iter().any(|cmd| !is_allowlisted_command(cmd)) {
-                    return reject_auto_reply(
-                        eval,
-                        "[Resposta automática bloqueada: comando fora da lista permitida]",
-                    );
+                for cmd in &cmds {
+                    match check_command_allowlist(cmd, rules) {
+                        Ok(rid) => {
+                            if matched_rule_id.is_none() {
+                                matched_rule_id = rid;
+                            }
+                        }
+                        Err(floor_reason) => {
+                            return SanitizedReply {
+                                eval: reject_auto_reply(
+                                    eval,
+                                    "[Resposta automática bloqueada: comando fora da lista permitida]",
+                                ),
+                                rule_id: floor_reason.map(|r| format!("floor:{r}")),
+                            };
+                        }
+                    }
                 }
             }
             eval.hc_command_payload = key;
-            eval
+            SanitizedReply {
+                eval,
+                rule_id: matched_rule_id,
+            }
         }
         None => {
             let shown: String = raw.chars().take(60).collect();
-            reject_auto_reply(
-                eval,
-                &format!("[Resposta automática bloqueada: '{shown}' não serve para este prompt]"),
-            )
+            SanitizedReply {
+                eval: reject_auto_reply(
+                    eval,
+                    &format!(
+                        "[Resposta automática bloqueada: '{shown}' não serve para este prompt]"
+                    ),
+                ),
+                rule_id: None,
+            }
         }
     }
+}
+
+#[cfg(test)]
+pub fn sanitize_auto_reply(
+    output: &str,
+    kind: Option<&str>,
+    msg: Option<&str>,
+    eval: CognitiveEvaluation,
+) -> CognitiveEvaluation {
+    sanitize_auto_reply_with_rules(output, kind, msg, &GuardrailRules::default(), eval).eval
 }
 
 fn fast_path_regexes() -> &'static [Regex; 5] {
@@ -1000,25 +1173,6 @@ fn is_approve_msg(msg: &str) -> bool {
         .is_some_and(|w| w.eq_ignore_ascii_case("approve"))
 }
 
-/// A named tool request: a Read tool on one non-sensitive file (same as `cat`), or a shell tool
-/// running one allowlisted read-only command. Write/Edit/other tools are never fast-pathed.
-fn approve_tool_request(
-    tool: &str,
-    target: &str,
-    payload: &str,
-    exact_read: bool,
-) -> Option<(String, String)> {
-    match classify_tool_request(tool, target, exact_read) {
-        IdentifiedCommand::ReadToolTarget(t) if is_safe_read_target(&t) => {
-            Some((payload.to_string(), format!("Read {t}")))
-        }
-        IdentifiedCommand::Shell(cmd) if is_safe_readonly_command(&cmd) => {
-            Some((payload.to_string(), cmd))
-        }
-        _ => None,
-    }
-}
-
 fn command_prefix_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -1027,32 +1181,29 @@ fn command_prefix_regex() -> &'static Regex {
     })
 }
 
-/// Deterministic approval of trivial read-only commands, before (and without) the LLM.
+/// Deterministic fixed-rule decision before (and without) the LLM.
 ///
-/// Returns `(payload, command)` when the pending prompt is a yes/no prompt (`y`) or a permission
-/// menu with `1. Yes` (`1`), the command — the nearest non-chrome line above the prompt — is a
-/// single allowlisted read-only command without shell metacharacters or sensitive paths, the
-/// prompt area holds nothing destructive, and the hc kind is not `question`. Otherwise `None`
-/// and the normal LLM flow decides. See docs/superpowers/specs/2026-11-15-readonly-fast-path-design.md.
-pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, String)> {
-    readonly_fast_path_with_msg(output, kind, None)
-}
-
-/// Like [`readonly_fast_path`], but when hc's status message names the request
-/// (`approve Bash: <cmd>`, `approve Read: <file>` — Claude Code's OSC 7501 `msg`), the command is
-/// taken from it instead of the screen; the screen only decides the key (`1` on a `1. Yes` menu,
-/// `y` on a yes/no prompt) and that a prompt is actually showing.
-pub fn readonly_fast_path_with_msg(
+/// Order: `floor:question` -> `floor:destructive` -> no prompt (`requires_llm`) -> invalid rules
+/// (`guardrails_invalid`) -> command floor -> `deny_*` -> built-in -> user `allow_commands` ->
+/// `requires_llm`.
+pub fn decide_fixed(
     output: &str,
     kind: Option<&str>,
     msg: Option<&str>,
-) -> Option<(String, String)> {
+    rules: &GuardrailRules,
+) -> FixedDecision {
+    let refuse = |rule_id: String| FixedDecision {
+        approval: None,
+        rule_id,
+    };
+
     if kind.is_some_and(|k| k.eq_ignore_ascii_case("question")) {
-        return None;
+        return refuse("floor:question".to_string());
     }
     if detect_destructive(output, msg.unwrap_or("")).is_some() {
-        return None;
+        return refuse("floor:destructive".to_string());
     }
+
     let [menu_yes, ..] = fast_path_regexes();
     let (earlier, area) = pending_prompt_split(output);
     let lines: Vec<&str> = area
@@ -1067,54 +1218,137 @@ pub fn readonly_fast_path_with_msg(
     // printed after the prompt (timeouts, hints) are ignored.
     let (payload, prompt_idx) = if let Some(i) = lines.iter().position(|l| menu_yes.is_match(l)) {
         ("1", i)
+    } else if let Some(i) = lines.iter().rposition(|l| is_yes_no(l)) {
+        ("y", i)
     } else {
-        ("y", lines.iter().rposition(|l| is_yes_no(l))?)
+        return refuse("requires_llm".to_string());
     };
 
-    // The request as hc reports it, e.g. `approve Bash: git diff --stat`.
-    if let Some(caps) = msg.and_then(|m| status_msg_regex().captures(m.trim())) {
-        return approve_tool_request(&caps["tool"], &caps["arg"], payload, true);
-    }
-    // hc names a request in a form we cannot read (e.g. a multi-line command): never guess it from
-    // the screen.
-    if msg.is_some_and(is_approve_msg) {
-        return None;
+    if rules.invalid.is_some() {
+        return refuse("guardrails_invalid".to_string());
     }
 
-    // Command inline in the prompt line, e.g. `Allow bash tool: ls -la src/ ? [y/N]`.
-    if let Some(caps) = inline_prompt_regex().captures(lines[prompt_idx]) {
-        return approve_tool_request(&caps["lead"], &caps["cmd"], payload, false);
+    let (identified, allow_user_cmd) =
+        if let Some(caps) = msg.and_then(|m| status_msg_regex().captures(m.trim())) {
+            (
+                Some(classify_tool_request(&caps["tool"], &caps["arg"], true)),
+                true,
+            )
+        } else if msg.is_some_and(is_approve_msg) {
+            // hc names a request in a form we cannot read (e.g. a multi-line command): never guess it
+            // from the screen.
+            (None, false)
+        } else if let Some(caps) = inline_prompt_regex().captures(lines[prompt_idx]) {
+            (
+                Some(classify_tool_request(&caps["lead"], &caps["cmd"], false)),
+                true,
+            )
+        } else if payload == "1" && !is_single_visible_request(&earlier, &lines[..prompt_idx]) {
+            // A permission menu without a readable msg: the request may be several lines long, so it
+            // is only trusted when all of it is on screen and a single line can be the command.
+            (None, false)
+        } else {
+            match find_screen_command_candidate(&lines, prompt_idx) {
+                ScreenCommandCandidate::Line { line, under_header } => {
+                    let had_bash_paren = line.to_ascii_lowercase().starts_with("bash(");
+                    let mut cmd = command_prefix_regex().replace(line, "").trim().to_string();
+                    if had_bash_paren {
+                        cmd = cmd.trim_end_matches(')').trim().to_string();
+                    }
+                    // A command shown wrapped in backticks or quotes: unwrap one matching pair.
+                    for q in ['`', '"', '\''] {
+                        if cmd.len() >= 2 && cmd.starts_with(q) && cmd.ends_with(q) {
+                            cmd = cmd[1..cmd.len() - 1].trim().to_string();
+                            break;
+                        }
+                    }
+                    (Some(IdentifiedCommand::Shell(cmd)), under_header)
+                }
+                ScreenCommandCandidate::AmbiguousUnderHeader | ScreenCommandCandidate::None => {
+                    (None, false)
+                }
+            }
+        };
+
+    let mut deny_texts: Vec<&str> = Vec::with_capacity(3);
+    deny_texts.push(&area);
+    if let Some(m) = msg {
+        deny_texts.push(m);
     }
 
-    // A permission menu without a readable msg: the request may be several lines long, so it is
-    // only trusted when all of it is on screen and a single line can be the command.
-    if payload == "1" && !is_single_visible_request(&earlier, &lines[..prompt_idx]) {
-        return None;
-    }
-
-    let raw = match find_screen_command_candidate(&lines, prompt_idx) {
-        ScreenCommandCandidate::Line { line, .. } => line,
-        ScreenCommandCandidate::AmbiguousUnderHeader | ScreenCommandCandidate::None => {
-            return None;
+    match identified {
+        Some(IdentifiedCommand::ReadToolTarget(target)) => {
+            if let Some(reason) = read_target_floor_violation(&target) {
+                return refuse(format!("floor:{reason}"));
+            }
+            deny_texts.push(&target);
+            if let Some(hit) = check_deny(rules, &deny_texts) {
+                return refuse(hit.rule_id);
+            }
+            if rules.allow_read_tool {
+                return FixedDecision {
+                    approval: Some(FixedApproval {
+                        payload: payload.to_string(),
+                        command: format!("Read {target}"),
+                    }),
+                    rule_id: "builtin_tool:Read".to_string(),
+                };
+            }
+            refuse("requires_llm".to_string())
         }
-    };
-    let had_bash_paren = raw.to_ascii_lowercase().starts_with("bash(");
-    let mut cmd = command_prefix_regex().replace(raw, "").trim().to_string();
-    if had_bash_paren {
-        cmd = cmd.trim_end_matches(')').trim().to_string();
-    }
-    // A command shown wrapped in backticks or quotes: unwrap one matching pair.
-    for q in ['`', '"', '\''] {
-        if cmd.len() >= 2 && cmd.starts_with(q) && cmd.ends_with(q) {
-            cmd = cmd[1..cmd.len() - 1].trim().to_string();
-            break;
+        Some(IdentifiedCommand::Shell(cmd)) => {
+            if let Some(reason) = floor_violation(&cmd) {
+                return refuse(format!("floor:{reason}"));
+            }
+            deny_texts.push(&cmd);
+            if let Some(hit) = check_deny(rules, &deny_texts) {
+                return refuse(hit.rule_id);
+            }
+            if rules.builtin_read_only && is_safe_readonly_command(&cmd) {
+                return FixedDecision {
+                    approval: Some(FixedApproval {
+                        payload: payload.to_string(),
+                        command: cmd,
+                    }),
+                    rule_id: "builtin_read_only".to_string(),
+                };
+            }
+            if allow_user_cmd {
+                if let Some(entry) = rules.match_allow(&cmd) {
+                    return FixedDecision {
+                        approval: Some(FixedApproval {
+                            payload: payload.to_string(),
+                            command: cmd,
+                        }),
+                        rule_id: format!("allow_command:{entry}"),
+                    };
+                }
+            }
+            refuse("requires_llm".to_string())
+        }
+        Some(IdentifiedCommand::OtherTool) | None => {
+            if let Some(hit) = check_deny(rules, &deny_texts) {
+                return refuse(hit.rule_id);
+            }
+            refuse("requires_llm".to_string())
         }
     }
+}
 
-    if !is_safe_readonly_command(&cmd) {
-        return None;
-    }
-    Some((payload.to_string(), cmd))
+#[cfg(test)]
+pub fn readonly_fast_path(output: &str, kind: Option<&str>) -> Option<(String, String)> {
+    readonly_fast_path_with_msg(output, kind, None)
+}
+
+#[cfg(test)]
+pub fn readonly_fast_path_with_msg(
+    output: &str,
+    kind: Option<&str>,
+    msg: Option<&str>,
+) -> Option<(String, String)> {
+    decide_fixed(output, kind, msg, &GuardrailRules::default())
+        .approval
+        .map(|a| (a.payload, a.command))
 }
 
 fn error_signature_regex() -> &'static Regex {
@@ -2287,5 +2521,216 @@ mod tests {
         assert!(f("cat .e*").is_none());
         assert!(f("cat *.rs").is_some());
         assert!(f("ls ../*.rs").is_some());
+    }
+
+    fn rules(body: &str) -> super::super::rules::GuardrailRules {
+        super::super::rules::parse_guardrails(&format!("[guardrails]\n{body}"))
+    }
+
+    const MENU: &str = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+
+    fn on_menu(cmd: &str, r: &super::super::rules::GuardrailRules) -> FixedDecision {
+        decide_fixed(
+            MENU,
+            Some("permission"),
+            Some(&format!("approve Bash: {cmd}")),
+            r,
+        )
+    }
+
+    #[test]
+    fn user_allow_is_approved_on_the_claude_menu() {
+        let r = rules(r#"allow_commands = ["just test"]"#);
+        let d = on_menu("just test", &r);
+        assert_eq!(
+            (d.approval.unwrap().payload.as_str(), d.rule_id.as_str()),
+            ("1", "allow_command:just test")
+        );
+        assert_eq!(on_menu("just test x", &r).rule_id, "requires_llm");
+        assert_eq!(on_menu("just test & evil", &r).rule_id, "floor:metachar");
+        assert!(
+            decide_fixed(MENU, Some("question"), Some("approve Bash: just test"), &r)
+                .approval
+                .is_none()
+        );
+        assert!(decide_fixed(
+            "working",
+            Some("permission"),
+            Some("approve Bash: just test"),
+            &r
+        )
+        .approval
+        .is_none());
+    }
+
+    #[test]
+    fn builtins_report_their_rule_and_can_be_turned_off() {
+        let d = super::super::rules::GuardrailRules::default();
+        assert_eq!(on_menu("git status", &d).rule_id, "builtin_read_only");
+        assert_eq!(
+            decide_fixed(MENU, None, Some("approve Read: a.rs"), &d).rule_id,
+            "builtin_tool:Read"
+        );
+        assert!(on_menu("git status", &rules("builtin_read_only = false"))
+            .approval
+            .is_none());
+        assert!(decide_fixed(
+            MENU,
+            None,
+            Some("approve Read: a.rs"),
+            &rules("allow_tools = []")
+        )
+        .approval
+        .is_none());
+    }
+
+    #[test]
+    fn deny_beats_builtin_and_allow() {
+        assert_eq!(
+            on_menu("git log", &rules(r#"deny_commands = ["git log"]"#)).rule_id,
+            "deny_command:git log"
+        );
+        assert_eq!(
+            on_menu("cat prod/x", &rules(r#"deny_paths = ["prod"]"#)).rule_id,
+            "deny_path:prod"
+        );
+        assert_eq!(
+            decide_fixed(
+                MENU,
+                None,
+                Some("approve Read: prod/x"),
+                &rules(r#"deny_paths = ["prod"]"#)
+            )
+            .rule_id,
+            "deny_path:prod"
+        );
+        let r = rules("allow_commands = [\"just *\"]\ndeny_commands = [\"just deploy\"]");
+        assert!(on_menu("just test", &r).approval.is_some());
+        assert_eq!(
+            on_menu("just deploy", &r).rule_id,
+            "deny_command:just deploy"
+        );
+    }
+
+    #[test]
+    fn deny_reads_the_pending_area_not_answered_prompts() {
+        let r = rules(r#"deny_commands = ["npm publish"]"#);
+        let d = decide_fixed(
+            "npm publish\nDo you want to proceed?\n❯ 1. Yes",
+            None,
+            Some("approve Bash: ls"),
+            &r,
+        );
+        assert_eq!(d.rule_id, "deny_command:npm publish");
+        let old = "npm publish\nProceed? [y/N]\nn\nAllow bash tool: ls src ? [y/N]";
+        assert!(decide_fixed(old, None, None, &r).approval.is_some());
+    }
+
+    #[test]
+    fn user_allow_on_screen_needs_a_header_or_inline_prompt() {
+        let r = rules(r#"allow_commands = ["just test"]"#);
+        assert!(
+            decide_fixed("Bash command\n  just test\nAllow? [y/N]", None, None, &r)
+                .approval
+                .is_some()
+        );
+        assert!(
+            decide_fixed("Allow bash tool: just test ? [y/N]", None, None, &r)
+                .approval
+                .is_some()
+        );
+        assert!(decide_fixed("just test\nAllow? [y/N]", None, None, &r)
+            .approval
+            .is_none());
+    }
+
+    #[test]
+    fn llm_reply_is_denied_with_the_rule_in_the_reason() {
+        let r = rules(r#"deny_commands = ["cargo publish"]"#);
+        let s = "cargo publish\nProceed? [y/N]";
+        let out = sanitize_auto_reply_with_rules(s, None, None, &r, auto("y"));
+        assert_eq!(out.eval.decision, SupervisorDecision::AlertOperator);
+        assert_eq!(out.eval.urgency, Urgency::Normal);
+        assert!(out.eval.hc_command_payload.is_empty());
+        assert!(out
+            .eval
+            .reason_for_operator
+            .contains(r#"[Resposta automática bloqueada: regra deny_commands "cargo publish"]"#));
+        assert_eq!(out.rule_id.as_deref(), Some("deny_command:cargo publish"));
+        assert_eq!(
+            sanitize_auto_reply_with_rules(s, None, None, &r, auto("n"))
+                .eval
+                .decision,
+            SupervisorDecision::AutoReply
+        );
+    }
+
+    #[test]
+    fn llm_reply_to_a_user_allowed_command_and_switches() {
+        let s = "just test\nProceed? [y/N]";
+        let ok = |b: &str, s: &str| {
+            sanitize_auto_reply_with_rules(s, None, None, &rules(b), auto("y"))
+                .eval
+                .decision
+                == SupervisorDecision::AutoReply
+        };
+        assert!(!ok("", s));
+        assert!(ok(r#"allow_commands = ["just test"]"#, s));
+        assert!(ok("", "cargo test\nProceed? [y/N]"));
+        assert!(!ok(
+            "builtin_build_test = false",
+            "cargo test\nProceed? [y/N]"
+        ));
+        assert!(!ok("llm_auto_reply = false", "cargo test\nProceed? [y/N]"));
+    }
+
+    #[test]
+    fn llm_build_test_approval_is_unchanged_without_user_rules() {
+        // The read-only floor (sensitive words, `$`) never applied to the build/test list.
+        for cmd in [
+            "cargo test auth_token",
+            "pytest -k password",
+            "npm run test key",
+        ] {
+            let out = sanitize_auto_reply(&format!("{cmd}\nProceed? [y/N]"), None, None, auto("y"));
+            assert_eq!(out.decision, SupervisorDecision::AutoReply, "{cmd}");
+        }
+        let r = rules(r#"deny_commands = ["cargo test"]"#);
+        let out = sanitize_auto_reply_with_rules(
+            "cargo test auth_token\nProceed? [y/N]",
+            None,
+            None,
+            &r,
+            auto("y"),
+        );
+        assert_eq!(out.rule_id.as_deref(), Some("deny_command:cargo test"));
+    }
+
+    #[test]
+    fn llm_yes_is_refused_when_the_approve_msg_cannot_be_read() {
+        for msg in [
+            "approve Bash: ls\npython evil.py",
+            "approve Bash:",
+            "approve",
+        ] {
+            let out = sanitize_auto_reply("ls\nProceed? [y/N]", None, Some(msg), auto("y"));
+            assert_eq!(out.decision, SupervisorDecision::AlertOperator, "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn invalid_rules_stop_every_automatic_reply() {
+        let r = super::super::rules::GuardrailRules::invalid("x");
+        let d = on_menu("ls", &r);
+        assert!(d.approval.is_none());
+        assert_eq!(d.rule_id, "guardrails_invalid");
+        for p in ["y", "n"] {
+            let out = sanitize_auto_reply_with_rules("Continue? [y/N]", None, None, &r, auto(p));
+            assert_eq!(out.eval.decision, SupervisorDecision::AlertOperator);
+            assert_eq!(out.rule_id.as_deref(), Some("guardrails_invalid"));
+            assert!(out.eval.reason_for_operator.contains(
+                "[Resposta automática bloqueada: [guardrails] inválido no supervisor.toml]"
+            ));
+        }
     }
 }

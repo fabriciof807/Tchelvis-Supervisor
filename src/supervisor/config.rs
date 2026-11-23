@@ -678,4 +678,11 @@ mod tests {
         fs::write(&tchelvis, "poll_interval_secs = 20\n").unwrap();
         assert_eq!(supervisor_config_path_in(home.path()), tchelvis);
     }
+
+    #[test]
+    fn guardrails_table_does_not_affect_other_settings() {
+        let raw = "ollama_model = \"m\"\n\n[guardrails]\ndeny_command = 3\n";
+        let parsed: SupervisorConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.ollama_model, "m");
+    }
 }

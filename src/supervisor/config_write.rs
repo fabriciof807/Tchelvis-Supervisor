@@ -272,4 +272,21 @@ mod tests {
         assert_eq!(parsed3.fallback, Default::default());
         assert_eq!(parsed3.poll_interval_secs, 25);
     }
+
+    #[test]
+    fn model_selection_keeps_guardrails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.toml");
+        let guardrails_block =
+            "[guardrails]\nallow_commands = [\"just test\"]\ndeny_commands = [\"cargo publish\"]\n";
+        fs::write(
+            &path,
+            format!("ollama_model = \"old:1b\"\n\n{guardrails_block}"),
+        )
+        .unwrap();
+
+        write_model_selection(&path, "ollama:qwen2.5:3b", Some("qwen2.5:3b")).unwrap();
+        let updated = fs::read_to_string(&path).unwrap();
+        assert!(updated.contains(guardrails_block), "{updated}");
+    }
 }

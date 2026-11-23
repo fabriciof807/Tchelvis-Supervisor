@@ -74,7 +74,8 @@ pub fn build_engine_from_config(
     let hc = HcCliAdapter::new(config.hc.clone());
     hc.register_self_terminal();
     let cognitive = OllamaClient::new(config.clone());
-    let mut engine = WatcherEngine::new(config.clone(), store, hc, cognitive);
+    let mut engine = WatcherEngine::new(config.clone(), store, hc, cognitive)
+        .with_rules_source(Box::new(rules::load_default_guardrail_rules));
     if config.container_mode_active() {
         engine = engine.with_fallback(Box::new(fallback::LiveFallback {
             state_path: fallback::fallback_state_path(),

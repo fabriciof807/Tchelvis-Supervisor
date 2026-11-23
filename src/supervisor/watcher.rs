@@ -4,11 +4,12 @@ use super::fallback::{
     apply_health_probe, primary_stopped, FallbackProvider, FallbackState, NoFallback, ProbeCtx,
 };
 use super::guardrails::{
-    enforce_blocked_policy_with_msg, has_error_or_loop_signature, readonly_fast_path_with_msg,
-    sanitize_auto_reply, tidy_operator_reason, validate_evaluation,
+    decide_fixed, enforce_blocked_policy_with_msg, has_error_or_loop_signature,
+    sanitize_auto_reply_with_rules, tidy_operator_reason, validate_evaluation,
 };
 use super::hc::{HcBackend, HcSession};
 use super::ollama::{CognitiveBackend, CognitiveEvaluation, SupervisorDecision};
+use super::rules::GuardrailRules;
 use super::state::{
     compute_sha256, unix_now_ms, AgentDurableState, AutoReplyAuditEntry, AutoReplySource,
     DurableAutoReplyEntry, DurableStateStore, LifecycleState, PendingOperatorAction,
@@ -57,6 +58,7 @@ pub struct WatcherEngine<H: HcBackend, C: CognitiveBackend> {
     pub model_loaded: bool,
     pub runtime_status: SupervisorRuntimeStatus,
     pub fallback: Box<dyn FallbackProvider>,
+    rules_source: Box<dyn Fn() -> GuardrailRules + Send>,
     last_fallback_state: FallbackState,
     last_eval_model: Option<String>,
 }
@@ -74,6 +76,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             model_loaded,
             runtime_status: SupervisorRuntimeStatus::Idle,
             fallback: Box::new(NoFallback),
+            rules_source: Box::new(GuardrailRules::default),
             last_fallback_state: FallbackState::default(),
             last_eval_model: None,
         }
@@ -82,6 +85,11 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
     pub fn with_fallback(mut self, p: Box<dyn FallbackProvider>) -> Self {
         self.last_fallback_state = p.load_state();
         self.fallback = p;
+        self
+    }
+
+    pub fn with_rules_source(mut self, source: Box<dyn Fn() -> GuardrailRules + Send>) -> Self {
+        self.rules_source = source;
         self
     }
 
@@ -95,6 +103,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
 
     /// Executes one deterministic poll/diff/evaluate cycle at Unix timestamp `now`.
     pub fn tick(&mut self, now: u64) -> Result<TickOutcome> {
+        let rules = (self.rules_source)();
         let sessions = self.hc.list_sessions()?;
         let active_ids: std::collections::HashSet<&str> =
             sessions.iter().map(|s| s.agent_id.as_str()).collect();
@@ -248,7 +257,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 continue;
             };
             let current_hash = self.observe_output(session, &output, now);
-            if self.try_readonly_fast_path(session, &output, &current_hash, now, &mut outcome) {
+            if self.try_readonly_fast_path(
+                session,
+                &output,
+                &current_hash,
+                &rules,
+                now,
+                &mut outcome,
+            ) {
                 fixed_rule_handled.insert(session.agent_id.as_str());
             } else {
                 pass1_outputs.insert(session.agent_id.as_str(), output);
@@ -280,7 +296,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             let current_hash = self.observe_output(session, &output, now);
 
             // The screen may have turned into a read-only request since pass 1.
-            if self.try_readonly_fast_path(session, &output, &current_hash, now, &mut outcome) {
+            if self.try_readonly_fast_path(
+                session,
+                &output,
+                &current_hash,
+                &rules,
+                now,
+                &mut outcome,
+            ) {
                 continue;
             }
             let Some(state) = self.store.agents.get_mut(&session.agent_id) else {
@@ -395,13 +418,14 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 session.msg.as_deref(),
                 eval,
             );
-            eval = sanitize_auto_reply(
+            let sanitized = sanitize_auto_reply_with_rules(
                 &output,
                 session.kind.as_deref(),
                 session.msg.as_deref(),
+                &rules,
                 eval,
             );
-            eval = tidy_operator_reason(llm_decision, eval);
+            eval = tidy_operator_reason(llm_decision, sanitized.eval);
             outcome.evaluated_agents.push(session.agent_id.clone());
 
             if let Some(state) = self.store.agents.get_mut(&session.agent_id) {
@@ -425,6 +449,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 eval,
                 llm_decision,
                 AutoReplySource::Llm,
+                sanitized.rule_id.as_deref(),
                 now,
                 &mut outcome,
             );
@@ -468,13 +493,15 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         current_hash
     }
 
-    /// Read-only fast path: trivial read-only requests are approved by a fixed rule, without the
-    /// LLM and outside the per-tick evaluation cap. Returns whether a decision was applied.
+    /// Read-only fast path: trivial read-only and user-allowed requests are approved by a fixed
+    /// rule, without the LLM and outside the per-tick evaluation cap. Returns whether a decision was
+    /// applied.
     fn try_readonly_fast_path(
         &mut self,
         session: &HcSession,
         output: &str,
         current_hash: &str,
+        rules: &GuardrailRules,
         now: u64,
         outcome: &mut TickOutcome,
     ) -> bool {
@@ -487,18 +514,35 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         if current_hash == state.last_evaluated_hash {
             return false;
         }
-        let Some((payload, cmd)) =
-            readonly_fast_path_with_msg(output, session.kind.as_deref(), session.msg.as_deref())
-        else {
+        let decision = decide_fixed(
+            output,
+            session.kind.as_deref(),
+            session.msg.as_deref(),
+            rules,
+        );
+        let Some(approval) = decision.approval else {
             return false;
         };
         state.last_hc_status = session.status.clone();
+        let updated_summary = if decision.rule_id.starts_with("allow_command:")
+            || decision.rule_id.starts_with("allow_tool:")
+        {
+            format!(
+                "Comando aprovado pela regra {}: {}",
+                decision.rule_id, approval.command
+            )
+        } else {
+            format!(
+                "Comando somente leitura aprovado pela regra fixa: {}",
+                approval.command
+            )
+        };
         let raw = CognitiveEvaluation {
-            updated_summary: format!("Comando somente leitura aprovado pela regra fixa: {cmd}"),
+            updated_summary,
             detected_state: LifecycleState::WaitingConfirmation,
             decision: SupervisorDecision::AutoReply,
             urgency: Urgency::Low,
-            hc_command_payload: payload,
+            hc_command_payload: approval.payload,
             reason_for_operator: String::new(),
         };
         let eval = validate_evaluation(state, self.store.mode, raw);
@@ -508,6 +552,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
             eval,
             SupervisorDecision::AutoReply,
             AutoReplySource::FixedRule,
+            Some(&decision.rule_id),
             now,
             outcome,
         );
@@ -524,6 +569,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
         eval: CognitiveEvaluation,
         raw_decision: SupervisorDecision,
         source: AutoReplySource,
+        rule_id: Option<&str>,
         now: u64,
         outcome: &mut TickOutcome,
     ) {
@@ -545,6 +591,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                 &session.session_name,
                 &reason,
                 Some(&eval.reason_for_operator),
+                rule_id,
             ));
         }
 
@@ -601,6 +648,7 @@ impl<H: HcBackend, C: CognitiveBackend> WatcherEngine<H, C> {
                                 &eval.hc_command_payload,
                                 model_opt.as_deref(),
                                 &eval.updated_summary,
+                                rule_id,
                             ));
                             outcome.auto_replied_agents.push(session.agent_id.clone());
                         }
@@ -2319,5 +2367,168 @@ mod tests {
         let o = engine.tick(1000).unwrap();
         assert_eq!(o.auto_replied_agents, vec!["t1"]);
         assert_eq!(engine.store.agents["t1"].consecutive_auto_replies, 1);
+    }
+
+    #[test]
+    fn user_allow_replies_without_the_llm() {
+        use crate::supervisor::events::{read_events, EventLogQuery, SupervisorEventKind};
+        use crate::supervisor::rules::parse_guardrails;
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let mut session = test_session("t1");
+        session.kind = Some("permission".to_string());
+        session.msg = Some("approve Bash: just test".to_string());
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let hc = MockHc::new(vec![session], vec![menu]);
+        let cognitive = MockCognitive::new(noop_eval());
+        *cognitive.available.lock().unwrap() = false;
+        let mut engine =
+            WatcherEngine::new(cfg, store, hc, cognitive).with_rules_source(Box::new(|| {
+                parse_guardrails("[guardrails]\nallow_commands = [\"just test\"]\n")
+            }));
+
+        let o = engine.tick(1000).unwrap();
+        assert_eq!(o.auto_replied_agents, vec!["t1"]);
+        assert_eq!(*engine.cognitive.eval_calls.lock().unwrap(), 0);
+        assert_eq!(
+            engine.hc.sent_inputs.lock().unwrap().as_slice(),
+            &[("t1".to_string(), "1".to_string(), true)]
+        );
+
+        let log_path = dir.path().join("supervisor_events.jsonl");
+        let events = read_events(
+            &log_path,
+            &EventLogQuery {
+                limit: 10,
+                kinds: vec![SupervisorEventKind::AutoReply],
+                agent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].rule_id.as_deref(),
+            Some("allow_command:just test")
+        );
+        assert!(events[0]
+            .summary
+            .contains("Comando aprovado pela regra allow_command:just test: just test"));
+    }
+
+    #[test]
+    fn user_allow_respects_alert_only_and_max_auto_replies() {
+        use crate::supervisor::rules::parse_guardrails;
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let mut store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        store.mode = SupervisorMode::AlertOnly;
+        let mut session = test_session("t1");
+        session.kind = Some("permission".to_string());
+        session.msg = Some("approve Bash: just test".to_string());
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let hc = MockHc::new(vec![session.clone()], vec![menu]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()))
+            .with_rules_source(Box::new(|| {
+                parse_guardrails("[guardrails]\nallow_commands = [\"just *\"]\n")
+            }));
+
+        let o = engine.tick(1000).unwrap();
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
+        assert_eq!(o.alerted_agents, vec!["t1"]);
+
+        // max_auto_replies = 1
+        let dir2 = tempdir().unwrap();
+        let mut cfg2 = test_config(&dir2);
+        cfg2.max_auto_replies = 1;
+        let store2 = DurableStateStore::load_or_init(&cfg2.state_file_path).unwrap();
+        let hc2 = MockHc::new(
+            vec![session.clone()],
+            vec![
+                "Bash command\n  just test\nDo you want to proceed?\n❯ 1. Yes\n  2. No",
+                "Bash command\n  just lint\nDo you want to proceed?\n❯ 1. Yes\n  2. No",
+            ],
+        );
+        let mut engine2 = WatcherEngine::new(cfg2, store2, hc2, MockCognitive::new(noop_eval()))
+            .with_rules_source(Box::new(|| {
+                parse_guardrails("[guardrails]\nallow_commands = [\"just *\"]\n")
+            }));
+
+        let o1 = engine2.tick(1000).unwrap();
+        assert_eq!(o1.auto_replied_agents, vec!["t1"]);
+        assert_eq!(engine2.hc.sent_inputs.lock().unwrap().len(), 1);
+
+        let mut s2 = session;
+        s2.msg = Some("approve Bash: just lint".to_string());
+        *engine2.hc.sessions.lock().unwrap() = vec![s2];
+        let o2 = engine2.tick(1012).unwrap();
+        assert!(o2.auto_replied_agents.is_empty());
+        assert_eq!(o2.alerted_agents, vec!["t1"]);
+        assert_eq!(engine2.hc.sent_inputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rules_are_reloaded_on_each_tick() {
+        use crate::supervisor::rules::{parse_guardrails, GuardrailRules};
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(
+            vec![test_session("t1")],
+            vec![
+                "Bash command\n  git log --oneline\nAllow? [y/N]",
+                "Bash command\n  git log -n 5\nAllow? [y/N]",
+            ],
+        );
+        let current_rules = std::sync::Arc::new(Mutex::new(GuardrailRules::default()));
+        let source_rules = std::sync::Arc::clone(&current_rules);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(auto_reply_eval()))
+            .with_rules_source(Box::new(move || source_rules.lock().unwrap().clone()));
+
+        let o1 = engine.tick(1000).unwrap();
+        assert_eq!(o1.auto_replied_agents, vec!["t1"]);
+        assert_eq!(engine.hc.sent_inputs.lock().unwrap().len(), 1);
+
+        *current_rules.lock().unwrap() =
+            parse_guardrails("[guardrails]\ndeny_commands = [\"git log\"]\n");
+        let o2 = engine.tick(1012).unwrap();
+        assert!(o2.auto_replied_agents.is_empty());
+        assert_eq!(o2.alerted_agents, vec!["t1"]);
+        assert_eq!(engine.hc.sent_inputs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_rules_send_nothing_but_still_alert() {
+        use crate::supervisor::events::{read_events, EventLogQuery, SupervisorEventKind};
+        use crate::supervisor::rules::GuardrailRules;
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        let hc = MockHc::new(vec![test_session("t1")], vec!["Continue? [y/N]"]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(auto_reply_eval()))
+            .with_rules_source(Box::new(|| GuardrailRules::invalid("bad toml")));
+
+        let o = engine.tick(1000).unwrap();
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
+        assert!(o.auto_replied_agents.is_empty());
+        assert_eq!(o.alerted_agents, vec!["t1"]);
+        assert!(engine.store.agents["t1"].pending_operator_action.is_some());
+
+        let log_path = dir.path().join("supervisor_events.jsonl");
+        let events = read_events(
+            &log_path,
+            &EventLogQuery {
+                limit: 10,
+                kinds: vec![SupervisorEventKind::AutoReplyBlocked],
+                agent_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].rule_id.as_deref(), Some("guardrails_invalid"));
     }
 }

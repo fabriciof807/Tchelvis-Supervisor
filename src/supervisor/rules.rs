@@ -395,6 +395,46 @@ pub fn parse_guardrails(raw_toml: &str) -> GuardrailRules {
     rules
 }
 
+pub fn load_guardrail_rules(path: &std::path::Path) -> GuardrailRules {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return GuardrailRules::default();
+        }
+        Err(err) => {
+            return GuardrailRules::invalid(format!(
+                "não foi possível acessar {}: {err}",
+                path.display()
+            ));
+        }
+    }
+    match std::fs::read_to_string(path) {
+        Ok(raw) => parse_guardrails(&raw),
+        Err(err) => {
+            GuardrailRules::invalid(format!("não foi possível ler {}: {err}", path.display()))
+        }
+    }
+}
+
+pub fn load_default_guardrail_rules() -> GuardrailRules {
+    super::config::resolve_home_dir().map_or_else(GuardrailRules::default, |home| {
+        load_guardrail_rules_in(&home)
+    })
+}
+
+/// Anything at the current path wins, even when unreadable: rules must not fall back to the legacy
+/// file (or to none) because the current one is broken.
+fn load_guardrail_rules_in(home: &std::path::Path) -> GuardrailRules {
+    let config = home.join(".config");
+    let current = config.join("tchelvis").join("supervisor.toml");
+    match std::fs::symlink_metadata(&current) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            load_guardrail_rules(&config.join("herdr").join("supervisor.toml"))
+        }
+        _ => load_guardrail_rules(&current),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -577,5 +617,74 @@ mod tests {
         assert!(r.match_allow(&long).is_none());
         assert_eq!(r.match_allow("just ação"), Some("just ação"));
         let _ = (r.match_deny_command(&long), r.match_deny_path(&long));
+    }
+
+    #[test]
+    fn missing_file_is_default() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_guardrail_rules(&dir.path().join("missing.toml")),
+            GuardrailRules::default()
+        );
+    }
+
+    #[test]
+    fn directory_or_broken_symlink_or_bad_utf8_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let as_dir = dir.path().join("dir.toml");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(load_guardrail_rules(&as_dir).invalid.is_some());
+
+        #[cfg(unix)]
+        {
+            let broken = dir.path().join("broken.toml");
+            std::os::unix::fs::symlink(dir.path().join("target_missing.toml"), &broken).unwrap();
+            assert!(load_guardrail_rules(&broken).invalid.is_some());
+        }
+
+        let bad_utf8 = dir.path().join("bad_utf8.toml");
+        std::fs::write(&bad_utf8, [0xff_u8, 0xfe, 0xfd]).unwrap();
+        assert!(load_guardrail_rules(&bad_utf8).invalid.is_some());
+    }
+
+    #[test]
+    fn legacy_file_is_used_only_when_the_current_one_is_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let (cur, old) = (
+            home.path().join(".config/tchelvis"),
+            home.path().join(".config/herdr"),
+        );
+        assert_eq!(
+            load_guardrail_rules_in(home.path()),
+            GuardrailRules::default()
+        );
+        std::fs::create_dir_all(&cur).unwrap();
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(
+            old.join("supervisor.toml"),
+            "[guardrails]\nallow_commands = [\"just test\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_guardrail_rules_in(home.path()).allow_commands,
+            ["just test"]
+        );
+        std::os::unix::fs::symlink(home.path().join("gone"), cur.join("supervisor.toml")).unwrap();
+        assert!(load_guardrail_rules_in(home.path()).invalid.is_some());
+    }
+
+    #[test]
+    fn unrelated_bad_setting_keeps_deny_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("supervisor.toml");
+        std::fs::write(
+            &path,
+            "poll_interval_secs = \"x\"\n\n[guardrails]\ndeny_commands = [\"npm publish\"]\n",
+        )
+        .unwrap();
+        let r = load_guardrail_rules(&path);
+        assert!(r.invalid.is_none());
+        assert_eq!(r.deny_commands, ["npm publish"]);
     }
 }
