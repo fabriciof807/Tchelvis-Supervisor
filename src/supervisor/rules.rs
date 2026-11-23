@@ -66,48 +66,58 @@ fn is_deny_sep(c: char) -> bool {
     c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '{' | '}' | '$' | '`')
 }
 
-/// Quotes either end a word (`bash -c "cargo publish"`) or vanish inside one (`cargo pub''lish`).
+/// One way of splitting text into words. A request is denied when any reading matches.
 #[derive(Clone, Copy)]
-enum Quotes {
-    Separate,
-    Drop,
+struct DenyView {
+    /// Quotes vanish inside a word (`cargo pub''lish`) instead of ending it
+    /// (`bash -c "cargo publish"`).
+    drop_quotes: bool,
+    /// Punctuation ends a word (`cargo publish?`, `a,prod/x`) instead of belonging to it
+    /// (`build:prod`).
+    split_punctuation: bool,
 }
 
-/// Both readings of the quotes: a denied entry that matches either one is denied.
-fn deny_token_views(s: &str) -> [Vec<String>; 2] {
-    [
-        tokenize_deny(s, Quotes::Separate),
-        tokenize_deny(s, Quotes::Drop),
-    ]
+const PLAIN_VIEW: DenyView = DenyView {
+    drop_quotes: false,
+    split_punctuation: false,
+};
+
+fn deny_views() -> impl Iterator<Item = DenyView> {
+    [false, true].into_iter().flat_map(|drop_quotes| {
+        [false, true].map(|split_punctuation| DenyView {
+            drop_quotes,
+            split_punctuation,
+        })
+    })
 }
 
 fn contains_run<T: PartialEq>(haystack: &[T], needle: &[T]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-fn tokenize_deny(s: &str, quotes: Quotes) -> Vec<String> {
+fn is_deny_punctuation(c: char) -> bool {
+    !c.is_alphanumeric() && !matches!(c, '_' | '-' | '.' | '/' | '~' | '+' | '%')
+}
+
+fn tokenize_deny(s: &str, view: DenyView) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
-    for c in s.chars() {
-        if c == '\\' {
-            continue;
-        }
+    for c in s.chars().chain([' ']) {
         let is_quote = matches!(c, '"' | '\'');
-        if is_quote && matches!(quotes, Quotes::Drop) {
+        if c == '\\' || (is_quote && view.drop_quotes) {
             continue;
         }
-        if is_quote || is_deny_sep(c) {
+        if is_quote || is_deny_sep(c) || (view.split_punctuation && is_deny_punctuation(c)) {
+            if view.split_punctuation {
+                // End of a sentence: `cargo publish.`
+                cur.truncate(cur.trim_end_matches('.').len());
+            }
             if !cur.is_empty() {
                 tokens.push(std::mem::take(&mut cur));
             }
         } else {
-            for lc in c.to_lowercase() {
-                cur.push(lc);
-            }
+            cur.extend(c.to_lowercase());
         }
-    }
-    if !cur.is_empty() {
-        tokens.push(cur);
     }
     tokens
 }
@@ -251,32 +261,30 @@ impl GuardrailRules {
         if self.deny_commands.is_empty() {
             return None;
         }
-        let views = deny_token_views(text);
         self.deny_commands
             .iter()
             .find(|entry| {
-                let entry_tokens = tokenize_deny(entry, Quotes::Separate);
-                views.iter().any(|v| contains_run(v, &entry_tokens))
+                deny_views().any(|view| {
+                    contains_run(&tokenize_deny(text, view), &tokenize_deny(entry, view))
+                })
             })
             .map(String::as_str)
     }
 
     pub fn match_deny_path(&self, text: &str) -> Option<&str> {
-        if self.deny_paths.is_empty() {
-            return None;
-        }
-        let tokens = deny_token_views(text).concat();
-        let token_segs: Vec<Vec<&str>> = tokens.iter().map(|t| path_segments_of_token(t)).collect();
         self.deny_paths
             .iter()
             .find(|entry| {
-                // `parse_guardrails` only accepts entries that are a single token.
-                let entry_tokens = tokenize_deny(entry, Quotes::Separate);
-                entry_tokens.first().is_some_and(|entry| {
+                deny_views().any(|view| {
+                    // A path is one word; an entry that this view splits cannot match in it.
+                    let entry_tokens = tokenize_deny(entry, view);
+                    let [entry] = entry_tokens.as_slice() else {
+                        return false;
+                    };
                     let entry_segs = path_segments_of_token(entry);
-                    token_segs
+                    tokenize_deny(text, view)
                         .iter()
-                        .any(|segs| contains_run(segs, &entry_segs))
+                        .any(|tok| contains_run(&path_segments_of_token(tok), &entry_segs))
                 })
             })
             .map(String::as_str)
@@ -324,7 +332,7 @@ pub fn parse_guardrails(raw_toml: &str) -> GuardrailRules {
         if shlex::split(trimmed).is_none() {
             return GuardrailRules::invalid(format!("aspas abertas em deny_commands: {trimmed}"));
         }
-        if tokenize_deny(trimmed, Quotes::Separate).is_empty() {
+        if tokenize_deny(trimmed, PLAIN_VIEW).is_empty() {
             return GuardrailRules::invalid(format!(
                 "entrada sem tokens válidos em deny_commands: {trimmed}"
             ));
@@ -346,7 +354,7 @@ pub fn parse_guardrails(raw_toml: &str) -> GuardrailRules {
         if shlex::split(trimmed).is_none() {
             return GuardrailRules::invalid(format!("aspas abertas em deny_paths: {trimmed}"));
         }
-        let tokens = tokenize_deny(trimmed, Quotes::Separate);
+        let tokens = tokenize_deny(trimmed, PLAIN_VIEW);
         if tokens.len() != 1 || path_segments_of_token(&tokens[0]).is_empty() {
             return GuardrailRules::invalid(format!("caminho inválido em deny_paths: {trimmed}"));
         }
@@ -417,9 +425,14 @@ pub fn load_guardrail_rules(path: &std::path::Path) -> GuardrailRules {
 }
 
 pub fn load_default_guardrail_rules() -> GuardrailRules {
-    super::config::resolve_home_dir().map_or_else(GuardrailRules::default, |home| {
-        load_guardrail_rules_in(&home)
-    })
+    load_guardrail_rules_for(super::config::resolve_home_dir().as_deref())
+}
+
+fn load_guardrail_rules_for(home: Option<&std::path::Path>) -> GuardrailRules {
+    home.map_or_else(
+        || GuardrailRules::invalid("HOME não definido"),
+        load_guardrail_rules_in,
+    )
 }
 
 /// Anything at the current path wins, even when unreadable: rules must not fall back to the legacy
@@ -646,6 +659,28 @@ mod tests {
         let bad_utf8 = dir.path().join("bad_utf8.toml");
         std::fs::write(&bad_utf8, [0xff_u8, 0xfe, 0xfd]).unwrap();
         assert!(load_guardrail_rules(&bad_utf8).invalid.is_some());
+    }
+
+    #[test]
+    fn missing_home_is_invalid() {
+        assert!(load_guardrail_rules_for(None).invalid.is_some());
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_guardrail_rules_for(Some(home.path())),
+            GuardrailRules::default()
+        );
+    }
+
+    #[test]
+    fn deny_entries_with_punctuation_still_match_exactly() {
+        let r = rules("deny_commands = [\"npm run build:prod\"]\ndeny_paths = [\"a,b\", \"c@d\"]");
+        assert!(r.invalid.is_none());
+        assert!(r.match_deny_command("npm run build:prod").is_some());
+        assert!(r.match_deny_command("npm run build:prod?").is_some());
+        assert!(r.match_deny_command("npm run build").is_none());
+        assert_eq!(r.match_deny_path("cat x/a,b/c"), Some("a,b"));
+        assert!(r.match_deny_path("cat a b").is_none());
+        assert!(r.match_deny_path("cat c@d/x").is_some());
     }
 
     #[test]

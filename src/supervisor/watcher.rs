@@ -2470,6 +2470,27 @@ mod tests {
     }
 
     #[test]
+    fn user_allow_sends_nothing_while_paused() {
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let mut store = DurableStateStore::load_or_init(&cfg.state_file_path).unwrap();
+        store.mode = SupervisorMode::Paused;
+        let mut session = test_session("t1");
+        session.kind = Some("permission".to_string());
+        session.msg = Some("approve Bash: just test".to_string());
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let hc = MockHc::new(vec![session], vec![menu]);
+        let mut engine = WatcherEngine::new(cfg, store, hc, MockCognitive::new(noop_eval()))
+            .with_rules_source(Box::new(|| {
+                crate::supervisor::rules::parse_guardrails(
+                    "[guardrails]\nallow_commands = [\"just test\"]\n",
+                )
+            }));
+        engine.tick(1000).unwrap();
+        assert!(engine.hc.sent_inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn rules_are_reloaded_on_each_tick() {
         use crate::supervisor::rules::{parse_guardrails, GuardrailRules};
 

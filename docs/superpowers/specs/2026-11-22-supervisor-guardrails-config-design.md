@@ -78,7 +78,7 @@ Sem a seção, o comportamento é o de hoje.
 ### `deny_commands`
 - O `msg`, o comando identificado e todas as linhas da área pendente são divididos em tokens (espaços, aspas e `; | & ( )` separam). A entrada casa se seus tokens aparecem em sequência em qualquer ponto: pega `cd x && cargo publish` e `bash -c "cargo publish"`.
 - Não aceita `*`. Sem diferenciar maiúsculas.
-- Aspas e `\` são lidas das duas formas (separando palavras e sumindo dentro delas), então `cargo pub''lish` também casa. Vale para `deny_paths`.
+- Aspas e `\` são lidas das duas formas (separando palavras e sumindo dentro delas), então `cargo pub''lish` também casa. Vale para `deny_paths`. O mesmo vale para a pontuação em volta (`cargo publish?`, `a,prod/x`).
 - Falso positivo só gera alerta. Limite conhecido: `npm --silent publish` não casa com `npm publish`.
 
 ### `deny_paths`
@@ -101,7 +101,7 @@ O fast-path não aprova. Se a LLM propuser resposta afirmativa, vira `AlertOpera
 | Entrada de `allow_*` inválida | Ignorada, com aviso; o resto vale |
 | Entrada de `deny_*` inválida (vazia, aspas abertas, `*`) | `[guardrails]` inválido |
 | Chave desconhecida ou tipo errado em `[guardrails]` | `[guardrails]` inválido |
-| TOML ilegível ou arquivo sem permissão de leitura | `[guardrails]` inválido |
+| TOML ilegível, arquivo sem permissão de leitura ou `HOME` ausente | `[guardrails]` inválido |
 
 **`[guardrails]` inválido desliga toda resposta automática** (fixa e LLM); propostas viram alerta, com motivo visível. O restante do arquivo, se legível, continua valendo: `[guardrails]` é lido à parte e não derruba modelo, fallback ou container.
 

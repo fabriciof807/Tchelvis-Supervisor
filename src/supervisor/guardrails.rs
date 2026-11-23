@@ -658,6 +658,10 @@ pub(crate) fn floor_violation(cmd: &str) -> Option<&'static str> {
     if tokens.is_empty() {
         return Some("empty");
     }
+    // Quotes and escapes must not hide a token: `git pu''sh`.
+    if contains_forbidden_payload(&tokens.join(" ")).is_some() {
+        return Some("forbidden");
+    }
     let bin = tokens[0].rsplit('/').next().unwrap_or(&tokens[0]);
     if tokens.iter().any(|tok| has_dot_segment_glob(tok))
         || (matches!(bin, "rg" | "git") && has_unquoted_leading_glob(cmd))
@@ -2716,6 +2720,57 @@ mod tests {
             let out = sanitize_auto_reply("ls\nProceed? [y/N]", None, Some(msg), auto("y"));
             assert_eq!(out.decision, SupervisorDecision::AlertOperator, "{msg:?}");
         }
+    }
+
+    #[test]
+    fn quoting_does_not_hide_a_forbidden_token() {
+        for c in [
+            "git pu''sh --fo''rce",
+            "git ''push",
+            "git pu\\sh",
+            "git re\\set --hard",
+            "r''m -rf /tmp/x",
+            "git \"push\" origin",
+        ] {
+            assert_eq!(floor_violation(c), Some("forbidden"), "{c}");
+        }
+        let r = rules(r#"allow_commands = ["git *", "r''m x"]"#);
+        assert_eq!(r.allow_commands, ["git *"]);
+        assert!(on_menu("git pu''sh", &r).approval.is_none());
+        assert!(on_menu("git branch", &r).approval.is_some());
+    }
+
+    #[test]
+    fn deny_ignores_punctuation_around_the_request() {
+        let r = rules("deny_commands = [\"cargo publish\"]\ndeny_paths = [\"prod/data\"]");
+        for s in [
+            "Run cargo publish? [y/N]",
+            "Vou rodar: cargo publish, ok?\nProceed? [y/N]",
+            "[cargo publish]\nProceed? [y/N]",
+            "“cargo publish”.\nProceed? [y/N]",
+            "Read ~/prod/data? [y/N]",
+        ] {
+            let out = sanitize_auto_reply_with_rules(s, None, None, &r, auto("y"));
+            assert!(
+                out.rule_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("deny_")),
+                "{s}: {:?}",
+                out.rule_id
+            );
+        }
+        let r = rules("allow_commands = [\"just *\"]\ndeny_paths = [\"prod/data\"]");
+        for c in [
+            "just check prod/data,",
+            "just check [prod/data]",
+            "just check prod/data!",
+            "just check a,prod/data",
+            "just check x@prod/data/y",
+        ] {
+            assert_eq!(on_menu(c, &r).rule_id, "deny_path:prod/data", "{c}");
+        }
+        assert!(on_menu("just check reprod/data", &r).approval.is_some());
+        assert!(on_menu("just check prod/data-old", &r).approval.is_some());
     }
 
     #[test]
