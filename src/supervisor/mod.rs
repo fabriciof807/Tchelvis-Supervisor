@@ -11,6 +11,7 @@ pub mod hc;
 pub mod model_delete;
 pub mod models;
 pub mod ollama;
+pub mod rules;
 pub mod slot_lock;
 pub mod state;
 pub mod tui;

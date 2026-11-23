@@ -632,42 +632,55 @@ fn is_dangerous_git_token(tok: &str) -> bool {
     bad_output || bad_ext || bad_textconv
 }
 
-fn is_safe_readonly_command(cmd: &str) -> bool {
+fn has_dot_segment_glob(tok: &str) -> bool {
+    tok.split('/')
+        .any(|seg| seg.starts_with('.') && seg.contains(['*', '?', '[']))
+}
+
+pub(crate) fn floor_violation(cmd: &str) -> Option<&'static str> {
     let cmd = cmd.trim();
-    if cmd.is_empty()
-        || has_readonly_disallowed_metachar(cmd)
-        || has_brace_expansion(cmd)
-        || is_truncated_command(cmd)
-    {
-        return false;
+    if cmd.is_empty() {
+        return Some("empty");
+    }
+    if contains_forbidden_payload(cmd).is_some() {
+        return Some("forbidden");
+    }
+    if has_readonly_disallowed_metachar(cmd) || has_brace_expansion(cmd) {
+        return Some("metachar");
+    }
+    if is_truncated_command(cmd) {
+        return Some("truncated");
     }
     let Some(tokens) = shlex::split(cmd) else {
-        return false;
+        return Some("unparsable");
     };
     if tokens.is_empty() {
-        return false;
+        return Some("empty");
     }
-    let [_, _, _, allow, sensitive] = fast_path_regexes();
-    if !allow.is_match(cmd) {
-        return false;
+    let bin = tokens[0].rsplit('/').next().unwrap_or(&tokens[0]);
+    if tokens.iter().any(|tok| has_dot_segment_glob(tok))
+        || (matches!(bin, "rg" | "git") && has_unquoted_leading_glob(cmd))
+    {
+        return Some("glob");
     }
+    let [_, _, _, _, sensitive] = fast_path_regexes();
     if sensitive.is_match(cmd) || tokens.iter().any(|tok| sensitive.is_match(tok)) {
-        return false;
+        return Some("sensitive");
     }
-    match tokens[0].as_str() {
-        "rg" if has_unquoted_leading_glob(cmd)
-            || tokens[1..].iter().any(|tok| is_dangerous_rg_token(tok)) =>
-        {
-            false
+    match bin {
+        "rg" if tokens[1..].iter().any(|tok| is_dangerous_rg_token(tok)) => return Some("option"),
+        "git" if tokens[1..].iter().any(|tok| is_dangerous_git_token(tok)) => {
+            return Some("option")
         }
-        "git"
-            if has_unquoted_leading_glob(cmd)
-                || tokens[1..].iter().any(|tok| is_dangerous_git_token(tok)) =>
-        {
-            false
-        }
-        _ => true,
+        _ => {}
     }
+    None
+}
+
+fn is_safe_readonly_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    let [_, _, _, allow, _] = fast_path_regexes();
+    floor_violation(cmd).is_none() && allow.is_match(cmd)
 }
 
 fn is_safe_read_target(target: &str) -> bool {
@@ -2234,5 +2247,45 @@ mod tests {
             readonly_fast_path_with_msg(menu, Some("permission"), Some("approve Read: README.md")),
             Some(("1".into(), "Read README.md".into()))
         );
+    }
+
+    #[test]
+    fn floor_accepts_any_plain_single_command() {
+        for c in ["just test", "cargo test --lib", "git branch", "docker ps"] {
+            assert_eq!(floor_violation(c), None, "{c}");
+        }
+    }
+
+    #[test]
+    fn floor_names_the_reason() {
+        for (c, r) in [
+            ("", "empty"),
+            ("rm -rf x", "forbidden"),
+            ("just test & evil", "metachar"),
+            ("just $X", "metachar"),
+            ("just te…", "truncated"),
+            ("just 'x", "unparsable"),
+            ("cat .e*", "glob"),
+            ("cat a/.e?v", "glob"),
+            ("cat .ssh/x", "sensitive"),
+            ("git diff --output=x", "option"),
+        ] {
+            assert_eq!(floor_violation(c), Some(r), "{c}");
+        }
+    }
+
+    #[test]
+    fn fast_path_refuses_glob_on_dot_segment_but_not_plain_globs() {
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let f = |c: &str| {
+            readonly_fast_path_with_msg(
+                menu,
+                Some("permission"),
+                Some(&format!("approve Bash: {c}")),
+            )
+        };
+        assert!(f("cat .e*").is_none());
+        assert!(f("cat *.rs").is_some());
+        assert!(f("ls ../*.rs").is_some());
     }
 }
