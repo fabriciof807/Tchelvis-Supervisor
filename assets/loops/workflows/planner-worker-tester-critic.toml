@@ -1,0 +1,37 @@
+name = "planner-worker-tester-critic"
+description = "Planeja, implementa, testa e audita antes de aprovar"
+max_cycles = 3
+stage_timeout_secs = 1800
+stall_secs = 600
+max_duration_secs = 7200
+
+[[stages]]
+id = "plan"
+role = "planner"
+reads = ["input.md"]
+writes = "design.md"
+next = "implement"
+
+[[stages]]
+id = "implement"
+role = "worker"
+reads = ["input.md", "design.md", "test-report.md", "critic.md"]
+edits = true
+next = "test"
+
+[[stages]]
+id = "test"
+role = "tester"
+reads = ["input.md", "design.md", "current.diff"]
+writes = "test-report.md"
+edits = true
+next = "audit"
+
+[[stages]]
+id = "audit"
+role = "critic"
+reads = ["input.md", "design.md", "current.diff", "test-report.md"]
+writes = "critic.md"
+verdict_gate = true
+on_pass = "done"
+on_retry = "implement"

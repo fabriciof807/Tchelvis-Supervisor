@@ -8,6 +8,7 @@ pub mod envvars;
 pub mod herdr;
 pub mod home;
 pub mod logging;
+pub mod loops;
 pub mod model;
 pub mod orch;
 pub mod procs;

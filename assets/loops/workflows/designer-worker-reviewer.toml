@@ -1,0 +1,29 @@
+name = "designer-worker-reviewer"
+description = "Projeta a solução, implementa e revisa antes de aprovar"
+max_cycles = 3
+stage_timeout_secs = 1800
+stall_secs = 600
+max_duration_secs = 7200
+
+[[stages]]
+id = "design"
+role = "designer"
+reads = ["input.md"]
+writes = "design.md"
+next = "implement"
+
+[[stages]]
+id = "implement"
+role = "worker"
+reads = ["input.md", "design.md", "review.md"]
+edits = true
+next = "review"
+
+[[stages]]
+id = "review"
+role = "reviewer"
+reads = ["input.md", "design.md", "current.diff"]
+writes = "review.md"
+verdict_gate = true
+on_pass = "done"
+on_retry = "implement"

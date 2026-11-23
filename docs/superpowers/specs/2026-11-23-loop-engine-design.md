@@ -155,7 +155,7 @@ on_pass = "done"
 on_retry = "implement"
 ```
 
-Destinos são sempre **ids de etapa** ou `done`. Chave desconhecida é erro. Antes de iniciar, o motor recusa: id repetido ou inválido; destino inexistente; etapa inalcançável; nenhum caminho até `done`; ciclo sem `verdict_gate`; gate sem `writes`; `next` junto com gate; nome de artefato com `/`, `..` ou reservado; `reads` que ninguém produz; provider fora da lista ou ausente no sandbox. O modelo é opcional.
+Destinos são sempre **ids de etapa** ou `done`. Chave desconhecida é erro. Antes de iniciar, o motor recusa: id repetido ou inválido; destino inexistente; etapa inalcançável; nenhum caminho até `done`; ciclo sem `verdict_gate`; gate sem `writes`; `next` junto com gate; nome de artefato com `/`, `..` ou reservado; `reads` que ninguém produz; provider fora da lista ou ausente no sandbox. Só o `on_pass` de um gate leva a `done`, e o grafo sem `on_retry` não pode ter ciclos, porque só `RETRY` conta como ciclo. Nomes de workflow e role usam `[a-z0-9-]`; `max_cycles` vai até 20 e os tempos, até 7 dias. `home_rw` e `home_ro` não podem alcançar os arquivos do próprio `tchelvis`. O modelo é opcional.
 
 **Presets:** `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic` e `fast-worker-reviewer`. Como os modelos mudam, os presets não fixam provider nem modelo: vêm de `[defaults.<role>]` em `loops.toml`, e faltar é erro claro.
 
