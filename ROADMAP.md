@@ -41,7 +41,7 @@ with the UI track.
 | M8 | Supervisor chat + Pi Durable ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`, `238191a`, `6c472d3`); **Phase B: adopt Pi Durable** |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
 | M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Implemented**; host validation pending |
-| M11 | Declarative multi-agent loops (`tchelvis loop`) | M10 | Proposed (spec to be revised after M10) |
+| M11 | Declarative multi-agent loops (`tchelvis loop`, [design](docs/superpowers/specs/2026-11-23-loop-engine-design.md)) | M10 | **Next** — design approved 2026-11-23, phase A plan approved |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -171,11 +171,11 @@ a closed `allow_tools` list, and `tchelvis supervisor rules [test]` for dry runs
 stays immutable and an invalid table turns automatic replies off.
 Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md).
 
-### M11 — Declarative multi-agent loops (proposed, after M10)
-`tchelvis loop`: a fixed engine runs worker/reviewer/critic stages in clean headless sessions inside a
-worktree, exchanging files. Agreed 2026-11-23: the caller ends its turn and `tchelvis` watches the
-loop, waking it once when the loop finishes, stalls or needs a human. Stages run in a sandbox (Incus
-or another tool, not ai-jail). Workflow format (TOML recommended) still open.
+### M11 — Declarative multi-agent loops (proposed)
+`tchelvis loop`: a fixed engine runs worker/reviewer/critic stages from TOML workflows in clean headless
+sessions inside a mandatory sandbox (Incus, bubblewrap or an explicit existing container), exchanging
+files. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls or needs a
+human. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
 
 ### M6 — Delegator mode & multi-agent orchestration (implemented)
 Event-driven parent-child agent orchestration (`tchelvis orch`) over Herdr (`hc`) terminals. Design: [M6 spec](docs/designs/m6-orchestration.md).
