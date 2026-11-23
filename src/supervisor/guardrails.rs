@@ -498,17 +498,217 @@ fn parse_command_candidate(raw: &str, under_header: bool) -> Option<String> {
     valid_cmd_token.then_some(cmd)
 }
 
+fn has_readonly_disallowed_metachar(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c, '|' | ';' | '&' | '>' | '<' | '`' | '$' | '(' | ')')
+            || (c.is_control() && c != '\t')
+    })
+}
+
+fn is_truncated_command(s: &str) -> bool {
+    s.ends_with('…') || s.ends_with("...")
+}
+
+fn has_brace_expansion(cmd: &str) -> bool {
+    let mut stack: Vec<(bool, bool)> = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev_dot = false;
+
+    for c in cmd.chars() {
+        if escaped {
+            escaped = false;
+            prev_dot = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                }
+                prev_dot = false;
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    escaped = true;
+                }
+                prev_dot = false;
+            }
+            _ => {
+                if c == '\\' {
+                    escaped = true;
+                    prev_dot = false;
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                    prev_dot = false;
+                } else if c == '{' {
+                    stack.push((false, false));
+                    prev_dot = false;
+                } else if c == '}' {
+                    if let Some((has_comma, has_dotdot)) = stack.pop() {
+                        if has_comma || has_dotdot {
+                            return true;
+                        }
+                    }
+                    prev_dot = false;
+                } else {
+                    if let Some((has_comma, has_dotdot)) = stack.last_mut() {
+                        if c == ',' {
+                            *has_comma = true;
+                        } else if c == '.' && prev_dot {
+                            *has_dotdot = true;
+                        }
+                    }
+                    prev_dot = c == '.';
+                }
+            }
+        }
+    }
+    false
+}
+
+fn has_unquoted_leading_glob(cmd: &str) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut has_prefix_char = false;
+
+    for c in cmd.chars() {
+        if escaped {
+            escaped = false;
+            has_prefix_char = true;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    quote = None;
+                } else {
+                    has_prefix_char = true;
+                }
+            }
+            Some('"') => {
+                if c == '"' {
+                    quote = None;
+                } else if c == '\\' {
+                    escaped = true;
+                } else {
+                    has_prefix_char = true;
+                }
+            }
+            _ => {
+                if c.is_whitespace() {
+                    has_prefix_char = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '\'' || c == '"' {
+                    quote = Some(c);
+                } else {
+                    if !has_prefix_char && matches!(c, '*' | '?' | '[') {
+                        return true;
+                    }
+                    has_prefix_char = true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_dangerous_rg_token(tok: &str) -> bool {
+    tok == "--pre"
+        || tok.starts_with("--pre=")
+        || tok == "--hostname-bin"
+        || tok.starts_with("--hostname-bin=")
+}
+
+fn is_dangerous_git_token(tok: &str) -> bool {
+    let opt = tok.split_once('=').map_or(tok, |(name, _)| name);
+    let bad_output = opt == "--o"
+        || (opt.starts_with("--ou") && opt != "--ours" && !opt.starts_with("--output-indicator-"));
+    let bad_ext = opt == "--e" || opt == "--ex" || opt.starts_with("--ext");
+    let bad_textconv = opt == "--textconv";
+    bad_output || bad_ext || bad_textconv
+}
+
+fn is_safe_readonly_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty()
+        || has_readonly_disallowed_metachar(cmd)
+        || has_brace_expansion(cmd)
+        || is_truncated_command(cmd)
+    {
+        return false;
+    }
+    let Some(tokens) = shlex::split(cmd) else {
+        return false;
+    };
+    if tokens.is_empty() {
+        return false;
+    }
+    let [_, _, _, allow, sensitive] = fast_path_regexes();
+    if !allow.is_match(cmd) {
+        return false;
+    }
+    if sensitive.is_match(cmd) || tokens.iter().any(|tok| sensitive.is_match(tok)) {
+        return false;
+    }
+    match tokens[0].as_str() {
+        "rg" if has_unquoted_leading_glob(cmd)
+            || tokens[1..].iter().any(|tok| is_dangerous_rg_token(tok)) =>
+        {
+            false
+        }
+        "git"
+            if has_unquoted_leading_glob(cmd)
+                || tokens[1..].iter().any(|tok| is_dangerous_git_token(tok)) =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
+fn is_safe_read_target(target: &str) -> bool {
+    let target = target.trim();
+    if target.is_empty()
+        || target.contains(char::is_whitespace)
+        || has_readonly_disallowed_metachar(target)
+        || is_truncated_command(target)
+    {
+        return false;
+    }
+    let Some(tokens) = shlex::split(target) else {
+        return false;
+    };
+    if tokens.len() != 1 || tokens[0].is_empty() {
+        return false;
+    }
+    let [_, _, _, _, sensitive] = fast_path_regexes();
+    !sensitive.is_match(target) && !sensitive.is_match(&tokens[0])
+}
+
+fn classify_tool_request(tool: &str, target: &str, exact_read: bool) -> IdentifiedCommand {
+    let lower = tool.trim().to_ascii_lowercase();
+    if shell_tool_regex().is_match(&lower) {
+        return IdentifiedCommand::Shell(target.trim().to_string());
+    }
+    let is_read = if exact_read {
+        lower == "read"
+    } else {
+        read_tool_regex().is_match(&lower)
+    };
+    if is_read {
+        IdentifiedCommand::ReadToolTarget(target.trim().to_string())
+    } else {
+        IdentifiedCommand::OtherTool
+    }
+}
+
 fn identify_inline_or_prompt_line(line: &str) -> Option<IdentifiedCommand> {
     if let Some(caps) = inline_prompt_regex().captures(line) {
-        let lead = caps["lead"].trim().to_ascii_lowercase();
-        let cmd = caps["cmd"].trim().to_string();
-        if read_tool_regex().is_match(&lead) {
-            return Some(IdentifiedCommand::ReadToolTarget(cmd));
-        }
-        if shell_tool_regex().is_match(&lead) {
-            return Some(IdentifiedCommand::Shell(cmd));
-        }
-        return Some(IdentifiedCommand::OtherTool);
+        return Some(classify_tool_request(&caps["lead"], &caps["cmd"], false));
     }
     if let Some(m) = yn_prompt_regex().find(line) {
         let before = line[..m.start()].trim();
@@ -519,6 +719,68 @@ fn identify_inline_or_prompt_line(line: &str) -> Option<IdentifiedCommand> {
     None
 }
 
+enum ScreenCommandCandidate<'a> {
+    Line { line: &'a str, under_header: bool },
+    AmbiguousUnderHeader,
+    None,
+}
+
+fn find_screen_command_candidate<'a>(
+    lines: &[&'a str],
+    prompt_idx: usize,
+) -> ScreenCommandCandidate<'a> {
+    let [_, menu_item, chrome, ..] = fast_path_regexes();
+    let is_yes_no = |l: &str| yn_prompt_regex().is_match(l) || yes_no_question_regex().is_match(l);
+    let is_candidate = |l: &str| !is_yes_no(l) && !menu_item.is_match(l) && !chrome.is_match(l);
+
+    // The first header: a command line that merely looks like one must not hide the lines above it.
+    if let Some(header_idx) = lines[..prompt_idx]
+        .iter()
+        .position(|l| command_header_regex().is_match(l))
+    {
+        let mut candidates = lines[header_idx + 1..prompt_idx]
+            .iter()
+            .copied()
+            .filter(|l| is_candidate(l));
+        let first = candidates.next();
+        let second = candidates.next();
+        match (first, second) {
+            (Some(line), None) => ScreenCommandCandidate::Line {
+                line,
+                under_header: true,
+            },
+            _ => ScreenCommandCandidate::AmbiguousUnderHeader,
+        }
+    } else if let Some(line) = lines[..prompt_idx]
+        .iter()
+        .rev()
+        .copied()
+        .find(|l| is_candidate(l))
+    {
+        // Known risk (no header): nearest non-chrome line above the prompt is assumed to be the command.
+        ScreenCommandCandidate::Line {
+            line,
+            under_header: false,
+        }
+    } else {
+        ScreenCommandCandidate::None
+    }
+}
+
+/// True when nothing is above the pending area and exactly one line before the menu can be the
+/// command.
+fn is_single_visible_request(earlier: &str, before_prompt: &[&str]) -> bool {
+    let [_, menu_item, chrome, ..] = fast_path_regexes();
+    earlier.trim().is_empty()
+        && before_prompt
+            .iter()
+            .filter(|l| !yn_prompt_regex().is_match(l))
+            .filter(|l| !yes_no_question_regex().is_match(l))
+            .filter(|l| !menu_item.is_match(l) && !chrome.is_match(l))
+            .count()
+            == 1
+}
+
 fn extract_identifiable_commands(area: &str, msg: Option<&str>) -> Vec<IdentifiedCommand> {
     let mut cmds = Vec::new();
     if let Some(m) = msg.map(str::trim).filter(|m| !m.is_empty()) {
@@ -527,7 +789,6 @@ fn extract_identifiable_commands(area: &str, msg: Option<&str>) -> Vec<Identifie
         }
     }
 
-    let [_, menu_item, chrome, ..] = fast_path_regexes();
     let lines: Vec<&str> = area
         .lines()
         .map(str::trim)
@@ -547,39 +808,33 @@ fn extract_identifiable_commands(area: &str, msg: Option<&str>) -> Vec<Identifie
         lines.len()
     };
 
-    if let Some(ci) = lines[..prompt_idx]
-        .iter()
-        .rposition(|l| !is_yes_no(l) && !menu_item.is_match(l) && !chrome.is_match(l))
-    {
-        let under_header = lines[..ci]
-            .iter()
-            .any(|l| command_header_regex().is_match(l));
-        if let Some(cmd) = parse_command_candidate(lines[ci], under_header) {
-            cmds.push(IdentifiedCommand::Shell(cmd));
+    match find_screen_command_candidate(&lines, prompt_idx) {
+        ScreenCommandCandidate::Line { line, under_header } => {
+            if let Some(cmd) = parse_command_candidate(line, under_header) {
+                cmds.push(IdentifiedCommand::Shell(cmd));
+            } else if under_header {
+                cmds.push(IdentifiedCommand::OtherTool);
+            }
         }
+        ScreenCommandCandidate::AmbiguousUnderHeader => {
+            cmds.push(IdentifiedCommand::OtherTool);
+        }
+        ScreenCommandCandidate::None => {}
     }
 
     cmds
 }
 
 fn is_allowlisted_command(cmd: &IdentifiedCommand) -> bool {
-    let [_, _, _, metachar, allow, sensitive] = fast_path_regexes();
     match cmd {
-        IdentifiedCommand::ReadToolTarget(target) => {
-            let target = target.trim();
-            !target.is_empty()
-                && !target.contains(char::is_whitespace)
-                && !metachar.is_match(target)
-                && !sensitive.is_match(target)
-        }
+        IdentifiedCommand::ReadToolTarget(target) => is_safe_read_target(target),
         IdentifiedCommand::OtherTool => false,
         IdentifiedCommand::Shell(raw_cmd) => {
             let cmd = raw_cmd.trim();
             if cmd.is_empty() {
                 return false;
             }
-            let passes_readonly =
-                !metachar.is_match(cmd) && allow.is_match(cmd) && !sensitive.is_match(cmd);
+            let passes_readonly = is_safe_readonly_command(cmd);
             let passes_build_test = !build_test_metachar_regex().is_match(cmd)
                 && build_test_allowlist_regex().is_match(cmd);
             passes_readonly || passes_build_test
@@ -677,8 +932,8 @@ pub fn sanitize_auto_reply(
     }
 }
 
-fn fast_path_regexes() -> &'static [Regex; 6] {
-    static RE: OnceLock<[Regex; 6]> = OnceLock::new();
+fn fast_path_regexes() -> &'static [Regex; 5] {
+    static RE: OnceLock<[Regex; 5]> = OnceLock::new();
     RE.get_or_init(|| {
         [
             // 0: permission menu "1. Yes" (Claude Code style, optional ❯ cursor)
@@ -687,11 +942,9 @@ fn fast_path_regexes() -> &'static [Regex; 6] {
             Regex::new(r"^\W*\d+[.)]\s").unwrap(),
             // 2: prompt chrome without a command
             Regex::new(r"(?i)^\W*(do you want|would you like)\b|^\W*(bash command|command|permission required)\W*$").unwrap(),
-            // 3: shell metacharacters (more than one command, redirection, substitution)
-            Regex::new(r"\||;|&&|>|<|\$\(|`").unwrap(),
-            // 4: read-only allowlist
+            // 3: read-only allowlist
             Regex::new(r"^(ls|cat|head|tail|wc|pwd|rg|grep|git\s+(status|diff|log|show))(\s|$)").unwrap(),
-            // 5: sensitive paths
+            // 4: sensitive paths
             Regex::new(r"(?i)\.ssh|\.gnupg|\.env|id_rsa|id_ed25519|secret|token|credential|password|key|/etc/shadow").unwrap(),
         ]
     })
@@ -709,7 +962,9 @@ fn inline_prompt_regex() -> &'static Regex {
 
 fn read_tool_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"\bread\b").expect("valid read tool regex"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?:^|[^a-zA-Z0-9_-])read(?:$|[^a-zA-Z0-9_-])").expect("valid read tool regex")
+    })
 }
 
 fn shell_tool_regex() -> &'static Regex {
@@ -725,26 +980,30 @@ fn status_msg_regex() -> &'static Regex {
     })
 }
 
+/// hc's status message announces a tool request, whether or not [`status_msg_regex`] can read it.
+fn is_approve_msg(msg: &str) -> bool {
+    msg.split_whitespace()
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("approve"))
+}
+
 /// A named tool request: a Read tool on one non-sensitive file (same as `cat`), or a shell tool
 /// running one allowlisted read-only command. Write/Edit/other tools are never fast-pathed.
-fn approve_tool_request(tool: &str, target: &str, payload: &str) -> Option<(String, String)> {
-    let [_, _, _, metachar, allow, sensitive] = fast_path_regexes();
-    let tool = tool.to_ascii_lowercase();
-    let target = target.trim();
-    if read_tool_regex().is_match(&tool) {
-        let single = !target.is_empty() && !target.contains(char::is_whitespace);
-        if single && !metachar.is_match(target) && !sensitive.is_match(target) {
-            return Some((payload.to_string(), format!("Read {target}")));
+fn approve_tool_request(
+    tool: &str,
+    target: &str,
+    payload: &str,
+    exact_read: bool,
+) -> Option<(String, String)> {
+    match classify_tool_request(tool, target, exact_read) {
+        IdentifiedCommand::ReadToolTarget(t) if is_safe_read_target(&t) => {
+            Some((payload.to_string(), format!("Read {t}")))
         }
-        return None;
+        IdentifiedCommand::Shell(cmd) if is_safe_readonly_command(&cmd) => {
+            Some((payload.to_string(), cmd))
+        }
+        _ => None,
     }
-    if !shell_tool_regex().is_match(&tool) {
-        return None;
-    }
-    if metachar.is_match(target) || !allow.is_match(target) || sensitive.is_match(target) {
-        return None;
-    }
-    Some((payload.to_string(), target.to_string()))
 }
 
 fn command_prefix_regex() -> &'static Regex {
@@ -781,8 +1040,8 @@ pub fn readonly_fast_path_with_msg(
     if detect_destructive(output, msg.unwrap_or("")).is_some() {
         return None;
     }
-    let [menu_yes, menu_item, chrome, metachar, allow, sensitive] = fast_path_regexes();
-    let area = pending_prompt_area(output);
+    let [menu_yes, ..] = fast_path_regexes();
+    let (earlier, area) = pending_prompt_split(output);
     let lines: Vec<&str> = area
         .lines()
         .map(str::trim)
@@ -801,18 +1060,31 @@ pub fn readonly_fast_path_with_msg(
 
     // The request as hc reports it, e.g. `approve Bash: git diff --stat`.
     if let Some(caps) = msg.and_then(|m| status_msg_regex().captures(m.trim())) {
-        return approve_tool_request(&caps["tool"], &caps["arg"], payload);
+        return approve_tool_request(&caps["tool"], &caps["arg"], payload, true);
+    }
+    // hc names a request in a form we cannot read (e.g. a multi-line command): never guess it from
+    // the screen.
+    if msg.is_some_and(is_approve_msg) {
+        return None;
     }
 
     // Command inline in the prompt line, e.g. `Allow bash tool: ls -la src/ ? [y/N]`.
     if let Some(caps) = inline_prompt_regex().captures(lines[prompt_idx]) {
-        return approve_tool_request(&caps["lead"], &caps["cmd"], payload);
+        return approve_tool_request(&caps["lead"], &caps["cmd"], payload, false);
     }
 
-    let raw = lines[..prompt_idx]
-        .iter()
-        .rev()
-        .find(|l| !is_yes_no(l) && !menu_item.is_match(l) && !chrome.is_match(l))?;
+    // A permission menu without a readable msg: the request may be several lines long, so it is
+    // only trusted when all of it is on screen and a single line can be the command.
+    if payload == "1" && !is_single_visible_request(&earlier, &lines[..prompt_idx]) {
+        return None;
+    }
+
+    let raw = match find_screen_command_candidate(&lines, prompt_idx) {
+        ScreenCommandCandidate::Line { line, .. } => line,
+        ScreenCommandCandidate::AmbiguousUnderHeader | ScreenCommandCandidate::None => {
+            return None;
+        }
+    };
     let had_bash_paren = raw.to_ascii_lowercase().starts_with("bash(");
     let mut cmd = command_prefix_regex().replace(raw, "").trim().to_string();
     if had_bash_paren {
@@ -826,7 +1098,7 @@ pub fn readonly_fast_path_with_msg(
         }
     }
 
-    if metachar.is_match(&cmd) || !allow.is_match(&cmd) || sensitive.is_match(&cmd) {
+    if !is_safe_readonly_command(&cmd) {
         return None;
     }
     Some((payload.to_string(), cmd))
@@ -1713,5 +1985,254 @@ mod tests {
         let neg = sanitize_auto_reply("frobnicate --all\nAllow? [y/N]", None, None, auto("n"));
         assert_eq!(neg.decision, SupervisorDecision::AutoReply);
         assert_eq!(neg.hc_command_payload, "n");
+    }
+
+    #[test]
+    fn fast_path_rejects_hardening_evidence_table_via_msg() {
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let f = |cmd: &str| {
+            readonly_fast_path_with_msg(
+                menu,
+                Some("permission"),
+                Some(&format!("approve Bash: {cmd}")),
+            )
+        };
+
+        for cmd in [
+            "ls & python evil.py",
+            "rg --pre ./e.sh foo",
+            "rg \"--pre=./e.sh\" foo",
+            r"rg \-\-pre ./e.sh foo",
+            "rg --hostname-bin ./e.sh x",
+            "rg --hostname-bin=./e.sh x",
+            "rg $'--pre=./e.sh' foo",
+            "rg $X foo",
+            "rg -{-pre=./e.sh,-x} foo",
+            "rg {1..5} foo",
+            "rg foo *",
+            "rg ?foo src",
+            "rg [a-z] src",
+            "git diff --output=f",
+            "git log --output=x",
+            "git diff --outp=x",
+            "git diff \"--output=x\"",
+            "git diff --o=x",
+            "git diff --output x",
+            "git diff --ext-diff",
+            "git diff --e",
+            "git diff --ex",
+            "git diff --ext",
+            "git diff --textconv",
+            "git diff *",
+            "ls =(python evil.py)",
+            "ls *(e:evil:)",
+            "cat .e''nv",
+            r"cat .e\nv",
+            "ls aaaa…",
+            "ls aaaa...",
+            "ls\nrm -rf /",
+            "ls\rrm -rf /",
+            "ls 'unterminated",
+        ] {
+            assert_eq!(f(cmd), None, "command should be refused: {cmd}");
+        }
+
+        // Tool names via hc msg: mcp-read and bash-read must not be treated as Read.
+        assert_eq!(
+            readonly_fast_path_with_msg(menu, Some("permission"), Some("approve mcp-read: ./x")),
+            None
+        );
+        assert_eq!(
+            readonly_fast_path_with_msg(
+                menu,
+                Some("permission"),
+                Some("approve bash-read: ./evil.sh")
+            ),
+            None
+        );
+
+        // Read target hardening via hc msg.
+        for target in [
+            ".e''nv",
+            r".e\nv",
+            "aaaa…",
+            "aaaa...",
+            "foo&bar",
+            "foo$bar",
+            "foo(bar)",
+            "'unterminated",
+        ] {
+            assert_eq!(
+                readonly_fast_path_with_msg(
+                    menu,
+                    Some("permission"),
+                    Some(&format!("approve Read: {target}"))
+                ),
+                None,
+                "Read target should be refused: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_rejects_hardening_evidence_screen_only() {
+        // Inline tool precedence: shell tool regex wins over "read".
+        assert_eq!(fast("Allow bash tool (read): ./evil.sh ? [y/N]"), None);
+        assert_eq!(fast("Allow mcp-read tool: ./x ? [y/N]"), None);
+        // Inline Read tool remains approved, and shell+read with a safe command stays shell.
+        assert_eq!(
+            fast("Allow Read tool: README.md ? [y/N]"),
+            Some(("y".into(), "Read README.md".into()))
+        );
+        assert_eq!(
+            fast("Allow bash tool (read): ls -la ? [y/N]"),
+            Some(("y".into(), "ls -la".into()))
+        );
+
+        // Screen-only with a command header: multiple candidate lines or zero lines -> None.
+        let desc_screen = "Bash command\n\n  python evil.py\n  ls the project files\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert_eq!(fast(desc_screen), None);
+
+        let multiline_screen =
+            "Bash command\n  python evil.py &&\n  ls\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert_eq!(fast(multiline_screen), None);
+
+        let empty_header_screen = "Bash command\nAllow? [y/N]";
+        assert_eq!(fast(empty_header_screen), None);
+    }
+
+    #[test]
+    fn fast_path_malformed_approve_msg_never_falls_back_to_the_screen() {
+        let screen = "Bash(ls)\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+        for msg in [
+            "approve Bash: ls\npython evil.py",
+            "approve Bash:",
+            "approve",
+        ] {
+            assert_eq!(
+                readonly_fast_path_with_msg(screen, Some("permission"), Some(msg)),
+                None,
+                "{msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fast_path_menu_without_msg_needs_the_whole_request_on_screen() {
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        assert!(fast(&format!("Bash command\n\n  git status\n\n{menu}")).is_some());
+        // A command line that looks like a header must not hide the lines above it.
+        assert_eq!(
+            fast(&format!(
+                "Bash command\n  python evil.py &&\n  Command\n  ls\n{menu}"
+            )),
+            None
+        );
+        // Unknown header text, or no header: more than one line could be the command.
+        assert_eq!(
+            fast(&format!(
+                "Bash command (unsandboxed)\n  python evil.py\n  ls files\n{menu}"
+            )),
+            None
+        );
+        assert_eq!(fast(&format!("python evil.py\nBash(ls)\n{menu}")), None);
+        // The request starts above the prompt window: what is visible is not all of it.
+        let body: String = (0..12).map(|i| format!("  echo {i}\n")).collect();
+        for last in ["ls", "Command\n  ls"] {
+            assert_eq!(
+                fast(&format!(
+                    "Bash command\n  python evil.py\n{body}  {last}\n{menu}"
+                )),
+                None,
+                "{last}"
+            );
+        }
+    }
+
+    #[test]
+    fn llm_yes_is_refused_when_a_fake_header_hides_command_lines() {
+        let screen = "Bash command\n  python evil.py &&\n  Command\n  ls\nAllow? [y/N]";
+        assert_eq!(fast(screen), None);
+        assert_eq!(
+            sanitize_auto_reply(screen, None, None, auto("y")).decision,
+            SupervisorDecision::AlertOperator
+        );
+    }
+
+    #[test]
+    fn sanitize_rejects_hardened_commands_and_ambiguous_headers() {
+        // Plain [y/N] prompt with single `&` -> AlertOperator.
+        let amp = sanitize_auto_reply("ls & python evil.py\nProceed? [y/N]", None, None, auto("y"));
+        assert_eq!(amp.decision, SupervisorDecision::AlertOperator);
+        assert!(amp.hc_command_payload.is_empty());
+
+        // Plain [y/N] prompt with obfuscated sensitive path or dangerous rg/git options -> AlertOperator.
+        for screen in [
+            "cat .e''nv\nProceed? [y/N]",
+            "rg --pre ./e.sh foo\nProceed? [y/N]",
+            "git diff --output=f\nProceed? [y/N]",
+            "Allow bash tool (read): ./evil.sh ? [y/N]",
+            "Bash command\n\n  python evil.py\n  ls the project files\n\nDo you want to proceed? [y/N]",
+            "Bash command\n  python evil.py &&\n  ls\nDo you want to proceed? [y/N]",
+            "Bash command\nAllow? [y/N]",
+        ] {
+            let out = sanitize_auto_reply(screen, None, None, auto("y"));
+            assert_eq!(
+                out.decision,
+                SupervisorDecision::AlertOperator,
+                "LLM y should be refused for: {screen}"
+            );
+            assert!(out.hc_command_payload.is_empty());
+        }
+    }
+
+    #[test]
+    fn fast_path_keeps_safe_commands_approved() {
+        let menu = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+        let f = |cmd: &str| {
+            readonly_fast_path_with_msg(
+                menu,
+                Some("permission"),
+                Some(&format!("approve Bash: {cmd}")),
+            )
+        };
+
+        for cmd in [
+            "ls -la src/",
+            "git status --short",
+            "git diff --stat",
+            "git diff main...HEAD",
+            "git show HEAD@{1}",
+            "git log --oneline",
+            "git log --pretty=oneline",
+            "rg --pretty foo",
+            "rg \"foo bar\" src",
+            "cat *.rs",
+            "head -n 20 a.txt",
+            "rg --pre-glob '*.rs' foo",
+            "rg \"*.rs\" src",
+            "rg \"foo * bar\" src",
+            "rg \"a{2,4}\" src",
+            "git diff --ours",
+            "git diff --output-indicator-new=+",
+            "git diff --exit-code",
+            "git log --exclude=refs/stash",
+            "git diff --pretty=fuller",
+            "git diff --no-textconv",
+            "git diff --no-ext-diff",
+            "ls\t-la",
+        ] {
+            assert_eq!(
+                f(cmd),
+                Some(("1".into(), cmd.into())),
+                "safe command should stay approved: {cmd}"
+            );
+        }
+
+        // Read tool on normal file stays approved.
+        assert_eq!(
+            readonly_fast_path_with_msg(menu, Some("permission"), Some("approve Read: README.md")),
+            Some(("1".into(), "Read README.md".into()))
+        );
     }
 }

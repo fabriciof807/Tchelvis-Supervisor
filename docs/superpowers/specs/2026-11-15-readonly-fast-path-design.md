@@ -6,6 +6,8 @@
 
 **Update (test 8, real Claude Code):** only Claude prompts for permission in the user's setup (opencode autoaccept, pi no gate, agy auto). Its request is read from the hc status `msg` (`approve Bash: <cmd>` / `approve Read: <file>`), not the screen — on the real screen the command sits ~8 lines above the `1. Yes` menu. The screen only picks the key (`1` / `y`) and proves a prompt is showing. Options 2/3 (always allow, auto mode) are never chosen.
 
+**Update (2026-11-23, hardening):** see `is_safe_readonly_command` in `guardrails.rs` for the full refusal list (it supersedes the character list below). A command header needs exactly one command line; a permission menu without a readable `msg` also needs the whole request on screen. `[y/N]` screens without a header still use the nearest line.
+
 ## Intent
 Test 5: Semi-Auto approved only 1 of 4 trivial read-only requests (`ls`, `cat`, `git status`) —
 the 1.7B model alerts too often and takes 40–245 s. Approve the trivial ones with a fixed rule,
