@@ -76,6 +76,8 @@ fn git() -> Command {
         "core.fsmonitor=false",
         "core.trustctime=true",
         "core.checkStat=default",
+        // Never enter, move or fetch a submodule, whatever the user's configuration says.
+        "submodule.recurse=false",
     ] {
         cmd.args(["-c", setting]);
     }
@@ -180,6 +182,18 @@ fn filters_in_use(repo_root: &Path) -> Result<BTreeSet<String>> {
         .collect())
 }
 
+/// The commands `git lfs install` writes. Git runs them through a shell, so nothing may follow.
+const GIT_LFS_COMMANDS: &[&str] = &[
+    "git-lfs clean -- %f",
+    "git-lfs clean %f",
+    "git-lfs smudge -- %f",
+    "git-lfs smudge %f",
+    "git-lfs smudge --skip -- %f",
+    "git-lfs smudge --skip %f",
+    "git-lfs filter-process",
+    "git-lfs filter-process --skip",
+];
+
 /// A filter command runs outside the sandbox with the workspace as its directory, over files the
 /// agents wrote. Only Git LFS is trusted, and only where the repository already uses it. Every
 /// other filter is switched off; a repository that depends on one is refused, because storing its
@@ -188,7 +202,10 @@ fn filters_to_disable(git_dir: &Path, repo_root: &Path) -> Result<Vec<String>> {
     let in_use = filters_in_use(repo_root)?;
     let mut disable = Vec::new();
     for (name, commands) in configured_filters(git_dir)? {
-        let is_lfs = name == "lfs" && commands.iter().all(|c| c.starts_with("git-lfs "));
+        let is_lfs = name == "lfs"
+            && commands
+                .iter()
+                .all(|c| GIT_LFS_COMMANDS.contains(&c.as_str()));
         match (in_use.contains(&name), is_lfs) {
             (true, true) => {}
             (true, false) => bail!(
@@ -200,61 +217,42 @@ fn filters_to_disable(git_dir: &Path, repo_root: &Path) -> Result<Vec<String>> {
     Ok(disable)
 }
 
-fn parse_gitlinks_from_ls_tree(raw: &[u8]) -> BTreeMap<String, String> {
+/// The text of a gitlink line of `ls-tree`/`ls-files --stage`; `None` for any other entry. A path
+/// that is not UTF-8 is refused: skipping it would leave that submodule unchecked.
+fn gitlink_entry(entry: &[u8]) -> Result<Option<&str>> {
+    if !entry.starts_with(b"160000 ") {
+        return Ok(None);
+    }
+    let text = std::str::from_utf8(entry).context("submódulo com caminho que não é UTF-8")?;
+    Ok(Some(text))
+}
+
+fn parse_gitlinks_from_ls_tree(raw: &[u8]) -> Result<BTreeMap<String, String>> {
     let mut map = BTreeMap::new();
     for entry in raw.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
         // Format: "<mode> <type> <oid>\t<path>"
-        let Ok(s) = std::str::from_utf8(entry) else {
+        let Some((meta, path)) = gitlink_entry(entry)?.and_then(|s| s.split_once('\t')) else {
             continue;
         };
-        let Some((meta, path)) = s.split_once('\t') else {
-            continue;
-        };
-        let mut parts = meta.split_whitespace();
-        let Some(mode) = parts.next() else {
-            continue;
-        };
-        let Some(_kind) = parts.next() else {
-            continue;
-        };
-        let Some(oid) = parts.next() else {
-            continue;
-        };
-        if mode == "160000" {
+        if let Some(oid) = meta.split_whitespace().nth(2) {
             map.insert(path.to_string(), oid.to_string());
         }
     }
-    map
+    Ok(map)
 }
 
-fn parse_gitlinks_from_ls_files_stage(raw: &[u8]) -> Vec<(String, String)> {
+fn parse_gitlinks_from_ls_files_stage(raw: &[u8]) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     for entry in raw.split(|&b| b == 0) {
-        if entry.is_empty() {
-            continue;
-        }
         // Format: "<mode> <oid> <stage>\t<path>"
-        let Ok(s) = std::str::from_utf8(entry) else {
+        let Some((meta, path)) = gitlink_entry(entry)?.and_then(|s| s.split_once('\t')) else {
             continue;
         };
-        let Some((meta, path)) = s.split_once('\t') else {
-            continue;
-        };
-        let mut parts = meta.split_whitespace();
-        let Some(mode) = parts.next() else {
-            continue;
-        };
-        let Some(oid) = parts.next() else {
-            continue;
-        };
-        if mode == "160000" {
+        if let Some(oid) = meta.split_whitespace().nth(1) {
             out.push((path.to_string(), oid.to_string()));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Through `GIT_CONFIG_*` and not `-c`: a filter name may contain `=`.
@@ -344,10 +342,23 @@ impl GitWorkspace {
             bail!("a branch '{branch}' já existe no repositório");
         }
 
+        // Before `status`, which runs the filters.
+        let disabled_filters = filters_to_disable(&main_git_dir, &repo_root)?;
+
         if !from_head {
             let mut status_cmd = repo_git_cmd(&repo_root);
-            // `.loops/` holds the workflows themselves, usually not committed yet.
-            status_cmd.args(["status", "--porcelain", "--", ":/", ":(top,exclude).loops"]);
+            set_disabled_filters(&mut status_cmd, &disabled_filters);
+            // `.loops/` holds the workflows themselves, usually not committed yet. The content of
+            // a submodule never reaches the workspace, and looking at it would run its
+            // configuration: only its commit counts.
+            status_cmd.args([
+                "status",
+                "--porcelain",
+                "--ignore-submodules=dirty",
+                "--",
+                ":/",
+                ":(top,exclude).loops",
+            ]);
             let status_out =
                 run_git_checked(status_cmd, "falha ao verificar status do repositório")?;
             if !String::from_utf8_lossy(&status_out.stdout)
@@ -357,8 +368,6 @@ impl GitWorkspace {
                 bail!("repositório possui mudanças não commitadas (use --from-head para partir de HEAD)");
             }
         }
-
-        let disabled_filters = filters_to_disable(&main_git_dir, &repo_root)?;
 
         Ok(RepoPreflightInfo {
             repo_root,
@@ -428,7 +437,7 @@ impl GitWorkspace {
         let mut ls_tree_cmd = main_git_dir_cmd(&info.main_git_dir);
         ls_tree_cmd.args(["ls-tree", "-r", "-z", &info.base_tree]);
         let ls_tree_out = run_git_checked(ls_tree_cmd, "falha ao inspecionar árvore base")?;
-        let base_gitlinks = parse_gitlinks_from_ls_tree(&ls_tree_out.stdout);
+        let base_gitlinks = parse_gitlinks_from_ls_tree(&ls_tree_out.stdout)?;
 
         let ws = Self {
             main_git_dir: info.main_git_dir,
@@ -500,6 +509,29 @@ impl GitWorkspace {
         cmd
     }
 
+    /// Submodules are never checked out, so their directories stay empty. Git would run commands
+    /// inside a repository planted there, with the agent's configuration and outside the sandbox.
+    fn check_submodule_dirs_untouched(&self) -> Result<()> {
+        for path in self.base_gitlinks.keys() {
+            let full = self.workspace_path.join(path);
+            let empty = match fs::symlink_metadata(&full) {
+                Ok(meta) if meta.is_dir() => fs::read_dir(&full)
+                    .with_context(|| format!("falha ao ler o submódulo '{path}'"))?
+                    .next()
+                    .is_none(),
+                Ok(_) => true,
+                Err(e) => matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ),
+            };
+            if !empty {
+                bail!("submódulo alterado em '{path}': a pasta de um submódulo deve ficar vazia no workspace do loop");
+            }
+        }
+        Ok(())
+    }
+
     fn git_config_get(&self, key: &str) -> Option<String> {
         let mut cmd = main_git_dir_cmd(&self.main_git_dir);
         cmd.args(["config", "--get", key]);
@@ -516,6 +548,7 @@ impl GitWorkspace {
 
 impl Workspace for GitWorkspace {
     fn snapshot(&mut self) -> Result<String> {
+        self.check_submodule_dirs_untouched()?;
         // Entries read from a tree carry no stat data, so every file is read again: forged size and
         // times (git compares whole seconds) cannot hide a change.
         let mut reset_cmd = self.engine_git();
@@ -529,7 +562,7 @@ impl Workspace for GitWorkspace {
         let mut stage_cmd = self.engine_git();
         stage_cmd.args(["ls-files", "--stage", "-z"]);
         let stage_out = run_git_checked(stage_cmd, "falha ao inspecionar índice após add")?;
-        for (path, oid) in parse_gitlinks_from_ls_files_stage(&stage_out.stdout) {
+        for (path, oid) in parse_gitlinks_from_ls_files_stage(&stage_out.stdout)? {
             match self.base_gitlinks.get(&path) {
                 Some(base_oid) if base_oid == &oid => {}
                 Some(_) => bail!("submódulo alterado em '{path}'"),
@@ -549,6 +582,7 @@ impl Workspace for GitWorkspace {
 
     fn restore(&mut self, tree: &str) -> Result<()> {
         validate_object_id(tree, "restore tree")?;
+        self.check_submodule_dirs_untouched()?;
 
         let mut read_cmd = self.engine_git();
         read_cmd.args(["read-tree", "--reset", "-u", tree]);
@@ -571,6 +605,7 @@ impl Workspace for GitWorkspace {
             "diff",
             "--no-ext-diff",
             "--no-textconv",
+            "--submodule=short",
             &self.base_tree,
             tree,
         ]);
@@ -610,6 +645,7 @@ impl Workspace for GitWorkspace {
             "-z",
             "--no-ext-diff",
             "--no-textconv",
+            "--submodule=short",
             &self.base_tree,
             tree,
         ]);
@@ -1148,5 +1184,139 @@ mod tests {
 
         let head_branch = git_ok(&repo, &["rev-parse", "--verify", "loop/sep"]);
         assert!(!head_branch.trim().is_empty());
+    }
+
+    /// A clean/fsmonitor command that leaves a marker, configured in the repository at `git_dir`.
+    fn make_hostile(dir: &Path, marker: &Path) {
+        let cmd = format!("touch '{}'; cat", marker.display());
+        git_ok(dir, &["config", "filter.evil.clean", &cmd]);
+        git_ok(dir, &["config", "core.fsmonitor", &cmd]);
+        let git_dir = PathBuf::from(git_ok(dir, &["rev-parse", "--absolute-git-dir"]));
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::write(git_dir.join("info/attributes"), "*.txt filter=evil\n").unwrap();
+    }
+
+    fn repo_with_submodule(tmp: &TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let (repo, run) = new_repo(tmp);
+        let inner = tmp.path().join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        init_repo_with_commit(&inner);
+        let url = inner.to_str().unwrap();
+        let add = ["-c", "protocol.file.allow=always", "submodule", "add", url];
+        git_ok(&repo, &[&add[..], &["sm"]].concat());
+        git_ok(&repo, &["commit", "-m", "submodule"]);
+        (repo, run, inner)
+    }
+
+    #[test]
+    fn a_repository_planted_in_a_submodule_directory_runs_nothing() {
+        for recurse in ["false", "true"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, run, inner) = repo_with_submodule(&tmp);
+            git_ok(&repo, &["config", "submodule.recurse", recurse]);
+            let modules = repo.join(".git/modules/sm");
+            let config_before = fs::read_to_string(modules.join("config")).unwrap();
+            let marker = tmp.path().join("pwned.marker");
+            let mut ws = GitWorkspace::create(&repo, &run, "loop/sm", false).unwrap();
+            let base = ws.snapshot().unwrap();
+
+            let sm = ws.path().join("sm");
+            git_ok(ws.path(), &["clone", "-q", inner.to_str().unwrap(), "sm"]);
+            make_hostile(&sm, &marker);
+            fs::write(sm.join("keep.txt"), "KEEP\n").unwrap();
+
+            let err = ws.snapshot().unwrap_err().to_string();
+            assert!(err.contains("submódulo"), "{err}");
+            let _ = ws.restore(&base);
+            assert!(!marker.exists(), "recurse={recurse}");
+            assert_eq!(
+                fs::read_to_string(modules.join("config")).unwrap(),
+                config_before
+            );
+        }
+    }
+
+    #[test]
+    fn gitlinks_with_a_path_that_is_not_utf8_are_refused() {
+        let oid = "a".repeat(40);
+        let line = |mode: &str, rest: &str| {
+            let mut raw = format!("{mode} {rest}\t").into_bytes();
+            raw.extend_from_slice(b"\xff\0");
+            raw
+        };
+        assert!(parse_gitlinks_from_ls_tree(&line("160000", &format!("commit {oid}"))).is_err());
+        assert!(parse_gitlinks_from_ls_files_stage(&line("160000", &format!("{oid} 0"))).is_err());
+        // An ordinary file may have any name.
+        assert!(
+            parse_gitlinks_from_ls_tree(&line("100644", &format!("blob {oid}")))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_removed_submodule_is_diffed_without_entering_it() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, run, _) = repo_with_submodule(&tmp);
+        git_ok(&repo, &["config", "diff.submodule", "diff"]);
+        let mut ws = GitWorkspace::create(&repo, &run, "loop/sm", false).unwrap();
+        fs::remove_dir(ws.path().join("sm")).unwrap();
+        let tree = ws.snapshot().unwrap();
+        assert!(!ws.diff(&tree).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn the_status_check_runs_no_filter_of_the_repository_or_of_a_submodule() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run, _) = repo_with_submodule(&tmp);
+        let marker = tmp.path().join("pwned.marker");
+
+        // The submodule's own configuration.
+        make_hostile(&repo.join("sm"), &marker);
+        fs::write(repo.join("sm/keep.txt"), "KEEP\n").unwrap();
+        let _ = GitWorkspace::preflight_check_repo(&repo, "loop/s", false);
+        assert!(!marker.exists(), "submodule");
+
+        // The repository's: refused, and without running it first.
+        make_hostile(&repo, &marker);
+        fs::write(repo.join("keep.txt"), "KEEP\n").unwrap();
+        let err = GitWorkspace::preflight_check_repo(&repo, "loop/s", false).unwrap_err();
+        assert!(err.to_string().contains("evil"), "{err:#}");
+        assert!(!marker.exists(), "repository");
+    }
+
+    #[test]
+    fn only_the_exact_git_lfs_commands_are_trusted() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = new_repo(&tmp);
+        fs::write(repo.join(".gitattributes"), "keep.txt filter=lfs\n").unwrap();
+        git_ok(&repo, &["add", "."]);
+        git_ok(&repo, &["commit", "-m", "attr"]);
+        git_ok(
+            &repo,
+            &["config", "filter.lfs.process", "git-lfs filter-process"],
+        );
+        git_ok(
+            &repo,
+            &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+        );
+        for bad in [
+            "git-lfs clean -- %f; touch pwned",
+            "git-lfs clean -- %f && x",
+            "git-lfs $(x)",
+            "git-lfs clean -- %f\nx",
+            "git-lfs  clean",
+        ] {
+            git_ok(&repo, &["config", "filter.lfs.clean", bad]);
+            assert!(
+                GitWorkspace::preflight_check_repo(&repo, "loop/l", true).is_err(),
+                "{bad}"
+            );
+        }
+        for good in ["git-lfs clean -- %f", "git-lfs clean %f"] {
+            git_ok(&repo, &["config", "filter.lfs.clean", good]);
+            GitWorkspace::preflight_check_repo(&repo, "loop/l", true).unwrap();
+        }
+        let _ = run;
     }
 }

@@ -380,9 +380,12 @@ impl BwrapSandbox {
                 .unwrap_or_default();
             if real != bin && real.starts_with(home) && !Self::is_under_tchelvis_home(home, &real) {
                 // The directory of the real executable may hold files it loads; a directory of the
-                // PATH holds unrelated programs.
+                // PATH holds unrelated programs, and one above tchelvis' own holds its state.
                 match real.parent() {
-                    Some(dir) if dir != home && !path_dirs.iter().any(|p| p == dir) => {
+                    Some(dir)
+                        if !path_dirs.iter().any(|p| p == dir)
+                            && !Self::is_under_tchelvis_home(home, dir) =>
+                    {
                         binds.push((dir.to_path_buf(), dir.to_path_buf()));
                     }
                     _ => binds.push((real.clone(), real.clone())),
@@ -1072,6 +1075,32 @@ mod tests {
             assert!(sb.check(&ws).is_ok());
         } else {
             assert!(sb.check(&ws).is_err());
+        }
+    }
+
+    #[test]
+    fn a_cli_next_to_the_tchelvis_directories_exposes_only_itself() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        for parent in [".local/share", ".local/state", ".config", ".local"] {
+            fs::create_dir_all(home.join(parent)).unwrap();
+            let real = home.join(parent).join("claude-bin");
+            crate::test_support::write_executable(&real, "#!/bin/sh\n");
+            let link = bin.join("claude");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let binds = BwrapSandbox::adapter_binds(
+                std::ffi::OsStr::new("claude"),
+                &home,
+                Some(bin.as_os_str()),
+            );
+            assert_eq!(
+                binds,
+                vec![(real.clone(), real.clone()), (real.clone(), link.clone())],
+                "{parent}"
+            );
         }
     }
 }

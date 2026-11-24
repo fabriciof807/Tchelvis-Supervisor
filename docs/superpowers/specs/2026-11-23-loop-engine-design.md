@@ -63,7 +63,7 @@ Cada run tem um **clone separado** (`git clone --no-hardlinks`) no commit `HEAD`
 - **Etapas sem `edits = true`:** se a árvore mudar, a etapa falha e o workspace volta ao snapshot anterior.
 - **Resultado:** `commit-tree` na branch `loop/<workflow>-<run-id>` do repositório principal, sem mexer no checkout. A branch nunca pode já existir; o `tchelvis` não faz merge nem push.
 - **Repositório com mudanças não commitadas:** erro, a menos que se passe `--from-head` (elas ficam de fora).
-- **Repositórios aninhados, submódulos alterados ou falha no `add`:** `ERROR` com o caminho, workspace preservado.
+- **Repositórios aninhados, submódulos alterados ou falha no `add`:** `ERROR` com o caminho, workspace preservado. A pasta de um submódulo fica vazia no workspace e deve continuar vazia: o git executaria, fora do sandbox, a configuração de um repositório criado ali. Filtros só são aceitos se forem exatamente os comandos do Git LFS.
 
 ## Artefatos
 
