@@ -38,10 +38,12 @@ Skill comum, sem depender do `tchelvis` e sem citar modelos. Recebe uma spec (ca
    - dá para **demonstrar** sozinha;
    - cabe em uma sessão limpa de um modelo barato;
    - não exige decisão de projeto.
-4. Preparação do código vem primeiro. Mudança ampla: criar o novo, migrar em lotes, remover o velho.
+4. Preparação do código vem primeiro. Se build ou teste deixa arquivos que o projeto não ignora, o
+   primeiro ticket os ignora (no ensaio, entraram na branch e derrubaram o revisor). Mudança ampla: criar o novo, migrar em lotes, remover o velho.
 5. `blocked_by` só para dependência real. Arquivo em comum, ou dúvida: dependência em vez de
    paralelo. Arquivos que todos tocam (lockfile, changelog, índice de módulos) contam.
 6. O último ticket é sempre **integração**: bloqueado por todos, roda a suíte e corrige o conjunto.
+   Seus `files` são a união dos demais.
 7. Mostra a lista (título, bloqueios, o que demonstra, trecho da spec) e o que da spec ficou **sem
    ticket**. Só grava depois da aprovação.
 8. Grava um arquivo por ticket em `.loops/tickets/<feature>/NN-<slug>.md` se o projeto tem `.loops/`;
@@ -86,10 +88,11 @@ Nova seção "Executar tickets com loops". Regras:
   (delicado), `planner-worker-tester-critic` (testes no centro), `designer-worker-reviewer`
   (solução a projetar). Modelos vêm da configuração; o revisor não deve ser mais fraco que o worker.
 - **Ao acordar** (um aviso por loop): `orch check` e `loop result`.
-  - `PASS` e `ARQUIVOS` dentro de `files`: merge com hooks desligados
+  - `PASS` e todos os nomes de `git diff --name-only HEAD...<branch>` dentro de `files` (a linha
+    `ARQUIVOS` é cortada quando longa): merge com hooks desligados
     (`git -c core.hooksPath=/dev/null merge --no-ff <branch>`), `status: merged`, dispara os
     liberados.
-  - `PASS` com arquivo fora de `files`: para e pergunta.
+  - `PASS` com arquivo fora de `files`: para e pergunta. Sem branch: nada a juntar, `merged`.
   - Outro status, ou conflito (desfeito com `merge --abort`): `status: failed`, não dispara nada
     novo, espera os ativos e reporta em até 6 linhas (ticket, `RUN_ID`, relatório).
 - **Testes do conjunto** rodam no ticket de integração, dentro do sandbox. O coordenador não os

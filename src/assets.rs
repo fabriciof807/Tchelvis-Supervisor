@@ -475,6 +475,7 @@ mod tests {
             "open decision",
             "demo",
             "lockfile",
+            "adds the ignore rules",
             "union of every other ticket's `files`",
             "expand",
             "contract",

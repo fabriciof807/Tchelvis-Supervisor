@@ -26,6 +26,8 @@ Divide the work into vertical slices. Each ticket must:
 - Fit one clean session without requiring design decisions.
 - List only the `files` it creates or modifies.
 
+If building or testing leaves generated files the project does not ignore (caches, build output), the first ticket adds the ignore rules, and every ticket that runs code depends on it.
+
 Put preparatory code changes first. For broad changes, expand, migrate in batches, and contract: build the new path first, move callers in small slices, then remove the old path.
 
 ## 5. Dependency rules

@@ -155,6 +155,7 @@ Operational limits and guarantees to know before launching or advising a user:
   Write `run_id` right after. Repeat for every eligible ticket, then end your turn. If refused by the concurrency limit, set that ticket back to `ready` and end your turn.
 - **On wake-up (one per loop):** Run `tchelvis orch check --run loop_<RUN_ID>` and `tchelvis loop result <RUN_ID>`. On `PASS`, list the changed names in the worktree with `git diff --name-only HEAD...<branch>` (`<branch>` is the `BRANCH:` line; the `ARQUIVOS:` line is shortened when long).
   - Every name inside the ticket's `files`: run `git -c core.hooksPath=/dev/null merge --no-ff <branch>` in the worktree, set `status: merged`, launch the tickets it unblocked, and end your turn.
+  - `BRANCH: (nenhuma)`: the ticket needed no change; nothing to merge, set `status: merged`.
   - A name outside `files`: do not merge; stop and ask the user.
   - Other status or merge conflict (undo with `git merge --abort`): set `status: failed`, launch nothing new, wait for active loops, and report in the user's language in at most 6 lines (ticket, `RUN_ID`, report).
 - **Finish:** Launch an independent review of `integration/<feature>` with `tchelvis orch launch` (outside your context) and report in the user's language; merging into `main` is the user's decision.
@@ -302,6 +303,7 @@ mod tests {
             "tchelvis loop list --active",
             "max_concurrent",
             "ARQUIVOS",
+            "BRANCH: (nenhuma)",
             "git diff --name-only HEAD...<branch>",
             "never push",
             "fast-worker-reviewer",
