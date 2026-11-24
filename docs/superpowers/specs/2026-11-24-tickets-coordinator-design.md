@@ -86,7 +86,9 @@ Nova seção "Executar tickets com loops". Regras:
   Grava `status: running` e `run_id`, e **encerra o turno**.
 - **Time:** o do ticket; sem ele, `fast-worker-reviewer` (simples), `worker-reviewer-critic`
   (delicado), `planner-worker-tester-critic` (testes no centro), `designer-worker-reviewer`
-  (solução a projetar). Modelos vêm da configuração; o revisor não deve ser mais fraco que o worker.
+  (solução a projetar). Só oferece times cujo `loop check` passa (no host, um
+  time planejado não tinha modelo para o `critic`); a escolha aparece no pedido de autorização.
+  Modelos vêm da configuração; o revisor não deve ser mais fraco que o worker.
 - **Ao acordar** (um aviso por loop): `orch check` e `loop result`.
   - `PASS` e todos os nomes de `git diff --name-only --no-renames HEAD...<branch>` dentro de `files` (a linha
     `ARQUIVOS` é cortada quando longa): merge com hooks desligados

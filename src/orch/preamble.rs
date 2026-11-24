@@ -141,13 +141,13 @@ Operational limits and guarantees to know before launching or advising a user:
 ## Running Tickets with Loops
 
 - **Context:** Read only ticket frontmatter and the 5 lines of `tchelvis loop result <RUN_ID>`. Never read diffs or implementation files, never edit code, and never run the project's build or tests (the final integration ticket runs them in the sandbox).
-- **One upfront approval:** Show the ticket list, branch `integration/<feature>`, and `max_concurrent` (default 2 in `loops.toml`), and ask once to create a dedicated worktree and merge there:
+- **One upfront approval:** Show the ticket list with each ticket's team, the branch `integration/<feature>`, and `max_concurrent` (default 2 in `loops.toml`), and ask once to create a dedicated worktree and merge there:
   ```bash
   git -c core.hooksPath=/dev/null -c core.fsmonitor=false worktree add -b integration/<feature> <worktree_path>
   ```
   Never touch `main` and never push.
 - **Worktree preflight:** Run all loop commands from inside the worktree using each ticket's absolute path. Before the first launch, run `tchelvis loop list` and `tchelvis loop check <workflow>` there; if a workflow/team is missing or model confirmation is pending, stop and ask. Never edit `loops.toml`.
-- **Team:** Use the ticket's `workflow`, or pick: `fast-worker-reviewer` (simple), `worker-reviewer-critic` (delicate), `planner-worker-tester-critic` (test-centric), `designer-worker-reviewer` (needs design). Models come from config; the reviewer must not be weaker than the worker.
+- **Team:** Use the ticket's `workflow`, or pick: `fast-worker-reviewer` (simple), `worker-reviewer-critic` (delicate), `planner-worker-tester-critic` (test-centric), `designer-worker-reviewer` (needs design). Only offer teams whose check passes: before asking for approval, run `tchelvis loop check <workflow>` in the repository, and where it fails (for example, no model for a role) propose another team and say why. Models come from config; the reviewer must not be weaker than the worker.
 - **Launch:** Pick `ready` tickets whose `blocked_by` are all `merged` and whose `files` do not overlap active tickets, up to `max_concurrent`. Write `status: running` **before** launching, run:
   ```bash
   tchelvis loop run <workflow> --input-file <abs_ticket_path> --detach
@@ -309,6 +309,7 @@ mod tests {
             ".gitmodules",
             "any other reason",
             "never run the project's code",
+            "Only offer teams whose check passes",
             "never push",
             "fast-worker-reviewer",
             "worker-reviewer-critic",
