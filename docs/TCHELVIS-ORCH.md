@@ -184,6 +184,36 @@ tchelvis loop result <RUN_ID>
 - **Models from the repository need confirmation.** Use
   `tchelvis loop models confirm <workflow>` when running with `--detach`.
 
+## From a spec to merged branches
+
+When a feature is too large for a single session or loop, pair `/to-tickets`
+with `/orchestration-tchelvis`:
+
+1. **Split the spec with `/to-tickets`.** Run `/to-tickets` on your spec (file
+   path or conversation). It asks about any open decisions, proposes vertical
+   slices plus a final `integration` ticket, waits for your approval, and writes
+   `.loops/tickets/<feature>/NN-<slug>.md` (or `.tickets/<feature>/` when
+   `.loops/` does not exist).
+2. **Coordinate with `/orchestration-tchelvis`.** Follow **Running Tickets with
+   Loops**: the coordinator asks once to create `integration/<feature>` in its
+   own git worktree, checks `tchelvis loop list` and `tchelvis loop check` from
+   inside that worktree, launches independent ready tickets with
+   `tchelvis loop run <workflow> --input-file <path> --detach` (up to
+   `max_concurrent`), and ends its turn.
+3. **Merge and review.** On each wake-up, it checks `tchelvis orch check` and
+   `tchelvis loop result`, merges `PASS` branches whose changed files stay
+   inside the ticket's `files` via `git -c core.hooksPath=/dev/null merge --no-ff <branch>`, stops
+   on out-of-scope edits or failures, and finishes with an independent
+   `tchelvis orch launch` review. Merging into `main` is always your call.
+
+Known limits:
+
+- `PASS` reflects the reviewer's verdict; running the verification command
+  deterministically requires Phase B `checks`.
+- `tchelvis loop` supports `claude`, `agy`, and `opencode` stages only.
+- `.loops/runs` inside the integration worktree is removed if you delete that
+  worktree.
+
 ## Troubleshooting
 
 - **No wake-up arrived.** Run `tchelvis orch check --run <run_id>`. Act on

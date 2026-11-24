@@ -144,7 +144,7 @@ Desktop after installing `herdr-mod`. The UI needs the collector running: `tchel
 | `opencode` | `~/.config/opencode/plugins/tchelvis.js` |
 | `pi` | `~/.pi/agent/extensions/tchelvis.js` |
 | `herdr-mod` | `~/.config/herdr-app/mods/tchelvis/`, `~/.config/herdr-app/layouts/tchelvis.json`; with `--set-default-layout`, also `~/.config/herdr-app/settings.json` |
-| `skills` | `<agent>/skills/orchestration-tchelvis/SKILL.md` for `claude`, `opencode`, `pi`, `agents`, `codex`, and `gemini`; OpenCode also gets `~/.config/opencode/commands/orchestration-tchelvis.md` |
+| `skills` | `<agent>/skills/orchestration-tchelvis/SKILL.md` for `claude`, `opencode`, `pi`, `agents`, `codex`, and `gemini` (plus `~/.config/opencode/commands/orchestration-tchelvis.md`); `~/.agents/skills/to-tickets/SKILL.md` (linked at `~/.claude/skills/to-tickets` when `~/.claude` exists; `setup` asks before replacing an existing user file and leaves symlinks untouched) |
 | `systemd` | `~/.config/systemd/user/tchelvis.service` |
 
 ## Procedure C — Set up the supervisor LLM container (C3)

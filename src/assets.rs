@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 pub const HERDR_MOD_MAIN_JS: &str = include_str!("../assets/herdr-app/mods/tchelvis/main.js");
 pub const HERDR_MOD_JSON: &str = include_str!("../assets/herdr-app/mods/tchelvis/mod.json");
 pub const HERDR_LAYOUT_JSON: &str = include_str!("../assets/herdr-app/layouts/tchelvis.json");
+pub const TO_TICKETS_SKILL_NAME: &str = "to-tickets";
+pub const TO_TICKETS_SKILL: &str = include_str!("../assets/skills/to-tickets/SKILL.md");
 pub const HERDR_MOD_ICONS: &[(&str, &str)] = &[
     (
         "LICENSE-lucide.txt",
@@ -394,10 +396,14 @@ RestartSec=3
 WantedBy=default.target
 "#;
 
-pub fn asset_sha256(content: &str) -> String {
+pub fn bytes_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
+    hasher.update(bytes);
     format!("{:x}", hasher.finalize())
+}
+
+pub fn asset_sha256(content: &str) -> String {
+    bytes_sha256(content.as_bytes())
 }
 
 #[cfg(test)]
@@ -448,5 +454,48 @@ mod tests {
             .collect();
         assert_eq!(HERDR_MOD_ICONS.len(), 17);
         assert_eq!(embedded, on_disk);
+    }
+
+    #[test]
+    fn to_tickets_skill_states_its_contract() {
+        assert_eq!(TO_TICKETS_SKILL_NAME, "to-tickets");
+        assert!(
+            TO_TICKETS_SKILL.starts_with("---\nname: to-tickets\ndescription: "),
+            "missing required frontmatter prefix"
+        );
+        for needle in [
+            "status: ready",
+            "blocked_by:",
+            "files:",
+            "workflow:",
+            "run_id:",
+            ".loops/tickets/<feature>/",
+            ".tickets/<feature>/",
+            "integration",
+            "open decision",
+            "demo",
+            "lockfile",
+            "union of every other ticket's `files`",
+            "expand",
+            "contract",
+            "approve",
+        ] {
+            assert!(
+                TO_TICKETS_SKILL.contains(needle),
+                "TO_TICKETS_SKILL missing required substring: {needle}"
+            );
+        }
+        let lower = TO_TICKETS_SKILL.to_ascii_lowercase();
+        for forbidden in ["claude", "gemini", "gpt", "haiku", "opus", "sonnet"] {
+            assert!(
+                !lower.contains(forbidden),
+                "TO_TICKETS_SKILL must not name model/provider '{forbidden}'"
+            );
+        }
+        assert!(
+            TO_TICKETS_SKILL.lines().count() <= 120,
+            "TO_TICKETS_SKILL has {} lines, expected <= 120",
+            TO_TICKETS_SKILL.lines().count()
+        );
     }
 }

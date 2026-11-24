@@ -50,6 +50,7 @@ A coordinator agent running inside a Herdr terminal can delegate work to paralle
 - Invoke **`/orchestration-tchelvis`** inside Claude Code, OpenCode, Pi, Codex, or Gemini CLI (or run `tchelvis orch skill`) to launch workers in one command (`tchelvis orch launch`), define DAG tasks, and manage recovery (`send -> retry -> stop`) in shared or isolated git worktrees (`--worktree current|new-child`).
 - `tchelvis daemon` manages `orch.db` (SQLite WAL) and wakes coordinators or workers atomically via `hc send --if idle`—including a `1500 ms` post-turn silent-stop safety net and a `3000 ms` blocked-prompt fallback that work even when the local supervisor LLM is unloaded.
 - Coordinators with active child dispatches surface as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
+- Split an approved spec into small vertical tickets with **`/to-tickets`**, then execute them in an isolated `integration/<feature>` worktree via **`/orchestration-tchelvis`** (`tchelvis loop run --input-file … --detach`).
 - Step-by-step guide for newcomers, with the full command reference: [`docs/TCHELVIS-ORCH.md`](docs/TCHELVIS-ORCH.md).
 
 ---
@@ -109,7 +110,7 @@ docker pull ghcr.io/ggml-org/llama.cpp:server        # or: podman pull ...
 tchelvis doctor
 ```
 
-> `tchelvis setup` (also run automatically by `tchelvis update`) applies the `shell`, `claude`, `opencode`, `pi`, `herdr-mod`, and `skills` targets by default (plus `systemd` with `--systemd`; filter with `--only` / `--skip`). The `skills` target installs **`/orchestration-tchelvis`** for Claude Code, OpenCode, Pi, Codex, Gemini CLI, and `~/.agents/skills`, and `tchelvis doctor` verifies `orch.db`, `tchelvis daemon`, and skill installation alongside `hc` and LLM health.
+> `tchelvis setup` (also run automatically by `tchelvis update`) applies the `shell`, `claude`, `opencode`, `pi`, `herdr-mod`, and `skills` targets by default (plus `systemd` with `--systemd`; filter with `--only` / `--skip`). The `skills` target installs **`/orchestration-tchelvis`** for Claude Code, OpenCode, Pi, Codex, Gemini CLI, and `~/.agents/skills`, and installs **`to-tickets`** as one copy in `~/.agents/skills` (linked for Claude Code when `~/.claude` exists; `setup` asks before replacing the user's own file and leaves symlinks untouched). `tchelvis doctor` verifies `orch.db`, `tchelvis daemon`, and skill installation alongside `hc` and LLM health.
 >
 > If `which -a tchelvis` lists an older binary (e.g. `~/.cargo/bin/tchelvis`) ahead of `~/.local/bin/tchelvis`, replace or remove it. The Herdr mod calls plain `tchelvis`.
 

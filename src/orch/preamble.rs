@@ -137,6 +137,28 @@ Operational limits and guarantees to know before launching or advising a user:
 - **`bwrap` shares the network and localhost:** `bubblewrap` is the default sandbox (no silent fallback); it blocks outside filesystem writes/reads and clean-mounts `$HOME`, but network access, `localhost` services, and abstract sockets remain reachable.
 - **Three-level preflight before creating a workspace or terminal:** prior to creating anything, `run` runs free sandboxed CLI checks (`claude auth status`, `agy models`, `opencode models --standalone`), reuses recent valid `model_evidence.json` entries (12 h default; invalidated on stage failure or binary/account/sandbox change), and sends lean `Reply with exactly: OK` probes only when needed (`[preflight]` supports `mode = "auto" | "always" | "free"` and `valid_hours = 1..=168`; `check --live` probes and renews all). Repo-defined model choices also require prior confirmation (`tchelvis loop models confirm <workflow>` when running with `--detach` or non-interactively).
 - **An exported `OPENCODE_API_KEY` is visible to every program started from that shell:** `tchelvis` never saves keys to disk; inside the loop it forwards `OPENCODE_API_KEY` only to `opencode` stages and probes, though exporting it in an interactive shell exposes it to any child process spawned from that shell.
+
+## Running Tickets with Loops
+
+- **Context:** Read only ticket frontmatter and the 5 lines of `tchelvis loop result <RUN_ID>`. Never read diffs or implementation files, never edit code, and never run the project's build or tests (the final integration ticket runs them in the sandbox).
+- **One upfront approval:** Show the ticket list, branch `integration/<feature>`, and `max_concurrent` (default 2 in `loops.toml`), and ask once to create a dedicated worktree and merge there:
+  ```bash
+  git worktree add -b integration/<feature> <worktree_path>
+  ```
+  Never touch `main` and never push.
+- **Worktree preflight:** Run all loop commands from inside the worktree using each ticket's absolute path. Before the first launch, run `tchelvis loop list` and `tchelvis loop check <workflow>` there; if a workflow/team is missing or model confirmation is pending, stop and ask. Never edit `loops.toml`.
+- **Team:** Use the ticket's `workflow`, or pick: `fast-worker-reviewer` (simple), `worker-reviewer-critic` (delicate), `planner-worker-tester-critic` (test-centric), `designer-worker-reviewer` (needs design). Models come from config; the reviewer must not be weaker than the worker.
+- **Launch:** Pick `ready` tickets whose `blocked_by` are all `merged` and whose `files` do not overlap active tickets, up to `max_concurrent`. Write `status: running` **before** launching, run:
+  ```bash
+  tchelvis loop run <workflow> --input-file <abs_ticket_path> --detach
+  ```
+  Write `run_id` right after. Repeat for every eligible ticket, then end your turn. If refused by the concurrency limit, set that ticket back to `ready` and end your turn.
+- **On wake-up (one per loop):** Run `tchelvis orch check --run loop_<RUN_ID>` and `tchelvis loop result <RUN_ID>`. On `PASS`, list the changed names in the worktree with `git diff --name-only HEAD...<branch>` (`<branch>` is the `BRANCH:` line; the `ARQUIVOS:` line is shortened when long).
+  - Every name inside the ticket's `files`: run `git -c core.hooksPath=/dev/null merge --no-ff <branch>` in the worktree, set `status: merged`, launch the tickets it unblocked, and end your turn.
+  - A name outside `files`: do not merge; stop and ask the user.
+  - Other status or merge conflict (undo with `git merge --abort`): set `status: failed`, launch nothing new, wait for active loops, and report in the user's language in at most 6 lines (ticket, `RUN_ID`, report).
+- **Finish:** Launch an independent review of `integration/<feature>` with `tchelvis orch launch` (outside your context) and report in the user's language; merging into `main` is the user's decision.
+- **Lost session:** Rebuild state from ticket frontmatter, `tchelvis loop list --runs`, and `tchelvis loop list --active`. Check `tchelvis loop status <RUN_ID>` for `running` tickets (if `running` has no `run_id`, inspect `tchelvis loop list --active`; if unclear, ask) before any new launch.
 "#
 }
 
@@ -251,5 +273,50 @@ mod tests {
         assert!(command.contains("description: \"Orchestrate parallel child agents"));
         assert!(command.ends_with("User request: $ARGUMENTS\n"));
         assert_skill_documents_subcommands(&command);
+    }
+
+    #[test]
+    fn orchestration_skill_documents_running_tickets() {
+        let skill = orchestration_skill_markdown();
+        let idx = skill
+            .find("## Running Tickets with Loops")
+            .expect("missing '## Running Tickets with Loops' section");
+        let section = &skill[idx..];
+        assert!(
+            section.lines().count() <= 70,
+            "section has {} lines, expected <= 70",
+            section.lines().count()
+        );
+        for needle in [
+            "integration/<feature>",
+            "git worktree add",
+            "--input-file",
+            "--detach",
+            "loop_<RUN_ID>",
+            "git -c core.hooksPath=/dev/null merge --no-ff",
+            "git merge --abort",
+            "status: running",
+            "status: merged",
+            "status: failed",
+            "end your turn",
+            "tchelvis loop list --active",
+            "max_concurrent",
+            "ARQUIVOS",
+            "git diff --name-only HEAD...<branch>",
+            "never push",
+            "fast-worker-reviewer",
+            "worker-reviewer-critic",
+            "planner-worker-tester-critic",
+            "designer-worker-reviewer",
+            "tchelvis orch launch",
+        ] {
+            assert!(
+                section.contains(needle),
+                "Running Tickets with Loops section missing '{needle}'"
+            );
+        }
+        let lower = section.to_ascii_lowercase();
+        assert!(!lower.contains("sleep"), "section must not contain 'sleep'");
+        assert!(!lower.contains("--yes"), "section must not contain '--yes'");
     }
 }

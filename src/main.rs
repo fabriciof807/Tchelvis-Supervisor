@@ -12,7 +12,7 @@ use tchelvis::model::{
     AgentRow, AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest,
 };
 use tchelvis::providers::ProviderCoordinator;
-use tchelvis::setup::{run_setup, run_uninstall, SetupOptions};
+use tchelvis::setup::{run_setup_with, run_uninstall, SetupOptions};
 use tchelvis::store::CacheStore;
 use tchelvis::supervisor::state::SupervisorMode;
 use tchelvis::supervisor::{
@@ -690,7 +690,15 @@ async fn main() -> Result<()> {
                 systemd,
                 purge,
             };
-            let rep = run_setup(&paths, &opts)?;
+            let rep = run_setup_with(&paths, &opts, &mut |path| {
+                use std::io::IsTerminal;
+                if !std::io::stdin().is_terminal() {
+                    return false;
+                }
+                let mut err = std::io::stderr();
+                let mut stdin = std::io::stdin().lock();
+                confirm_replace_skill_io(path, &mut stdin, &mut err)
+            })?;
             println!("Cockpit {} (dry_run={}):", rep.action, rep.dry_run);
             for line in &rep.planned_or_applied {
                 println!("  - {line}");
@@ -1911,10 +1919,56 @@ fn print_model_table(out: &tchelvis::supervisor::models::ModelListOutput) {
     }
 }
 
+fn confirm_replace_skill_io(
+    path: &std::path::Path,
+    reader: &mut dyn std::io::BufRead,
+    writer: &mut dyn std::io::Write,
+) -> bool {
+    let _ = write!(
+        writer,
+        "'{}' já existe e não é do tchelvis. Sobrescrever? [y/N]: ",
+        path.display()
+    );
+    let _ = writer.flush();
+    let mut input = String::new();
+    match reader.read_line(&mut input) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(
+            input.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes" | "s" | "sim"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn confirm_replace_skill_io_matches_contract() {
+        let p = std::path::Path::new("/tmp/to-tickets/SKILL.md");
+        for yes in ["y\n", "Y\n", "yes\n", "s\n", "sim\n", "  SIM  \n"] {
+            let mut out = Vec::new();
+            let mut cursor = std::io::Cursor::new(yes.as_bytes());
+            assert!(
+                confirm_replace_skill_io(p, &mut cursor, &mut out),
+                "expected true for {yes:?}"
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                "'/tmp/to-tickets/SKILL.md' já existe e não é do tchelvis. Sobrescrever? [y/N]: "
+            );
+        }
+        for no in ["\n", "n\n", "no\n", "nao\n", ""] {
+            let mut out = Vec::new();
+            let mut cursor = std::io::Cursor::new(no.as_bytes());
+            assert!(
+                !confirm_replace_skill_io(p, &mut cursor, &mut out),
+                "expected false for {no:?}"
+            );
+        }
+    }
 
     #[test]
     fn task_add_requires_title_without_edit() {

@@ -1,7 +1,8 @@
 use crate::assets::{
-    asset_sha256, CLAUDE_HOOK_MARKER, CLAUDE_HOOK_SH, FENCE_END, FENCE_START, HERDR_LAYOUT_JSON,
-    HERDR_MOD_ICONS, HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_TCHELVIS_JS, PI_TCHELVIS_JS,
-    SHELL_FISH, SHELL_NU, SHELL_SH, SYSTEMD_UNIT_TEMPLATE,
+    asset_sha256, bytes_sha256, CLAUDE_HOOK_MARKER, CLAUDE_HOOK_SH, FENCE_END, FENCE_START,
+    HERDR_LAYOUT_JSON, HERDR_MOD_ICONS, HERDR_MOD_JSON, HERDR_MOD_MAIN_JS, OPENCODE_TCHELVIS_JS,
+    PI_TCHELVIS_JS, SHELL_FISH, SHELL_NU, SHELL_SH, SYSTEMD_UNIT_TEMPLATE, TO_TICKETS_SKILL,
+    TO_TICKETS_SKILL_NAME,
 };
 use crate::config::CockpitPaths;
 use crate::orch::preamble::{
@@ -45,6 +46,8 @@ pub struct ManifestEntry {
     pub pre_sha256: Option<String>,
     pub post_sha256: String,
     pub action: ManifestActionKind,
+    #[serde(default)]
+    pub keep_if_modified: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +137,14 @@ pub fn resolve_active_targets(opts: &SetupOptions) -> Result<BTreeSet<String>> {
 }
 
 pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupReport> {
+    run_setup_with(paths, opts, &mut |_| false)
+}
+
+pub fn run_setup_with(
+    paths: &CockpitPaths,
+    opts: &SetupOptions,
+    confirm: &mut dyn FnMut(&Path) -> bool,
+) -> Result<SetupReport> {
     if opts.undo {
         return run_uninstall(paths, opts.dry_run, opts.purge, None);
     }
@@ -347,6 +358,11 @@ pub fn run_setup(paths: &CockpitPaths, opts: &SetupOptions) -> Result<SetupRepor
         }
     }
 
+    // 4c. /to-tickets general skill (~/.agents/skills/to-tickets/SKILL.md + Claude link)
+    if targets.contains("skills") {
+        apply_to_tickets_skill(paths, opts.dry_run, &mut manifest, &mut actions, confirm)?;
+    }
+
     // 5. Herdr Desktop Mod & Layout
     if targets.contains("herdr-mod") {
         let herdr_dir = paths.home_dir.join(".config/herdr-app");
@@ -439,7 +455,38 @@ pub fn run_uninstall(
             let p = PathBuf::from(&entry.path);
             match &entry.action {
                 ManifestActionKind::CreatedFile => {
-                    if p.exists() {
+                    if entry.keep_if_modified {
+                        if let Ok(meta) = fs::symlink_metadata(&p) {
+                            let ft = meta.file_type();
+                            let expected_target = paths
+                                .home_dir
+                                .join(".agents/skills")
+                                .join(TO_TICKETS_SKILL_NAME);
+                            let can_remove = if ft.is_symlink() {
+                                fs::read_link(&p)
+                                    .map(|target| {
+                                        target == expected_target
+                                            || asset_sha256(&target.to_string_lossy())
+                                                == entry.post_sha256
+                                    })
+                                    .unwrap_or(false)
+                            } else if ft.is_file() {
+                                fs::read(&p)
+                                    .map(|bytes| bytes_sha256(&bytes) == entry.post_sha256)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+                            if can_remove {
+                                actions.push(format!("remove file {}", p.display()));
+                                if !dry_run {
+                                    let _ = fs::remove_file(&p);
+                                }
+                            } else {
+                                actions.push(format!("keep {} (modified)", p.display()));
+                            }
+                        }
+                    } else if p.exists() {
                         actions.push(format!("remove file {}", p.display()));
                         if !dry_run {
                             let _ = fs::remove_file(&p);
@@ -564,6 +611,47 @@ pub fn run_uninstall(
                 actions.push(format!("remove file {}", extra_file.display()));
                 if !dry_run {
                     let _ = fs::remove_file(&extra_file);
+                }
+            }
+        }
+
+        let to_tickets_dir = paths
+            .home_dir
+            .join(".agents/skills")
+            .join(TO_TICKETS_SKILL_NAME);
+        let to_tickets_file = to_tickets_dir.join("SKILL.md");
+        if !is_symlink_path(&paths.home_dir.join(".agents"))
+            && !is_symlink_path(&paths.home_dir.join(".agents/skills"))
+            && !is_symlink_path(&to_tickets_dir)
+        {
+            if let Ok(meta) = fs::symlink_metadata(&to_tickets_file) {
+                if meta.file_type().is_file()
+                    && fs::read(&to_tickets_file).ok().as_deref()
+                        == Some(TO_TICKETS_SKILL.as_bytes())
+                {
+                    actions.push(format!("remove file {}", to_tickets_file.display()));
+                    if !dry_run {
+                        let _ = fs::remove_file(&to_tickets_file);
+                    }
+                }
+            }
+        }
+
+        let to_tickets_link = paths
+            .home_dir
+            .join(".claude/skills")
+            .join(TO_TICKETS_SKILL_NAME);
+        if !is_symlink_path(&paths.home_dir.join(".claude"))
+            && !is_symlink_path(&paths.home_dir.join(".claude/skills"))
+        {
+            if let Ok(meta) = fs::symlink_metadata(&to_tickets_link) {
+                if meta.file_type().is_symlink()
+                    && fs::read_link(&to_tickets_link).ok().as_ref() == Some(&to_tickets_dir)
+                {
+                    actions.push(format!("remove file {}", to_tickets_link.display()));
+                    if !dry_run {
+                        let _ = fs::remove_file(&to_tickets_link);
+                    }
                 }
             }
         }
@@ -716,6 +804,182 @@ fn cleanup_legacy_supervisor_mods(home_dir: &Path, dry_run: bool, actions: &mut 
     }
 }
 
+fn is_symlink_path(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+fn apply_to_tickets_skill(
+    paths: &CockpitPaths,
+    dry_run: bool,
+    manifest: &mut SetupManifest,
+    actions: &mut Vec<String>,
+    confirm: &mut dyn FnMut(&Path) -> bool,
+) -> Result<()> {
+    let agents_dir = paths.home_dir.join(".agents");
+    let skills_dir = agents_dir.join("skills");
+    let skill_dir = skills_dir.join(TO_TICKETS_SKILL_NAME);
+    let skill_path = skill_dir.join("SKILL.md");
+
+    if is_symlink_path(&agents_dir)
+        || is_symlink_path(&skills_dir)
+        || is_symlink_path(&skill_dir)
+        || is_symlink_path(&skill_path)
+    {
+        actions.push(format!(
+            "skip {} (symlink; not managed by tchelvis)",
+            skill_path.display()
+        ));
+        return Ok(());
+    }
+
+    let ours_hash = asset_sha256(TO_TICKETS_SKILL);
+    let skill_path_str = skill_path.to_string_lossy().to_string();
+
+    let file_is_ours = match fs::symlink_metadata(&skill_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            actions.push(format!("write {}", skill_path.display()));
+            if !dry_run {
+                atomic_write_file(&skill_path, TO_TICKETS_SKILL, 0o644)?;
+                upsert_manifest_entry(
+                    manifest,
+                    ManifestEntry {
+                        path: skill_path_str.clone(),
+                        existed_before: false,
+                        pre_sha256: None,
+                        post_sha256: ours_hash,
+                        action: ManifestActionKind::CreatedFile,
+                        keep_if_modified: true,
+                    },
+                );
+            }
+            true
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed inspecting {}", skill_path.display()))
+        }
+        Ok(meta) => {
+            if !meta.file_type().is_file() {
+                actions.push(format!(
+                    "skip {} (not a regular file; not managed by tchelvis)",
+                    skill_path.display()
+                ));
+                return Ok(());
+            }
+            let bytes = fs::read(&skill_path)
+                .with_context(|| format!("failed reading {}", skill_path.display()))?;
+            let actual_hash = bytes_sha256(&bytes);
+
+            if actual_hash == ours_hash {
+                actions.push(format!("up-to-date {}", skill_path.display()));
+                // Also refreshes a hash left behind by an interrupted setup.
+                if !dry_run {
+                    upsert_manifest_entry(
+                        manifest,
+                        ManifestEntry {
+                            path: skill_path_str.clone(),
+                            existed_before: true,
+                            pre_sha256: Some(actual_hash),
+                            post_sha256: ours_hash,
+                            action: ManifestActionKind::CreatedFile,
+                            keep_if_modified: true,
+                        },
+                    );
+                }
+                true
+            } else if manifest
+                .entries
+                .iter()
+                .any(|e| e.path == skill_path_str && e.post_sha256 == actual_hash)
+            {
+                actions.push(format!("write {}", skill_path.display()));
+                if !dry_run {
+                    atomic_write_file(&skill_path, TO_TICKETS_SKILL, 0o644)?;
+                    upsert_manifest_entry(
+                        manifest,
+                        ManifestEntry {
+                            path: skill_path_str.clone(),
+                            existed_before: true,
+                            pre_sha256: Some(actual_hash),
+                            post_sha256: ours_hash,
+                            action: ManifestActionKind::CreatedFile,
+                            keep_if_modified: true,
+                        },
+                    );
+                }
+                true
+            } else if dry_run {
+                actions.push(format!(
+                    "would ask before replacing {}",
+                    skill_path.display()
+                ));
+                false
+            } else if confirm(&skill_path) {
+                actions.push(format!("write {}", skill_path.display()));
+                atomic_write_file(&skill_path, TO_TICKETS_SKILL, 0o644)?;
+                upsert_manifest_entry(
+                    manifest,
+                    ManifestEntry {
+                        path: skill_path_str.clone(),
+                        existed_before: true,
+                        pre_sha256: Some(actual_hash),
+                        post_sha256: ours_hash,
+                        action: ManifestActionKind::CreatedFile,
+                        keep_if_modified: true,
+                    },
+                );
+                true
+            } else {
+                actions.push(format!(
+                    "skip {} (your own file; not replaced)",
+                    skill_path.display()
+                ));
+                false
+            }
+        }
+    };
+
+    let claude_dir = paths.home_dir.join(".claude");
+    let claude_exists = fs::symlink_metadata(&claude_dir)
+        .map(|m| m.file_type().is_dir())
+        .unwrap_or(false);
+    if claude_exists && file_is_ours {
+        let claude_skills_dir = claude_dir.join("skills");
+        if !is_symlink_path(&claude_skills_dir) {
+            let link_path = claude_skills_dir.join(TO_TICKETS_SKILL_NAME);
+            if matches!(
+                fs::symlink_metadata(&link_path),
+                Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+            ) {
+                actions.push(format!(
+                    "symlink {} -> {}",
+                    link_path.display(),
+                    skill_dir.display()
+                ));
+                if !dry_run {
+                    fs::create_dir_all(&claude_skills_dir)?;
+                    std::os::unix::fs::symlink(&skill_dir, &link_path)?;
+                    let target_sha = asset_sha256(&skill_dir.to_string_lossy());
+                    upsert_manifest_entry(
+                        manifest,
+                        ManifestEntry {
+                            path: link_path.to_string_lossy().to_string(),
+                            existed_before: false,
+                            pre_sha256: None,
+                            post_sha256: target_sha,
+                            action: ManifestActionKind::CreatedFile,
+                            keep_if_modified: true,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn apply_created_file(
     path: &Path,
     content: &str,
@@ -748,6 +1012,7 @@ fn apply_created_file(
                 pre_sha256: pre_hash,
                 post_sha256: post_hash,
                 action: ManifestActionKind::CreatedFile,
+                keep_if_modified: false,
             },
         );
     }
@@ -798,6 +1063,7 @@ fn apply_fenced_block(
                 pre_sha256: pre_hash,
                 post_sha256: post_hash,
                 action: ManifestActionKind::FencedBlock,
+                keep_if_modified: false,
             },
         );
     }
@@ -895,6 +1161,7 @@ fn apply_claude_settings_merge(
                 action: ManifestActionKind::JsonMerge {
                     previous_value: prev_val,
                 },
+                keep_if_modified: false,
             },
         );
     }
@@ -950,6 +1217,7 @@ fn apply_herdr_default_layout(
                 action: ManifestActionKind::JsonMerge {
                     previous_value: prev_val,
                 },
+                keep_if_modified: false,
             },
         );
     }
@@ -991,6 +1259,7 @@ fn apply_herdr_shared_layout(
                 action: ManifestActionKind::JsonMerge {
                     previous_value: prev_val,
                 },
+                keep_if_modified: false,
             },
         );
     }
@@ -1001,6 +1270,7 @@ fn upsert_manifest_entry(manifest: &mut SetupManifest, entry: ManifestEntry) {
     if let Some(existing) = manifest.entries.iter_mut().find(|e| e.path == entry.path) {
         // Keep the original pre_sha256 and existed_before from the first time Cockpit touched it
         existing.post_sha256 = entry.post_sha256;
+        existing.keep_if_modified = entry.keep_if_modified;
     } else {
         manifest.entries.push(entry);
     }
@@ -1227,5 +1497,484 @@ mod tests {
                 "missing OK verification line for {expected_path}"
             );
         }
+    }
+
+    fn test_paths(home: &Path) -> CockpitPaths {
+        CockpitPaths {
+            home_dir: home.to_path_buf(),
+            config_dir: home.join(".config/tchelvis"),
+            data_dir: home.join(".local/share/tchelvis"),
+            state_dir: home.join(".local/state/tchelvis"),
+            runtime_dir: home.join(".local/state/tchelvis/run"),
+        }
+    }
+
+    fn contains_named_entry(root: &Path, target_name: &str) -> bool {
+        if !root.exists() {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(root) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some(target_name) {
+                return true;
+            }
+            if path.is_dir() && contains_named_entry(&path, target_name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn setup_installs_to_tickets_only_in_agents_and_uninstall_removes_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = test_paths(home);
+
+        for dir in [
+            ".claude",
+            ".config/opencode",
+            ".pi/agent",
+            ".codex",
+            ".gemini",
+        ] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+        run_setup(&paths, &opts).unwrap();
+
+        let skill_file = home.join(".agents/skills/to-tickets/SKILL.md");
+        assert_eq!(
+            fs::read_to_string(&skill_file).unwrap(),
+            crate::assets::TO_TICKETS_SKILL
+        );
+        let claude_link = home.join(".claude/skills/to-tickets");
+        let link_meta = fs::symlink_metadata(&claude_link).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            fs::read_link(&claude_link).unwrap(),
+            home.join(".agents/skills/to-tickets")
+        );
+
+        for dir in [".config/opencode", ".pi", ".codex", ".gemini"] {
+            assert!(
+                !contains_named_entry(&home.join(dir), "to-tickets"),
+                "unexpected to-tickets under {dir}"
+            );
+        }
+
+        run_uninstall(&paths, false, false, None).unwrap();
+        assert!(fs::symlink_metadata(&skill_file).is_err());
+        assert!(fs::symlink_metadata(&claude_link).is_err());
+    }
+
+    #[test]
+    fn setup_asks_before_replacing_a_foreign_to_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = test_paths(home);
+        fs::create_dir_all(home.join(".claude")).unwrap();
+
+        let skill_file = home.join(".agents/skills/to-tickets/SKILL.md");
+        fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        fs::write(&skill_file, "# mine\n").unwrap();
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+
+        let mut asked = false;
+        let rep_no = run_setup_with(&paths, &opts, &mut |p| {
+            assert_eq!(p, skill_file);
+            asked = true;
+            false
+        })
+        .unwrap();
+        assert!(asked);
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), "# mine\n");
+        assert!(rep_no
+            .planned_or_applied
+            .iter()
+            .any(|l| l.contains("your own file; not replaced")));
+        assert!(fs::symlink_metadata(home.join(".claude/skills/to-tickets")).is_err());
+        let manifest = load_manifest(&paths).unwrap().unwrap();
+        assert!(!manifest
+            .entries
+            .iter()
+            .any(|e| e.path == skill_file.to_string_lossy()));
+
+        run_uninstall(&paths, false, false, None).unwrap();
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), "# mine\n");
+
+        let mut asked_yes = false;
+        run_setup_with(&paths, &opts, &mut |_| {
+            asked_yes = true;
+            true
+        })
+        .unwrap();
+        assert!(asked_yes);
+        assert_eq!(
+            fs::read_to_string(&skill_file).unwrap(),
+            crate::assets::TO_TICKETS_SKILL
+        );
+        let manifest_yes = load_manifest(&paths).unwrap().unwrap();
+        assert!(manifest_yes
+            .entries
+            .iter()
+            .any(|e| e.path == skill_file.to_string_lossy() && e.keep_if_modified));
+        assert!(fs::symlink_metadata(home.join(".claude/skills/to-tickets"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn setup_updates_its_own_older_to_tickets_without_asking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = test_paths(home);
+        paths.ensure_dirs().unwrap();
+
+        let skill_file = home.join(".agents/skills/to-tickets/SKILL.md");
+        fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        let older = "# older tchelvis version\n";
+        fs::write(&skill_file, older).unwrap();
+
+        let manifest = SetupManifest {
+            version: 1,
+            updated_at: 0,
+            entries: vec![ManifestEntry {
+                path: skill_file.to_string_lossy().to_string(),
+                existed_before: false,
+                pre_sha256: None,
+                post_sha256: asset_sha256(older),
+                action: ManifestActionKind::CreatedFile,
+                keep_if_modified: true,
+            }],
+        };
+        save_manifest(&paths, &manifest).unwrap();
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+        run_setup_with(&paths, &opts, &mut |_| {
+            panic!("confirm must not be called when updating our own older file")
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&skill_file).unwrap(),
+            crate::assets::TO_TICKETS_SKILL
+        );
+        let updated_manifest = load_manifest(&paths).unwrap().unwrap();
+        let entry = updated_manifest
+            .entries
+            .iter()
+            .find(|e| e.path == skill_file.to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            entry.post_sha256,
+            asset_sha256(crate::assets::TO_TICKETS_SKILL)
+        );
+    }
+
+    #[test]
+    fn an_edited_to_tickets_asks_on_setup_and_survives_uninstall() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = test_paths(home);
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+        run_setup(&paths, &opts).unwrap();
+
+        let skill_file = home.join(".agents/skills/to-tickets/SKILL.md");
+        let edited = "# edited by user\n";
+        fs::write(&skill_file, edited).unwrap();
+
+        let mut asked = false;
+        let rep = run_setup_with(&paths, &opts, &mut |_| {
+            asked = true;
+            false
+        })
+        .unwrap();
+        assert!(asked);
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), edited);
+        assert!(rep
+            .planned_or_applied
+            .iter()
+            .any(|l| l.contains("your own file; not replaced")));
+
+        let un_rep = run_uninstall(&paths, false, false, None).unwrap();
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), edited);
+        assert!(un_rep
+            .planned_or_applied
+            .iter()
+            .any(|l| l.contains("keep ") && l.contains("(modified)")));
+    }
+
+    #[test]
+    fn a_symlinked_to_tickets_is_left_alone() {
+        use std::os::unix::fs::symlink;
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+
+        // 1. SKILL.md is a symlink
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let target = home.join("external-skill.md");
+            fs::write(&target, "# external\n").unwrap();
+            let skill_dir = home.join(".agents/skills/to-tickets");
+            fs::create_dir_all(&skill_dir).unwrap();
+            let skill_file = skill_dir.join("SKILL.md");
+            symlink(&target, &skill_file).unwrap();
+
+            let rep = run_setup_with(&paths, &opts, &mut |_| {
+                panic!("confirm must not be called for symlink")
+            })
+            .unwrap();
+            assert!(fs::symlink_metadata(&skill_file)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "# external\n");
+            assert!(rep
+                .planned_or_applied
+                .iter()
+                .any(|l| l.contains("symlink; not managed by tchelvis")));
+        }
+
+        // 2. folder is a symlink
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let target_dir = home.join("external-dir");
+            fs::create_dir_all(&target_dir).unwrap();
+            let target_file = target_dir.join("SKILL.md");
+            fs::write(&target_file, "# external dir\n").unwrap();
+            let skills_root = home.join(".agents/skills");
+            fs::create_dir_all(&skills_root).unwrap();
+            let skill_dir = skills_root.join("to-tickets");
+            symlink(&target_dir, &skill_dir).unwrap();
+
+            let rep = run_setup_with(&paths, &opts, &mut |_| {
+                panic!("confirm must not be called for folder symlink")
+            })
+            .unwrap();
+            assert!(fs::symlink_metadata(&skill_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(
+                fs::read_to_string(&target_file).unwrap(),
+                "# external dir\n"
+            );
+            assert!(rep
+                .planned_or_applied
+                .iter()
+                .any(|l| l.contains("symlink; not managed by tchelvis")));
+        }
+
+        // 3. dangling folder symlink
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let missing_dir = home.join("does-not-exist");
+            let skills_root = home.join(".agents/skills");
+            fs::create_dir_all(&skills_root).unwrap();
+            let skill_dir = skills_root.join("to-tickets");
+            symlink(&missing_dir, &skill_dir).unwrap();
+
+            let rep = run_setup_with(&paths, &opts, &mut |_| {
+                panic!("confirm must not be called for dangling symlink")
+            })
+            .unwrap();
+            assert!(fs::symlink_metadata(&skill_dir)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert!(!missing_dir.exists());
+            assert!(rep
+                .planned_or_applied
+                .iter()
+                .any(|l| l.contains("symlink; not managed by tchelvis")));
+        }
+    }
+
+    #[test]
+    fn an_existing_claude_entry_is_left_alone() {
+        use std::os::unix::fs::symlink;
+
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+
+        // 1. Existing directory at ~/.claude/skills/to-tickets
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let claude_entry = home.join(".claude/skills/to-tickets");
+            fs::create_dir_all(&claude_entry).unwrap();
+            fs::write(claude_entry.join("SKILL.md"), "# user claude dir\n").unwrap();
+
+            run_setup(&paths, &opts).unwrap();
+            assert!(claude_entry.is_dir());
+            assert_eq!(
+                fs::read_to_string(claude_entry.join("SKILL.md")).unwrap(),
+                "# user claude dir\n"
+            );
+        }
+
+        // 2. Existing regular file at ~/.claude/skills/to-tickets
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let claude_entry = home.join(".claude/skills/to-tickets");
+            fs::create_dir_all(claude_entry.parent().unwrap()).unwrap();
+            fs::write(&claude_entry, "custom file\n").unwrap();
+
+            run_setup(&paths, &opts).unwrap();
+            assert!(fs::symlink_metadata(&claude_entry)
+                .unwrap()
+                .file_type()
+                .is_file());
+            assert_eq!(fs::read_to_string(&claude_entry).unwrap(), "custom file\n");
+        }
+
+        // 3. Existing foreign symlink at ~/.claude/skills/to-tickets
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let foreign_target = home.join("other-skills/to-tickets");
+            fs::create_dir_all(&foreign_target).unwrap();
+            let claude_entry = home.join(".claude/skills/to-tickets");
+            fs::create_dir_all(claude_entry.parent().unwrap()).unwrap();
+            symlink(&foreign_target, &claude_entry).unwrap();
+
+            run_setup(&paths, &opts).unwrap();
+            assert_eq!(fs::read_link(&claude_entry).unwrap(), foreign_target);
+        }
+    }
+
+    #[test]
+    fn purge_without_a_manifest_removes_only_our_to_tickets() {
+        use std::os::unix::fs::symlink;
+
+        // 1. Exact embedded file + our symlink, no manifest -> both removed on purge
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let skill_dir = home.join(".agents/skills/to-tickets");
+            fs::create_dir_all(&skill_dir).unwrap();
+            let skill_file = skill_dir.join("SKILL.md");
+            fs::write(&skill_file, crate::assets::TO_TICKETS_SKILL).unwrap();
+            let claude_skills = home.join(".claude/skills");
+            fs::create_dir_all(&claude_skills).unwrap();
+            let claude_link = claude_skills.join("to-tickets");
+            symlink(&skill_dir, &claude_link).unwrap();
+
+            run_uninstall(&paths, false, true, None).unwrap();
+            assert!(fs::symlink_metadata(&skill_file).is_err());
+            assert!(fs::symlink_metadata(&claude_link).is_err());
+        }
+
+        // 2. Foreign file + foreign symlink, no manifest -> both kept on purge
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let paths = test_paths(home);
+            let skill_dir = home.join(".agents/skills/to-tickets");
+            fs::create_dir_all(&skill_dir).unwrap();
+            let skill_file = skill_dir.join("SKILL.md");
+            fs::write(&skill_file, "# foreign\n").unwrap();
+            let foreign_target = home.join("elsewhere/to-tickets");
+            fs::create_dir_all(&foreign_target).unwrap();
+            let claude_skills = home.join(".claude/skills");
+            fs::create_dir_all(&claude_skills).unwrap();
+            let claude_link = claude_skills.join("to-tickets");
+            symlink(&foreign_target, &claude_link).unwrap();
+
+            run_uninstall(&paths, false, true, None).unwrap();
+            assert_eq!(fs::read_to_string(&skill_file).unwrap(), "# foreign\n");
+            assert_eq!(fs::read_link(&claude_link).unwrap(), foreign_target);
+        }
+    }
+
+    #[test]
+    fn a_manifest_without_the_new_field_loads() {
+        let json = r#"{
+            "version": 1,
+            "updated_at": 1700000000,
+            "entries": [
+                {
+                    "path": "/tmp/example",
+                    "existed_before": false,
+                    "pre_sha256": null,
+                    "post_sha256": "abc123",
+                    "action": { "kind": "created_file" }
+                }
+            ]
+        }"#;
+        let parsed: SetupManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.entries.len(), 1);
+        assert!(!parsed.entries[0].keep_if_modified);
+    }
+
+    #[test]
+    fn dry_run_writes_no_to_tickets_and_never_asks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let paths = test_paths(home);
+        fs::create_dir_all(home.join(".claude")).unwrap();
+
+        let opts = SetupOptions {
+            dry_run: true,
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+
+        // Absent case
+        run_setup_with(&paths, &opts, &mut |_| {
+            panic!("confirm must not be called in dry_run")
+        })
+        .unwrap();
+        let skill_file = home.join(".agents/skills/to-tickets/SKILL.md");
+        assert!(fs::symlink_metadata(&skill_file).is_err());
+        assert!(fs::symlink_metadata(home.join(".claude/skills/to-tickets")).is_err());
+
+        // Foreign file case
+        fs::create_dir_all(skill_file.parent().unwrap()).unwrap();
+        fs::write(&skill_file, "# foreign\n").unwrap();
+        let rep = run_setup_with(&paths, &opts, &mut |_| {
+            panic!("confirm must not be called in dry_run")
+        })
+        .unwrap();
+        assert_eq!(fs::read_to_string(&skill_file).unwrap(), "# foreign\n");
+        assert!(rep
+            .planned_or_applied
+            .iter()
+            .any(|l| l.contains("would ask before replacing")));
     }
 }
