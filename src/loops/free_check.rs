@@ -2,19 +2,18 @@ use crate::loops::config::{PreflightConfig, PreflightMode};
 use crate::loops::evidence::{CliIdentity, EvidenceStore};
 use crate::loops::preflight::{ProbeTarget, ProbeTempDir};
 use crate::loops::process::{run_process, Clock, Limits, Outcome};
-use crate::loops::sandbox::Sandbox;
+use crate::loops::sandbox::{resolve_agy_credential, Sandbox};
 use crate::loops::workflow::Provider;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 pub const FREE_CHECK_TIMEOUT_SECS: u64 = 15;
 const MAX_FREE_OUTPUT_BYTES: usize = 1024 * 1024;
-pub const AGY_ABSENT_REASON: &str = "conta do 'agy' ausente no arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token — o login pode estar no chaveiro do sistema, mas o loop usa o arquivo; rode 'tchelvis loop auth login agy'";
+pub const AGY_ABSENT_REASON: &str = "conta do 'agy' ausente — o loop usa um login próprio em arquivo (o login no chaveiro do sistema não serve); rode 'tchelvis loop auth login agy'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listed {
@@ -240,13 +239,6 @@ pub fn plan_preflight(
         .collect()
 }
 
-fn non_empty_regular_file(path: &Path) -> bool {
-    let Ok(meta) = fs::metadata(path) else {
-        return false;
-    };
-    meta.is_file() && meta.len() > 0
-}
-
 fn run_one_free_check(
     provider: Provider,
     sandbox: &(dyn Sandbox + Sync),
@@ -382,9 +374,7 @@ fn run_one_free_check(
                     };
                 }
                 if captured.trim().is_empty()
-                    && !non_empty_regular_file(
-                        &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-                    )
+                    && resolve_agy_credential(home_dir, sandbox.agy_state_dir()).is_none()
                 {
                     return fallback(Err(AGY_ABSENT_REASON.to_string()), None);
                 }

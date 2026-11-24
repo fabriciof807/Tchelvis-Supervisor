@@ -23,7 +23,9 @@ use crate::loops::preflight::{
 };
 use crate::loops::process::SystemClock;
 use crate::loops::report::render_report_with_secrets;
-use crate::loops::sandbox::{BwrapSandbox, InheritedSandbox, Sandbox};
+use crate::loops::sandbox::{
+    resolve_agy_credential, BwrapSandbox, InheritedSandbox, Sandbox, AGY_TOKEN_FILE,
+};
 use crate::loops::state::{
     format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState, Usage,
 };
@@ -412,8 +414,10 @@ fn find_in_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let cand = dir.join(bin);
-        if cand.is_file() {
-            return Some(cand);
+        if let Ok(meta) = fs::metadata(&cand) {
+            if meta.is_file() && (meta.permissions().mode() & 0o111) != 0 {
+                return Some(cand);
+            }
         }
     }
     None
@@ -771,12 +775,14 @@ fn load_roles_for_workflow(
     Ok(roles)
 }
 
-fn build_sandbox(cfg: &LoopsConfig) -> Box<dyn Sandbox + Sync> {
+fn build_sandbox(cfg: &LoopsConfig, paths: &CockpitPaths) -> Box<dyn Sandbox + Sync> {
     match &cfg.sandbox {
         SandboxConfig::Inherited => Box::new(InheritedSandbox::new(cfg.env_pass.clone())),
-        SandboxConfig::Bwrap { home_ro } => {
-            Box::new(BwrapSandbox::new(home_ro.clone(), cfg.env_pass.clone()))
-        }
+        SandboxConfig::Bwrap { home_ro } => Box::new(BwrapSandbox::new(
+            home_ro.clone(),
+            cfg.env_pass.clone(),
+            paths.state_dir.clone(),
+        )),
     }
 }
 
@@ -907,10 +913,12 @@ fn distinct_providers(targets: &[ProbeTarget]) -> Vec<Provider> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_cli_identity_for_provider(
     provider: Provider,
     free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
     home_dir: &Path,
+    agy_state_dir: Option<&Path>,
     opencode_api_key: Option<&str>,
     sandbox_kind: &str,
     salt: &[u8; 32],
@@ -938,6 +946,14 @@ fn build_cli_identity_for_provider(
                     },
                 )
             }
+            // Inside the sandbox some logins report nothing that tells accounts apart. A new login
+            // rewrites the credential file, and so does a renewal, which costs one more probe.
+            Some(ClaudeStatus::LoggedIn { .. }) => {
+                let meta = fs::metadata(home_dir.join(".claude/.credentials.json"))
+                    .ok()
+                    .filter(|meta| meta.is_file() && meta.len() > 0)?;
+                compute_account_identity(salt, AccountIdentityInput::ClaudeCredentialFile(&meta))
+            }
             // No known account: evidence would be shared by every account.
             _ => return None,
         },
@@ -945,10 +961,8 @@ fn build_cli_identity_for_provider(
             compute_account_identity(salt, AccountIdentityInput::OpencodeKey(opencode_api_key))
         }
         Provider::Agy => {
-            let present = non_empty_regular_file(
-                &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            );
-            compute_account_identity(salt, AccountIdentityInput::AgyTokenPresent(present))
+            let source = resolve_agy_credential(home_dir, agy_state_dir).map(|c| c.source);
+            compute_account_identity(salt, AccountIdentityInput::AgyCredential(source))
         }
     };
     Some(CliIdentity {
@@ -958,10 +972,12 @@ fn build_cli_identity_for_provider(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_cli_identities(
     providers: &[Provider],
     free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
     home_dir: &Path,
+    agy_state_dir: Option<&Path>,
     opencode_api_key: Option<&str>,
     sandbox_kind: &str,
     salt: &[u8; 32],
@@ -973,6 +989,7 @@ fn build_cli_identities(
             provider,
             free_outcomes,
             home_dir,
+            agy_state_dir,
             opencode_api_key,
             sandbox_kind,
             salt,
@@ -988,6 +1005,7 @@ fn build_free_checks_for_targets(
     targets: &[ProbeTarget],
     free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
     home_dir: &Path,
+    agy_state_dir: Option<&Path>,
     opencode_api_key: Option<&str>,
 ) -> Vec<FreeCheck> {
     targets
@@ -1027,9 +1045,7 @@ fn build_free_checks_for_targets(
             }
             Provider::Agy => {
                 let outcome = free_outcomes.get(&Provider::Agy);
-                let token_present = non_empty_regular_file(
-                    &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-                );
+                let token_present = resolve_agy_credential(home_dir, agy_state_dir).is_some();
                 let account_ok = if !token_present {
                     Err(AGY_ABSENT_REASON.to_string())
                 } else if let Some(out) = outcome {
@@ -1120,6 +1136,7 @@ fn record_probe_evidence(
     records: &[ProbeRecord],
     free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
     home_dir: &Path,
+    agy_state_dir: Option<&Path>,
     opencode_api_key: Option<&str>,
     sandbox_kind: &str,
     now_ms: i64,
@@ -1136,6 +1153,7 @@ fn record_probe_evidence(
                 rec.provider,
                 free_outcomes,
                 home_dir,
+                agy_state_dir,
                 opencode_api_key,
                 sandbox_kind,
                 salt,
@@ -1888,7 +1906,7 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 Err(e) => return Err(LoopError::usage(format!("{e:#}"))),
             };
             ensure_sandbox_prereqs(&cfg)?;
-            let sandbox = build_sandbox(&cfg);
+            let sandbox = build_sandbox(&cfg, paths);
             let auth_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
                 ".auth-{}-{}",
                 std::process::id(),
@@ -1912,11 +1930,8 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
 
             let claude_cred =
                 non_empty_regular_file(&paths.home_dir.join(".claude/.credentials.json"));
-            let agy_cred = non_empty_regular_file(
-                &paths
-                    .home_dir
-                    .join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            );
+            let agy_cred =
+                resolve_agy_credential(&paths.home_dir, sandbox.agy_state_dir()).is_some();
 
             let claude_line = match outcomes
                 .get(&Provider::Claude)
@@ -1946,12 +1961,12 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
             };
 
             let agy_line = match outcomes.get(&Provider::Agy) {
+                Some(out) if !agy_cred || out.account_ok.is_err() => {
+                    format!("agy:      ausente ({AGY_ABSENT_REASON})")
+                }
                 Some(out) if out.list_known => {
                     let count = out.models.len() / 2;
                     format!("agy:      autenticado ({count} modelo(s) listado(s) por 'agy models')")
-                }
-                Some(out) if out.account_ok.is_err() || !agy_cred => {
-                    format!("agy:      ausente ({AGY_ABSENT_REASON})")
                 }
                 _ => {
                     if agy_cred {
@@ -1998,16 +2013,31 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
             }
             let argv: Vec<String> = match cli.as_str() {
                 "claude" => vec!["claude".into(), "auth".into(), "login".into()],
-                // Force file-based OAuth storage (never keyring / D-Bus session bus) so the
-                // bwrap sandbox receives ~/.gemini/antigravity-cli/antigravity-oauth-token.
+                // Redirect ~/.gemini/antigravity-cli to <state>/loops/agy-login with file-only
+                // token storage while keeping D-Bus/XDG_RUNTIME_DIR intact so the browser opens.
                 "agy" => {
-                    let runtime_dir = ensure_private_agy_runtime_dir(&paths.state_dir)
+                    // The absolute path: a Herdr terminal has its own `PATH`.
+                    let bwrap = find_in_path("bwrap").ok_or_else(|| {
+                        LoopError::err(
+                            "bubblewrap ('bwrap') não encontrado no PATH; instale o pacote 'bubblewrap' (ex.: 'sudo apt install bubblewrap' ou 'sudo pacman -S bubblewrap') para separar o login do 'agy'",
+                        )
+                    })?;
+                    let login_dir = ensure_private_agy_login_dir(&paths.state_dir)
+                        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                    let target_dir = ensure_agy_target_dir(&paths.home_dir)
                         .map_err(|e| LoopError::err(format!("{e:#}")))?;
                     vec![
+                        bwrap.to_string_lossy().into_owned(),
+                        "--dev-bind".into(),
+                        "/".into(),
+                        "/".into(),
+                        "--bind".into(),
+                        login_dir.to_string_lossy().into_owned(),
+                        target_dir.to_string_lossy().into_owned(),
+                        "--die-with-parent".into(),
+                        "--".into(),
                         "/usr/bin/env".into(),
-                        "-u".into(),
-                        "DBUS_SESSION_BUS_ADDRESS".into(),
-                        format!("XDG_RUNTIME_DIR={}", runtime_dir.display()),
+                        "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1".into(),
                         "agy".into(),
                     ]
                 }
@@ -2033,7 +2063,75 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
     }
 }
 
-fn ensure_private_agy_runtime_dir(state_dir: &Path) -> Result<PathBuf> {
+fn open_private_dir_nofollow(dir: &Path, ensure_mode_0700: bool) -> Result<OwnedFd> {
+    let raw = dir.to_str().context("caminho não UTF-8")?;
+    let c_path = CString::new(raw)?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            bail!("'{}' é um link simbólico e foi recusado", dir.display());
+        }
+        return Err(err).with_context(|| format!("falha ao abrir '{}'", dir.display()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("falha ao inspecionar '{}'", dir.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        bail!("'{}' não é um diretório", dir.display());
+    }
+    let my_uid = unsafe { libc::geteuid() };
+    if st.st_uid != my_uid {
+        bail!(
+            "'{}' pertence a outro usuário (uid {}; esperado {my_uid})",
+            dir.display(),
+            st.st_uid
+        );
+    }
+    if ensure_mode_0700 && unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("falha ao ajustar permissões 0700 de '{}'", dir.display()));
+    }
+    Ok(owned)
+}
+
+fn ensure_private_subdir_nofollow(parent: &Path, name: &str, force_0700: bool) -> Result<PathBuf> {
+    let dir = parent.join(name);
+    let mut created = false;
+    match fs::symlink_metadata(&dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("'{}' é um link simbólico e foi recusado", dir.display());
+            }
+            if !meta.file_type().is_dir() {
+                bail!("'{}' já existe e não é um diretório", dir.display());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(&dir)
+                .with_context(|| format!("falha ao criar diretório {}", dir.display()))?;
+            created = true;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("falha ao verificar {}", dir.display()));
+        }
+    }
+    let _owned = open_private_dir_nofollow(&dir, force_0700 || created)?;
+    Ok(dir)
+}
+
+fn ensure_private_agy_login_dir(state_dir: &Path) -> Result<PathBuf> {
     match fs::symlink_metadata(state_dir) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -2055,81 +2153,28 @@ fn ensure_private_agy_runtime_dir(state_dir: &Path) -> Result<PathBuf> {
         }
     }
     let loops_dir = ensure_dir_no_symlink(state_dir, &["loops"])?;
-    let runtime_dir = loops_dir.join("agy-runtime");
-    match fs::symlink_metadata(&runtime_dir) {
-        Ok(meta) => {
-            if meta.file_type().is_symlink() {
-                bail!(
-                    "'{}' é um link simbólico e foi recusado",
-                    runtime_dir.display()
-                );
-            }
-            if !meta.file_type().is_dir() {
-                bail!("'{}' já existe e não é um diretório", runtime_dir.display());
-            }
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let mut builder = fs::DirBuilder::new();
-            builder.mode(0o700);
-            builder
-                .create(&runtime_dir)
-                .with_context(|| format!("falha ao criar diretório {}", runtime_dir.display()))?;
-        }
-        Err(err) => {
-            return Err(err)
-                .with_context(|| format!("falha ao verificar {}", runtime_dir.display()));
-        }
-    }
-    let raw = runtime_dir.to_str().context("caminho não UTF-8")?;
-    let c_path = CString::new(raw)?;
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ELOOP) {
+    let login_dir = ensure_private_subdir_nofollow(&loops_dir, "agy-login", true)?;
+    let token_path = login_dir.join(AGY_TOKEN_FILE);
+    if let Ok(meta) = fs::symlink_metadata(&token_path) {
+        if meta.file_type().is_symlink() {
             bail!(
                 "'{}' é um link simbólico e foi recusado",
-                runtime_dir.display()
+                token_path.display()
             );
         }
-        return Err(err).with_context(|| format!("falha ao abrir '{}'", runtime_dir.display()));
+        if !meta.file_type().is_file() {
+            bail!(
+                "'{}' já existe e não é um arquivo regular",
+                token_path.display()
+            );
+        }
     }
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("falha ao inspecionar '{}'", runtime_dir.display()));
-    }
-    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-        bail!("'{}' não é um diretório", runtime_dir.display());
-    }
-    let my_uid = unsafe { libc::geteuid() };
-    if st.st_uid != my_uid {
-        bail!(
-            "'{}' pertence a outro usuário (uid {}; esperado {my_uid})",
-            runtime_dir.display(),
-            st.st_uid
-        );
-    }
-    if unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) } < 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "falha ao ajustar permissões 0700 de '{}'",
-                runtime_dir.display()
-            )
-        });
-    }
-    if fs::symlink_metadata(runtime_dir.join("bus")).is_ok() {
-        bail!(
-            "'{}' contém socket/entrada 'bus' inesperada",
-            runtime_dir.display()
-        );
-    }
-    Ok(runtime_dir)
+    Ok(login_dir)
+}
+
+fn ensure_agy_target_dir(home_dir: &Path) -> Result<PathBuf> {
+    let gemini_dir = ensure_private_subdir_nofollow(home_dir, ".gemini", false)?;
+    ensure_private_subdir_nofollow(&gemini_dir, "antigravity-cli", false)
 }
 
 fn check_project_models_warnings(
@@ -2239,7 +2284,7 @@ fn cmd_check(
     }
 
     ensure_sandbox_prereqs(&cfg)?;
-    let sandbox = build_sandbox(&cfg);
+    let sandbox = build_sandbox(&cfg, paths);
     let check_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
         ".check-{}-{}",
         std::process::id(),
@@ -2278,6 +2323,7 @@ fn cmd_check(
         &providers,
         &free_outcomes,
         &paths.home_dir,
+        sandbox.agy_state_dir(),
         opencode_key.as_deref(),
         sandbox.kind(),
         evidence.salt(),
@@ -2287,6 +2333,7 @@ fn cmd_check(
         &targets,
         &free_outcomes,
         &paths.home_dir,
+        sandbox.agy_state_dir(),
         opencode_key.as_deref(),
     );
     let mut account_errs = Vec::new();
@@ -2391,6 +2438,7 @@ fn cmd_check(
                     &records,
                     &free_outcomes,
                     &paths.home_dir,
+                    sandbox.agy_state_dir(),
                     opencode_key.as_deref(),
                     sandbox.kind(),
                     unix_now_ms(),
@@ -2572,7 +2620,7 @@ async fn cmd_run(
 
     // 1. Sandbox check
     ensure_sandbox_prereqs(&cfg)?;
-    let sandbox = build_sandbox(&cfg);
+    let sandbox = build_sandbox(&cfg, paths);
     let sandbox_probe_dir = TempDirGuard::create(
         paths
             .state_dir
@@ -2670,6 +2718,7 @@ async fn cmd_run(
         &providers,
         &free_outcomes,
         &paths.home_dir,
+        sandbox.agy_state_dir(),
         opencode_key.as_deref(),
         sandbox.kind(),
         evidence.salt(),
@@ -2679,6 +2728,7 @@ async fn cmd_run(
         &targets,
         &free_outcomes,
         &paths.home_dir,
+        sandbox.agy_state_dir(),
         opencode_key.as_deref(),
     );
     let planned = plan_preflight(
@@ -2730,6 +2780,7 @@ async fn cmd_run(
                     &records,
                     &free_outcomes,
                     &paths.home_dir,
+                    sandbox.agy_state_dir(),
                     opencode_key.as_deref(),
                     sandbox.kind(),
                     unix_now_ms(),
@@ -2753,6 +2804,7 @@ async fn cmd_run(
         &providers,
         &free_outcomes,
         &paths.home_dir,
+        sandbox.agy_state_dir(),
         opencode_key.as_deref(),
         sandbox.kind(),
         &frozen_salt,
@@ -2997,12 +3049,15 @@ async fn run_frozen_engine_with_cancel(
     let secrets_for_thread = extra_secrets.clone();
     let orch_db_path = paths.orch_db_file();
     let ev_path = evidence_store_path(paths);
+    let state_dir = paths.state_dir.clone();
     let final_state = tokio::task::spawn_blocking(move || -> RunState {
         let sandbox: Box<dyn Sandbox + Sync> = match &frozen.sandbox {
             SandboxConfig::Inherited => Box::new(InheritedSandbox::new(frozen.env_pass.clone())),
-            SandboxConfig::Bwrap { home_ro } => {
-                Box::new(BwrapSandbox::new(home_ro.clone(), frozen.env_pass.clone()))
-            }
+            SandboxConfig::Bwrap { home_ro } => Box::new(BwrapSandbox::new(
+                home_ro.clone(),
+                frozen.env_pass.clone(),
+                state_dir,
+            )),
         };
         let clock = SystemClock::new();
         let runner = ProcessStageRunner::new(sandbox.as_ref(), &clock)
@@ -3712,6 +3767,7 @@ mod tests {
                 &outcomes,
                 tmp.path(),
                 None,
+                None,
                 "bwrap",
                 &[7u8; 32],
                 None,
@@ -3731,5 +3787,115 @@ mod tests {
         let a = identity(logged_in(Some("2026-12-09T01:02:03.456Z"))).unwrap();
         let b = identity(logged_in(Some("2026-12-09T01:02:03.457Z"))).unwrap();
         assert_ne!(a.account, b.account);
+
+        // Some logins report no expiry either: the credential file then stands for the account,
+        // by its metadata only, and a rewritten file is another account.
+        let cred = tmp.path().join(".claude/.credentials.json");
+        fs::create_dir_all(cred.parent().unwrap()).unwrap();
+        fs::write(&cred, "{}").unwrap();
+        let first = identity(logged_in(None)).unwrap();
+        assert_eq!(identity(logged_in(None)).unwrap(), first);
+        assert_ne!(first.account, a.account);
+        let swapped = cred.with_extension("new");
+        fs::write(&swapped, "{}").unwrap();
+        fs::rename(&swapped, &cred).unwrap();
+        assert_ne!(identity(logged_in(None)).unwrap().account, first.account);
+        fs::write(&cred, "").unwrap();
+        assert!(identity(logged_in(None)).is_none());
+        assert!(identity(None).is_none());
+    }
+
+    #[test]
+    fn the_user_agy_directory_keeps_its_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path().join(".gemini/antigravity-cli");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(ensure_agy_target_dir(tmp.path()).unwrap(), dir);
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[test]
+    fn agy_evidence_identity_tracks_chosen_credential_location() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state).unwrap();
+
+        let id_for = |agy_state: Option<&Path>| {
+            build_cli_identity_for_provider(
+                Provider::Agy,
+                &BTreeMap::new(),
+                &home,
+                agy_state,
+                None,
+                "bwrap",
+                &[9u8; 32],
+                None,
+            )
+            .unwrap()
+        };
+
+        let id_none = id_for(Some(&state));
+
+        let def_tok = home.join(crate::loops::sandbox::AGY_TOKEN_REL);
+        fs::create_dir_all(def_tok.parent().unwrap()).unwrap();
+        fs::write(&def_tok, "default-tok").unwrap();
+        let id_default = id_for(Some(&state));
+        assert_ne!(id_none.account, id_default.account);
+
+        let loop_tok = state
+            .join(crate::loops::sandbox::AGY_LOGIN_DIR_REL)
+            .join(crate::loops::sandbox::AGY_TOKEN_FILE);
+        fs::create_dir_all(loop_tok.parent().unwrap()).unwrap();
+        fs::write(&loop_tok, "loop-tok").unwrap();
+        let id_loop = id_for(Some(&state));
+        assert_ne!(id_default.account, id_loop.account);
+        assert_ne!(id_none.account, id_loop.account);
+
+        // Inherited (state_dir = None) ignores the loop login and still uses the default file.
+        let id_inherited = id_for(None);
+        assert_eq!(id_inherited.account, id_default.account);
+
+        // Removing the default file does not change loop identity, but makes inherited absent.
+        fs::remove_file(&def_tok).unwrap();
+        assert_eq!(id_for(Some(&state)).account, id_loop.account);
+        assert_eq!(id_for(None).account, id_none.account);
+    }
+
+    #[test]
+    fn agy_free_check_respects_state_dir_for_loop_login() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let state = tmp.path().join("state");
+        let loop_tok = state
+            .join(crate::loops::sandbox::AGY_LOGIN_DIR_REL)
+            .join(crate::loops::sandbox::AGY_TOKEN_FILE);
+        fs::create_dir_all(loop_tok.parent().unwrap()).unwrap();
+        fs::write(&loop_tok, "loop-tok").unwrap();
+
+        let targets = vec![ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Agy,
+                model: None,
+            },
+            stage_ids: vec!["s1".to_string()],
+        }];
+        let with_state =
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, Some(&state), None);
+        assert!(with_state[0].account_ok.is_ok());
+
+        let without_state =
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None);
+        assert_eq!(
+            without_state[0]
+                .account_ok
+                .as_ref()
+                .err()
+                .map(String::as_str),
+            Some(AGY_ABSENT_REASON)
+        );
     }
 }

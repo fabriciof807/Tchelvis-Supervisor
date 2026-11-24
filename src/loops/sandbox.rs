@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io::Write;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -11,13 +12,26 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BASE_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TERM"];
+pub const AGY_TOKEN_REL: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+pub const AGY_LOGIN_DIR_REL: &str = "loops/agy-login";
+pub const AGY_TOKEN_FILE: &str = "antigravity-oauth-token";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgyCredentialSource {
+    LoopLogin,
+    DefaultFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgyCredential {
+    pub source: AgyCredentialSource,
+    pub path: PathBuf,
+}
+
 /// The one file each CLI needs from the home directory, always read-only. Measured on 2026-11-23.
 const ADAPTER_CREDENTIALS: &[(&str, Option<&str>)] = &[
     ("claude", Some(".claude/.credentials.json")),
-    (
-        "agy",
-        Some(".gemini/antigravity-cli/antigravity-oauth-token"),
-    ),
+    ("agy", Some(AGY_TOKEN_REL)),
     ("opencode", None),
 ];
 const TCHELVIS_HOME_DIRS: &[&str] = &[
@@ -35,6 +49,9 @@ pub struct SandboxedCommand {
 
 pub trait Sandbox {
     fn kind(&self) -> &'static str;
+    fn agy_state_dir(&self) -> Option<&Path> {
+        None
+    }
     fn check(&self, workspace: &Path) -> Result<Vec<String>>;
     fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand>;
     fn wrap_with_extra_env(
@@ -47,6 +64,101 @@ pub trait Sandbox {
         apply_extra_env(&mut cmd.env, extra_env);
         Ok(cmd)
     }
+}
+
+fn is_symlink_component(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+fn open_dir_nofollow_segments(root: &Path, segments: &[&str]) -> Option<OwnedFd> {
+    let root_raw = root.to_str()?;
+    let root_c = CString::new(root_raw).ok()?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return None;
+    }
+    let mut cur = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for seg in segments {
+        let c_seg = CString::new(*seg).ok()?;
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c_seg.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return None;
+        }
+        cur = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Some(cur)
+}
+
+fn dir_owned_by_current_user(dir_fd: &OwnedFd) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut st) } < 0 {
+        return false;
+    }
+    (st.st_mode & libc::S_IFMT) == libc::S_IFDIR && st.st_uid == unsafe { libc::geteuid() }
+}
+
+fn regular_non_empty_file_nofollow_owned(dir_fd: BorrowedFd<'_>, name: &str) -> bool {
+    let Ok(c_name) = CString::new(name) else {
+        return false;
+    };
+    let fd = unsafe {
+        libc::openat(
+            dir_fd.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
+        return false;
+    }
+    (st.st_mode & libc::S_IFMT) == libc::S_IFREG
+        && st.st_size > 0
+        && st.st_uid == unsafe { libc::geteuid() }
+}
+
+/// Single credential resolver for `agy`: loop login under `<state_dir>/loops/agy-login/` first
+/// (when `state_dir` is provided, i.e. bwrap), then `<home_dir>/.gemini/antigravity-cli/`.
+pub fn resolve_agy_credential(home_dir: &Path, state_dir: Option<&Path>) -> Option<AgyCredential> {
+    if let Some(state_dir) = state_dir {
+        if !is_symlink_component(state_dir) {
+            if let Some(login_dir_fd) =
+                open_dir_nofollow_segments(state_dir, &["loops", "agy-login"])
+            {
+                if dir_owned_by_current_user(&login_dir_fd)
+                    && regular_non_empty_file_nofollow_owned(login_dir_fd.as_fd(), AGY_TOKEN_FILE)
+                {
+                    return Some(AgyCredential {
+                        source: AgyCredentialSource::LoopLogin,
+                        path: state_dir.join(AGY_LOGIN_DIR_REL).join(AGY_TOKEN_FILE),
+                    });
+                }
+            }
+        }
+    }
+
+    let path = home_dir.join(AGY_TOKEN_REL);
+    fs::metadata(&path)
+        .is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        .then_some(AgyCredential {
+            source: AgyCredentialSource::DefaultFile,
+            path,
+        })
 }
 
 fn apply_extra_env(env: &mut Vec<(OsString, OsString)>, extra_env: &[(&str, &str)]) {
@@ -339,11 +451,16 @@ impl Sandbox for InheritedSandbox {
 pub struct BwrapSandbox {
     pub home_ro: Vec<String>,
     pub env_pass: Vec<String>,
+    pub state_dir: PathBuf,
 }
 
 impl BwrapSandbox {
-    pub fn new(home_ro: Vec<String>, env_pass: Vec<String>) -> Self {
-        Self { home_ro, env_pass }
+    pub fn new(home_ro: Vec<String>, env_pass: Vec<String>, state_dir: PathBuf) -> Self {
+        Self {
+            home_ro,
+            env_pass,
+            state_dir,
+        }
     }
 
     fn is_under_tchelvis_home(home: &Path, path: &Path) -> bool {
@@ -365,6 +482,7 @@ impl BwrapSandbox {
         program: &std::ffi::OsStr,
         home: &Path,
         path_var: Option<&std::ffi::OsStr>,
+        state_dir: &Path,
     ) -> Vec<(PathBuf, PathBuf)> {
         let Some((name, credential)) = ADAPTER_CREDENTIALS
             .iter()
@@ -395,7 +513,11 @@ impl BwrapSandbox {
                 binds.push((real, bin));
             }
         }
-        if let Some(rel) = credential {
+        if *name == "agy" {
+            if let Some(cred) = resolve_agy_credential(home, Some(state_dir)) {
+                binds.push((cred.path, home.join(AGY_TOKEN_REL)));
+            }
+        } else if let Some(rel) = credential {
             let file = home.join(rel);
             if file.is_file() {
                 binds.push((file.clone(), file));
@@ -435,7 +557,12 @@ impl BwrapSandbox {
                 binds.push((full.clone(), full));
             }
         }
-        binds.extend(Self::adapter_binds(&argv[0], &home, path_var));
+        binds.extend(Self::adapter_binds(
+            &argv[0],
+            &home,
+            path_var,
+            &self.state_dir,
+        ));
 
         let mut wrapped = vec![
             OsString::from("bwrap"),
@@ -655,6 +782,10 @@ impl Sandbox for BwrapSandbox {
         "bwrap"
     }
 
+    fn agy_state_dir(&self) -> Option<&Path> {
+        Some(&self.state_dir)
+    }
+
     fn check(&self, workspace: &Path) -> Result<Vec<String>> {
         let env_pairs = current_env_pairs();
         let clean_env = build_clean_env(&self.env_pass, &env_pairs);
@@ -727,6 +858,7 @@ mod tests {
         let sb = BwrapSandbox::new(
             vec![".cargo".into(), ".missing_ro".into()],
             vec!["CUSTOM_KEY".into()],
+            tmp.path().join("state"),
         );
         let cmd = sb
             .wrap_with_env(
@@ -837,7 +969,11 @@ mod tests {
                 .collect::<BTreeSet<_>>()
         );
 
-        let bwrap = BwrapSandbox::new(vec![], vec!["ALLOWED_API_KEY".into()]);
+        let bwrap = BwrapSandbox::new(
+            vec![],
+            vec!["ALLOWED_API_KEY".into()],
+            tmp.path().join("state"),
+        );
         let cmd_bw = bwrap
             .wrap_with_env(&[OsString::from("/bin/true")], &ws, &env_map)
             .unwrap();
@@ -878,7 +1014,7 @@ mod tests {
             ("TERM", "xterm"),
         ];
 
-        let sb = BwrapSandbox::new(vec![], vec![]);
+        let sb = BwrapSandbox::new(vec![], vec![], tmp.path().join("state"));
         let exposures = sb.check_with_env(&ws, &env_map).unwrap();
         assert!(exposures
             .iter()
@@ -988,7 +1124,7 @@ mod tests {
              echo x >> .claude/.credentials.json\necho x >> .local/bin/claude\nexit 0\n",
         );
         let path_var = format!("{}:/usr/bin:/bin", bin.display());
-        let cmd = BwrapSandbox::new(vec![], vec![])
+        let cmd = BwrapSandbox::new(vec![], vec![], tmp.path().join("state"))
             .wrap_with_env(
                 &[OsString::from("claude")],
                 &ws,
@@ -1026,7 +1162,7 @@ mod tests {
 
     #[test]
     fn wrap_with_extra_env_passes_key_only_through_process_env_not_bwrap_argv() {
-        let sb = BwrapSandbox::new(vec![], vec![]);
+        let sb = BwrapSandbox::new(vec![], vec![], PathBuf::from("/tmp/state"));
         let cmd = sb
             .wrap_with_extra_env(
                 &[OsString::from("opencode"), OsString::from("run")],
@@ -1082,6 +1218,7 @@ mod tests {
     fn a_cli_next_to_the_tchelvis_directories_exposes_only_itself() {
         let tmp = tempfile::TempDir::new().unwrap();
         let home = tmp.path().canonicalize().unwrap();
+        let state_dir = tmp.path().join("state");
         let bin = home.join(".local/bin");
         fs::create_dir_all(&bin).unwrap();
         for parent in [".local/share", ".local/state", ".config", ".local"] {
@@ -1095,6 +1232,7 @@ mod tests {
                 std::ffi::OsStr::new("claude"),
                 &home,
                 Some(bin.as_os_str()),
+                &state_dir,
             );
             assert_eq!(
                 binds,
@@ -1102,5 +1240,240 @@ mod tests {
                 "{parent}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_agy_credential_enforces_priority_empty_symlinks_and_inherited() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let state = home.join(".local/state/tchelvis");
+        let loop_dir = state.join(AGY_LOGIN_DIR_REL);
+        let loop_tok = loop_dir.join(AGY_TOKEN_FILE);
+        let default_dir = home.join(".gemini/antigravity-cli");
+        let default_tok = default_dir.join(AGY_TOKEN_FILE);
+
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), None);
+
+        // Only default present -> DefaultFile
+        fs::create_dir_all(&default_dir).unwrap();
+        fs::write(&default_tok, "default-token\n").unwrap();
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::DefaultFile,
+                path: default_tok.clone(),
+            })
+        );
+
+        // Both present -> LoopLogin wins in bwrap (Some(state)), DefaultFile in inherited (None)
+        fs::create_dir_all(&loop_dir).unwrap();
+        fs::write(&loop_tok, "loop-token\n").unwrap();
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::LoopLogin,
+                path: loop_tok.clone(),
+            })
+        );
+        assert_eq!(
+            resolve_agy_credential(&home, None),
+            Some(AgyCredential {
+                source: AgyCredentialSource::DefaultFile,
+                path: default_tok.clone(),
+            })
+        );
+
+        // Empty loop token falls back to default; empty default with no loop -> None
+        fs::write(&loop_tok, "").unwrap();
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::DefaultFile,
+                path: default_tok.clone(),
+            })
+        );
+        fs::write(&default_tok, "").unwrap();
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), None);
+        assert_eq!(resolve_agy_credential(&home, None), None);
+
+        // Restoring default and removing loop -> DefaultFile; symlinked loop token is ignored
+        fs::write(&default_tok, "default-token\n").unwrap();
+        let decoy_file = tmp.path().join("decoy-token");
+        fs::write(&decoy_file, "decoy\n").unwrap();
+        fs::remove_file(&loop_tok).unwrap();
+        std::os::unix::fs::symlink(&decoy_file, &loop_tok).unwrap();
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::DefaultFile,
+                path: default_tok.clone(),
+            })
+        );
+
+        // Symlinked agy-login dir is ignored
+        fs::remove_dir_all(&loop_dir).unwrap();
+        let decoy_dir = tmp.path().join("decoy-dir");
+        fs::create_dir_all(&decoy_dir).unwrap();
+        fs::write(decoy_dir.join(AGY_TOKEN_FILE), "decoy\n").unwrap();
+        std::os::unix::fs::symlink(&decoy_dir, &loop_dir).unwrap();
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::DefaultFile,
+                path: default_tok.clone(),
+            })
+        );
+
+        // Only loop login (no default) -> inherited ignores loop login
+        fs::remove_file(&loop_dir).unwrap();
+        fs::create_dir_all(&loop_dir).unwrap();
+        fs::write(&loop_tok, "loop-token\n").unwrap();
+        fs::remove_file(&default_tok).unwrap();
+        assert_eq!(resolve_agy_credential(&home, None), None);
+        assert_eq!(
+            resolve_agy_credential(&home, Some(&state)),
+            Some(AgyCredential {
+                source: AgyCredentialSource::LoopLogin,
+                path: loop_tok.clone(),
+            })
+        );
+
+        // The default file is the user's own layout: links in it are followed, as always.
+        let default = Some(AgyCredential {
+            source: AgyCredentialSource::DefaultFile,
+            path: default_tok.clone(),
+        });
+        fs::remove_dir_all(&loop_dir).unwrap();
+        std::os::unix::fs::symlink(&decoy_file, &default_tok).unwrap();
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), default);
+        fs::remove_file(&default_tok).unwrap();
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), None);
+
+        fs::remove_dir_all(&default_dir).unwrap();
+        std::os::unix::fs::symlink(&decoy_dir, &default_dir).unwrap();
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), default);
+
+        fs::remove_dir_all(home.join(".gemini")).unwrap();
+        let decoy_gemini = tmp.path().join("decoy-gemini");
+        fs::create_dir_all(decoy_gemini.join("antigravity-cli")).unwrap();
+        fs::write(
+            decoy_gemini.join("antigravity-cli").join(AGY_TOKEN_FILE),
+            "decoy\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&decoy_gemini, home.join(".gemini")).unwrap();
+        assert_eq!(resolve_agy_credential(&home, Some(&state)), default);
+    }
+
+    #[test]
+    fn bwrap_mounts_only_chosen_agy_credential_readonly_and_hides_state_and_siblings() {
+        if !bwrap_available() {
+            println!("SKIPPED: bwrap unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (home, ws) = (tmp.path().join("home"), tmp.path().join("ws"));
+        let state_dir = home.join(".local/state/tchelvis");
+        let loop_dir = state_dir.join(AGY_LOGIN_DIR_REL);
+        let loop_tok = loop_dir.join(AGY_TOKEN_FILE);
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&loop_dir).unwrap();
+        fs::create_dir_all(loop_dir.join("logs")).unwrap();
+        fs::create_dir_all(loop_dir.join("conversations")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        // Populate loop login + sibling state/logs + default file (different content)
+        fs::write(&loop_tok, "loop-secret-token\n").unwrap();
+        fs::write(loop_dir.join("logs/agy.log"), "private-log").unwrap();
+        fs::write(loop_dir.join("conversations/c1.json"), "private-conv").unwrap();
+        fs::write(state_dir.join("other-state.txt"), "tchelvis-state").unwrap();
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::write(home.join(AGY_TOKEN_REL), "default-token\n").unwrap();
+
+        crate::test_support::write_executable(
+            bin.join("agy"),
+            "#!/bin/sh\ncd \"$HOME\" && find . -type f | sort\n\
+             echo TOKEN=$(cat .gemini/antigravity-cli/antigravity-oauth-token)\n\
+             if echo tampered >> .gemini/antigravity-cli/antigravity-oauth-token 2>/dev/null; then echo WROTE; fi\n\
+             exit 0\n",
+        );
+
+        let path_var = format!("{}:/usr/bin:/bin", bin.display());
+        let cmd = BwrapSandbox::new(vec![], vec![], state_dir.clone())
+            .wrap_with_env(
+                &[OsString::from("agy")],
+                &ws,
+                &[
+                    ("PATH", path_var.as_str()),
+                    ("HOME", home.to_str().unwrap()),
+                ],
+            )
+            .unwrap();
+        let mut lines = Vec::new();
+        let outcome = run_process(
+            cmd,
+            b"",
+            &tmp.path().join("agy-bwrap.log"),
+            Limits {
+                timeout: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |l| lines.push(l.to_string()),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert_eq!(
+            lines,
+            [
+                "./.gemini/antigravity-cli/antigravity-oauth-token",
+                "./.local/bin/agy",
+                "TOKEN=loop-secret-token",
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(&loop_tok).unwrap(),
+            "loop-secret-token\n"
+        );
+
+        // Even after deleting ~/.gemini on host, bwrap still mounts loop-token at the exact destination
+        fs::remove_dir_all(home.join(".gemini")).unwrap();
+        let cmd2 = BwrapSandbox::new(vec![], vec![], state_dir)
+            .wrap_with_env(
+                &[OsString::from("agy")],
+                &ws,
+                &[
+                    ("PATH", path_var.as_str()),
+                    ("HOME", home.to_str().unwrap()),
+                ],
+            )
+            .unwrap();
+        let mut lines2 = Vec::new();
+        let outcome2 = run_process(
+            cmd2,
+            b"",
+            &tmp.path().join("agy-bwrap2.log"),
+            Limits {
+                timeout: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |l| lines2.push(l.to_string()),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(outcome2, Outcome::Exited(0));
+        assert_eq!(
+            lines2,
+            [
+                "./.gemini/antigravity-cli/antigravity-oauth-token",
+                "./.local/bin/agy",
+                "TOKEN=loop-secret-token",
+            ]
+        );
     }
 }

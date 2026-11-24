@@ -1,4 +1,5 @@
 use crate::loops::models::ModelChoice;
+use crate::loops::sandbox::AgyCredentialSource;
 use crate::loops::workflow::Provider;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ pub struct CliIdentity {
     pub sandbox: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum AccountIdentityInput<'a> {
     ClaudeKnown {
         org_id: Option<&'a str>,
@@ -35,7 +36,9 @@ pub enum AccountIdentityInput<'a> {
         login_expires_at: Option<&'a str>,
     },
     OpencodeKey(Option<&'a str>),
-    AgyTokenPresent(bool),
+    AgyCredential(Option<AgyCredentialSource>),
+    /// Metadata of the credential file, whose content is never read.
+    ClaudeCredentialFile(&'a fs::Metadata),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -579,6 +582,21 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
             }
             format!("claude:{}", hex_encode(&hmac_sha256(salt, &msg)))
         }
+        AccountIdentityInput::ClaudeCredentialFile(meta) => {
+            let mut msg = b"claude-file\0".to_vec();
+            for part in [meta.dev(), meta.ino(), meta.len()] {
+                msg.extend_from_slice(&part.to_le_bytes());
+            }
+            for part in [
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            ] {
+                msg.extend_from_slice(&part.to_le_bytes());
+            }
+            format!("claude:{}", hex_encode(&hmac_sha256(salt, &msg)))
+        }
         AccountIdentityInput::OpencodeKey(Some(key)) => {
             let mut msg = Vec::with_capacity(4 + key.len());
             msg.extend_from_slice(b"key\0");
@@ -591,8 +609,13 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
                 hex_encode(&hmac_sha256(salt, b"opencode-nokey"))
             )
         }
-        AccountIdentityInput::AgyTokenPresent(true) => "present".to_string(),
-        AccountIdentityInput::AgyTokenPresent(false) => "absent".to_string(),
+        AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::LoopLogin)) => {
+            "loop".to_string()
+        }
+        AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::DefaultFile)) => {
+            "default".to_string()
+        }
+        AccountIdentityInput::AgyCredential(None) => "absent".to_string(),
     }
 }
 
@@ -690,11 +713,18 @@ mod tests {
         assert_ne!(k1, k_none);
         assert!(!k1.contains(oc_key));
 
-        let agy_yes =
-            compute_account_identity(s1.salt(), AccountIdentityInput::AgyTokenPresent(true));
-        let agy_no =
-            compute_account_identity(s1.salt(), AccountIdentityInput::AgyTokenPresent(false));
-        assert_ne!(agy_yes, agy_no);
+        let agy_loop = compute_account_identity(
+            s1.salt(),
+            AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::LoopLogin)),
+        );
+        let agy_default = compute_account_identity(
+            s1.salt(),
+            AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::DefaultFile)),
+        );
+        let agy_no = compute_account_identity(s1.salt(), AccountIdentityInput::AgyCredential(None));
+        assert_ne!(agy_loop, agy_default);
+        assert_ne!(agy_loop, agy_no);
+        assert_ne!(agy_default, agy_no);
 
         s1.record(
             &ModelChoice {

@@ -2057,15 +2057,22 @@ fn terminal_output_never_carries_escape_sequences() {
 #[test]
 fn auth_login_opens_the_official_command_and_nothing_else() {
     let h = LoopHarness::new();
-    let expected_runtime_arg = format!(
-        "XDG_RUNTIME_DIR={}",
-        h.state_dir.join("loops/agy-runtime").display()
-    );
+    common::write_executable(h.bin_dir.join("bwrap"), "#!/bin/sh\nexit 0\n");
+    let loop_login_dir = h.state_dir.join("loops/agy-login").display().to_string();
+    let target_dir = h.home.join(".gemini/antigravity-cli").display().to_string();
+    let bwrap = h.bin_dir.join("bwrap").display().to_string();
     let agy_expected: Vec<&str> = vec![
+        bwrap.as_str(),
+        "--dev-bind",
+        "/",
+        "/",
+        "--bind",
+        loop_login_dir.as_str(),
+        target_dir.as_str(),
+        "--die-with-parent",
+        "--",
         "/usr/bin/env",
-        "-u",
-        "DBUS_SESSION_BUS_ADDRESS",
-        expected_runtime_arg.as_str(),
+        "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1",
         "agy",
     ];
     for (cli, expected) in [
@@ -2671,11 +2678,8 @@ fn agy_absent_message_mentions_keyring_vs_file_and_matches_between_auth_and_pref
         .find(|l| l.starts_with("agy:"))
         .expect("missing agy line");
     assert!(agy_line.contains("ausente"), "{agy_line}");
+    assert!(agy_line.contains("login próprio"), "{agy_line}");
     assert!(agy_line.contains("chaveiro"), "{agy_line}");
-    assert!(
-        agy_line.contains(".gemini/antigravity-cli/antigravity-oauth-token"),
-        "{agy_line}"
-    );
     assert!(
         agy_line.contains("tchelvis loop auth login agy"),
         "{agy_line}"
@@ -2702,6 +2706,25 @@ fn agy_absent_message_mentions_keyring_vs_file_and_matches_between_auth_and_pref
 #[test]
 fn auth_login_agy_sets_private_0700_runtime_dir_rejects_symlink_and_prints_instructions() {
     let h = LoopHarness::new();
+
+    // Missing bwrap must error and never launch `hc run`.
+    let no_bwrap = h
+        .cmd()
+        .env("PATH", h.path_without_bwrap())
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_ne!(no_bwrap.status.code(), Some(0));
+    let no_bwrap_err = String::from_utf8_lossy(&no_bwrap.stderr);
+    assert!(no_bwrap_err.contains("bubblewrap"), "{no_bwrap_err}");
+    assert!(
+        !h.trace_dir.join("hc_run_calls").exists(),
+        "missing bwrap must not invoke hc run"
+    );
+
+    common::write_executable(h.bin_dir.join("bwrap"), "#!/bin/sh\nexit 0\n");
     let out = h
         .cmd()
         .env("HC_TERMINAL_ID", "t1")
@@ -2725,25 +2748,96 @@ fn auth_login_agy_sets_private_0700_runtime_dir_rejects_symlink_and_prints_instr
     assert!(stdout.contains("URL"), "{stdout}");
     assert!(stdout.contains("hc attach t-loop-1"), "{stdout}");
 
-    let runtime_dir = h.state_dir.join("loops/agy-runtime");
-    let meta = fs::symlink_metadata(&runtime_dir).unwrap();
+    let login_dir = h.state_dir.join("loops/agy-login");
+    let meta = fs::symlink_metadata(&login_dir).unwrap();
     assert!(meta.file_type().is_dir());
     assert_eq!(meta.permissions().mode() & 0o777, 0o700);
-    assert!(!runtime_dir.join("bus").exists());
+    assert!(!h.state_dir.join("loops/agy-runtime").exists());
 
-    // Symlink at agy-runtime must be refused cleanly without launching hc
-    fs::remove_dir(&runtime_dir).unwrap();
-    let decoy = h.tmp.path().join("decoy-runtime");
+    let gemini_dir = h.home.join(".gemini");
+    let target_dir = gemini_dir.join("antigravity-cli");
+    assert_eq!(
+        fs::symlink_metadata(&gemini_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::symlink_metadata(&target_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    // D-Bus / XDG_RUNTIME_DIR must not be stripped in argv passed to `hc run`.
+    let argv: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(h.trace_dir.join("hc_run_argv.json")).unwrap())
+            .unwrap();
+    assert!(!argv.iter().any(|a| a == "DBUS_SESSION_BUS_ADDRESS"));
+    assert!(!argv.iter().any(|a| a.starts_with("XDG_RUNTIME_DIR=")));
+
+    // 1) Symlink at agy-login/antigravity-oauth-token must be refused without launching hc.
+    let _ = fs::remove_file(h.trace_dir.join("hc_run_calls"));
+    let decoy = h.tmp.path().join("decoy-dir");
     fs::create_dir_all(&decoy).unwrap();
-    std::os::unix::fs::symlink(&decoy, &runtime_dir).unwrap();
-    let sym_out = h
+    let decoy_tok = decoy.join("tok");
+    fs::write(&decoy_tok, "tok\n").unwrap();
+    std::os::unix::fs::symlink(&decoy_tok, login_dir.join("antigravity-oauth-token")).unwrap();
+    let sym_tok = h
         .cmd()
         .env("HC_TERMINAL_ID", "t1")
         .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
         .args(["loop", "auth", "login", "agy"])
         .output()
         .unwrap();
-    assert_ne!(sym_out.status.code(), Some(0));
+    assert_ne!(sym_tok.status.code(), Some(0));
+    assert!(!h.trace_dir.join("hc_run_calls").exists());
+    fs::remove_file(login_dir.join("antigravity-oauth-token")).unwrap();
+
+    // 2) Symlink at agy-login must be refused without launching hc.
+    fs::remove_dir(&login_dir).unwrap();
+    std::os::unix::fs::symlink(&decoy, &login_dir).unwrap();
+    let sym_login = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_ne!(sym_login.status.code(), Some(0));
+    assert!(!h.trace_dir.join("hc_run_calls").exists());
+    fs::remove_file(&login_dir).unwrap();
+
+    // 3) Symlink at .gemini/antigravity-cli must be refused without launching hc.
+    fs::remove_dir(&target_dir).unwrap();
+    std::os::unix::fs::symlink(&decoy, &target_dir).unwrap();
+    let sym_target = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_ne!(sym_target.status.code(), Some(0));
+    assert!(!h.trace_dir.join("hc_run_calls").exists());
+    fs::remove_file(&target_dir).unwrap();
+
+    // 4) Symlink at .gemini must be refused without launching hc.
+    fs::remove_dir(&gemini_dir).unwrap();
+    std::os::unix::fs::symlink(&decoy, &gemini_dir).unwrap();
+    let sym_gemini = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_ne!(sym_gemini.status.code(), Some(0));
+    assert!(!h.trace_dir.join("hc_run_calls").exists());
 }
 
 #[test]
@@ -3129,4 +3223,476 @@ fn cleaned_run_commands_report_removed_records_and_preserve_unstarted_message() 
         .unwrap();
     let u_val: serde_json::Value = serde_json::from_slice(&st_u_json.stdout).unwrap();
     assert!(u_val.get("records_removed").is_none());
+}
+
+#[test]
+fn inherited_sandbox_ignores_agy_loop_login_and_empty_default() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    let claude_cred = h.home.join(".claude/.credentials.json");
+    fs::create_dir_all(claude_cred.parent().unwrap()).unwrap();
+    fs::write(&claude_cred, "{\"token\":\"dummy\"}\n").unwrap();
+
+    // Only loop login exists -> inherited sandbox must ignore it completely.
+    let loop_tok = h.state_dir.join("loops/agy-login/antigravity-oauth-token");
+    fs::create_dir_all(loop_tok.parent().unwrap()).unwrap();
+    fs::write(&loop_tok, "loop-only-token\n").unwrap();
+
+    let auth_out = h.cmd().args(["loop", "auth"]).output().unwrap();
+    assert_eq!(auth_out.status.code(), Some(0));
+    let auth_stdout = String::from_utf8_lossy(&auth_out.stdout);
+    let agy_line = auth_stdout
+        .lines()
+        .find(|l| l.starts_with("agy:"))
+        .expect("missing agy line");
+    assert!(agy_line.contains("ausente"), "{agy_line}");
+
+    let check_out = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(check_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&check_out.stderr).contains("login próprio"));
+
+    let run_out = h
+        .cmd()
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "inherited ignores loop",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(run_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&run_out.stderr).contains("login próprio"));
+
+    // Empty default file is also ignored.
+    let def_tok = h
+        .home
+        .join(".gemini/antigravity-cli/antigravity-oauth-token");
+    fs::create_dir_all(def_tok.parent().unwrap()).unwrap();
+    fs::write(&def_tok, "").unwrap();
+    let check_empty = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(check_empty.status.code(), Some(1));
+
+    // A link in the user's own layout is followed, as always.
+    fs::remove_file(&def_tok).unwrap();
+    let linked = h.tmp.path().join("linked-default-tok");
+    fs::write(&linked, "linked\n").unwrap();
+    std::os::unix::fs::symlink(&linked, &def_tok).unwrap();
+    let check_sym = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(check_sym.status.code(), Some(0));
+
+    // Real non-empty default file works in inherited mode.
+    fs::remove_file(&def_tok).unwrap();
+    fs::write(&def_tok, "real-default\n").unwrap();
+    let check_ok = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        check_ok.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&check_ok.stderr)
+    );
+}
+
+#[test]
+fn bwrap_agy_loop_login_mounts_only_chosen_token_ro_survives_default_delete_and_works_with_engine()
+{
+    let bwrap_works = Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "--", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bwrap_works {
+        eprintln!("SKIPPED: bwrap unavailable or unprivileged userns disabled");
+        return;
+    }
+
+    let h = LoopHarness::new();
+    let claude_cred = h.home.join(".claude/.credentials.json");
+    fs::create_dir_all(claude_cred.parent().unwrap()).unwrap();
+    fs::write(&claude_cred, "{\"token\":\"dummy\"}\n").unwrap();
+
+    let home_bin = h.home.join("fakebin");
+    fs::create_dir_all(&home_bin).unwrap();
+    for cli in ["claude", "opencode"] {
+        fs::copy(h.bin_dir.join(cli), home_bin.join(cli)).unwrap();
+        fs::set_permissions(home_bin.join(cli), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let inspect_agy = r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+
+argv = sys.argv[1:]
+home = pathlib.Path(os.environ.get("HOME", ""))
+cli_dir = home / ".gemini" / "antigravity-cli"
+tok = cli_dir / "antigravity-oauth-token"
+if argv[:1] == ["models"]:
+    if tok.is_file() and tok.stat().st_size > 0:
+        print("gemini-test\tGemini Test")
+    sys.exit(0)
+
+prompt = ""
+if "-p" in argv:
+    idx = argv.index("-p")
+    if idx + 1 < len(argv):
+        prompt = argv[idx + 1]
+
+if prompt.strip() == "Reply with exactly: OK":
+    print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "state": "DONE"}}))
+    print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "usage": {"input_tokens": 5, "output_tokens": 1, "cache_read_tokens": 0}}}))
+    sys.exit(0)
+
+tok_text = tok.read_text()
+ro_blocked = False
+try:
+    with open(tok, "a") as f:
+        f.write("mutated")
+except OSError:
+    ro_blocked = True
+
+info = {
+    "token": tok_text,
+    "read_only": ro_blocked,
+    "logs_hidden": not (cli_dir / "logs" / "secret.log").exists(),
+    "conv_hidden": not (cli_dir / "conversations" / "chat.json").exists(),
+    "state_hidden": (
+        not (home / ".local" / "state" / "tchelvis" / "loops" / "agy-login").exists()
+        and not (home / ".local" / "state" / "tchelvis" / "loops" / "state_secret.txt").exists()
+    ),
+}
+pathlib.Path.cwd().joinpath("agy_inspect.json").write_text(json.dumps(info))
+
+for line in prompt.splitlines():
+    if ".tchelvis-loop/out/" in line:
+        idx = line.find(".tchelvis-loop/out/") + len(".tchelvis-loop/out/")
+        name = line[idx:].strip().split()[0].rstrip(".,;:)`'\"")
+        if name and "/" not in name:
+            out_p = pathlib.Path.cwd() / ".tchelvis-loop" / "out" / name
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text("Reviewed OK\nVERDICT: PASS\n")
+
+print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "state": "DONE"}}))
+print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "usage": {"input_tokens": 50, "output_tokens": 20, "cache_read_tokens": 5}}}))
+"#;
+    common::write_executable(home_bin.join("agy"), inspect_agy);
+    let path_with_home_bin = format!("{}:{}", home_bin.display(), h.path_with_fake_bins());
+
+    h.write_config(
+        2,
+        true,
+        "bwrap",
+        "[defaults.worker]\nprovider = \"agy\"\nmodel = \"gemini-test\"\n\
+         [defaults.reviewer]\nprovider = \"claude\"\nmodel = \"sonnet\"\n",
+    );
+
+    // Populate both default and loop credentials + siblings in agy-login.
+    let def_tok = h
+        .home
+        .join(".gemini/antigravity-cli/antigravity-oauth-token");
+    fs::create_dir_all(def_tok.parent().unwrap()).unwrap();
+    fs::write(&def_tok, "default-token-123\n").unwrap();
+
+    let login_dir = h.state_dir.join("loops/agy-login");
+    let loop_tok = login_dir.join("antigravity-oauth-token");
+    fs::create_dir_all(login_dir.join("logs")).unwrap();
+    fs::create_dir_all(login_dir.join("conversations")).unwrap();
+    fs::write(&loop_tok, "loop-token-456\n").unwrap();
+    fs::write(login_dir.join("logs/secret.log"), "secret-log").unwrap();
+    fs::write(login_dir.join("conversations/chat.json"), "{}").unwrap();
+    fs::write(h.state_dir.join("loops/state_secret.txt"), "secret-state").unwrap();
+
+    // 1. Run with both present: loop login takes priority, mounted RO, siblings & state hidden.
+    let run1 = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "run", "fast-worker-reviewer", "priority and ro"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run1.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&run1.stdout),
+        String::from_utf8_lossy(&run1.stderr)
+    );
+    let id1 = extract_run_id(&run1.stdout);
+    let inspect1: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            h.state_dir
+                .join("loops")
+                .join(&id1)
+                .join("workspace/agy_inspect.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect1["token"], "loop-token-456\n");
+    assert_eq!(inspect1["read_only"], true);
+    assert_eq!(inspect1["logs_hidden"], true);
+    assert_eq!(inspect1["conv_hidden"], true);
+    assert_eq!(inspect1["state_hidden"], true);
+
+    // 2. Delete ~/.gemini completely after loop login: auth, check, run, and detached engine keep working.
+    fs::remove_dir_all(h.home.join(".gemini")).unwrap();
+
+    let auth_out = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "auth"])
+        .output()
+        .unwrap();
+    assert_eq!(auth_out.status.code(), Some(0));
+    let auth_stdout = String::from_utf8_lossy(&auth_out.stdout);
+    let agy_line = auth_stdout
+        .lines()
+        .find(|l| l.starts_with("agy:"))
+        .expect("missing agy line");
+    assert!(agy_line.contains("autenticado"), "{agy_line}");
+
+    let check_out = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        check_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&check_out.stderr)
+    );
+
+    let run2 = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "after default deleted",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run2.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&run2.stdout),
+        String::from_utf8_lossy(&run2.stderr)
+    );
+    let id2 = extract_run_id(&run2.stdout);
+    let inspect2: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            h.state_dir
+                .join("loops")
+                .join(&id2)
+                .join("workspace/agy_inspect.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect2["token"], "loop-token-456\n");
+
+    // 3. Detached `loop engine` also uses the same state_dir loop login.
+    let detach_out = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "detached engine",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        detach_out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&detach_out.stderr)
+    );
+    let detached_id = String::from_utf8_lossy(&detach_out.stdout)
+        .trim()
+        .to_string();
+    let engine_out = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "engine", &detached_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        engine_out.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&engine_out.stdout),
+        String::from_utf8_lossy(&engine_out.stderr)
+    );
+    let inspect_eng: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            h.state_dir
+                .join("loops")
+                .join(&detached_id)
+                .join("workspace/agy_inspect.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect_eng["token"], "loop-token-456\n");
+    assert_eq!(inspect_eng["read_only"], true);
+
+    // 4. Symlink loop token is ignored and falls back to default file if present.
+    fs::create_dir_all(def_tok.parent().unwrap()).unwrap();
+    fs::write(&def_tok, "default-fallback-789\n").unwrap();
+    fs::remove_file(&loop_tok).unwrap();
+    let decoy = h.tmp.path().join("decoy-loop-tok");
+    fs::write(&decoy, "should-not-read\n").unwrap();
+    std::os::unix::fs::symlink(&decoy, &loop_tok).unwrap();
+    let run3 = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "run", "fast-worker-reviewer", "fallback to default"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run3.status.code(),
+        Some(0),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&run3.stdout),
+        String::from_utf8_lossy(&run3.stderr)
+    );
+    let id3 = extract_run_id(&run3.stdout);
+    let inspect3: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            h.state_dir
+                .join("loops")
+                .join(&id3)
+                .join("workspace/agy_inspect.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(inspect3["token"], "default-fallback-789\n");
+}
+
+#[test]
+fn agy_evidence_identity_invalidates_when_switching_between_default_and_loop_login() {
+    let bwrap_works = Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "--", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bwrap_works {
+        eprintln!("SKIPPED: bwrap unavailable or unprivileged userns disabled");
+        return;
+    }
+
+    let h = LoopHarness::new();
+    let claude_cred = h.home.join(".claude/.credentials.json");
+    fs::create_dir_all(claude_cred.parent().unwrap()).unwrap();
+    fs::write(&claude_cred, "{\"token\":\"dummy\"}\n").unwrap();
+
+    let home_bin = h.home.join("fakebin");
+    fs::create_dir_all(&home_bin).unwrap();
+    for cli in ["claude", "agy", "opencode"] {
+        fs::copy(h.bin_dir.join(cli), home_bin.join(cli)).unwrap();
+        fs::set_permissions(home_bin.join(cli), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_with_home_bin = format!("{}:{}", home_bin.display(), h.path_with_fake_bins());
+
+    h.write_config(
+        2,
+        true,
+        "bwrap",
+        "[defaults.worker]\nprovider = \"claude\"\nmodel = \"sonnet\"\n\
+         [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"gemini-test\"\n",
+    );
+
+    // 1. Seed default credential and record evidence via `loop run`.
+    let def_tok = h
+        .home
+        .join(".gemini/antigravity-cli/antigravity-oauth-token");
+    fs::create_dir_all(def_tok.parent().unwrap()).unwrap();
+    fs::write(&def_tok, "default-tok\n").unwrap();
+
+    let run_default = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "run", "fast-worker-reviewer", "default ev"])
+        .output()
+        .unwrap();
+    assert_eq!(run_default.status.code(), Some(0));
+
+    let check_default_cached = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    let chk1 = String::from_utf8_lossy(&check_default_cached.stdout);
+    let agy_chk1 = chk1
+        .lines()
+        .find(|l| l.trim_start().starts_with("agy:") && l.contains("etapas:"))
+        .unwrap_or_else(|| panic!("agy line missing in:\n{chk1}"));
+    assert!(agy_chk1.contains("evidência recente válida"), "{agy_chk1}");
+
+    // 2. Switching to loop login invalidates agy evidence identity even while default exists.
+    let loop_tok = h.state_dir.join("loops/agy-login/antigravity-oauth-token");
+    fs::create_dir_all(loop_tok.parent().unwrap()).unwrap();
+    fs::write(&loop_tok, "loop-tok-a\n").unwrap();
+
+    let check_switched = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    let chk2 = String::from_utf8_lossy(&check_switched.stdout);
+    let agy_chk2 = chk2
+        .lines()
+        .find(|l| l.trim_start().starts_with("agy:") && l.contains("etapas:"))
+        .unwrap_or_else(|| panic!("agy line missing in:\n{chk2}"));
+    assert!(
+        agy_chk2.contains("chamada real (sem evidência válida)"),
+        "{agy_chk2}"
+    );
+
+    // 3. Running records evidence for loop login; changing token contents keeps the same identity.
+    let run_loop = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "run", "fast-worker-reviewer", "loop ev"])
+        .output()
+        .unwrap();
+    assert_eq!(run_loop.status.code(), Some(0));
+
+    fs::write(&loop_tok, "loop-tok-b-refreshed\n").unwrap();
+    let check_loop_cached = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    let chk3 = String::from_utf8_lossy(&check_loop_cached.stdout);
+    let agy_chk3 = chk3
+        .lines()
+        .find(|l| l.trim_start().starts_with("agy:") && l.contains("etapas:"))
+        .unwrap_or_else(|| panic!("agy line missing in:\n{chk3}"));
+    assert!(agy_chk3.contains("evidência recente válida"), "{agy_chk3}");
 }
