@@ -15,10 +15,10 @@ use std::time::Duration;
 
 static NEXT_PROBE_DIR_ID: AtomicU64 = AtomicU64::new(1);
 
-struct ProbeTempDir(PathBuf);
+pub(crate) struct ProbeTempDir(PathBuf);
 
 impl ProbeTempDir {
-    fn new_in(parent: &Path, prefix: &str) -> std::io::Result<Self> {
+    pub(crate) fn new_in(parent: &Path, prefix: &str) -> std::io::Result<Self> {
         for _ in 0..64 {
             let seq = NEXT_PROBE_DIR_ID.fetch_add(1, Ordering::Relaxed);
             let candidate = parent.join(format!("{prefix}{}-{seq}", std::process::id()));
@@ -36,7 +36,7 @@ impl ProbeTempDir {
         ))
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 }
@@ -64,11 +64,32 @@ pub struct ProbeFailure {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeMethod {
+    #[default]
+    Probe,
+    Evidence,
+    FreeOnly,
+}
+
+impl ProbeMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Evidence => "evidência",
+            Self::FreeOnly => "gratuito",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProbeRecord {
     pub provider: Provider,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default)]
+    pub method: ProbeMethod,
     pub usage: Usage,
     pub duration_ms: u64,
 }
@@ -181,6 +202,8 @@ fn probe_one(
     if target.choice.provider == Provider::Claude {
         cmd.argv.push(OsString::from("--tools"));
         cmd.argv.push(OsString::from(""));
+        cmd.argv.push(OsString::from("--system-prompt"));
+        cmd.argv.push(OsString::from("Reply briefly."));
     }
 
     let mut sandboxed = match (target.choice.provider, opencode_api_key) {
@@ -219,6 +242,7 @@ fn probe_one(
         Ok(Outcome::Exited(0)) if parsed.error.is_none() => Ok(ProbeRecord {
             provider: target.choice.provider,
             model: target.choice.model.clone(),
+            method: ProbeMethod::Probe,
             usage: parsed.usage,
             duration_ms,
         }),
@@ -895,5 +919,55 @@ echo $$ > "{}"
             failures[0].reason
         );
         assert!(failures[0].reason.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn claude_probe_argv_has_lean_flags_while_stage_argv_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let probe_root = tmp.path().join("probes");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&probe_root).unwrap();
+
+        crate::test_support::write_executable(
+            bin_dir.join("claude"),
+            "#!/usr/bin/env sh\ncat >/dev/null\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"num_turns\":1,\"result\":\"OK\"}'\n",
+        );
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        let sb = FakeSandbox::new().with_env("PATH", &test_path);
+
+        let target = ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Claude,
+                model: Some("haiku".into()),
+            },
+            stage_ids: vec!["implement".into()],
+        };
+        run_preflight(&[target], &sb, &probe_root, &AtomicBool::new(false)).unwrap();
+
+        let argvs = sb.recorded_argvs.lock().unwrap();
+        let probe_argv: Vec<String> = argvs[0]
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(probe_argv.windows(2).any(|w| w == ["--tools", ""]));
+        assert!(
+            probe_argv
+                .windows(2)
+                .any(|w| w == ["--system-prompt", "Reply briefly."]),
+            "missing lean --system-prompt flag in probe argv: {probe_argv:?}"
+        );
+
+        let stage_argv: Vec<String> =
+            adapter_command(Provider::Claude, Some("haiku"), "stage prompt")
+                .unwrap()
+                .argv
+                .into_iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+        assert!(!stage_argv.iter().any(|a| a == "--tools"));
+        assert!(!stage_argv.iter().any(|a| a == "--system-prompt"));
     }
 }

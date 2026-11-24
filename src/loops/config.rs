@@ -18,6 +18,43 @@ pub enum SandboxConfig {
     Bwrap { home_ro: Vec<String> },
 }
 
+pub const DEFAULT_PREFLIGHT_VALID_HOURS: u32 = 12;
+pub const MAX_PREFLIGHT_VALID_HOURS: u32 = 168;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightMode {
+    #[default]
+    Auto,
+    Always,
+    Free,
+}
+
+impl PreflightMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Free => "free",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreflightConfig {
+    pub mode: PreflightMode,
+    pub valid_hours: u32,
+}
+
+impl Default for PreflightConfig {
+    fn default() -> Self {
+        Self {
+            mode: PreflightMode::Auto,
+            valid_hours: DEFAULT_PREFLIGHT_VALID_HOURS,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopsConfig {
     pub max_concurrent: u32,
@@ -25,6 +62,7 @@ pub struct LoopsConfig {
     pub env_pass: Vec<String>,
     pub sandbox: SandboxConfig,
     pub defaults: RoleDefaults,
+    pub preflight: PreflightConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,6 +78,30 @@ struct RawLoopsConfig {
     sandbox: RawSandbox,
     #[serde(default)]
     defaults: RoleDefaults,
+    #[serde(default)]
+    preflight: RawPreflightConfig,
+}
+
+fn default_preflight_valid_hours() -> u32 {
+    DEFAULT_PREFLIGHT_VALID_HOURS
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPreflightConfig {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default = "default_preflight_valid_hours")]
+    valid_hours: u32,
+}
+
+impl Default for RawPreflightConfig {
+    fn default() -> Self {
+        Self {
+            mode: None,
+            valid_hours: DEFAULT_PREFLIGHT_VALID_HOURS,
+        }
+    }
 }
 
 fn default_max_concurrent() -> u32 {
@@ -178,12 +240,28 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
         other => bail!("tipo de sandbox desconhecido em [sandbox]: '{other}'"),
     };
 
+    let preflight_mode = match parsed.preflight.mode.as_deref() {
+        None | Some("auto") => PreflightMode::Auto,
+        Some("always") => PreflightMode::Always,
+        Some("free") => PreflightMode::Free,
+        Some(other) => {
+            bail!("modo desconhecido em [preflight]: '{other}' (use auto, always ou free)")
+        }
+    };
+    if !(1..=MAX_PREFLIGHT_VALID_HOURS).contains(&parsed.preflight.valid_hours) {
+        bail!("'valid_hours' em [preflight] deve ficar entre 1 e {MAX_PREFLIGHT_VALID_HOURS}");
+    }
+
     Ok(LoopsConfig {
         max_concurrent: parsed.max_concurrent,
         auto_approve_in_sandbox: parsed.auto_approve_in_sandbox,
         env_pass: parsed.env_pass,
         sandbox,
         defaults: parsed.defaults,
+        preflight: PreflightConfig {
+            mode: preflight_mode,
+            valid_hours: parsed.preflight.valid_hours,
+        },
     })
 }
 
@@ -407,5 +485,45 @@ model = "claude-sonnet-4"
 "#;
         let err = parse_loops_config(raw).unwrap_err();
         assert!(err.to_string().contains("provider"), "got: {err}");
+    }
+
+    #[test]
+    fn preflight_config_parses_modes_and_valid_hours_bounds() {
+        let def = parse_loops_config("").unwrap();
+        assert_eq!(def.preflight.mode, PreflightMode::Auto);
+        assert_eq!(def.preflight.valid_hours, 12);
+
+        for (raw_mode, expected) in [
+            ("auto", PreflightMode::Auto),
+            ("always", PreflightMode::Always),
+            ("free", PreflightMode::Free),
+        ] {
+            let cfg = parse_loops_config(&format!(
+                "[preflight]\nmode = \"{raw_mode}\"\nvalid_hours = 24\n"
+            ))
+            .unwrap();
+            assert_eq!(cfg.preflight.mode, expected);
+            assert_eq!(cfg.preflight.valid_hours, 24);
+        }
+
+        assert_eq!(
+            parse_loops_config("[preflight]\nvalid_hours = 1\n")
+                .unwrap()
+                .preflight
+                .valid_hours,
+            1
+        );
+        assert_eq!(
+            parse_loops_config("[preflight]\nvalid_hours = 168\n")
+                .unwrap()
+                .preflight
+                .valid_hours,
+            168
+        );
+
+        assert!(parse_loops_config("[preflight]\nvalid_hours = 0\n").is_err());
+        assert!(parse_loops_config("[preflight]\nvalid_hours = 169\n").is_err());
+        assert!(parse_loops_config("[preflight]\nmode = \"bogus\"\n").is_err());
+        assert!(parse_loops_config("[preflight]\nextra = true\n").is_err());
     }
 }

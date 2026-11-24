@@ -582,6 +582,7 @@ mod tests {
         modern.preflight.push(ProbeRecord {
             provider: Provider::Claude,
             model: Some("haiku".to_string()),
+            method: crate::loops::preflight::ProbeMethod::Probe,
             usage: Usage {
                 turns: Some(1),
                 input_tokens: Some(3500),

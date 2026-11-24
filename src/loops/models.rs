@@ -1244,4 +1244,14 @@ provider = "opencode"
         );
         assert!(!err.contains("segredo_da_linha"), "{err}");
     }
+
+    #[test]
+    fn project_models_refuses_preflight_section() {
+        let raw = r#"
+[preflight]
+mode = "free"
+valid_hours = 1
+"#;
+        assert!(parse_project_models(raw).is_err());
+    }
 }

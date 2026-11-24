@@ -156,7 +156,7 @@ impl LoopHarness {
         let body = format!(
             "max_concurrent = {max_concurrent}\n\
              auto_approve_in_sandbox = {auto_approve}\n\
-             env_pass = [\"LOOP_TEST_TRACE_DIR\", \"LOOP_TEST_CLAUDE_FAIL\", \"LOOP_TEST_CLAUDE_FAIL_PROBE\", \"LOOP_TEST_PROBE_READY_FILE\", \"LOOP_TEST_PROBE_SLEEP_SECS\", \"LOOP_TEST_AGY_FAIL_PROBE\", \"LOOP_TEST_OPENCODE_FAIL_PROBE\", \"LOOP_TEST_GATE_VERDICT\", \"LOOP_TEST_EDIT_WORKSPACE\", \"LOOP_TEST_READY_FILE\", \"LOOP_TEST_SLEEP_SECS\", \"LOOP_TEST_LEAK_SECRET\", \"LOOP_TEST_ESCAPE_ANSI\", \"LOOP_TEST_SPAWN_SETSID_PIDFILE\"]\n\
+             env_pass = [\"LOOP_TEST_TRACE_DIR\", \"LOOP_TEST_CLAUDE_FAIL\", \"LOOP_TEST_CLAUDE_FAIL_PROBE\", \"LOOP_TEST_PROBE_READY_FILE\", \"LOOP_TEST_PROBE_SLEEP_SECS\", \"LOOP_TEST_AGY_FAIL_PROBE\", \"LOOP_TEST_AGY_FAIL\", \"LOOP_TEST_AGY_MALFORMED_VERDICT\", \"LOOP_TEST_AGY_MISSING_OUT\", \"LOOP_TEST_AGY_MODELS_SLEEP_SECS\", \"LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS\", \"LOOP_TEST_CHECK_EVIDENCE_PATH\", \"LOOP_TEST_CHECK_EVIDENCE_OUT\", \"LOOP_TEST_OPENCODE_FAIL_PROBE\", \"LOOP_TEST_GATE_VERDICT\", \"LOOP_TEST_EDIT_WORKSPACE\", \"LOOP_TEST_READY_FILE\", \"LOOP_TEST_SLEEP_SECS\", \"LOOP_TEST_LEAK_SECRET\", \"LOOP_TEST_ESCAPE_ANSI\", \"LOOP_TEST_SPAWN_SETSID_PIDFILE\"]\n\
              \n\
              [sandbox]\n\
              kind = \"{sandbox_kind}\"\n\
@@ -192,16 +192,33 @@ impl LoopHarness {
     }
 
     fn install_fake_clis(&self) {
-        // Fake `claude`: inspects argv & stdin to separate preflight probes vs real stages.
+        // Fake `claude`: inspects argv & stdin to separate auth/status, preflight probes, and real stages.
         let claude_script = r#"#!/usr/bin/env python3
 import json, os, pathlib, signal, subprocess, sys, time
 
 argv = sys.argv[1:]
+if argv[:2] == ["auth", "status"]:
+    if os.environ.get("LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS"):
+        time.sleep(float(os.environ["LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS"]))
+    cred = pathlib.Path(os.environ.get("HOME", "")) / ".claude" / ".credentials.json"
+    logged_in = cred.is_file() and cred.stat().st_size > 0
+    if logged_in:
+        print(json.dumps({
+            "loggedIn": True,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": "fake-user@example.com",
+            "orgId": "org-secret-999",
+            "orgName": "SecretFakeOrg",
+        }))
+    else:
+        print(json.dumps({"loggedIn": False, "authMethod": "none"}))
+    sys.exit(0)
 if argv and argv[0] == "auth":
     sys.exit(0)
 prompt = sys.stdin.read()
 trace_dir = os.environ.get("LOOP_TEST_TRACE_DIR")
-if trace_dir:
+if trace_dir and pathlib.Path(trace_dir).is_dir():
     rec = {
         "cli": "claude",
         "argv": argv,
@@ -211,7 +228,10 @@ if trace_dir:
         "opencode_key": os.environ.get("OPENCODE_API_KEY"),
     }
     p = pathlib.Path(trace_dir) / f"claude-{os.getpid()}-{time.time_ns()}.json"
-    p.write_text(json.dumps(rec))
+    try:
+        p.write_text(json.dumps(rec))
+    except OSError:
+        pass
 
 if prompt.strip() == "Reply with exactly: OK":
     if os.environ.get("LOOP_TEST_PROBE_READY_FILE"):
@@ -234,6 +254,11 @@ if prompt.strip() == "Reply with exactly: OK":
         "result": "OK"
     }))
     sys.exit(0)
+
+if os.environ.get("LOOP_TEST_CHECK_EVIDENCE_PATH") and os.environ.get("LOOP_TEST_CHECK_EVIDENCE_OUT"):
+    ev_p = pathlib.Path(os.environ["LOOP_TEST_CHECK_EVIDENCE_PATH"])
+    out_file = pathlib.Path.cwd() / os.environ["LOOP_TEST_CHECK_EVIDENCE_OUT"]
+    out_file.write_text("READABLE" if ev_p.exists() else "BLOCKED")
 
 if os.environ.get("LOOP_TEST_READY_FILE"):
     pathlib.Path(os.environ["LOOP_TEST_READY_FILE"]).write_text(str(os.getpid()))
@@ -297,11 +322,26 @@ print(json.dumps({
 "#;
         common::write_executable(self.bin_dir.join("claude"), claude_script);
 
-        // Fake `agy`: reads prompt from argv `-p <prompt>`
+        // Fake `agy`: handles `agy models` and `-p <prompt>`
         let agy_script = r#"#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 
 argv = sys.argv[1:]
+if argv[:1] == ["models"]:
+    if os.environ.get("LOOP_TEST_AGY_MODELS_SLEEP_SECS"):
+        time.sleep(float(os.environ["LOOP_TEST_AGY_MODELS_SLEEP_SECS"]))
+    tok = pathlib.Path(os.environ.get("HOME", "")) / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    if tok.is_file() and tok.stat().st_size > 0:
+        for row in [
+            ("gemini-test", "Gemini Test"),
+            ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-neon-high", "Gemini 4 Neon (High)"),
+            ("gemini-40-high", "Gemini 40 (High)"),
+            ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+        ]:
+            print(f"{row[0]}\t{row[1]}")
+    sys.exit(0)
+
 prompt = ""
 if "-p" in argv:
     idx = argv.index("-p")
@@ -309,7 +349,7 @@ if "-p" in argv:
         prompt = argv[idx + 1]
 
 trace_dir = os.environ.get("LOOP_TEST_TRACE_DIR")
-if trace_dir:
+if trace_dir and pathlib.Path(trace_dir).is_dir():
     rec = {
         "cli": "agy",
         "argv": argv,
@@ -318,7 +358,10 @@ if trace_dir:
         "has_opencode_key": "OPENCODE_API_KEY" in os.environ,
     }
     p = pathlib.Path(trace_dir) / f"agy-{os.getpid()}-{time.time_ns()}.json"
-    p.write_text(json.dumps(rec))
+    try:
+        p.write_text(json.dumps(rec))
+    except OSError:
+        pass
 
 if prompt.strip() == "Reply with exactly: OK":
     if os.environ.get("LOOP_TEST_AGY_FAIL_PROBE") == "1":
@@ -334,6 +377,10 @@ if prompt.strip() == "Reply with exactly: OK":
     }))
     sys.exit(0)
 
+if os.environ.get("LOOP_TEST_AGY_FAIL") == "1":
+    print(json.dumps({"event": "result", "result": {"status": "ERROR", "error": "agy stage failed"}}))
+    sys.exit(1)
+
 writes_name = None
 for line in prompt.splitlines():
     if ".tchelvis-loop/out/" in line:
@@ -343,11 +390,14 @@ for line in prompt.splitlines():
         if token and "/" not in token:
             writes_name = token
 
-if writes_name:
-    verdict = os.environ.get("LOOP_TEST_GATE_VERDICT", "PASS")
+if writes_name and os.environ.get("LOOP_TEST_AGY_MISSING_OUT") != "1":
     out_path = pathlib.Path.cwd() / ".tchelvis-loop" / "out" / writes_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(f"Reviewed OK\nVERDICT: {verdict}\n")
+    if os.environ.get("LOOP_TEST_AGY_MALFORMED_VERDICT") == "1":
+        out_path.write_text("Reviewed without a verdict line\n")
+    else:
+        verdict = os.environ.get("LOOP_TEST_GATE_VERDICT", "PASS")
+        out_path.write_text(f"Reviewed OK\nVERDICT: {verdict}\n")
 
 print(json.dumps({"event": "step_update", "step_update": {"step_type": "agent_response", "state": "DONE"}}))
 print(json.dumps({
@@ -360,14 +410,32 @@ print(json.dumps({
 "#;
         common::write_executable(self.bin_dir.join("agy"), agy_script);
 
-        // Fake `opencode`: reads prompt from stdin
+        // Fake `opencode`: handles `opencode models --standalone` and stdin prompts
         let opencode_script = r#"#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 
 argv = sys.argv[1:]
+if argv[:1] == ["models"]:
+    models = [
+        "opencode/beam-free",
+        "opencode/free-test",
+        "opencode/glm-4.7-free",
+        "opencode/proj-def-r",
+        "openrouter/x:free",
+    ]
+    if os.environ.get("OPENCODE_API_KEY"):
+        models.extend([
+            "opencode-go/glm-paid",
+            "opencode-go/glm-5.3-flash",
+            "opencode-go/hy4-flash-free",
+        ])
+    for m in models:
+        print(m)
+    sys.exit(0)
+
 prompt = sys.stdin.read()
 trace_dir = os.environ.get("LOOP_TEST_TRACE_DIR")
-if trace_dir:
+if trace_dir and pathlib.Path(trace_dir).is_dir():
     rec = {
         "cli": "opencode",
         "argv": argv,
@@ -377,7 +445,10 @@ if trace_dir:
         "opencode_key": os.environ.get("OPENCODE_API_KEY"),
     }
     p = pathlib.Path(trace_dir) / f"opencode-{os.getpid()}-{time.time_ns()}.json"
-    p.write_text(json.dumps(rec))
+    try:
+        p.write_text(json.dumps(rec))
+    except OSError:
+        pass
 
 if prompt.strip() == "Reply with exactly: OK":
     if os.environ.get("LOOP_TEST_OPENCODE_FAIL_PROBE") == "1":
@@ -1337,7 +1408,8 @@ fn preflight_deduplicates_lists_all_failures_leaves_zero_side_effects_and_respec
         2,
         true,
         "inherited",
-        "[defaults.worker]\nprovider = \"claude\"\nmodel = \"haiku\"\n\
+        "[preflight]\nmode = \"always\"\n\n\
+         [defaults.worker]\nprovider = \"claude\"\nmodel = \"haiku\"\n\
          [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"agy-bad\"\n\
          [defaults.critic]\nprovider = \"claude\"\nmodel = \"haiku\"\n\
          [defaults.tester]\nprovider = \"opencode\"\nmodel = \"opencode/free-bad\"\n",
@@ -2074,4 +2146,459 @@ fn detached_engine_is_the_same_binary_by_absolute_path() {
     let start = argv.iter().position(|a| a == "--json").unwrap() + 1;
     assert!(Path::new(&argv[start]).is_absolute(), "{argv:?}");
     assert_eq!(&argv[start + 1..start + 3], ["loop", "engine"]);
+}
+
+fn count_probe_traces(h: &LoopHarness, cli: &str) -> usize {
+    h.read_traces(cli)
+        .into_iter()
+        .filter(|tr| tr["prompt"].as_str() == Some("Reply with exactly: OK"))
+        .count()
+}
+
+fn extract_run_id(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    text.lines()
+        .find_map(|line| line.strip_prefix("RUN_ID: "))
+        .unwrap_or_else(|| panic!("missing RUN_ID line in stdout:\n{text}"))
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn preflight_auto_caches_evidence_discards_only_failed_stage_and_keeps_on_verdict_or_missing_out() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    let ev_path = h.state_dir.join("loops/model_evidence.json");
+    assert!(!ev_path.exists());
+
+    // 1. First run in default `auto` mode probes once per distinct model and records salted evidence (`0600`).
+    h.clear_traces();
+    let run1 = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "first auto run"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run1.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&run1.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 1);
+    assert_eq!(count_probe_traces(&h, "agy"), 1);
+
+    let mode = fs::metadata(&ev_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let ev_raw = fs::read_to_string(&ev_path).unwrap();
+    assert!(!ev_raw.contains("fake-user@example.com"));
+    assert!(!ev_raw.contains("org-secret-999"));
+    assert!(!ev_raw.contains("SecretFakeOrg"));
+
+    let run1_id = extract_run_id(&run1.stdout);
+    let report1 =
+        fs::read_to_string(h.repo.join(".loops/runs").join(&run1_id).join("report.md")).unwrap();
+    assert!(report1.contains("| claude | sonnet | probe |"));
+    assert!(report1.contains("| agy | gemini-test | probe |"));
+
+    // 2. Second run in `auto` mode reuses cached evidence -> ZERO probes.
+    h.clear_traces();
+    let run2 = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "second auto run"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run2.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&run2.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+    let run2_id = extract_run_id(&run2.stdout);
+    let report2 =
+        fs::read_to_string(h.repo.join(".loops/runs").join(&run2_id).join("report.md")).unwrap();
+    assert!(report2.contains("| claude | sonnet | evidência |"));
+    assert!(report2.contains("| agy | gemini-test | evidência |"));
+
+    // 3. Stage failure on `agy` discards ONLY `agy:gemini-test` evidence, keeping `claude:sonnet`.
+    h.clear_traces();
+    let fail_agy = h
+        .cmd()
+        .env("LOOP_TEST_AGY_FAIL", "1")
+        .args(["loop", "run", "fast-worker-reviewer", "agy stage fails"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        fail_agy.status.code(),
+        Some(1),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&fail_agy.stdout),
+        String::from_utf8_lossy(&fail_agy.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+
+    // Next run re-probes ONLY `agy`, still reuses `claude` evidence!
+    h.clear_traces();
+    let recover = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "after agy fail"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        recover.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&recover.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 1);
+    let recover_id = extract_run_id(&recover.stdout);
+    let report_recover = fs::read_to_string(
+        h.repo
+            .join(".loops/runs")
+            .join(&recover_id)
+            .join("report.md"),
+    )
+    .unwrap();
+    assert!(report_recover.contains("| claude | sonnet | evidência |"));
+    assert!(report_recover.contains("| agy | gemini-test | probe |"));
+
+    // 4. Malformed verdict or missing artifact does NOT discard model evidence.
+    for env_flag in [
+        "LOOP_TEST_AGY_MALFORMED_VERDICT",
+        "LOOP_TEST_AGY_MISSING_OUT",
+    ] {
+        h.clear_traces();
+        let bad_out = h
+            .cmd()
+            .env(env_flag, "1")
+            .args(["loop", "run", "fast-worker-reviewer", "bad reviewer output"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            bad_out.status.code(),
+            Some(1),
+            "{env_flag} stdout={}\nstderr={}",
+            String::from_utf8_lossy(&bad_out.stdout),
+            String::from_utf8_lossy(&bad_out.stderr)
+        );
+
+        h.clear_traces();
+        let next_ok = h
+            .cmd()
+            .args([
+                "loop",
+                "run",
+                "fast-worker-reviewer",
+                "after non-stage error",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            next_ok.status.code(),
+            Some(0),
+            "{env_flag} stderr={}",
+            String::from_utf8_lossy(&next_ok.stderr)
+        );
+        assert_eq!(count_probe_traces(&h, "claude"), 0);
+        assert_eq!(
+            count_probe_traces(&h, "agy"),
+            0,
+            "{env_flag} must NOT discard agy evidence"
+        );
+    }
+}
+
+#[test]
+fn preflight_free_and_always_modes_work_end_to_end() {
+    let h = LoopHarness::new();
+    h.write_accounts();
+
+    // `mode = "free"` with listed models (`claude:sonnet`, `agy:gemini-4-hydrogen`, `opencode:opencode/beam-free`)
+    // runs ZERO probes and records `gratuito` in report.md.
+    h.write_config(
+        2,
+        true,
+        "inherited",
+        "[preflight]\nmode = \"free\"\n\n\
+         [defaults.worker]\nprovider = \"opencode\"\nmodel = \"opencode/beam-free\"\n\
+         [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"gemini-4-hydrogen\"\n\
+         [defaults.critic]\nprovider = \"claude\"\nmodel = \"sonnet\"\n",
+    );
+
+    h.clear_traces();
+    let free_ok = h
+        .cmd()
+        .args(["loop", "run", "worker-reviewer-critic", "free mode run"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        free_ok.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&free_ok.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+    assert_eq!(count_probe_traces(&h, "opencode"), 0);
+    let free_id = extract_run_id(&free_ok.stdout);
+    let free_report =
+        fs::read_to_string(h.repo.join(".loops/runs").join(&free_id).join("report.md")).unwrap();
+    assert!(free_report.contains("| opencode | opencode/beam-free | gratuito |"));
+    assert!(free_report.contains("| agy | gemini-4-hydrogen | gratuito |"));
+    assert!(free_report.contains("| claude | sonnet | gratuito |"));
+
+    // `mode = "free"` refuses `agy` partial stem (`gemini-4-hydro`) and unlisted `opencode/free-bad` with 0 probes.
+    h.clear_traces();
+    let partial_stem = h
+        .cmd()
+        .args([
+            "loop",
+            "run",
+            "worker-reviewer-critic",
+            "bad models",
+            "--use",
+            "review=agy:gemini-4-hydro",
+            "--use",
+            "implement=opencode:opencode/free-bad",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(partial_stem.status.code(), Some(1));
+    let err_txt = String::from_utf8_lossy(&partial_stem.stderr);
+    assert!(err_txt.contains("agy:gemini-4-hydro"), "{err_txt}");
+    assert!(err_txt.contains("opencode:opencode/free-bad"), "{err_txt}");
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+    assert_eq!(count_probe_traces(&h, "opencode"), 0);
+
+    // `mode = "free"` refuses logged-out `claude` with 0 probes.
+    let claude_cred = h.home.join(".claude/.credentials.json");
+    fs::remove_file(&claude_cred).unwrap();
+    let logged_out = h
+        .cmd()
+        .args(["loop", "run", "worker-reviewer-critic", "logged out claude"])
+        .output()
+        .unwrap();
+    assert_eq!(logged_out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&logged_out.stderr).contains("desconectada"));
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+    assert_eq!(count_probe_traces(&h, "opencode"), 0);
+    h.write_accounts();
+
+    // `mode = "always"` ignores prior valid evidence and re-probes on every run.
+    h.write_config(
+        2,
+        true,
+        "inherited",
+        "[preflight]\nmode = \"auto\"\n\n\
+         [defaults.worker]\nprovider = \"claude\"\nmodel = \"sonnet\"\n\
+         [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"gemini-test\"\n",
+    );
+    let seed = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "seed evidence"])
+        .output()
+        .unwrap();
+    assert_eq!(seed.status.code(), Some(0));
+
+    h.write_config(
+        2,
+        true,
+        "inherited",
+        "[preflight]\nmode = \"always\"\n\n\
+         [defaults.worker]\nprovider = \"claude\"\nmodel = \"sonnet\"\n\
+         [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"gemini-test\"\n",
+    );
+    h.clear_traces();
+    let always_run = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "always probes"])
+        .output()
+        .unwrap();
+    assert_eq!(always_run.status.code(), Some(0));
+    assert_eq!(count_probe_traces(&h, "claude"), 1);
+    assert_eq!(count_probe_traces(&h, "agy"), 1);
+}
+
+#[test]
+fn loop_check_live_and_auth_never_leak_secrets() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    // `loop auth` uses free checks and never leaks email/org/key.
+    let secret_oc = "sk-opencode-auth-secret-4242";
+    let auth_out = h
+        .cmd()
+        .env("OPENCODE_API_KEY", secret_oc)
+        .args(["loop", "auth"])
+        .output()
+        .unwrap();
+    assert_eq!(auth_out.status.code(), Some(0));
+    let auth_stdout = String::from_utf8_lossy(&auth_out.stdout);
+    let auth_stderr = String::from_utf8_lossy(&auth_out.stderr);
+    assert!(auth_stdout.contains("claude:   autenticado (claude auth status)"));
+    assert!(auth_stdout.contains("modelo(s) listado(s) por 'agy models'"));
+    assert!(auth_stdout.contains("opencode: chave presente"));
+    assert!(auth_stdout.contains("modelo(s) listado(s) por 'opencode models'"));
+    for secret in [
+        "fake-user@example.com",
+        "org-secret-999",
+        "SecretFakeOrg",
+        secret_oc,
+    ] {
+        assert!(!auth_stdout.contains(secret), "stdout leaked {secret}");
+        assert!(!auth_stderr.contains(secret), "stderr leaked {secret}");
+    }
+
+    // `loop check` prints planned preflight actions without running probes.
+    h.clear_traces();
+    let chk1 = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(chk1.status.code(), Some(0));
+    let chk1_txt = String::from_utf8_lossy(&chk1.stdout);
+    assert!(chk1_txt.contains("Pré-teste (modo: auto, validade: 12h):"));
+    assert!(chk1_txt.contains("chamada real (sem evidência válida)"));
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+
+    // `loop check --live` executes probes and records evidence for subsequent runs.
+    let chk_live = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer", "--live"])
+        .output()
+        .unwrap();
+    assert_eq!(chk_live.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&chk_live.stdout).contains("Pré-teste ao vivo concluído"));
+    assert_eq!(count_probe_traces(&h, "claude"), 1);
+    assert_eq!(count_probe_traces(&h, "agy"), 1);
+
+    // Subsequent `loop check` and `loop run` in `auto` mode see valid evidence and run 0 probes.
+    h.clear_traces();
+    let chk2 = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer"])
+        .output()
+        .unwrap();
+    assert_eq!(chk2.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&chk2.stdout).contains("evidência recente válida"));
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+
+    let run_after_live = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "reuses live check"])
+        .output()
+        .unwrap();
+    assert_eq!(run_after_live.status.code(), Some(0));
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 0);
+}
+
+#[test]
+fn bwrap_sandbox_blocks_stage_from_reading_model_evidence() {
+    let bwrap_works = Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "--", "true"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bwrap_works {
+        eprintln!("SKIPPED: bwrap unavailable or unprivileged userns disabled");
+        return;
+    }
+
+    let h = LoopHarness::new();
+    h.write_accounts();
+    // Place fake CLIs inside `$HOME/fakebin` so BwrapSandbox::adapter_binds mounts them even with `--tmpfs /tmp`.
+    let home_bin = h.home.join("fakebin");
+    fs::create_dir_all(&home_bin).unwrap();
+    for cli in ["claude", "agy", "opencode"] {
+        fs::copy(h.bin_dir.join(cli), home_bin.join(cli)).unwrap();
+        fs::set_permissions(home_bin.join(cli), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path_with_home_bin = format!("{}:{}", home_bin.display(), h.path_with_fake_bins());
+
+    h.write_config(
+        2,
+        true,
+        "bwrap",
+        "[defaults.worker]\nprovider = \"claude\"\nmodel = \"sonnet\"\n\
+         [defaults.reviewer]\nprovider = \"agy\"\nmodel = \"gemini-test\"\n",
+    );
+
+    let ev_path = h.state_dir.join("loops/model_evidence.json");
+    let run = h
+        .cmd()
+        .env("PATH", &path_with_home_bin)
+        .env("LOOP_TEST_CHECK_EVIDENCE_PATH", &ev_path)
+        .env("LOOP_TEST_CHECK_EVIDENCE_OUT", "ev_check.txt")
+        .args(["loop", "run", "fast-worker-reviewer", "bwrap isolation"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(ev_path.is_file());
+
+    let run_id = extract_run_id(&run.stdout);
+    let ws_check = h
+        .state_dir
+        .join("loops")
+        .join(&run_id)
+        .join("workspace/ev_check.txt");
+    assert_eq!(fs::read_to_string(&ws_check).unwrap(), "BLOCKED");
+}
+
+#[test]
+fn a_failed_probe_discards_the_evidence_of_its_own_pair() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    let seed = h
+        .cmd()
+        .args(["loop", "check", "fast-worker-reviewer", "--live"])
+        .output()
+        .unwrap();
+    assert_eq!(seed.status.code(), Some(0));
+
+    let broken = h
+        .cmd()
+        .env("LOOP_TEST_AGY_FAIL_PROBE", "1")
+        .args(["loop", "check", "fast-worker-reviewer", "--live"])
+        .output()
+        .unwrap();
+    assert_eq!(broken.status.code(), Some(1));
+
+    h.clear_traces();
+    let run = h
+        .cmd()
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "after a failed probe",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
+    assert_eq!(count_probe_traces(&h, "agy"), 1);
 }

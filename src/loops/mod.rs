@@ -3,6 +3,8 @@ pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod engine;
+pub mod evidence;
+pub mod free_check;
 pub mod models;
 pub mod preflight;
 pub mod process;

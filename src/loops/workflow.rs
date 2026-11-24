@@ -74,7 +74,7 @@ const STAGE_KEYS: &[&str] = &[
 const RESERVED_READ_AND_WRITE: &[&str] = &["state.json", "report.md", "report.html", "logs"];
 const BUILTIN_READS: &[&str] = &["input.md", "current.diff"];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provider {
     Claude,
@@ -1630,5 +1630,29 @@ on_retry = "a"
         let preset = PRESET_WORKFLOWS[0].1;
         let unresolved = parse_workflow_unresolved(preset).expect("preset parses unresolved");
         assert!(unresolved.stages.iter().all(|s| s.provider.is_none()));
+    }
+
+    #[test]
+    fn workflow_refuses_preflight_section() {
+        let raw = r#"
+name = "w"
+[preflight]
+mode = "free"
+[[stages]]
+id = "a"
+role = "worker"
+provider = "claude"
+edits = true
+next = "b"
+[[stages]]
+id = "b"
+role = "critic"
+provider = "claude"
+writes = "critic.md"
+verdict_gate = true
+on_pass = "done"
+on_retry = "a"
+"#;
+        assert!(parse_workflow_unresolved(raw).is_err());
     }
 }

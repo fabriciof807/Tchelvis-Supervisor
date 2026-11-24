@@ -70,6 +70,11 @@ pub trait StageRunner {
     fn run(&mut self, req: StageRequest<'_>) -> StageResult;
 }
 
+pub trait EvidenceRecorder {
+    fn record(&mut self, provider: Provider, model: Option<&str>, now_ms: i64);
+    fn discard(&mut self, provider: Provider, model: Option<&str>);
+}
+
 pub struct ProcessStageRunner<'a> {
     pub sandbox: &'a dyn Sandbox,
     pub clock: &'a dyn Clock,
@@ -367,6 +372,7 @@ pub struct Engine<W: Workspace, R: StageRunner, C: Clock> {
     preflight: Vec<ProbeRecord>,
     extra_secrets: Vec<String>,
     on_final: Option<FinalHook>,
+    evidence: Option<Box<dyn EvidenceRecorder + Send>>,
 }
 
 fn sanitize_text(raw: &str, max_chars: Option<usize>, extra_secrets: &[&str]) -> String {
@@ -444,6 +450,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             preflight: Vec::new(),
             extra_secrets: Vec::new(),
             on_final: None,
+            evidence: None,
         }
     }
 
@@ -459,6 +466,14 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
 
     pub fn with_extra_secrets(mut self, extra_secrets: Vec<String>) -> Self {
         self.extra_secrets = extra_secrets;
+        self
+    }
+
+    pub fn with_evidence_recorder<E>(mut self, recorder: E) -> Self
+    where
+        E: EvidenceRecorder + Send + 'static,
+    {
+        self.evidence = Some(Box::new(recorder));
         self
     }
 
@@ -789,6 +804,18 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 let stage_finished_now = self.clock.now_ms();
                 let stage_duration_ms =
                     self.clock.monotonic_ms().saturating_sub(stage_started_mono);
+
+                if let Some(rec) = self.evidence.as_mut() {
+                    match result.outcome {
+                        StageOutcome::Ok if result.error.is_none() => {
+                            rec.record(stage.provider, stage.model.as_deref(), stage_finished_now);
+                        }
+                        StageOutcome::Cancelled => {}
+                        _ => {
+                            rec.discard(stage.provider, stage.model.as_deref());
+                        }
+                    }
+                }
 
                 // A stage that did not finish well: an editor's work is kept for the branch, and a
                 // reader's edits are undone. Best effort, the run is ending anyway.
@@ -2377,6 +2404,7 @@ on_retry = "implement"
         let probes = vec![ProbeRecord {
             provider: crate::loops::workflow::Provider::Claude,
             model: Some("haiku".to_string()),
+            method: crate::loops::preflight::ProbeMethod::Probe,
             usage: Usage {
                 turns: Some(1),
                 input_tokens: Some(400),
@@ -2480,5 +2508,137 @@ on_retry = "implement"
             })
             .run();
         assert_eq!(*seen.lock().unwrap(), Some(RunStatus::Cancelled));
+    }
+
+    type EvidenceEvent = (String, Provider, Option<String>);
+
+    #[derive(Clone, Default)]
+    struct RecordingEvidence(Arc<Mutex<Vec<EvidenceEvent>>>);
+
+    impl EvidenceRecorder for RecordingEvidence {
+        fn record(&mut self, provider: Provider, model: Option<&str>, _now_ms: i64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(("record".into(), provider, model.map(str::to_string)));
+        }
+
+        fn discard(&mut self, provider: Provider, model: Option<&str>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(("discard".into(), provider, model.map(str::to_string)));
+        }
+    }
+
+    #[test]
+    fn engine_records_ok_discards_only_failing_pair_and_keeps_on_cancel_missing_and_malformed() {
+        let mut wf = wrc_workflow(2);
+        wf.stages[0].provider = Provider::Claude;
+        wf.stages[0].model = Some("sonnet".into());
+        wf.stages[1].provider = Provider::Agy;
+        wf.stages[1].model = None;
+        wf.stages[2].provider = Provider::Claude;
+        wf.stages[2].model = Some("haiku".into());
+
+        // 1. Failing stage discards ONLY its own (provider, model) pair; earlier OK stage records its own.
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let mut runner = ScriptedRunner::new();
+        runner.push(|req| {
+            fs::write(req.workspace.join("a.txt"), "ok").unwrap();
+            StageResult::default()
+        });
+        runner.push(|_req| StageResult {
+            outcome: StageOutcome::NonZeroExit(1),
+            usage: Usage::default(),
+            error: Some("quota exhausted".into()),
+        });
+        let events = RecordingEvidence::default();
+        let state = Engine::new(make_config(&tmp, wf.clone()), ws, runner, FakeClock::new())
+            .with_evidence_recorder(events.clone())
+            .run();
+        assert_eq!(state.status, RunStatus::Error);
+        assert_eq!(
+            *events.0.lock().unwrap(),
+            vec![
+                ("record".into(), Provider::Claude, Some("sonnet".into())),
+                ("discard".into(), Provider::Agy, None),
+            ]
+        );
+
+        // 2. Cancelled stage touches neither record nor discard.
+        let tmp2 = TempDir::new().unwrap();
+        let ws2 = FakeWorkspace::new(tmp2.path().join("ws"));
+        let mut runner2 = ScriptedRunner::new();
+        runner2.push(|_req| StageResult {
+            outcome: StageOutcome::Cancelled,
+            usage: Usage::default(),
+            error: None,
+        });
+        let events2 = RecordingEvidence::default();
+        let state2 = Engine::new(
+            make_config(&tmp2, wf.clone()),
+            ws2,
+            runner2,
+            FakeClock::new(),
+        )
+        .with_evidence_recorder(events2.clone())
+        .run();
+        assert_eq!(state2.status, RunStatus::Cancelled);
+        assert!(events2.0.lock().unwrap().is_empty());
+
+        // 3. Missing artifact: model exited 0 without error -> keeps/records evidence, never discards.
+        let tmp3 = TempDir::new().unwrap();
+        let ws3 = FakeWorkspace::new(tmp3.path().join("ws"));
+        let mut runner3 = ScriptedRunner::new();
+        runner3.push(|_| StageResult::default());
+        runner3.push(|_| StageResult::default()); // does NOT write review.md!
+        let events3 = RecordingEvidence::default();
+        let state3 = Engine::new(
+            make_config(&tmp3, wf.clone()),
+            ws3,
+            runner3,
+            FakeClock::new(),
+        )
+        .with_evidence_recorder(events3.clone())
+        .run();
+        assert_eq!(state3.status, RunStatus::Error);
+        assert_eq!(
+            *events3.0.lock().unwrap(),
+            vec![
+                ("record".into(), Provider::Claude, Some("sonnet".into())),
+                ("record".into(), Provider::Agy, None),
+            ]
+        );
+
+        // 4. Malformed verdict: model responded cleanly -> keeps/records evidence, never discards.
+        let tmp4 = TempDir::new().unwrap();
+        let ws4 = FakeWorkspace::new(tmp4.path().join("ws"));
+        let mut runner4 = ScriptedRunner::new();
+        runner4.push(|_| StageResult::default());
+        runner4.push(|req| {
+            write_out(req.workspace, "review.md", "ok\n");
+            StageResult::default()
+        });
+        runner4.push(|req| {
+            write_out(req.workspace, "critic.md", "bad verdict without marker\n");
+            StageResult::default()
+        });
+        runner4.push(|req| {
+            write_out(req.workspace, "critic.md", "still malformed\n");
+            StageResult::default()
+        });
+        let events4 = RecordingEvidence::default();
+        let state4 = Engine::new(make_config(&tmp4, wf), ws4, runner4, FakeClock::new())
+            .with_evidence_recorder(events4.clone())
+            .run();
+        assert_eq!(state4.status, RunStatus::Error);
+        assert!(events4
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(kind, _, _)| kind == "record"));
     }
 }

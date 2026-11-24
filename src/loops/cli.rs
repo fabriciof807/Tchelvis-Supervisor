@@ -1,20 +1,31 @@
 use crate::config::CockpitPaths;
 use crate::herdr::HerdrClient;
 use crate::loops::config::{
-    check_home_ro_does_not_reach, parse_loops_config, LoopsConfig, SandboxConfig,
+    check_home_ro_does_not_reach, parse_loops_config, LoopsConfig, PreflightConfig, PreflightMode,
+    SandboxConfig, DEFAULT_MAX_CONCURRENT,
 };
-use crate::loops::engine::{Engine, EngineConfig, ProcessStageRunner};
+use crate::loops::engine::{Engine, EngineConfig, EvidenceRecorder, ProcessStageRunner};
+use crate::loops::evidence::{
+    compute_account_identity, compute_executable_identity, hex_decode_32, hex_encode,
+    AccountIdentityInput, CliIdentity, EvidenceStore,
+};
+use crate::loops::free_check::{
+    is_model_listed, plan_preflight, run_free_checks_with_options, ClaudeStatus, FreeCheck, Listed,
+    PlanAction, PlannedCheck, ProviderFreeOutcome,
+};
 use crate::loops::models::{
     check_project_models_references, is_confirmed, load_project_models_from_repo, parse_use_flag,
     record_confirmation, resolve_workflow, write_default_in_toml_file, ModelChoice, ModelSource,
     ProjectModels, WorkflowOrigin,
 };
-use crate::loops::preflight::{probe_targets, run_preflight_with_options, ProbeRecord};
+use crate::loops::preflight::{
+    probe_targets, run_preflight_with_options, ProbeFailure, ProbeMethod, ProbeRecord, ProbeTarget,
+};
 use crate::loops::process::SystemClock;
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{BwrapSandbox, InheritedSandbox, Sandbox};
 use crate::loops::state::{
-    format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState,
+    format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState, Usage,
 };
 use crate::loops::watch::{
     current_process_identity, LinuxProcTable, ProcTable, ENGINE_START_GRACE_MS,
@@ -219,6 +230,10 @@ struct FrozenRunConfig {
     caller: Option<CallerInfo>,
     model_sources: BTreeMap<String, ModelSource>,
     preflight: Vec<ProbeRecord>,
+    #[serde(default)]
+    evidence_identities: BTreeMap<Provider, CliIdentity>,
+    #[serde(default)]
+    evidence_salt: Option<String>,
     workspace: FrozenWorkspaceMeta,
     /// `PATH` the CLIs were verified with: a Herdr terminal has its own.
     path: Option<String>,
@@ -875,46 +890,347 @@ fn non_empty_regular_file(path: &Path) -> bool {
     meta.is_file() && meta.len() > 0
 }
 
-fn check_accounts(
-    wf: &Workflow,
+fn evidence_store_path(paths: &CockpitPaths) -> PathBuf {
+    paths.state_dir.join("loops/model_evidence.json")
+}
+
+fn distinct_providers(targets: &[ProbeTarget]) -> Vec<Provider> {
+    let mut out = Vec::new();
+    for t in targets {
+        if !out.contains(&t.choice.provider) {
+            out.push(t.choice.provider);
+        }
+    }
+    out
+}
+
+fn build_cli_identity_for_provider(
+    provider: Provider,
+    free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
     home_dir: &Path,
     opencode_api_key: Option<&str>,
-) -> std::result::Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-    let needs_claude = wf.stages.iter().any(|s| s.provider == Provider::Claude);
-    let needs_agy = wf.stages.iter().any(|s| s.provider == Provider::Agy);
-    let needs_opencode_key = wf
-        .stages
+    sandbox_kind: &str,
+    salt: &[u8; 32],
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<CliIdentity> {
+    let executable = compute_executable_identity(provider.as_str(), path_var);
+    let account = match provider {
+        Provider::Claude => match free_outcomes
+            .get(&Provider::Claude)
+            .and_then(|o| o.claude_status.as_ref())
+        {
+            Some(ClaudeStatus::LoggedIn {
+                email,
+                org_id,
+                org_name,
+            }) if org_id.is_some() || email.is_some() => compute_account_identity(
+                salt,
+                AccountIdentityInput::ClaudeKnown {
+                    org_id: org_id.as_deref(),
+                    org_name: org_name.as_deref(),
+                    email: email.as_deref(),
+                },
+            ),
+            // No known account: evidence would be shared by every account.
+            _ => return None,
+        },
+        Provider::Opencode => {
+            compute_account_identity(salt, AccountIdentityInput::OpencodeKey(opencode_api_key))
+        }
+        Provider::Agy => {
+            let present = non_empty_regular_file(
+                &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            );
+            compute_account_identity(salt, AccountIdentityInput::AgyTokenPresent(present))
+        }
+    };
+    Some(CliIdentity {
+        executable,
+        account,
+        sandbox: sandbox_kind.to_string(),
+    })
+}
+
+fn build_cli_identities(
+    providers: &[Provider],
+    free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
+    home_dir: &Path,
+    opencode_api_key: Option<&str>,
+    sandbox_kind: &str,
+    salt: &[u8; 32],
+    path_var: Option<&std::ffi::OsStr>,
+) -> BTreeMap<Provider, CliIdentity> {
+    let mut map = BTreeMap::new();
+    for &provider in providers {
+        if let Some(identity) = build_cli_identity_for_provider(
+            provider,
+            free_outcomes,
+            home_dir,
+            opencode_api_key,
+            sandbox_kind,
+            salt,
+            path_var,
+        ) {
+            map.insert(provider, identity);
+        }
+    }
+    map
+}
+
+fn build_free_checks_for_targets(
+    targets: &[ProbeTarget],
+    free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
+    home_dir: &Path,
+    opencode_api_key: Option<&str>,
+) -> Vec<FreeCheck> {
+    targets
         .iter()
-        .any(|s| s.provider == Provider::Opencode && needs_opencode_key(s.model.as_deref()));
+        .map(|target| match target.choice.provider {
+            Provider::Claude => {
+                let outcome = free_outcomes.get(&Provider::Claude);
+                match outcome.and_then(|o| o.claude_status.as_ref()) {
+                    Some(ClaudeStatus::LoggedIn { .. }) => FreeCheck {
+                        account_ok: Ok(()),
+                        listed: Listed::Yes,
+                    },
+                    Some(ClaudeStatus::LoggedOut) => FreeCheck {
+                        account_ok: Err(
+                            "conta do 'claude' desconectada; rode 'tchelvis loop auth login claude'"
+                                .to_string(),
+                        ),
+                        listed: Listed::No,
+                    },
+                    _ => {
+                        if !non_empty_regular_file(&home_dir.join(".claude/.credentials.json")) {
+                            FreeCheck {
+                                account_ok: Err(
+                                    "conta do 'claude' ausente (~/.claude/.credentials.json); rode 'tchelvis loop auth login claude'"
+                                        .to_string(),
+                                ),
+                                listed: Listed::Unknown,
+                            }
+                        } else {
+                            FreeCheck {
+                                account_ok: Ok(()),
+                                listed: Listed::Unknown,
+                            }
+                        }
+                    }
+                }
+            }
+            Provider::Agy => {
+                let outcome = free_outcomes.get(&Provider::Agy);
+                let token_present = non_empty_regular_file(
+                    &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+                );
+                let account_ok = if !token_present {
+                    Err(
+                        "conta do 'agy' ausente (~/.gemini/antigravity-cli/antigravity-oauth-token); rode 'tchelvis loop auth login agy'"
+                            .to_string(),
+                    )
+                } else if let Some(out) = outcome {
+                    out.account_ok.clone()
+                } else {
+                    Ok(())
+                };
+                let listed = match outcome {
+                    Some(out) if out.list_known => is_model_listed(
+                        Provider::Agy,
+                        target.choice.model.as_deref(),
+                        &out.models,
+                    ),
+                    _ => Listed::Unknown,
+                };
+                FreeCheck { account_ok, listed }
+            }
+            Provider::Opencode => {
+                let outcome = free_outcomes.get(&Provider::Opencode);
+                let account_ok =
+                    if needs_opencode_key(target.choice.model.as_deref()) && opencode_api_key.is_none()
+                    {
+                        Err(
+                            "chave OPENCODE_API_KEY ausente para um modelo 'opencode-go/' (exporte OPENCODE_API_KEY ou use um modelo gratuito 'opencode/...')"
+                                .to_string(),
+                        )
+                    } else if let Some(out) = outcome {
+                        out.account_ok.clone()
+                    } else {
+                        Ok(())
+                    };
+                let listed = match outcome {
+                    Some(out) if out.list_known => is_model_listed(
+                        Provider::Opencode,
+                        target.choice.model.as_deref(),
+                        &out.models,
+                    ),
+                    _ => Listed::Unknown,
+                };
+                FreeCheck { account_ok, listed }
+            }
+        })
+        .collect()
+}
 
-    if needs_claude && !non_empty_regular_file(&home_dir.join(".claude/.credentials.json")) {
-        errors.push(
-            "conta do 'claude' ausente (~/.claude/.credentials.json); rode 'tchelvis loop auth login claude'"
-                .to_string(),
+fn format_plan_failures(planned: &[PlannedCheck], extra_secrets: &[String]) -> Option<String> {
+    let fails: Vec<&PlannedCheck> = planned
+        .iter()
+        .filter(|p| matches!(p.action, PlanAction::Fail(_)))
+        .collect();
+    if fails.is_empty() {
+        return None;
+    }
+    let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+    let mut msg = String::from("pré-verificação falhou (nada foi criado):\n");
+    for fail in fails {
+        if let PlanAction::Fail(reason) = &fail.action {
+            let _ = writeln!(
+                msg,
+                "  - {} (etapas: {}): {}",
+                fail.target.choice.display(),
+                fail.target.stage_ids.join(", "),
+                reason
+            );
+        }
+    }
+    Some(redact_loop_text(msg.trim_end(), &refs))
+}
+
+fn format_probe_failures(failures: &[ProbeFailure], extra_secrets: &[String]) -> String {
+    let mut msg = String::from("pré-teste de modelos falhou (nada foi criado):\n");
+    for fail in failures {
+        let _ = writeln!(
+            msg,
+            "  - {} (etapas: {}): {}",
+            fail.choice.display(),
+            fail.stage_ids.join(", "),
+            fail.reason
         );
     }
-    if needs_agy
-        && !non_empty_regular_file(
-            &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-        )
-    {
-        errors.push(
-            "conta do 'agy' ausente (~/.gemini/antigravity-cli/antigravity-oauth-token); rode 'tchelvis loop auth login agy'"
-                .to_string(),
-        );
+    let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+    redact_loop_text(msg.trim_end(), &refs)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_probe_evidence(
+    evidence: &mut EvidenceStore,
+    records: &[ProbeRecord],
+    free_outcomes: &BTreeMap<Provider, ProviderFreeOutcome>,
+    home_dir: &Path,
+    opencode_api_key: Option<&str>,
+    sandbox_kind: &str,
+    now_ms: i64,
+    extra_secrets: &[String],
+) {
+    let path_var = std::env::var_os("PATH");
+    for rec in records {
+        let choice = ModelChoice {
+            provider: rec.provider,
+            model: rec.model.clone(),
+        };
+        if let Err(err) = evidence.record_with(&choice, now_ms, |salt| {
+            build_cli_identity_for_provider(
+                rec.provider,
+                free_outcomes,
+                home_dir,
+                opencode_api_key,
+                sandbox_kind,
+                salt,
+                path_var.as_deref(),
+            )
+        }) {
+            eprint_redacted(
+                &format!(
+                    "aviso: falha ao gravar evidência de {}: {err:#}",
+                    choice.display()
+                ),
+                extra_secrets,
+            );
+        }
     }
-    if needs_opencode_key && opencode_api_key.is_none() {
-        errors.push(
-            "chave OPENCODE_API_KEY ausente para um modelo 'opencode-go/' (exporte OPENCODE_API_KEY ou use um modelo gratuito 'opencode/...')"
-                .to_string(),
-        );
+}
+
+fn discard_failed_probes(
+    evidence: &mut EvidenceStore,
+    failures: &[ProbeFailure],
+    extra_secrets: &[String],
+) {
+    for fail in failures {
+        if let Err(err) = evidence.discard(&fail.choice) {
+            eprint_redacted(
+                &format!(
+                    "aviso: falha ao descartar evidência de {}: {err:#}",
+                    fail.choice.display()
+                ),
+                extra_secrets,
+            );
+        }
+    }
+}
+
+fn assemble_preflight_records(
+    planned: &[PlannedCheck],
+    probed: Vec<ProbeRecord>,
+) -> Vec<ProbeRecord> {
+    let mut probed_iter = probed.into_iter();
+    let mut out = Vec::with_capacity(planned.len());
+    for item in planned {
+        match &item.action {
+            PlanAction::Evidence => out.push(ProbeRecord {
+                provider: item.target.choice.provider,
+                model: item.target.choice.model.clone(),
+                method: ProbeMethod::Evidence,
+                usage: Usage::default(),
+                duration_ms: 0,
+            }),
+            PlanAction::FreeOnly => out.push(ProbeRecord {
+                provider: item.target.choice.provider,
+                model: item.target.choice.model.clone(),
+                method: ProbeMethod::FreeOnly,
+                usage: Usage::default(),
+                duration_ms: 0,
+            }),
+            PlanAction::Probe => {
+                if let Some(rec) = probed_iter.next() {
+                    out.push(rec);
+                }
+            }
+            PlanAction::Fail(_) => {}
+        }
+    }
+    out
+}
+
+struct StoreEvidenceRecorder {
+    path: PathBuf,
+    salt: Option<[u8; 32]>,
+    identities: BTreeMap<Provider, CliIdentity>,
+}
+
+impl EvidenceRecorder for StoreEvidenceRecorder {
+    fn record(&mut self, provider: Provider, model: Option<&str>, now_ms: i64) {
+        let Some(identity) = self.identities.get(&provider).cloned() else {
+            return;
+        };
+        let mut store = EvidenceStore::open(&self.path);
+        if let Some(salt) = self.salt {
+            store.set_salt_if_uninitialized(salt);
+        }
+        let choice = ModelChoice {
+            provider,
+            model: model.map(ToString::to_string),
+        };
+        if self.salt.is_none_or(|s| *store.salt() == s) || provider == Provider::Agy {
+            let _ = store.record(&choice, &identity, now_ms);
+        }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
+    fn discard(&mut self, provider: Provider, model: Option<&str>) {
+        let mut store = EvidenceStore::open(&self.path);
+        let choice = ModelChoice {
+            provider,
+            model: model.map(ToString::to_string),
+        };
+        let _ = store.discard(&choice);
     }
 }
 
@@ -1141,6 +1457,10 @@ fn default_loops_toml_template() -> &'static str {
      \n\
      [sandbox.bwrap]\n\
      home_ro = [\".cargo\", \".rustup\"]\n\
+     \n\
+     # [preflight]\n\
+     # mode = \"auto\"      # \"auto\" | \"always\" | \"free\"\n\
+     # valid_hours = 12   # 1..=168\n\
      \n\
      # [defaults.worker]\n\
      # provider = \"claude\"\n\
@@ -1541,28 +1861,115 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
         None => {
             let opencode_key = resolve_opencode_api_key();
             let extra = collect_extra_secrets(opencode_key.as_deref());
-            let claude_ok =
+            let cfg = match load_loops_config_optional(paths) {
+                Ok(Some(c)) => c,
+                Ok(None) => LoopsConfig {
+                    max_concurrent: DEFAULT_MAX_CONCURRENT,
+                    auto_approve_in_sandbox: false,
+                    env_pass: Vec::new(),
+                    sandbox: SandboxConfig::Bwrap {
+                        home_ro: Vec::new(),
+                    },
+                    defaults: RoleDefaults::default(),
+                    preflight: PreflightConfig::default(),
+                },
+                Err(e) => return Err(LoopError::usage(format!("{e:#}"))),
+            };
+            ensure_sandbox_prereqs(&cfg)?;
+            let sandbox = build_sandbox(&cfg);
+            let auth_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
+                ".auth-{}-{}",
+                std::process::id(),
+                generate_run_id()
+            )))
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+            let cancel = install_cancel_signal_flag();
+            let clock = SystemClock::new();
+            let providers = [Provider::Claude, Provider::Agy, Provider::Opencode];
+            let outcomes = run_free_checks_with_options(
+                &providers,
+                sandbox.as_ref(),
+                auth_dir.path(),
+                &paths.home_dir,
+                &cancel,
+                &clock,
+                opencode_key.as_deref(),
+            )
+            .map_err(LoopError::cancelled)?;
+            drop(auth_dir);
+
+            let claude_cred =
                 non_empty_regular_file(&paths.home_dir.join(".claude/.credentials.json"));
-            let agy_ok = non_empty_regular_file(
+            let agy_cred = non_empty_regular_file(
                 &paths
                     .home_dir
                     .join(".gemini/antigravity-cli/antigravity-oauth-token"),
             );
-            let opencode_ok = opencode_key.is_some();
 
-            println!(
-                "claude:   {} (arquivo ~/.claude/.credentials.json)",
-                if claude_ok { "autenticado" } else { "ausente" }
-            );
-            println!(
-                "agy:      {} (arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token)",
-                if agy_ok { "autenticado" } else { "ausente" }
-            );
-            println!(
-                "opencode: {} (OPENCODE_API_KEY; modelos gratuitos 'opencode/...' funcionam sem chave)",
-                if opencode_ok { "chave presente" } else { "sem chave" }
-            );
-            let _ = extra;
+            let claude_line = match outcomes
+                .get(&Provider::Claude)
+                .and_then(|o| o.claude_status.as_ref())
+            {
+                Some(ClaudeStatus::LoggedIn { .. }) => {
+                    "claude:   autenticado (claude auth status)".to_string()
+                }
+                Some(ClaudeStatus::LoggedOut) => {
+                    "claude:   ausente (rode 'tchelvis loop auth login claude')".to_string()
+                }
+                Some(ClaudeStatus::Unknown(reason)) => {
+                    if !claude_cred {
+                        "claude:   ausente (arquivo ~/.claude/.credentials.json; rode 'tchelvis loop auth login claude')"
+                            .to_string()
+                    } else {
+                        format!("claude:   indeterminado ({})", for_terminal(reason, &extra))
+                    }
+                }
+                None => {
+                    if claude_cred {
+                        "claude:   autenticado (arquivo ~/.claude/.credentials.json)".to_string()
+                    } else {
+                        "claude:   ausente (arquivo ~/.claude/.credentials.json)".to_string()
+                    }
+                }
+            };
+
+            let agy_line = match outcomes.get(&Provider::Agy) {
+                Some(out) if out.list_known => {
+                    let count = out.models.len() / 2;
+                    format!("agy:      autenticado ({count} modelo(s) listado(s) por 'agy models')")
+                }
+                Some(out) if out.account_ok.is_err() || !agy_cred => {
+                    "agy:      ausente (rode 'tchelvis loop auth login agy')".to_string()
+                }
+                _ => {
+                    if agy_cred {
+                        "agy:      autenticado (token presente; lista indisponível em 'agy models')"
+                            .to_string()
+                    } else {
+                        "agy:      ausente (arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token)"
+                            .to_string()
+                    }
+                }
+            };
+
+            let key_label = if opencode_key.is_some() {
+                "chave presente"
+            } else {
+                "sem chave"
+            };
+            let opencode_line = match outcomes.get(&Provider::Opencode) {
+                Some(out) if out.list_known => format!(
+                    "opencode: {key_label} ({} modelo(s) listado(s) por 'opencode models'; modelos gratuitos 'opencode/...' funcionam sem chave)",
+                    out.models.len()
+                ),
+                _ => format!(
+                    "opencode: {key_label} (OPENCODE_API_KEY; modelos gratuitos 'opencode/...' funcionam sem chave)"
+                ),
+            };
+
+            println!("{claude_line}");
+            println!("{agy_line}");
+            println!("{opencode_line}");
             Ok(())
         }
         Some(AuthSubcommand::Login { cli }) => {
@@ -1676,14 +2083,19 @@ fn cmd_check(
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra = collect_extra_secrets(opencode_key.as_deref());
 
+    let ev_path = evidence_store_path(paths);
     if let Some(r) = &repo {
         let _roles = load_roles_for_workflow(&resolution.workflow, Some(r), paths)
             .map_err(|e| LoopError::usage(format!("{e:#}")))?;
         let dummy_run = r.join(".loops/runs");
         let dummy_ws = paths.state_dir.join("loops");
         if let SandboxConfig::Bwrap { ref home_ro } = cfg.sandbox {
-            check_home_ro_does_not_reach(&paths.home_dir, home_ro, &[&dummy_run, &dummy_ws])
-                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            check_home_ro_does_not_reach(
+                &paths.home_dir,
+                home_ro,
+                &[&dummy_run, &dummy_ws, &ev_path],
+            )
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
         }
         for warn in check_project_models_warnings(r, paths, project_models.as_ref()) {
             eprintln!("aviso: {warn}");
@@ -1691,6 +2103,11 @@ fn cmd_check(
     } else {
         let _roles = load_roles_for_workflow(&resolution.workflow, None, paths)
             .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        let dummy_ws = paths.state_dir.join("loops");
+        if let SandboxConfig::Bwrap { ref home_ro } = cfg.sandbox {
+            check_home_ro_does_not_reach(&paths.home_dir, home_ro, &[&dummy_ws, &ev_path])
+                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        }
     }
 
     ensure_sandbox_prereqs(&cfg)?;
@@ -1708,13 +2125,64 @@ fn cmd_check(
         ))
     })?;
 
-    if let Err(account_errs) = check_accounts(
-        &resolution.workflow,
+    let targets = probe_targets(&resolution.workflow);
+    let providers = distinct_providers(&targets);
+    let cancel = install_cancel_signal_flag();
+    let clock = SystemClock::new();
+    let free_outcomes = run_free_checks_with_options(
+        &providers,
+        sandbox.as_ref(),
+        check_dir.path(),
+        &paths.home_dir,
+        &cancel,
+        &clock,
+        opencode_key.as_deref(),
+    )
+    .map_err(LoopError::cancelled)?;
+
+    let mut evidence = EvidenceStore::open(&ev_path);
+    if let Some(warn) = evidence.warning() {
+        eprint_redacted(&format!("aviso: {warn}"), &extra);
+    }
+
+    let path_var = std::env::var_os("PATH");
+    let identities = build_cli_identities(
+        &providers,
+        &free_outcomes,
         &paths.home_dir,
         opencode_key.as_deref(),
-    ) {
-        return Err(LoopError::err(account_errs.join("\n")));
+        sandbox.kind(),
+        evidence.salt(),
+        path_var.as_deref(),
+    );
+    let checks = build_free_checks_for_targets(
+        &targets,
+        &free_outcomes,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+    );
+    let mut account_errs = Vec::new();
+    for chk in &checks {
+        if let Err(reason) = &chk.account_ok {
+            if !account_errs.contains(reason) {
+                account_errs.push(reason.clone());
+            }
+        }
     }
+    if !account_errs.is_empty() {
+        let joined = account_errs.join("\n");
+        let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+        return Err(LoopError::err(redact_loop_text(&joined, &refs)));
+    }
+
+    let planned = plan_preflight(
+        &targets,
+        &checks,
+        &evidence,
+        &cfg.preflight,
+        &identities,
+        unix_now_ms(),
+    );
 
     println!(
         "Workflow '{workflow_name}' válido (sandbox: {}).",
@@ -1738,6 +2206,28 @@ fn cmd_check(
             st.source
         );
     }
+    println!(
+        "Pré-teste (modo: {}, validade: {}h):",
+        cfg.preflight.mode.as_str(),
+        cfg.preflight.valid_hours
+    );
+    for item in &planned {
+        let summary = match &item.action {
+            PlanAction::Evidence => "evidência recente válida (não chama modelo)".to_string(),
+            PlanAction::Probe => match cfg.preflight.mode {
+                PreflightMode::Always => "chamada real (modo always)".to_string(),
+                _ => "chamada real (sem evidência válida)".to_string(),
+            },
+            PlanAction::FreeOnly => "verificação gratuita ok (não chama modelo)".to_string(),
+            PlanAction::Fail(reason) => format!("FALHA: {}", for_terminal(reason, &extra)),
+        };
+        println!(
+            "  {} (etapas: {}): {}",
+            item.target.choice.display(),
+            item.target.stage_ids.join(", "),
+            summary
+        );
+    }
 
     if !cfg.auto_approve_in_sandbox {
         println!("Aviso: auto_approve_in_sandbox está false em ~/.config/tchelvis/loops.toml (obrigatório true para rodar).");
@@ -1749,15 +2239,12 @@ fn cmd_check(
                 "auto_approve_in_sandbox = true em ~/.config/tchelvis/loops.toml é obrigatório para --live",
             ));
         }
-        let cancel = install_cancel_signal_flag();
         let probe_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
             ".check-live-{}-{}",
             std::process::id(),
             generate_run_id()
         )))
         .map_err(|e| LoopError::err(format!("{e:#}")))?;
-        let targets = probe_targets(&resolution.workflow);
-        let clock = SystemClock::new();
         let probes = run_preflight_with_options(
             &targets,
             sandbox.as_ref(),
@@ -1771,6 +2258,16 @@ fn cmd_check(
         }
         match probes {
             Ok(records) => {
+                record_probe_evidence(
+                    &mut evidence,
+                    &records,
+                    &free_outcomes,
+                    &paths.home_dir,
+                    opencode_key.as_deref(),
+                    sandbox.kind(),
+                    unix_now_ms(),
+                    &extra,
+                );
                 println!("Pré-teste ao vivo concluído ({} modelo(s)):", records.len());
                 for rec in records {
                     println!(
@@ -1782,23 +2279,14 @@ fn cmd_check(
                 }
             }
             Err(failures) => {
-                let mut msg = String::from("pré-teste de modelos falhou:\n");
-                for fail in failures {
-                    let _ = writeln!(
-                        msg,
-                        "  - {} (etapas: {}): {}",
-                        fail.choice.display(),
-                        fail.stage_ids.join(", "),
-                        fail.reason
-                    );
-                }
-                let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-                return Err(LoopError::err(redact_loop_text(msg.trim_end(), &refs)));
+                discard_failed_probes(&mut evidence, &failures, &extra);
+                return Err(LoopError::err(format_probe_failures(&failures, &extra)));
             }
         }
+    } else if let Some(fail_msg) = format_plan_failures(&planned, &extra) {
+        return Err(LoopError::err(fail_msg));
     }
 
-    let _ = &extra;
     Ok(())
 }
 
@@ -1920,10 +2408,15 @@ async fn cmd_run(
         .join("loops")
         .join(&run_id)
         .join("workspace");
+    let ev_path = evidence_store_path(paths);
 
     if let SandboxConfig::Bwrap { ref home_ro } = cfg.sandbox {
-        check_home_ro_does_not_reach(&paths.home_dir, home_ro, &[&run_dir, &workspace_path])
-            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        check_home_ro_does_not_reach(
+            &paths.home_dir,
+            home_ro,
+            &[&run_dir, &workspace_path, &ev_path],
+        )
+        .map_err(|e| LoopError::usage(format!("{e:#}")))?;
     }
 
     // A foreground run prints its result: there is nobody to wake.
@@ -2006,30 +2499,19 @@ async fn cmd_run(
             .map_err(|e| LoopError::err(format!("{e:#}")))?;
     }
 
-    // 3. Account check + OPENCODE_API_KEY
+    // 3. Resolve OPENCODE_API_KEY + secrets for redaction
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
-    if let Err(acc_errs) = check_accounts(
-        &resolution.workflow,
-        &paths.home_dir,
-        opencode_key.as_deref(),
-    ) {
-        let joined = acc_errs.join("\n");
-        let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
-        return Err(LoopError::err(redact_loop_text(&joined, &refs)));
-    }
 
-    // 4. Read-only git check BEFORE preflight probes so dirty repo spends zero tokens
+    // 4. Read-only git check BEFORE preflight so dirty repo runs zero CLIs
     let branch = format!("loop/{}-{run_id}", resolution.workflow.name);
     let repo_info = GitWorkspace::preflight_check_repo(&repo, &branch, from_head)
         .map_err(|e| LoopError::err(format!("{e:#}")))?;
 
-    // 5. Preflight probes (with SIGINT/SIGTERM cancellation)
+    // 5. Three-level preflight: Level 1 (free CLI checks) -> Level 2 (evidence store) -> Level 3 (lean probes)
     let cancel = install_cancel_signal_flag();
     let targets = probe_targets(&resolution.workflow);
-    if verbose {
-        eprintln!("Testando {} modelo(s) antes de iniciar...", targets.len());
-    }
+    let providers = distinct_providers(&targets);
     let preflight_dir = TempDirGuard::create(
         paths
             .state_dir
@@ -2038,37 +2520,116 @@ async fn cmd_run(
     )
     .map_err(|e| LoopError::err(format!("{e:#}")))?;
     let clock = SystemClock::new();
-    let preflight_res = run_preflight_with_options(
-        &targets,
+
+    let free_outcomes = run_free_checks_with_options(
+        &providers,
         sandbox.as_ref(),
         preflight_dir.path(),
+        &paths.home_dir,
         &cancel,
         &clock,
         opencode_key.as_deref(),
-    );
-    drop(preflight_dir);
-    if cancel.load(Ordering::Relaxed) {
-        return Err(LoopError::cancelled(
-            "execução cancelada durante o pré-teste",
-        ));
+    )
+    .map_err(|_| LoopError::cancelled("execução cancelada durante o pré-teste"))?;
+
+    let mut evidence = EvidenceStore::open(&ev_path);
+    if let Some(warn) = evidence.warning() {
+        eprint_redacted(&format!("aviso: {warn}"), &extra_secrets);
     }
-    let preflight_records = match preflight_res {
-        Ok(records) => records,
-        Err(failures) => {
-            let mut msg = String::from("pré-teste de modelos falhou (nada foi criado):\n");
-            for fail in failures {
-                let _ = writeln!(
-                    msg,
-                    "  - {} (etapas: {}): {}",
-                    fail.choice.display(),
-                    fail.stage_ids.join(", "),
-                    fail.reason
+
+    let path_var = std::env::var_os("PATH");
+    let initial_identities = build_cli_identities(
+        &providers,
+        &free_outcomes,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+        sandbox.kind(),
+        evidence.salt(),
+        path_var.as_deref(),
+    );
+    let free_checks = build_free_checks_for_targets(
+        &targets,
+        &free_outcomes,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+    );
+    let planned = plan_preflight(
+        &targets,
+        &free_checks,
+        &evidence,
+        &cfg.preflight,
+        &initial_identities,
+        unix_now_ms(),
+    );
+    if let Some(fail_msg) = format_plan_failures(&planned, &extra_secrets) {
+        return Err(LoopError::err(fail_msg));
+    }
+
+    let to_probe: Vec<ProbeTarget> = planned
+        .iter()
+        .filter(|p| matches!(p.action, PlanAction::Probe))
+        .map(|p| p.target.clone())
+        .collect();
+
+    if verbose {
+        eprintln!(
+            "Pré-teste: {} modelo(s) via chamada real ({} no total)...",
+            to_probe.len(),
+            targets.len()
+        );
+    }
+
+    let probed_records = if to_probe.is_empty() {
+        Vec::new()
+    } else {
+        let preflight_res = run_preflight_with_options(
+            &to_probe,
+            sandbox.as_ref(),
+            preflight_dir.path(),
+            &cancel,
+            &clock,
+            opencode_key.as_deref(),
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LoopError::cancelled(
+                "execução cancelada durante o pré-teste",
+            ));
+        }
+        match preflight_res {
+            Ok(records) => {
+                record_probe_evidence(
+                    &mut evidence,
+                    &records,
+                    &free_outcomes,
+                    &paths.home_dir,
+                    opencode_key.as_deref(),
+                    sandbox.kind(),
+                    unix_now_ms(),
+                    &extra_secrets,
                 );
+                records
             }
-            let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
-            return Err(LoopError::err(redact_loop_text(msg.trim_end(), &refs)));
+            Err(failures) => {
+                discard_failed_probes(&mut evidence, &failures, &extra_secrets);
+                return Err(LoopError::err(format_probe_failures(
+                    &failures,
+                    &extra_secrets,
+                )));
+            }
         }
     };
+    drop(preflight_dir);
+    let preflight_records = assemble_preflight_records(&planned, probed_records);
+    let frozen_salt = *evidence.salt();
+    let frozen_identities = build_cli_identities(
+        &providers,
+        &free_outcomes,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+        sandbox.kind(),
+        &frozen_salt,
+        path_var.as_deref(),
+    );
 
     // 6. Side effects: .loops/runs/.gitignore, run_dir, workspace clone, frozen.json, orch.db row
     let _ =
@@ -2105,6 +2666,8 @@ async fn cmd_run(
         caller: caller.clone(),
         model_sources: resolution.model_sources(),
         preflight: preflight_records,
+        evidence_identities: frozen_identities,
+        evidence_salt: Some(hex_encode(&frozen_salt)),
         workspace: ws_meta,
         path: std::env::var("PATH").ok(),
     };
@@ -2286,6 +2849,7 @@ async fn run_frozen_engine_with_cancel(
     let cancel_for_thread = cancel.clone();
     let secrets_for_thread = extra_secrets.clone();
     let orch_db_path = paths.orch_db_file();
+    let ev_path = evidence_store_path(paths);
     let final_state = tokio::task::spawn_blocking(move || -> RunState {
         let sandbox: Box<dyn Sandbox + Sync> = match &frozen.sandbox {
             SandboxConfig::Inherited => Box::new(InheritedSandbox::new(frozen.env_pass.clone())),
@@ -2311,9 +2875,15 @@ async fn run_frozen_engine_with_cancel(
             caller: frozen.caller,
             cancel: cancel_for_thread,
         };
+        let recorder = StoreEvidenceRecorder {
+            path: ev_path,
+            salt: frozen.evidence_salt.as_deref().and_then(hex_decode_32),
+            identities: frozen.evidence_identities,
+        };
         Engine::new(cfg, ws, runner, SystemClock::new())
             .with_model_sources(frozen.model_sources)
             .with_preflight(frozen.preflight)
+            .with_evidence_recorder(recorder)
             .with_extra_secrets(secrets_for_thread)
             .with_on_final(move |st| {
                 if let Ok(store) = OrchStore::open(&orch_db_path) {
@@ -2888,5 +3458,44 @@ mod tests {
             resolve_opencode_api_key_with(None, Some(shell.as_os_str()), Duration::from_secs(5));
         assert_eq!(key.as_deref(), Some("k1"));
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn claude_without_a_known_account_has_no_evidence_identity() {
+        let tmp = TempDir::new().unwrap();
+        let identity = |status: Option<ClaudeStatus>| {
+            let outcomes = BTreeMap::from([(
+                Provider::Claude,
+                ProviderFreeOutcome {
+                    provider: Provider::Claude,
+                    account_ok: Ok(()),
+                    models: Vec::new(),
+                    list_known: status.is_some(),
+                    claude_status: status,
+                },
+            )]);
+            build_cli_identity_for_provider(
+                Provider::Claude,
+                &outcomes,
+                tmp.path(),
+                None,
+                "bwrap",
+                &[7u8; 32],
+                None,
+            )
+        };
+        let logged_in = |email: Option<&str>| {
+            Some(ClaudeStatus::LoggedIn {
+                email: email.map(str::to_string),
+                org_id: None,
+                org_name: None,
+            })
+        };
+        assert!(identity(None).is_none());
+        assert!(identity(Some(ClaudeStatus::Unknown("hang".into()))).is_none());
+        assert!(identity(logged_in(None)).is_none());
+        let a = identity(logged_in(Some("a@example.com"))).unwrap();
+        let b = identity(logged_in(Some("b@example.com"))).unwrap();
+        assert_ne!(a.account, b.account);
     }
 }

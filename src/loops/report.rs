@@ -247,9 +247,9 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
         );
         let _ = writeln!(
             out,
-            "| Provider | Modelo | Turnos | Tokens (In / Out / Cache) | Custo | Duração |"
+            "| Provider | Modelo | Método | Turnos | Tokens (In / Out / Cache) | Custo | Duração |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|");
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|");
         for probe in &state.preflight {
             let model = probe
                 .model
@@ -257,6 +257,7 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
                 .map(|m| escape_table_cell(&sanitize_line(m, None, extra_secrets)))
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "-".to_string());
+            let method = probe.method.as_str();
             let turns = probe
                 .usage
                 .turns
@@ -286,8 +287,8 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
             let dur = format_duration_ms(probe.duration_ms);
             let _ = writeln!(
                 out,
-                "| {} | {} | {} | {} / {} / {} | {} | {} |",
-                probe.provider, model, turns, tok_in, tok_out, tok_cache, cost, dur
+                "| {} | {} | {} | {} | {} / {} / {} | {} | {} |",
+                probe.provider, model, method, turns, tok_in, tok_out, tok_cache, cost, dur
             );
         }
     }
@@ -562,18 +563,28 @@ mod tests {
             reason: None,
             sandbox: "bwrap".to_string(),
             sandbox_exposures: vec![],
-            preflight: vec![crate::loops::preflight::ProbeRecord {
-                provider: Provider::Claude,
-                model: Some("haiku".to_string()),
-                usage: Usage {
-                    turns: Some(1),
-                    input_tokens: Some(9_000),
-                    output_tokens: Some(50),
-                    cache_read_tokens: Some(0),
-                    cost_usd: Some(0.5000),
+            preflight: vec![
+                crate::loops::preflight::ProbeRecord {
+                    provider: Provider::Claude,
+                    model: Some("haiku".to_string()),
+                    method: crate::loops::preflight::ProbeMethod::Probe,
+                    usage: Usage {
+                        turns: Some(1),
+                        input_tokens: Some(9_000),
+                        output_tokens: Some(50),
+                        cache_read_tokens: Some(0),
+                        cost_usd: Some(0.5000),
+                    },
+                    duration_ms: 2500,
                 },
-                duration_ms: 2500,
-            }],
+                crate::loops::preflight::ProbeRecord {
+                    provider: Provider::Agy,
+                    model: Some("gemini-4-hydrogen".to_string()),
+                    method: crate::loops::preflight::ProbeMethod::Evidence,
+                    usage: Usage::default(),
+                    duration_ms: 0,
+                },
+            ],
             current_cycle: 1,
             max_cycles: 3,
             branch: Some("loop/fast-worker-reviewer-20261123-182500-a1b2".to_string()),
@@ -613,6 +624,9 @@ mod tests {
 
         let md = render_report(&state, tmp.path());
         assert!(md.contains("Pré-teste de modelos"));
+        assert!(md.contains("Método"));
+        assert!(md.contains("| probe |"));
+        assert!(md.contains("| evidência |"));
         assert!(md.contains("$0.5000"));
         assert!(md.contains("- **Turnos:** 2\n"));
         assert!(md.contains("- **Tokens de entrada:** 100\n"));
