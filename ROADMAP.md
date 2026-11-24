@@ -4,7 +4,7 @@ Direction, milestone order, and dependencies. Behavior details and acceptance cr
 milestone belong in its own spec/plan when the milestone starts. Session-level status lives in
 [`HANDOFF.md`](HANDOFF.md).
 
-_Last updated: 2026-11-23_
+_Last updated: 2026-11-24_
 
 ## Dependency graph
 
@@ -41,7 +41,7 @@ with the UI track.
 | M8 | Supervisor chat + Pi Durable ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`, `238191a`, `6c472d3`); **Phase B: adopt Pi Durable** |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
 | M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Implemented**; host validation pending |
-| M11 | Declarative multi-agent loops (`tchelvis loop`, [design](docs/superpowers/specs/2026-11-23-loop-engine-design.md)) | M10 | **Next** — design approved 2026-11-23, phase A plan approved |
+| M11 | Declarative multi-agent loops (`tchelvis loop`, [design](docs/superpowers/specs/2026-11-23-loop-engine-design.md)) | M10 | **Phase A implemented** (host/Incus validation & Phases B–C pending) |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -171,11 +171,14 @@ a closed `allow_tools` list, and `tchelvis supervisor rules [test]` for dry runs
 stays immutable and an invalid table turns automatic replies off.
 Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md).
 
-### M11 — Declarative multi-agent loops (proposed)
-`tchelvis loop`: a fixed engine runs worker/reviewer/critic stages from TOML workflows in clean headless
-sessions inside a mandatory sandbox (Incus, bubblewrap or an explicit existing container), exchanging
-files. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls or needs a
-human. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
+### M11 — Declarative multi-agent loops (Phase A implemented; Phases B–C planned)
+`tchelvis loop`: a fixed engine runs headless worker/reviewer/critic stages from TOML workflows inside a mandatory sandbox (`bwrap` default, `inherited` inside containers, `incus` planned), exchanging files through symlink-safe `.tchelvis-loop/{in,out}` directories. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls, errors, or is cancelled. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
+- **Operational guarantees & security notes:**
+  - The loop never merges or pushes (commits only to a local `loop/<workflow>-<run-id>` branch, leaving checkout and `.gitignore` untouched).
+  - `auto_approve_in_sandbox` must be turned on by the user in `~/.config/tchelvis/loops.toml`.
+  - `bwrap` shares the network and localhost (plus abstract sockets), while keeping `/` read-only and binding only the cloned run workspace writable.
+  - Every model is really called once before a loop starts and that spends tokens (`Reply with exactly: OK` preflight probe per distinct `provider:model` pair).
+  - An exported `OPENCODE_API_KEY` is visible to every program started from that shell (`tchelvis` only passes it into `opencode` stages/probes via environment and redacts it, never writing it to disk).
 
 ### M6 — Delegator mode & multi-agent orchestration (implemented)
 Event-driven parent-child agent orchestration (`tchelvis orch`) over Herdr (`hc`) terminals. Design: [M6 spec](docs/designs/m6-orchestration.md).

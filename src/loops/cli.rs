@@ -1,0 +1,2892 @@
+use crate::config::CockpitPaths;
+use crate::herdr::HerdrClient;
+use crate::loops::config::{
+    check_home_ro_does_not_reach, parse_loops_config, LoopsConfig, SandboxConfig,
+};
+use crate::loops::engine::{Engine, EngineConfig, ProcessStageRunner};
+use crate::loops::models::{
+    check_project_models_references, is_confirmed, load_project_models_from_repo, parse_use_flag,
+    record_confirmation, resolve_workflow, write_default_in_toml_file, ModelChoice, ModelSource,
+    ProjectModels, WorkflowOrigin,
+};
+use crate::loops::preflight::{probe_targets, run_preflight_with_options, ProbeRecord};
+use crate::loops::process::SystemClock;
+use crate::loops::report::render_report_with_secrets;
+use crate::loops::sandbox::{BwrapSandbox, InheritedSandbox, Sandbox};
+use crate::loops::state::{
+    format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState,
+};
+use crate::loops::watch::{
+    current_process_identity, LinuxProcTable, ProcTable, ENGINE_START_GRACE_MS,
+};
+use crate::loops::workflow::{
+    is_valid_role_name, is_valid_slug, is_valid_stage_id, parse_workflow_unresolved, Provider,
+    RoleDefaults, UnresolvedWorkflow, Workflow, DEFAULT_MAX_CYCLES, DEFAULT_MAX_DURATION_SECS,
+    DEFAULT_ROLES, DEFAULT_STAGE_TIMEOUT_SECS, DEFAULT_STALL_SECS, PRESET_WORKFLOWS,
+};
+use crate::loops::workspace::{FrozenWorkspaceMeta, GitWorkspace};
+use crate::model::{IpcOp, IpcRequest};
+use crate::orch::store::{LoopRunRecord, OrchStore};
+use anyhow::{bail, Context, Result};
+use clap::Subcommand;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::fmt::Write as _;
+use std::fs::{self, File, OpenOptions};
+use std::io::{IsTerminal, Read, Write};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub const EXIT_PASS: i32 = 0;
+pub const EXIT_ERROR: i32 = 1;
+pub const EXIT_USAGE: i32 = 2;
+pub const EXIT_ESCALATE: i32 = 3;
+pub const EXIT_CANCELLED: i32 = 4;
+
+const MAX_INPUT_FILE_BYTES: usize = 1024 * 1024;
+const MAX_WORKFLOW_TOML_BYTES: usize = 256 * 1024;
+const MAX_ROLE_MD_BYTES: usize = 1024 * 1024;
+const MAX_FROZEN_BYTES: usize = 8 * 1024 * 1024;
+const MAX_LOG_PRINT_BYTES: usize = 64 * 1024 * 1024;
+const OPENCODE_KEY_START: &str = "\x1eTCHELVIS_OPENCODE_KEY_START\x1e";
+const OPENCODE_KEY_END: &str = "\x1eTCHELVIS_OPENCODE_KEY_END\x1e";
+const OPENCODE_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Subcommand)]
+pub enum LoopCommands {
+    /// Inicializa .loops/ e ~/.config/tchelvis/loops.toml (preserva arquivos existentes)
+    Init,
+    /// Cria um novo workflow em .loops/workflows/<nome>.toml
+    New {
+        /// Nome do workflow ([a-z0-9-]+)
+        name: String,
+        /// Lista separada por vírgulas de roles das etapas em ordem
+        #[arg(long, required = true, value_delimiter = ',')]
+        stages: Vec<String>,
+    },
+    /// Lista workflows disponíveis ou execuções registradas (--runs)
+    List {
+        /// Lista execuções registradas em vez de workflows
+        #[arg(long)]
+        runs: bool,
+    },
+    /// Valida workflow, configuração, modelos e sandbox (sem gastar tokens, salvo --live)
+    Check {
+        /// Nome do workflow
+        workflow: String,
+        /// Executa também o pré-teste real nos modelos do workflow
+        #[arg(long)]
+        live: bool,
+        /// Sobrescreve CLI/modelo de uma etapa (etapa=cli[:modelo])
+        #[arg(long = "use")]
+        use_overrides: Vec<String>,
+    },
+    /// Inspeciona ou configura modelos por workflow e role
+    #[command(args_conflicts_with_subcommands = true)]
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelsSubcommand>,
+        /// Nome do workflow (`tchelvis loop models <workflow>`)
+        workflow: Option<String>,
+    },
+    /// Verifica contas dos CLIs ou abre login oficial via Herdr
+    #[command(args_conflicts_with_subcommands = true)]
+    Auth {
+        #[command(subcommand)]
+        action: Option<AuthSubcommand>,
+    },
+    /// Executa um workflow multi-agente em sandbox
+    Run {
+        /// Nome do workflow
+        workflow: String,
+        /// Tarefa/prompt (mutuamente exclusivo com --input-file)
+        prompt: Option<String>,
+        /// Lê a tarefa/prompt de um arquivo (mutuamente exclusivo com prompt)
+        #[arg(long, conflicts_with = "prompt")]
+        input_file: Option<PathBuf>,
+        /// Parte do commit HEAD mesmo com mudanças não commitadas
+        #[arg(long)]
+        from_head: bool,
+        /// Número máximo de ciclos (1..=20)
+        #[arg(long)]
+        max_cycles: Option<u32>,
+        /// Sobrescreve CLI/modelo de uma etapa (etapa=cli[:modelo])
+        #[arg(long = "use")]
+        use_overrides: Vec<String>,
+        /// Inicia o motor em um terminal Herdr e retorna apenas o RUN_ID
+        #[arg(long)]
+        detach: bool,
+        /// Exibe detalhes extras de progresso durante a execução
+        #[arg(long)]
+        verbose: bool,
+    },
+    /// Mostra o status de uma execução
+    Status {
+        /// ID da execução (opcional; usa a mais recente se omitido)
+        run_id: Option<String>,
+        /// Saída em JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Imprime a saída resumida de 5 linhas de uma execução
+    Result {
+        /// ID da execução (opcional; usa a mais recente se omitido)
+        run_id: Option<String>,
+    },
+    /// Exibe os logs de uma execução
+    Logs {
+        /// ID da execução (opcional; usa a mais recente se omitido)
+        run_id: Option<String>,
+        /// Filtra por ID do estágio
+        #[arg(long)]
+        stage: Option<String>,
+    },
+    /// Exibe o report.md gerado para uma execução
+    Report {
+        /// ID da execução (opcional; usa a mais recente se omitido)
+        run_id: Option<String>,
+    },
+    /// Solicita o cancelamento de uma execução em andamento (SIGINT ao motor)
+    Stop {
+        /// ID da execução
+        run_id: String,
+    },
+    /// Remove artefatos de disco e workspaces de execuções finalizadas (mantém branches)
+    Clean {
+        /// ID específico para limpar (opcional; limpa todas finalizadas se omitido)
+        run_id: Option<String>,
+        /// Confirma sem pedir confirmação interativa
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Ponto de entrada interno para execução destacada via Herdr
+    #[command(hide = true)]
+    Engine {
+        /// ID da execução previamente preparada
+        run_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelsSubcommand {
+    /// Define o padrão de um role em .loops/models.toml (--project) ou ~/.config/tchelvis/loops.toml (--global)
+    Set {
+        /// Especificação role=cli[:modelo]
+        spec: String,
+        /// Grava em <repo>/.loops/models.toml
+        #[arg(long, conflicts_with = "global")]
+        project: bool,
+        /// Grava em ~/.config/tchelvis/loops.toml
+        #[arg(long, conflicts_with = "project")]
+        global: bool,
+    },
+    /// Registra confirmação para os modelos vindos do repositório neste workflow
+    Confirm {
+        /// Nome do workflow
+        workflow: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthSubcommand {
+    /// Abre uma sessão de login oficial em um terminal Herdr para <cli> (claude|agy|opencode)
+    Login {
+        /// CLI alvo (claude|agy|opencode)
+        cli: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct FrozenRunConfig {
+    run_id: String,
+    workflow: Workflow,
+    roles: BTreeMap<String, String>,
+    input_prompt: String,
+    sandbox_kind: String,
+    sandbox: SandboxConfig,
+    env_pass: Vec<String>,
+    sandbox_exposures: Vec<String>,
+    branch: String,
+    base_commit: Option<String>,
+    caller: Option<CallerInfo>,
+    model_sources: BTreeMap<String, ModelSource>,
+    preflight: Vec<ProbeRecord>,
+    workspace: FrozenWorkspaceMeta,
+    /// `PATH` the CLIs were verified with: a Herdr terminal has its own.
+    path: Option<String>,
+}
+
+struct TempDirGuard(PathBuf);
+
+impl TempDirGuard {
+    fn create(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .create(&path)
+            .with_context(|| format!("falha ao criar diretório temporário {}", path.display()))?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct FlockGuard {
+    file: File,
+}
+
+impl FlockGuard {
+    fn try_lock_exclusive(path: &Path) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("falha ao abrir trava {}", path.display()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                bail!("já existe um motor em execução para este loop");
+            }
+            bail!("falha ao adquirir trava em {}: {err}", path.display());
+        }
+        let (pid, ticks) = current_process_identity();
+        let _ = file.set_len(0);
+        let _ = writeln!(file, "{pid}:{}", ticks.unwrap_or(0));
+        let _ = file.flush();
+        Ok(Self { file })
+    }
+
+    fn is_locked(path: &Path) -> bool {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+            return false;
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            false
+        } else {
+            std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock
+        }
+    }
+}
+
+impl Drop for FlockGuard {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+struct LoopError {
+    code: i32,
+    message: String,
+}
+
+impl LoopError {
+    fn usage(msg: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_USAGE,
+            message: msg.into(),
+        }
+    }
+
+    fn err(msg: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_ERROR,
+            message: msg.into(),
+        }
+    }
+
+    fn cancelled(msg: impl Into<String>) -> Self {
+        Self {
+            code: EXIT_CANCELLED,
+            message: msg.into(),
+        }
+    }
+}
+
+pub fn validate_run_id(run_id: &str) -> Result<(), String> {
+    if run_id.is_empty()
+        || run_id.len() > 64
+        || !run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "run_id inválido '{run_id}' (use apenas [a-zA-Z0-9_-], até 64 caracteres)"
+        ));
+    }
+    Ok(())
+}
+
+fn unix_now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+fn generate_run_id() -> String {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let mut bytes = [0u8; 2];
+    if let Ok(mut f) = File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut bytes);
+    } else {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        bytes[0] = (nanos & 0xff) as u8;
+        bytes[1] = ((nanos >> 8) ^ std::process::id()) as u8;
+    }
+    format!("{ts}-{:02x}{:02x}", bytes[0], bytes[1])
+}
+
+fn find_git_repo_root() -> Result<PathBuf> {
+    let mut cmd = Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        let s = name.to_string_lossy();
+        if s.starts_with("GIT_")
+            && !matches!(
+                s.as_ref(),
+                "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG_NOSYSTEM"
+            )
+        {
+            cmd.env_remove(name);
+        }
+    }
+    cmd.args(["rev-parse", "--show-toplevel"]);
+    let out = cmd.output().context("falha ao executar git rev-parse")?;
+    if !out.status.success() {
+        bail!("diretório atual não está dentro de um repositório git");
+    }
+    let root = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    Ok(fs::canonicalize(&root).unwrap_or(root))
+}
+
+fn try_find_git_repo_root() -> Option<PathBuf> {
+    find_git_repo_root().ok()
+}
+
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let cand = dir.join(bin);
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+fn open_dir_nofollow_from_root(root: &Path, segments: &[&str]) -> Result<Option<OwnedFd>> {
+    let root_c = CString::new(root.to_str().context("caminho inválido")?)?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(err).with_context(|| format!("falha ao abrir {}", root.display()));
+    }
+    let mut cur = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    for seg in segments {
+        let c_seg = CString::new(*seg)?;
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                c_seg.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            if err.raw_os_error() == Some(libc::ELOOP) {
+                bail!("'{seg}' é um link simbólico e foi recusado");
+            }
+            if err.raw_os_error() == Some(libc::ENOTDIR) {
+                bail!("'{seg}' não é um diretório");
+            }
+            return Err(err).with_context(|| format!("falha ao abrir '{seg}'"));
+        }
+        cur = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    Ok(Some(cur))
+}
+
+fn read_regular_file_at(
+    dir: BorrowedFd<'_>,
+    name: &str,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    let c_name = CString::new(name)?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            bail!("'{name}' é um link simbólico e foi recusado");
+        }
+        return Err(err).with_context(|| format!("falha ao abrir '{name}'"));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("falha ao inspecionar '{name}'"));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        bail!("'{name}' não é um arquivo regular");
+    }
+    if st.st_size < 0 || st.st_size as usize > max_bytes {
+        bail!("'{name}' excede o tamanho máximo permitido ({max_bytes} bytes)");
+    }
+    let file = File::from(owned);
+    let mut buf = Vec::with_capacity(st.st_size as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("falha ao ler '{name}'"))?;
+    if buf.len() > max_bytes {
+        bail!("'{name}' excede o tamanho máximo permitido ({max_bytes} bytes)");
+    }
+    let text = String::from_utf8(buf)
+        .with_context(|| format!("'{name}' não está codificado em UTF-8 válido"))?;
+    Ok(Some(text))
+}
+
+fn read_regular_file_nofollow(path: &Path, max_bytes: usize) -> Result<String> {
+    String::from_utf8(read_regular_bytes_nofollow(path, max_bytes)?)
+        .with_context(|| format!("'{}' não é UTF-8 válido", path.display()))
+}
+
+fn read_regular_bytes_nofollow(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+    let raw_path = path.to_str().context("caminho não UTF-8")?;
+    let c_path = CString::new(raw_path)?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            bail!("'{}' é um link simbólico e foi recusado", path.display());
+        }
+        return Err(err).with_context(|| format!("falha ao abrir '{}'", path.display()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("falha ao inspecionar '{}'", path.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        bail!("'{}' não é um arquivo regular", path.display());
+    }
+    if st.st_size < 0 || st.st_size as usize > max_bytes {
+        bail!(
+            "'{}' excede o tamanho máximo permitido ({max_bytes} bytes)",
+            path.display()
+        );
+    }
+    let file = File::from(owned);
+    let mut buf = Vec::with_capacity(st.st_size as usize);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .with_context(|| format!("falha ao ler '{}'", path.display()))?;
+    if buf.len() > max_bytes {
+        bail!(
+            "'{}' excede o tamanho máximo permitido ({max_bytes} bytes)",
+            path.display()
+        );
+    }
+    Ok(buf)
+}
+
+fn ensure_dir_no_symlink(root: &Path, segments: &[&str]) -> Result<PathBuf> {
+    let mut cur = root.to_path_buf();
+    for seg in segments {
+        cur = cur.join(seg);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    bail!("'{}' é um link simbólico e foi recusado", cur.display());
+                }
+                if !meta.file_type().is_dir() {
+                    bail!("'{}' já existe e não é um diretório", cur.display());
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&cur)
+                    .with_context(|| format!("falha ao criar diretório {}", cur.display()))?;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| format!("falha ao verificar {}", cur.display()));
+            }
+        }
+    }
+    Ok(cur)
+}
+
+fn write_if_absent_nofollow(path: &Path, content: &str, mode: u32) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!("'{}' é um link simbólico e foi recusado", path.display());
+            }
+            return Ok(false);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("falha ao verificar {}", path.display()));
+        }
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(path)
+        .with_context(|| format!("falha ao criar {}", path.display()))?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(true)
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .context("caminho inválido")?;
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("nome de arquivo inválido")?;
+    let tmp_path = parent.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp_path)
+        .with_context(|| format!("falha ao criar temporário {}", tmp_path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("falha ao gravar {}", path.display())
+    })?;
+    Ok(())
+}
+
+fn load_loops_config_required(paths: &CockpitPaths) -> Result<LoopsConfig> {
+    let cfg_path = paths.config_dir.join("loops.toml");
+    if fs::symlink_metadata(&cfg_path).is_err() {
+        bail!(
+            "arquivo '{}' não encontrado (rode 'tchelvis loop init' e configure auto_approve_in_sandbox = true)",
+            cfg_path.display()
+        );
+    }
+    let raw = read_regular_file_nofollow(&cfg_path, MAX_WORKFLOW_TOML_BYTES)?;
+    parse_loops_config(&raw).with_context(|| format!("erro em '{}'", cfg_path.display()))
+}
+
+fn load_loops_config_optional(paths: &CockpitPaths) -> Result<Option<LoopsConfig>> {
+    let cfg_path = paths.config_dir.join("loops.toml");
+    match fs::symlink_metadata(&cfg_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => {
+            Err(err).with_context(|| format!("falha ao verificar '{}'", cfg_path.display()))
+        }
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "'{}' é um link simbólico e foi recusado",
+                    cfg_path.display()
+                );
+            }
+            let raw = read_regular_file_nofollow(&cfg_path, MAX_WORKFLOW_TOML_BYTES)?;
+            let cfg = parse_loops_config(&raw)
+                .with_context(|| format!("erro em '{}'", cfg_path.display()))?;
+            Ok(Some(cfg))
+        }
+    }
+}
+
+fn load_workflow_unresolved(
+    name: &str,
+    repo_root: Option<&Path>,
+    paths: &CockpitPaths,
+    max_cycles_override: Option<u32>,
+) -> Result<(UnresolvedWorkflow, WorkflowOrigin)> {
+    if !is_valid_slug(name, 48) {
+        bail!("nome de workflow inválido '{name}' (use apenas [a-z0-9-]+)");
+    }
+    let filename = format!("{name}.toml");
+
+    let mut found: Option<(String, WorkflowOrigin)> = None;
+    if let Some(repo) = repo_root {
+        if let Some(wf_dir) = open_dir_nofollow_from_root(repo, &[".loops", "workflows"])? {
+            if let Some(raw) =
+                read_regular_file_at(wf_dir.as_fd(), &filename, MAX_WORKFLOW_TOML_BYTES)?
+            {
+                found = Some((raw, WorkflowOrigin::Repo));
+            }
+        }
+    }
+    if found.is_none() {
+        if let Some(wf_dir) =
+            open_dir_nofollow_from_root(&paths.config_dir, &["loops", "workflows"])?
+        {
+            if let Some(raw) =
+                read_regular_file_at(wf_dir.as_fd(), &filename, MAX_WORKFLOW_TOML_BYTES)?
+            {
+                found = Some((raw, WorkflowOrigin::Global));
+            }
+        }
+    }
+    if found.is_none() {
+        if let Some((_, raw)) = PRESET_WORKFLOWS.iter().find(|(p_name, _)| *p_name == name) {
+            found = Some(((*raw).to_string(), WorkflowOrigin::Preset));
+        }
+    }
+
+    let Some((raw, origin)) = found else {
+        bail!("workflow '{name}' não encontrado no projeto, em ~/.config/tchelvis/loops/workflows/ nem nos presets");
+    };
+
+    let mut parsed = parse_workflow_unresolved(&raw)
+        .map_err(|errs| anyhow::anyhow!("workflow '{name}' inválido:\n- {}", errs.join("\n- ")))?;
+    if let Some(mc) = max_cycles_override {
+        if !(1..=20).contains(&mc) {
+            bail!("--max-cycles deve ficar entre 1 e 20");
+        }
+        parsed.max_cycles = mc;
+    }
+    Ok((parsed, origin))
+}
+
+fn load_roles_for_workflow(
+    wf: &Workflow,
+    repo_root: Option<&Path>,
+    paths: &CockpitPaths,
+) -> Result<BTreeMap<String, String>> {
+    let mut roles = BTreeMap::new();
+    for st in &wf.stages {
+        if roles.contains_key(&st.role) {
+            continue;
+        }
+        if !is_valid_role_name(&st.role) {
+            bail!("nome de role inválido '{}'", st.role);
+        }
+        let filename = format!("{}.md", st.role);
+        let mut content: Option<String> = None;
+
+        if let Some(repo) = repo_root {
+            if let Some(dir) = open_dir_nofollow_from_root(repo, &[".loops", "roles"])? {
+                if let Some(raw) = read_regular_file_at(dir.as_fd(), &filename, MAX_ROLE_MD_BYTES)?
+                {
+                    content = Some(raw);
+                }
+            }
+        }
+        if content.is_none() {
+            if let Some(dir) = open_dir_nofollow_from_root(&paths.config_dir, &["loops", "roles"])?
+            {
+                if let Some(raw) = read_regular_file_at(dir.as_fd(), &filename, MAX_ROLE_MD_BYTES)?
+                {
+                    content = Some(raw);
+                }
+            }
+        }
+        if content.is_none() {
+            if let Some((_, default_md)) = DEFAULT_ROLES.iter().find(|(r, _)| *r == st.role) {
+                content = Some((*default_md).to_string());
+            }
+        }
+
+        let Some(text) = content else {
+            bail!("role '{}' não encontrado em .loops/roles/, ~/.config/tchelvis/loops/roles/ ou padrões", st.role);
+        };
+        roles.insert(st.role.clone(), text);
+    }
+    Ok(roles)
+}
+
+fn build_sandbox(cfg: &LoopsConfig) -> Box<dyn Sandbox + Sync> {
+    match &cfg.sandbox {
+        SandboxConfig::Inherited => Box::new(InheritedSandbox::new(cfg.env_pass.clone())),
+        SandboxConfig::Bwrap { home_ro } => {
+            Box::new(BwrapSandbox::new(home_ro.clone(), cfg.env_pass.clone()))
+        }
+    }
+}
+
+fn ensure_sandbox_prereqs(cfg: &LoopsConfig) -> Result<(), LoopError> {
+    if matches!(cfg.sandbox, SandboxConfig::Bwrap { .. }) && find_in_path("bwrap").is_none() {
+        return Err(LoopError::err(
+            "bubblewrap ('bwrap') não encontrado no PATH; instale o pacote 'bubblewrap' (ex.: 'sudo apt install bubblewrap' ou 'sudo pacman -S bubblewrap') — bwrap é o sandbox padrão e nunca é substituído automaticamente",
+        ));
+    }
+    Ok(())
+}
+
+/// `opencode-go/` always needs `OPENCODE_API_KEY`, even for its free models. `opencode/` answers
+/// without one, and other providers have their own credentials: the model check decides.
+pub fn needs_opencode_key(model: Option<&str>) -> bool {
+    model.is_some_and(|m| m.starts_with("opencode-go/"))
+}
+
+pub fn resolve_opencode_api_key() -> Option<String> {
+    let env_val = std::env::var("OPENCODE_API_KEY").ok();
+    let shell = std::env::var_os("SHELL");
+    resolve_opencode_api_key_with(env_val.as_deref(), shell.as_deref(), OPENCODE_SHELL_TIMEOUT)
+}
+
+pub fn resolve_opencode_api_key_with(
+    env_val: Option<&str>,
+    shell: Option<&std::ffi::OsStr>,
+    timeout: Duration,
+) -> Option<String> {
+    if let Some(val) = env_val {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let shell = shell?;
+    if shell.is_empty() {
+        return None;
+    }
+
+    let snippet = "printf '\\036TCHELVIS_OPENCODE_KEY_START\\036%s\\036TCHELVIS_OPENCODE_KEY_END\\036' \"$OPENCODE_API_KEY\"";
+    let mut cmd = Command::new(shell);
+    cmd.args(["-ic", snippet])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    // SAFETY: only async-signal-safe `setsid` runs between fork and exec so we can reap any
+    // grandchildren if the interactive shell hangs.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut child = cmd.spawn().ok()?;
+    let pid = child.id() as libc::pid_t;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    // A process started by the shell files may keep the output open after the shell ends, so the
+    // end of the stream cannot be waited for: the closing marker is what ends the answer.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + timeout;
+    let mut seen: Vec<u8> = Vec::new();
+    let mut key = None;
+    while seen.len() < 1024 * 1024 {
+        let Ok(chunk) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+            break;
+        };
+        seen.extend_from_slice(&chunk);
+        let text = String::from_utf8_lossy(&seen);
+        let between = text
+            .split_once(OPENCODE_KEY_START)
+            .and_then(|(_, rest)| rest.split_once(OPENCODE_KEY_END))
+            .map(|(value, _)| value.trim().to_string());
+        if let Some(value) = between {
+            key = Some(value).filter(|v| !v.is_empty());
+            break;
+        }
+    }
+    // SAFETY: the shell leads its own session, created above.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    key
+}
+
+/// The key, when some stage needs it: asking for it may start the user's shell.
+fn opencode_key_for(workflow: &Workflow) -> Option<String> {
+    workflow
+        .stages
+        .iter()
+        .any(|s| s.provider == Provider::Opencode)
+        .then(resolve_opencode_api_key)
+        .flatten()
+}
+
+fn non_empty_regular_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && meta.len() > 0
+}
+
+fn check_accounts(
+    wf: &Workflow,
+    home_dir: &Path,
+    opencode_api_key: Option<&str>,
+) -> std::result::Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let needs_claude = wf.stages.iter().any(|s| s.provider == Provider::Claude);
+    let needs_agy = wf.stages.iter().any(|s| s.provider == Provider::Agy);
+    let needs_opencode_key = wf
+        .stages
+        .iter()
+        .any(|s| s.provider == Provider::Opencode && needs_opencode_key(s.model.as_deref()));
+
+    if needs_claude && !non_empty_regular_file(&home_dir.join(".claude/.credentials.json")) {
+        errors.push(
+            "conta do 'claude' ausente (~/.claude/.credentials.json); rode 'tchelvis loop auth login claude'"
+                .to_string(),
+        );
+    }
+    if needs_agy
+        && !non_empty_regular_file(
+            &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+        )
+    {
+        errors.push(
+            "conta do 'agy' ausente (~/.gemini/antigravity-cli/antigravity-oauth-token); rode 'tchelvis loop auth login agy'"
+                .to_string(),
+        );
+    }
+    if needs_opencode_key && opencode_api_key.is_none() {
+        errors.push(
+            "chave OPENCODE_API_KEY ausente para um modelo 'opencode-go/' (exporte OPENCODE_API_KEY ou use um modelo gratuito 'opencode/...')"
+                .to_string(),
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn collect_extra_secrets(opencode_api_key: Option<&str>) -> Vec<String> {
+    let mut secrets = Vec::new();
+    if let Some(k) = opencode_api_key {
+        if !k.is_empty() {
+            secrets.push(k.to_string());
+        }
+    }
+    if let Ok(env_k) = std::env::var("OPENCODE_API_KEY") {
+        let trimmed = env_k.trim();
+        if !trimmed.is_empty() && !secrets.iter().any(|s| s == trimmed) {
+            secrets.push(trimmed.to_string());
+        }
+    }
+    secrets
+}
+
+fn for_terminal(text: &str, extra_secrets: &[String]) -> String {
+    let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+    crate::loops::report::sanitize_multiline(text, &refs)
+}
+
+fn eprint_redacted(msg: &str, extra_secrets: &[String]) {
+    eprintln!("{}", for_terminal(msg, extra_secrets));
+}
+
+pub fn build_generated_workflow_and_roles(
+    name: &str,
+    stage_roles: &[String],
+) -> Result<(String, BTreeMap<String, String>)> {
+    if !is_valid_slug(name, 48) {
+        bail!("nome de workflow inválido '{name}' (use apenas [a-z0-9-]+)");
+    }
+    if stage_roles.is_empty() {
+        bail!("--stages requer pelo menos uma etapa");
+    }
+
+    struct GenStage {
+        id: String,
+        role: String,
+        edits: bool,
+        writes: Option<String>,
+        reads: Vec<String>,
+        next: Option<String>,
+        verdict_gate: bool,
+        on_pass: Option<String>,
+        on_retry: Option<String>,
+    }
+
+    let mut role_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stem_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut stages: Vec<GenStage> = Vec::with_capacity(stage_roles.len());
+
+    for raw_role in stage_roles {
+        let role = raw_role.trim();
+        if !is_valid_role_name(role) {
+            bail!("nome de role inválido '{role}' (use apenas [a-z0-9-]+)");
+        }
+        let count = {
+            let entry = role_counts.entry(role.to_string()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        let id = if count == 1 {
+            role.to_string()
+        } else {
+            format!("{role}-{count}")
+        };
+        if !is_valid_stage_id(&id) {
+            bail!("id de etapa gerado '{id}' é inválido ou excede 32 caracteres");
+        }
+
+        let edits = matches!(role, "worker" | "tester");
+        let writes = if role == "worker" {
+            None
+        } else {
+            let stem = match role {
+                "designer" | "planner" => "design",
+                "reviewer" => "review",
+                "tester" => "test-report",
+                other => other,
+            };
+            let s_count = {
+                let entry = stem_counts.entry(stem.to_string()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            Some(if s_count == 1 {
+                format!("{stem}.md")
+            } else {
+                format!("{stem}-{s_count}.md")
+            })
+        };
+
+        stages.push(GenStage {
+            id,
+            role: role.to_string(),
+            edits,
+            writes,
+            reads: Vec::new(),
+            next: None,
+            verdict_gate: false,
+            on_pass: None,
+            on_retry: None,
+        });
+    }
+
+    let Some(first_edit_idx) = stages.iter().position(|s| s.edits) else {
+        bail!("o workflow precisa de pelo menos uma etapa que edita (worker ou tester)");
+    };
+    if stages.last().is_some_and(|s| s.edits) {
+        bail!("a última etapa do workflow não pode ter edits = true (precisa ser um portão de veredito)");
+    }
+
+    let total = stages.len();
+    for i in 0..total {
+        let mut reads = vec!["input.md".to_string()];
+        let mut saw_editor = false;
+        for (j, prev) in stages.iter().enumerate().take(i) {
+            if let Some(w) = &prev.writes {
+                if !reads.contains(w) {
+                    reads.push(w.clone());
+                }
+            }
+            if prev.edits && !saw_editor {
+                saw_editor = true;
+                // Place `current.diff` right where edits become visible.
+                if j < i && !reads.iter().any(|r| r == "current.diff") {
+                    reads.push("current.diff".to_string());
+                }
+            }
+        }
+        if i == first_edit_idx {
+            for later in stages.iter().skip(i + 1) {
+                if let Some(w) = &later.writes {
+                    if !reads.contains(w) {
+                        reads.push(w.clone());
+                    }
+                }
+            }
+        }
+        stages[i].reads = reads;
+
+        if i + 1 < total {
+            stages[i].next = Some(stages[i + 1].id.clone());
+        } else {
+            stages[i].verdict_gate = true;
+            stages[i].on_pass = Some("done".to_string());
+            stages[i].on_retry = Some(stages[first_edit_idx].id.clone());
+        }
+    }
+
+    let mut toml = String::new();
+    let _ = writeln!(toml, "name = {:?}", name);
+    let _ = writeln!(
+        toml,
+        "description = {:?}",
+        format!("Workflow gerado: {}", stage_roles.join(" -> "))
+    );
+    let _ = writeln!(toml, "max_cycles = {DEFAULT_MAX_CYCLES}");
+    let _ = writeln!(toml, "stage_timeout_secs = {DEFAULT_STAGE_TIMEOUT_SECS}");
+    let _ = writeln!(toml, "stall_secs = {DEFAULT_STALL_SECS}");
+    let _ = writeln!(toml, "max_duration_secs = {DEFAULT_MAX_DURATION_SECS}");
+
+    let mut new_roles = BTreeMap::new();
+    for st in &stages {
+        let _ = writeln!(toml, "\n[[stages]]");
+        let _ = writeln!(toml, "id = {:?}", st.id);
+        let _ = writeln!(toml, "role = {:?}", st.role);
+        let _ = writeln!(toml, "reads = {:?}", st.reads);
+        if let Some(w) = &st.writes {
+            let _ = writeln!(toml, "writes = {:?}", w);
+        }
+        if st.edits {
+            let _ = writeln!(toml, "edits = true");
+        }
+        if let Some(next) = &st.next {
+            let _ = writeln!(toml, "next = {:?}", next);
+        }
+        if st.verdict_gate {
+            let _ = writeln!(toml, "verdict_gate = true");
+        }
+        if let Some(on_pass) = &st.on_pass {
+            let _ = writeln!(toml, "on_pass = {:?}", on_pass);
+        }
+        if let Some(on_retry) = &st.on_retry {
+            let _ = writeln!(toml, "on_retry = {:?}", on_retry);
+        }
+
+        let is_builtin = DEFAULT_ROLES.iter().any(|(r, _)| *r == st.role);
+        if !is_builtin && !new_roles.contains_key(&st.role) {
+            let out_file = st.writes.as_deref().unwrap_or("output.md");
+            let mut body = format!(
+                "Você atua no papel '{}'.\n\n\
+                 Leia os artefatos fornecidos em `.tchelvis-loop/in/`, execute apenas análise em modo somente leitura sem modificar arquivos do repositório e registre sua saída em `.tchelvis-loop/out/{out_file}`.\n",
+                st.role
+            );
+            if st.verdict_gate {
+                body.push_str(
+                    "\nTermine `.tchelvis-loop/out/` com uma última linha exata: `VERDICT: PASS` ou `VERDICT: RETRY`.\n",
+                );
+            }
+            new_roles.insert(st.role.clone(), body);
+        }
+    }
+
+    parse_workflow_unresolved(&toml)
+        .map_err(|errs| anyhow::anyhow!("TOML gerado inválido:\n- {}", errs.join("\n- ")))?;
+
+    Ok((toml, new_roles))
+}
+
+fn default_loops_toml_template() -> &'static str {
+    "# Configuração global de tchelvis loop\n\
+     max_concurrent = 2\n\
+     # Defina true após revisar que os CLIs rodam com aprovação automática apenas dentro do sandbox.\n\
+     auto_approve_in_sandbox = false\n\
+     env_pass = []\n\
+     \n\
+     [sandbox]\n\
+     kind = \"bwrap\"\n\
+     \n\
+     [sandbox.bwrap]\n\
+     home_ro = [\".cargo\", \".rustup\"]\n\
+     \n\
+     # [defaults.worker]\n\
+     # provider = \"claude\"\n\
+     # model = \"sonnet\"\n"
+}
+
+fn cmd_init(paths: &CockpitPaths) -> Result<(), LoopError> {
+    fs::create_dir_all(&paths.config_dir).map_err(|e| {
+        LoopError::err(format!(
+            "falha ao criar {}: {e:#}",
+            paths.config_dir.display()
+        ))
+    })?;
+    let global_cfg = paths.config_dir.join("loops.toml");
+    let created_cfg = write_if_absent_nofollow(&global_cfg, default_loops_toml_template(), 0o600)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    if created_cfg {
+        println!(
+            "Criado: {} (defina auto_approve_in_sandbox = true após revisar)",
+            global_cfg.display()
+        );
+    } else {
+        println!("Mantido: {}", global_cfg.display());
+    }
+
+    if let Some(repo) = try_find_git_repo_root() {
+        let _ = ensure_dir_no_symlink(&repo, &[".loops"])
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        let wf_dir = ensure_dir_no_symlink(&repo, &[".loops", "workflows"])
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        let roles_dir = ensure_dir_no_symlink(&repo, &[".loops", "roles"])
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        let runs_dir = ensure_dir_no_symlink(&repo, &[".loops", "runs"])
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+        let gitignore = runs_dir.join(".gitignore");
+        let _ = write_if_absent_nofollow(&gitignore, "*\n", 0o644)
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+        for (name, content) in PRESET_WORKFLOWS {
+            let p = wf_dir.join(format!("{name}.toml"));
+            let _ = write_if_absent_nofollow(&p, content, 0o644)
+                .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        }
+        for (name, content) in DEFAULT_ROLES {
+            let p = roles_dir.join(format!("{name}.md"));
+            let _ = write_if_absent_nofollow(&p, content, 0o644)
+                .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        }
+        println!(
+            "Inicializado repositório: {}",
+            repo.join(".loops").display()
+        );
+    } else {
+        println!("Fora de um repositório git: apenas a configuração global foi verificada.");
+    }
+
+    Ok(())
+}
+
+fn cmd_new(paths: &CockpitPaths, name: &str, stages: &[String]) -> Result<(), LoopError> {
+    let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    if !is_valid_slug(name, 48) {
+        return Err(LoopError::usage(format!(
+            "nome de workflow inválido '{name}' (use apenas [a-z0-9-]+)"
+        )));
+    }
+
+    if let Some(dir) = open_dir_nofollow_from_root(&repo, &[".loops", "workflows"])
+        .map_err(|e| LoopError::usage(format!("{e:#}")))?
+    {
+        if read_regular_file_at(
+            dir.as_fd(),
+            &format!("{name}.toml"),
+            MAX_WORKFLOW_TOML_BYTES,
+        )
+        .map_err(|e| LoopError::usage(format!("{e:#}")))?
+        .is_some()
+        {
+            return Err(LoopError::usage(format!(
+                "workflow '{name}' já existe em {}",
+                repo.join(".loops/workflows")
+                    .join(format!("{name}.toml"))
+                    .display()
+            )));
+        }
+    }
+    let target_wf_path = repo.join(".loops/workflows").join(format!("{name}.toml"));
+    if fs::symlink_metadata(&target_wf_path).is_ok() {
+        return Err(LoopError::usage(format!(
+            "arquivo '{}' já existe",
+            target_wf_path.display()
+        )));
+    }
+
+    let (toml_str, new_roles) = build_generated_workflow_and_roles(name, stages)
+        .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+
+    let _ =
+        ensure_dir_no_symlink(&repo, &[".loops"]).map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let wf_dir = ensure_dir_no_symlink(&repo, &[".loops", "workflows"])
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let roles_dir = ensure_dir_no_symlink(&repo, &[".loops", "roles"])
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    for (role_name, role_md) in new_roles {
+        let global_exists = open_dir_nofollow_from_root(&paths.config_dir, &["loops", "roles"])
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                read_regular_file_at(d.as_fd(), &format!("{role_name}.md"), MAX_ROLE_MD_BYTES).ok()
+            })
+            .flatten()
+            .is_some();
+        if !global_exists {
+            let role_path = roles_dir.join(format!("{role_name}.md"));
+            let _ = write_if_absent_nofollow(&role_path, &role_md, 0o644)
+                .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        }
+    }
+
+    let wf_path = wf_dir.join(format!("{name}.toml"));
+    if !write_if_absent_nofollow(&wf_path, &toml_str, 0o644)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+    {
+        return Err(LoopError::usage(format!(
+            "workflow '{name}' já existe em {}",
+            wf_path.display()
+        )));
+    }
+
+    print!("{toml_str}");
+    Ok(())
+}
+
+fn collect_workflow_catalog(
+    repo_root: Option<&Path>,
+    paths: &CockpitPaths,
+) -> Result<BTreeMap<String, (WorkflowOrigin, UnresolvedWorkflow)>> {
+    let mut catalog = BTreeMap::new();
+    for (name, raw) in PRESET_WORKFLOWS {
+        if let Ok(wf) = parse_workflow_unresolved(raw) {
+            catalog.insert((*name).to_string(), (WorkflowOrigin::Preset, wf));
+        }
+    }
+    if let Some(dir) = open_dir_nofollow_from_root(&paths.config_dir, &["loops", "workflows"])? {
+        let global_path = paths.config_dir.join("loops/workflows");
+        if let Ok(entries) = fs::read_dir(&global_path) {
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if let Some(slug) = fname.strip_suffix(".toml") {
+                    if is_valid_slug(slug, 48) {
+                        if let Ok(Some(raw)) =
+                            read_regular_file_at(dir.as_fd(), &fname, MAX_WORKFLOW_TOML_BYTES)
+                        {
+                            if let Ok(wf) = parse_workflow_unresolved(&raw) {
+                                catalog.insert(slug.to_string(), (WorkflowOrigin::Global, wf));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(repo) = repo_root {
+        if let Some(dir) = open_dir_nofollow_from_root(repo, &[".loops", "workflows"])? {
+            let repo_wf_path = repo.join(".loops/workflows");
+            if let Ok(entries) = fs::read_dir(&repo_wf_path) {
+                for entry in entries.flatten() {
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(slug) = fname.strip_suffix(".toml") {
+                        if is_valid_slug(slug, 48) {
+                            if let Ok(Some(raw)) =
+                                read_regular_file_at(dir.as_fd(), &fname, MAX_WORKFLOW_TOML_BYTES)
+                            {
+                                if let Ok(wf) = parse_workflow_unresolved(&raw) {
+                                    catalog.insert(slug.to_string(), (WorkflowOrigin::Repo, wf));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(catalog)
+}
+
+fn cmd_list(paths: &CockpitPaths, runs: bool) -> Result<(), LoopError> {
+    if runs {
+        let db_path = paths.orch_db_file();
+        if !db_path.exists() {
+            println!("Nenhuma execução registrada.");
+            return Ok(());
+        }
+        let store = OrchStore::open(&db_path).map_err(|e| LoopError::err(format!("{e:#}")))?;
+        let items = store
+            .list_loops()
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        if items.is_empty() {
+            println!("Nenhuma execução registrada.");
+            return Ok(());
+        }
+        for rec in items {
+            let notify_note = if rec.notify_state == "undelivered" {
+                " [aviso não entregue]"
+            } else if rec.notify_state == "pending" {
+                " [aviso pendente]"
+            } else {
+                ""
+            };
+            println!(
+                "{}\t{}\t{}{}",
+                rec.run_id, rec.workflow, rec.status, notify_note
+            );
+        }
+        return Ok(());
+    }
+
+    let repo = try_find_git_repo_root();
+    let catalog = collect_workflow_catalog(repo.as_deref(), paths)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    if catalog.is_empty() {
+        println!("Nenhum workflow disponível.");
+        return Ok(());
+    }
+    for (name, (origin, wf)) in catalog {
+        let origin_label = match origin {
+            WorkflowOrigin::Repo => "projeto",
+            WorkflowOrigin::Global => "global",
+            WorkflowOrigin::Preset => "preset",
+        };
+        let desc = if wf.description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", sanitize_single_line(&wf.description, Some(200)))
+        };
+        println!("{name}\t[{origin_label}]{desc}");
+    }
+    Ok(())
+}
+
+fn parse_use_overrides(raw_flags: &[String]) -> Result<Vec<(String, ModelChoice)>, LoopError> {
+    let mut parsed = Vec::with_capacity(raw_flags.len());
+    for raw in raw_flags {
+        let item = parse_use_flag(raw).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        parsed.push(item);
+    }
+    Ok(parsed)
+}
+
+fn cmd_models(
+    paths: &CockpitPaths,
+    action: Option<ModelsSubcommand>,
+    workflow: Option<String>,
+) -> Result<(), LoopError> {
+    match action {
+        Some(ModelsSubcommand::Set {
+            spec,
+            project,
+            global,
+        }) => {
+            if !project && !global {
+                return Err(LoopError::usage(
+                    "informe --project ou --global em 'tchelvis loop models set'",
+                ));
+            }
+            let (role, choice) =
+                parse_use_flag(&spec).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            if !is_valid_role_name(&role) {
+                return Err(LoopError::usage(format!(
+                    "nome de role inválido '{role}' (use apenas [a-z0-9-]+)"
+                )));
+            }
+            if project {
+                let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+                let loops_dir = ensure_dir_no_symlink(&repo, &[".loops"])
+                    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                let models_path = loops_dir.join("models.toml");
+                write_default_in_toml_file(&models_path, &role, &choice, true)
+                    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                println!(
+                    "Atualizado [defaults.{role}] = {} em {}",
+                    choice.display(),
+                    models_path.display()
+                );
+            } else {
+                fs::create_dir_all(&paths.config_dir).map_err(|e| {
+                    LoopError::err(format!(
+                        "falha ao criar {}: {e:#}",
+                        paths.config_dir.display()
+                    ))
+                })?;
+                let cfg_path = paths.config_dir.join("loops.toml");
+                write_default_in_toml_file(&cfg_path, &role, &choice, false)
+                    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                println!(
+                    "Atualizado [defaults.{role}] = {} em {}",
+                    choice.display(),
+                    cfg_path.display()
+                );
+            }
+            Ok(())
+        }
+        Some(ModelsSubcommand::Confirm { workflow }) => {
+            let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let cfg = load_loops_config_optional(paths)
+                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let defaults: RoleDefaults =
+                cfg.as_ref().map(|c| c.defaults.clone()).unwrap_or_default();
+            let (unresolved, origin) =
+                load_workflow_unresolved(&workflow, Some(&repo), paths, None)
+                    .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let project_models = load_project_models_from_repo(&repo)
+                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let resolution =
+                resolve_workflow(unresolved, origin, &[], project_models.as_ref(), &defaults)
+                    .map_err(|errs| LoopError::usage(errs.join("\n")))?;
+
+            if !resolution.needs_confirmation() {
+                println!(
+                    "Workflow '{workflow}' não possui escolhas vindas do repositório; confirmação desnecessária."
+                );
+                return Ok(());
+            }
+
+            let confirm_path = paths.state_dir.join("loops/confirmed.json");
+            record_confirmation(&confirm_path, &repo, &resolution)
+                .map_err(|e| LoopError::err(format!("{e:#}")))?;
+            println!("Confirmação registrada para '{workflow}':");
+            for st in &resolution.stages {
+                if st.from_repo {
+                    println!(
+                        "  {} ({}): {} [{}]",
+                        st.stage_id,
+                        st.role,
+                        st.choice.display(),
+                        st.source
+                    );
+                }
+            }
+            Ok(())
+        }
+        None => {
+            let Some(wf_name) = workflow else {
+                return Err(LoopError::usage(
+                    "uso: tchelvis loop models <workflow> | models set <role>=<cli[:modelo]> (--project|--global) | models confirm <workflow>",
+                ));
+            };
+            let repo = try_find_git_repo_root();
+            let cfg = load_loops_config_optional(paths)
+                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let defaults: RoleDefaults =
+                cfg.as_ref().map(|c| c.defaults.clone()).unwrap_or_default();
+            let (unresolved, origin) =
+                load_workflow_unresolved(&wf_name, repo.as_deref(), paths, None)
+                    .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let project_models = match &repo {
+                Some(r) => load_project_models_from_repo(r)
+                    .map_err(|e| LoopError::usage(format!("{e:#}")))?,
+                None => None,
+            };
+            let resolution =
+                resolve_workflow(unresolved, origin, &[], project_models.as_ref(), &defaults)
+                    .map_err(|errs| LoopError::usage(errs.join("\n")))?;
+
+            println!("Modelos efetivos de '{wf_name}':");
+            for st in &resolution.stages {
+                let repo_mark = if st.from_repo { " [repositório]" } else { "" };
+                println!(
+                    "  {} ({}): {} — origem: {}{}",
+                    st.stage_id,
+                    st.role,
+                    st.choice.display(),
+                    st.source,
+                    repo_mark
+                );
+            }
+            if resolution.needs_confirmation() {
+                if let Some(r) = &repo {
+                    let confirm_path = paths.state_dir.join("loops/confirmed.json");
+                    let confirmed = is_confirmed(&confirm_path, r, &resolution).unwrap_or(false);
+                    if !confirmed {
+                        println!(
+                            "Confirmação pendente para este repositório: rode 'tchelvis loop models confirm {wf_name}'."
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Result<(), LoopError> {
+    match action {
+        None => {
+            let opencode_key = resolve_opencode_api_key();
+            let extra = collect_extra_secrets(opencode_key.as_deref());
+            let claude_ok =
+                non_empty_regular_file(&paths.home_dir.join(".claude/.credentials.json"));
+            let agy_ok = non_empty_regular_file(
+                &paths
+                    .home_dir
+                    .join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            );
+            let opencode_ok = opencode_key.is_some();
+
+            println!(
+                "claude:   {} (arquivo ~/.claude/.credentials.json)",
+                if claude_ok { "autenticado" } else { "ausente" }
+            );
+            println!(
+                "agy:      {} (arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token)",
+                if agy_ok { "autenticado" } else { "ausente" }
+            );
+            println!(
+                "opencode: {} (OPENCODE_API_KEY; modelos gratuitos 'opencode/...' funcionam sem chave)",
+                if opencode_ok { "chave presente" } else { "sem chave" }
+            );
+            let _ = extra;
+            Ok(())
+        }
+        Some(AuthSubcommand::Login { cli }) => {
+            let argv: Vec<String> = match cli.as_str() {
+                "claude" => vec!["claude".into(), "auth".into(), "login".into()],
+                // It has no login command: started alone, it asks to sign in.
+                "agy" => vec!["agy".into()],
+                "opencode" => vec!["opencode".into(), "auth".into(), "login".into()],
+                other => {
+                    return Err(LoopError::usage(format!(
+                        "CLI desconhecido '{other}' (use claude, agy ou opencode)"
+                    )));
+                }
+            };
+            let herdr = HerdrClient::default();
+            let caller_id = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
+            if caller_id.trim().is_empty() {
+                return Err(LoopError::err(
+                    "HC_TERMINAL_ID ausente: execute 'tchelvis loop auth login' a partir de um terminal Herdr",
+                ));
+            }
+            let cwd = std::env::current_dir().unwrap_or_else(|_| paths.home_dir.clone());
+            let term = herdr
+                .run_worker(&caller_id, &cwd, &[], &argv, "")
+                .await
+                .map_err(|e| {
+                    LoopError::err(format!("falha ao abrir terminal de login via Herdr: {e:#}"))
+                })?;
+            println!("Terminal de login aberto para '{cli}': {}", term.address);
+            Ok(())
+        }
+    }
+}
+
+fn check_project_models_warnings(
+    repo: &Path,
+    paths: &CockpitPaths,
+    project: Option<&ProjectModels>,
+) -> Vec<String> {
+    let Some(pm) = project else {
+        return Vec::new();
+    };
+    let mut known_workflows: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Ok(catalog) = collect_workflow_catalog(Some(repo), paths) {
+        for (name, (_, wf)) in catalog {
+            let ids = wf.stages.into_iter().map(|s| s.id).collect();
+            known_workflows.insert(name, ids);
+        }
+    }
+    check_project_models_references(pm, &known_workflows)
+}
+
+fn install_cancel_signal_flag() -> Arc<AtomicBool> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel_task = cancel.clone();
+    tokio::spawn(async move {
+        let mut sigint =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).ok();
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = async {
+                if let Some(ref mut s) = sigint {
+                    s.recv().await
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => {}
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await
+                } else {
+                    std::future::pending::<Option<()>>().await
+                }
+            } => {}
+        }
+        cancel_task.store(true, Ordering::Relaxed);
+    });
+    cancel
+}
+
+fn cmd_check(
+    paths: &CockpitPaths,
+    workflow_name: &str,
+    live: bool,
+    use_overrides_raw: &[String],
+) -> Result<(), LoopError> {
+    let repo = try_find_git_repo_root();
+
+    let cfg = load_loops_config_required(paths).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    let use_overrides = parse_use_overrides(use_overrides_raw)?;
+
+    let (unresolved, origin) =
+        load_workflow_unresolved(workflow_name, repo.as_deref(), paths, None)
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+
+    let project_models = match &repo {
+        Some(r) => {
+            load_project_models_from_repo(r).map_err(|e| LoopError::usage(format!("{e:#}")))?
+        }
+        None => None,
+    };
+    let resolution = resolve_workflow(
+        unresolved,
+        origin,
+        &use_overrides,
+        project_models.as_ref(),
+        &cfg.defaults,
+    )
+    .map_err(|errs| LoopError::usage(errs.join("\n")))?;
+    let opencode_key = opencode_key_for(&resolution.workflow);
+    let extra = collect_extra_secrets(opencode_key.as_deref());
+
+    if let Some(r) = &repo {
+        let _roles = load_roles_for_workflow(&resolution.workflow, Some(r), paths)
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        let dummy_run = r.join(".loops/runs");
+        let dummy_ws = paths.state_dir.join("loops");
+        if let SandboxConfig::Bwrap { ref home_ro } = cfg.sandbox {
+            check_home_ro_does_not_reach(&paths.home_dir, home_ro, &[&dummy_run, &dummy_ws])
+                .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+        }
+        for warn in check_project_models_warnings(r, paths, project_models.as_ref()) {
+            eprintln!("aviso: {warn}");
+        }
+    } else {
+        let _roles = load_roles_for_workflow(&resolution.workflow, None, paths)
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    }
+
+    ensure_sandbox_prereqs(&cfg)?;
+    let sandbox = build_sandbox(&cfg);
+    let check_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
+        ".check-{}-{}",
+        std::process::id(),
+        generate_run_id()
+    )))
+    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let exposures = sandbox.check(check_dir.path()).map_err(|e| {
+        LoopError::err(format!(
+            "falha na verificação do sandbox ({}): {e:#}",
+            sandbox.kind()
+        ))
+    })?;
+
+    if let Err(account_errs) = check_accounts(
+        &resolution.workflow,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+    ) {
+        return Err(LoopError::err(account_errs.join("\n")));
+    }
+
+    println!(
+        "Workflow '{workflow_name}' válido (sandbox: {}).",
+        sandbox.kind()
+    );
+    if exposures.is_empty() {
+        println!("Exposições do sandbox: nenhuma adicional detectada.");
+    } else {
+        println!("Exposições do sandbox:");
+        for exp in &exposures {
+            println!("  - {exp}");
+        }
+    }
+    println!("Modelos resolvidos:");
+    for st in &resolution.stages {
+        println!(
+            "  {} ({}): {} [{}]",
+            st.stage_id,
+            st.role,
+            st.choice.display(),
+            st.source
+        );
+    }
+
+    if !cfg.auto_approve_in_sandbox {
+        println!("Aviso: auto_approve_in_sandbox está false em ~/.config/tchelvis/loops.toml (obrigatório true para rodar).");
+    }
+
+    if live {
+        if !cfg.auto_approve_in_sandbox {
+            return Err(LoopError::usage(
+                "auto_approve_in_sandbox = true em ~/.config/tchelvis/loops.toml é obrigatório para --live",
+            ));
+        }
+        let cancel = install_cancel_signal_flag();
+        let probe_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
+            ".check-live-{}-{}",
+            std::process::id(),
+            generate_run_id()
+        )))
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        let targets = probe_targets(&resolution.workflow);
+        let clock = SystemClock::new();
+        let probes = run_preflight_with_options(
+            &targets,
+            sandbox.as_ref(),
+            probe_dir.path(),
+            &cancel,
+            &clock,
+            opencode_key.as_deref(),
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err(LoopError::cancelled("pré-teste cancelado por sinal"));
+        }
+        match probes {
+            Ok(records) => {
+                println!("Pré-teste ao vivo concluído ({} modelo(s)):", records.len());
+                for rec in records {
+                    println!(
+                        "  {}: {} — {}ms",
+                        rec.provider,
+                        rec.model.as_deref().unwrap_or("(padrão)"),
+                        rec.duration_ms
+                    );
+                }
+            }
+            Err(failures) => {
+                let mut msg = String::from("pré-teste de modelos falhou:\n");
+                for fail in failures {
+                    let _ = writeln!(
+                        msg,
+                        "  - {} (etapas: {}): {}",
+                        fail.choice.display(),
+                        fail.stage_ids.join(", "),
+                        fail.reason
+                    );
+                }
+                let refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+                return Err(LoopError::err(redact_loop_text(msg.trim_end(), &refs)));
+            }
+        }
+    }
+
+    let _ = &extra;
+    Ok(())
+}
+
+async fn resolve_caller_info(require_herdr: bool) -> Result<Option<CallerInfo>, LoopError> {
+    let raw_term = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
+    let term_id = raw_term.trim();
+    if term_id.is_empty() {
+        if require_herdr {
+            return Err(LoopError::usage(
+                "--detach requer execução dentro de um terminal Herdr (HC_TERMINAL_ID ausente)",
+            ));
+        }
+        return Ok(None);
+    }
+
+    let herdr = HerdrClient::default();
+    let mut rpc = None;
+    match herdr.get_terminal(&mut rpc, term_id).await {
+        Ok(term) => match term.created_ms {
+            Some(created_ms) => Ok(Some(CallerInfo {
+                terminal: term.address,
+                created_ms,
+            })),
+            None if require_herdr => Err(LoopError::usage(
+                "--detach requer Herdr com 'created_ms' válido para o terminal atual",
+            )),
+            None => Ok(None),
+        },
+        Err(e) if require_herdr => Err(LoopError::err(format!(
+            "--detach requer Herdr ('hc') operacional: {e:#}"
+        ))),
+        Err(_) => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_run(
+    paths: &CockpitPaths,
+    workflow_name: String,
+    prompt_arg: Option<String>,
+    input_file: Option<PathBuf>,
+    from_head: bool,
+    max_cycles: Option<u32>,
+    use_overrides_raw: Vec<String>,
+    detach: bool,
+    verbose: bool,
+) -> Result<i32, LoopError> {
+    if let Some(mc) = max_cycles {
+        if !(1..=20).contains(&mc) {
+            return Err(LoopError::usage("--max-cycles deve ficar entre 1 e 20"));
+        }
+    }
+
+    let input_prompt = match (prompt_arg, input_file) {
+        (Some(p), None) => p,
+        (None, Some(path)) => read_regular_file_nofollow(&path, MAX_INPUT_FILE_BYTES)
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?,
+        (None, None) => {
+            return Err(LoopError::usage(
+                "informe [prompt] ou --input-file <arquivo>",
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(LoopError::usage(
+                "[prompt] e --input-file são mutuamente exclusivos",
+            ));
+        }
+    };
+    if input_prompt.trim().is_empty() {
+        return Err(LoopError::usage("a tarefa (prompt) não pode estar vazia"));
+    }
+
+    let use_overrides = parse_use_overrides(&use_overrides_raw)?;
+
+    let cfg = load_loops_config_required(paths).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    if !cfg.auto_approve_in_sandbox {
+        return Err(LoopError::usage(
+            "auto_approve_in_sandbox = true é obrigatório em ~/.config/tchelvis/loops.toml (revise os limites do sandbox antes de ativar)",
+        ));
+    }
+
+    let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    let (unresolved, origin) =
+        load_workflow_unresolved(&workflow_name, Some(&repo), paths, max_cycles)
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    let project_models =
+        load_project_models_from_repo(&repo).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    let without_use = resolve_workflow(
+        unresolved.clone(),
+        origin,
+        &[],
+        project_models.as_ref(),
+        &cfg.defaults,
+    );
+    let resolution = resolve_workflow(
+        unresolved,
+        origin,
+        &use_overrides,
+        project_models.as_ref(),
+        &cfg.defaults,
+    )
+    .map_err(|errs| LoopError::usage(errs.join("\n")))?;
+    // What is confirmed is the repository's choices, the same ones `models confirm` records,
+    // whatever `--use` replaces in this run.
+    let to_confirm = without_use.as_ref().unwrap_or(&resolution);
+
+    let roles = load_roles_for_workflow(&resolution.workflow, Some(&repo), paths)
+        .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+
+    let mut run_id = generate_run_id();
+    while repo.join(".loops/runs").join(&run_id).exists()
+        || paths.state_dir.join("loops").join(&run_id).exists()
+    {
+        run_id = generate_run_id();
+    }
+    let run_dir = repo.join(".loops/runs").join(&run_id);
+    let workspace_path = paths
+        .state_dir
+        .join("loops")
+        .join(&run_id)
+        .join("workspace");
+
+    if let SandboxConfig::Bwrap { ref home_ro } = cfg.sandbox {
+        check_home_ro_does_not_reach(&paths.home_dir, home_ro, &[&run_dir, &workspace_path])
+            .map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    }
+
+    // A foreground run prints its result: there is nobody to wake.
+    let caller = if detach {
+        resolve_caller_info(true).await?
+    } else {
+        None
+    };
+
+    // Check max_concurrent in orch.db
+    let store =
+        OrchStore::open(&paths.orch_db_file()).map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let active_count = store
+        .list_loops()
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+        .into_iter()
+        .filter(is_active)
+        .count();
+    if active_count >= cfg.max_concurrent as usize {
+        return Err(LoopError::err(format!(
+            "limite de concorrência atingido ({active_count}/{} loops em execução)",
+            cfg.max_concurrent
+        )));
+    }
+
+    // 1. Sandbox check
+    ensure_sandbox_prereqs(&cfg)?;
+    let sandbox = build_sandbox(&cfg);
+    let sandbox_probe_dir = TempDirGuard::create(
+        paths
+            .state_dir
+            .join("loops")
+            .join(format!(".sandbox-check-{run_id}")),
+    )
+    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let exposures = sandbox.check(sandbox_probe_dir.path()).map_err(|e| {
+        LoopError::err(format!(
+            "verificação do sandbox '{}' falhou: {e:#}",
+            sandbox.kind()
+        ))
+    })?;
+    drop(sandbox_probe_dir);
+
+    // 2. Model confirmation
+    let confirm_file = paths.state_dir.join("loops/confirmed.json");
+    if resolution.needs_confirmation()
+        && !is_confirmed(&confirm_file, &repo, to_confirm)
+            .map_err(|e| LoopError::err(format!("{e:#}")))?
+    {
+        if detach || !std::io::stdin().is_terminal() {
+            return Err(LoopError::err(format!(
+                "o workflow '{workflow_name}' usa escolhas de modelo definidas no repositório.\n\
+                 Confirme antes com:\n  tchelvis loop models confirm {workflow_name}"
+            )));
+        }
+        eprintln!("Modelos escolhidos para '{workflow_name}':");
+        for st in &to_confirm.stages {
+            eprintln!(
+                "  {} ({}): {} [{}]",
+                st.stage_id,
+                st.role,
+                st.choice.display(),
+                st.source
+            );
+        }
+        eprint!("Confirmar execução com esses modelos do repositório? [y/N]: ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err()
+            || !matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "y" | "yes" | "s" | "sim"
+            )
+        {
+            return Err(LoopError::err(
+                "execução recusada sem confirmação dos modelos",
+            ));
+        }
+        record_confirmation(&confirm_file, &repo, to_confirm)
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    }
+
+    // 3. Account check + OPENCODE_API_KEY
+    let opencode_key = opencode_key_for(&resolution.workflow);
+    let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
+    if let Err(acc_errs) = check_accounts(
+        &resolution.workflow,
+        &paths.home_dir,
+        opencode_key.as_deref(),
+    ) {
+        let joined = acc_errs.join("\n");
+        let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+        return Err(LoopError::err(redact_loop_text(&joined, &refs)));
+    }
+
+    // 4. Read-only git check BEFORE preflight probes so dirty repo spends zero tokens
+    let branch = format!("loop/{}-{run_id}", resolution.workflow.name);
+    let repo_info = GitWorkspace::preflight_check_repo(&repo, &branch, from_head)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    // 5. Preflight probes (with SIGINT/SIGTERM cancellation)
+    let cancel = install_cancel_signal_flag();
+    let targets = probe_targets(&resolution.workflow);
+    if verbose {
+        eprintln!("Testando {} modelo(s) antes de iniciar...", targets.len());
+    }
+    let preflight_dir = TempDirGuard::create(
+        paths
+            .state_dir
+            .join("loops")
+            .join(format!(".preflight-{run_id}")),
+    )
+    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let clock = SystemClock::new();
+    let preflight_res = run_preflight_with_options(
+        &targets,
+        sandbox.as_ref(),
+        preflight_dir.path(),
+        &cancel,
+        &clock,
+        opencode_key.as_deref(),
+    );
+    drop(preflight_dir);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(LoopError::cancelled(
+            "execução cancelada durante o pré-teste",
+        ));
+    }
+    let preflight_records = match preflight_res {
+        Ok(records) => records,
+        Err(failures) => {
+            let mut msg = String::from("pré-teste de modelos falhou (nada foi criado):\n");
+            for fail in failures {
+                let _ = writeln!(
+                    msg,
+                    "  - {} (etapas: {}): {}",
+                    fail.choice.display(),
+                    fail.stage_ids.join(", "),
+                    fail.reason
+                );
+            }
+            let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+            return Err(LoopError::err(redact_loop_text(msg.trim_end(), &refs)));
+        }
+    };
+
+    // 6. Side effects: .loops/runs/.gitignore, run_dir, workspace clone, frozen.json, orch.db row
+    let _ =
+        ensure_dir_no_symlink(&repo, &[".loops"]).map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let runs_root = ensure_dir_no_symlink(&repo, &[".loops", "runs"])
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let _ = write_if_absent_nofollow(&runs_root.join(".gitignore"), "*\n", 0o644)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    if detach {
+        // Without the daemon the caller would never be woken.
+        ensure_daemon(paths).await?;
+    }
+    let mut created = CreatedRun {
+        paths: vec![run_dir.clone(), paths.state_dir.join("loops").join(&run_id)],
+        keep: false,
+    };
+    let ws = GitWorkspace::create_in(repo_info, &run_dir, &workspace_path)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    let ws_meta = ws.to_frozen();
+    let base_commit = ws.base_commit().to_string();
+
+    let frozen = FrozenRunConfig {
+        run_id: run_id.clone(),
+        workflow: resolution.workflow.clone(),
+        roles: roles.clone(),
+        input_prompt,
+        sandbox_kind: sandbox.kind().to_string(),
+        sandbox: cfg.sandbox.clone(),
+        env_pass: cfg.env_pass.clone(),
+        sandbox_exposures: exposures,
+        branch: branch.clone(),
+        base_commit: Some(base_commit),
+        caller: caller.clone(),
+        model_sources: resolution.model_sources(),
+        preflight: preflight_records,
+        workspace: ws_meta,
+        path: std::env::var("PATH").ok(),
+    };
+    let frozen_bytes = serde_json::to_vec_pretty(&frozen)
+        .map_err(|e| LoopError::err(format!("falha ao serializar frozen.json: {e:#}")))?;
+    write_private_atomic(&run_dir.join("frozen.json"), &frozen_bytes)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    let now_ms = unix_now_ms();
+    let record = LoopRunRecord {
+        run_id: run_id.clone(),
+        dir: run_dir.to_string_lossy().into_owned(),
+        workflow: frozen.workflow.name.clone(),
+        status: "RUNNING".to_string(),
+        caller_terminal: caller.as_ref().map(|c| c.terminal.clone()),
+        caller_created_ms: caller.as_ref().map(|c| c.created_ms),
+        engine_pid: None,
+        engine_start_ticks: None,
+        orch_run_id: None,
+        notify_state: if caller.is_some() {
+            "pending".to_string()
+        } else {
+            "none".to_string()
+        },
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    };
+    let registered = store
+        .register_loop_limited(&record, cfg.max_concurrent as usize, &is_active)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    if !registered {
+        return Err(LoopError::err(format!(
+            "limite de concorrência atingido ({} loops em execução)",
+            cfg.max_concurrent
+        )));
+    }
+    created.keep = true;
+
+    if detach {
+        let caller_term = caller
+            .as_ref()
+            .map(|c| c.terminal.as_str())
+            .ok_or_else(|| LoopError::usage("--detach requer caller Herdr"))?;
+        // The same binary, whatever `PATH` the Herdr terminal has.
+        let exe = std::env::current_exe()
+            .map_err(|e| LoopError::err(format!("falha ao localizar binário tchelvis: {e:#}")))?
+            .to_string_lossy()
+            .into_owned();
+        let herdr = HerdrClient::default();
+        let argv = vec![exe, "loop".to_string(), "engine".to_string()];
+        if let Err(e) = herdr
+            .run_worker(
+                caller_term,
+                &repo,
+                &[("cockpit.loop_run", run_id.as_str())],
+                &argv,
+                &run_id,
+            )
+            .await
+        {
+            let _ = store.mark_loop_launch_failed(&run_id, unix_now_ms());
+            let refs: Vec<&str> = extra_secrets.iter().map(|s| s.as_str()).collect();
+            return Err(LoopError::err(redact_loop_text(
+                &format!("falha ao iniciar terminal do loop via Herdr: {e:#}"),
+                &refs,
+            )));
+        }
+        println!("{run_id}");
+        return Ok(EXIT_PASS);
+    }
+
+    run_frozen_engine_with_cancel(&run_dir, paths, cancel, verbose).await
+}
+
+/// Only registered runs: files under `.loops/runs` may come with a cloned repository.
+fn find_run_dir(
+    run_id: Option<&str>,
+    paths: &CockpitPaths,
+) -> Result<(String, PathBuf), LoopError> {
+    if let Some(id) = run_id {
+        let rec = registered_run(id, paths)?;
+        return Ok((rec.run_id, PathBuf::from(rec.dir)));
+    }
+    OrchStore::open(&paths.orch_db_file())
+        .and_then(|store| store.list_loops())
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+        .into_iter()
+        .rev()
+        .find(|r| Path::new(&r.dir).is_dir())
+        .map(|r| (r.run_id, PathBuf::from(r.dir)))
+        .ok_or_else(|| LoopError::err("nenhuma execução encontrada"))
+}
+
+/// Removes what a run created when it cannot start after all.
+struct CreatedRun {
+    paths: Vec<PathBuf>,
+    keep: bool,
+}
+
+impl Drop for CreatedRun {
+    fn drop(&mut self) {
+        if !self.keep {
+            for path in &self.paths {
+                let _ = fs::remove_dir_all(path);
+            }
+        }
+    }
+}
+
+async fn ensure_daemon(paths: &CockpitPaths) -> Result<(), LoopError> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("TCHELVIS_TEST_NO_DAEMON").is_some() {
+        return Ok(());
+    }
+    crate::daemon::ensure_daemon_running(paths)
+        .await
+        .map_err(|e| {
+            LoopError::err(format!(
+                "o daemon que avisa o fim do loop não iniciou: {e:#}"
+            ))
+        })
+}
+
+/// Whether a registered loop is really running: a dead engine takes no slot and blocks no cleanup.
+fn is_active(rec: &LoopRunRecord) -> bool {
+    if FlockGuard::is_locked(&Path::new(&rec.dir).join("engine.lock")) {
+        return true;
+    }
+    rec.status == "RUNNING"
+        && match rec.engine_pid {
+            Some(pid) => LinuxProcTable.is_alive(pid, rec.engine_start_ticks),
+            None => unix_now_ms().saturating_sub(rec.created_at_ms) <= ENGINE_START_GRACE_MS,
+        }
+}
+
+fn registered_run(run_id: &str, paths: &CockpitPaths) -> Result<LoopRunRecord, LoopError> {
+    validate_run_id(run_id).map_err(LoopError::usage)?;
+    OrchStore::open(&paths.orch_db_file())
+        .and_then(|store| store.get_loop(run_id))
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+        .ok_or_else(|| LoopError::err(format!("execução '{run_id}' não encontrada")))
+}
+
+async fn run_frozen_engine_with_cancel(
+    run_dir: &Path,
+    paths: &CockpitPaths,
+    cancel: Arc<AtomicBool>,
+    verbose: bool,
+) -> Result<i32, LoopError> {
+    let lock_path = run_dir.join("engine.lock");
+    let _lock =
+        FlockGuard::try_lock_exclusive(&lock_path).map_err(|e| LoopError::err(format!("{e:#}")))?;
+
+    let frozen_raw = read_regular_file_nofollow(&run_dir.join("frozen.json"), MAX_FROZEN_BYTES)
+        .map_err(|e| LoopError::err(format!("falha ao ler frozen.json: {e:#}")))?;
+    let frozen: FrozenRunConfig = serde_json::from_str(&frozen_raw)
+        .map_err(|e| LoopError::err(format!("frozen.json inválido: {e:#}")))?;
+
+    if let Some(path) = &frozen.path {
+        std::env::set_var("PATH", path);
+    }
+
+    if let Ok(store) = OrchStore::open(&paths.orch_db_file()) {
+        let (pid, ticks) = current_process_identity();
+        let _ = store.update_loop_engine_identity(&frozen.run_id, pid, ticks, unix_now_ms());
+    }
+
+    let opencode_key = opencode_key_for(&frozen.workflow);
+    let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
+
+    if verbose {
+        eprintln!(
+            "Iniciando loop {} ({}) em {}...",
+            frozen.run_id, frozen.workflow.name, frozen.sandbox_kind
+        );
+    }
+
+    let run_dir_owned = run_dir.to_path_buf();
+    let cancel_for_thread = cancel.clone();
+    let secrets_for_thread = extra_secrets.clone();
+    let orch_db_path = paths.orch_db_file();
+    let final_state = tokio::task::spawn_blocking(move || -> RunState {
+        let sandbox: Box<dyn Sandbox + Sync> = match &frozen.sandbox {
+            SandboxConfig::Inherited => Box::new(InheritedSandbox::new(frozen.env_pass.clone())),
+            SandboxConfig::Bwrap { home_ro } => {
+                Box::new(BwrapSandbox::new(home_ro.clone(), frozen.env_pass.clone()))
+            }
+        };
+        let clock = SystemClock::new();
+        let runner = ProcessStageRunner::new(sandbox.as_ref(), &clock)
+            .with_opencode_api_key(opencode_key)
+            .with_extra_secrets(secrets_for_thread.clone());
+        let ws = GitWorkspace::from_frozen(frozen.workspace);
+        let cfg = EngineConfig {
+            run_id: frozen.run_id,
+            workflow: frozen.workflow,
+            roles: frozen.roles,
+            run_dir: run_dir_owned,
+            input_prompt: frozen.input_prompt,
+            sandbox_kind: frozen.sandbox_kind,
+            sandbox_exposures: frozen.sandbox_exposures,
+            branch: frozen.branch,
+            base_commit: frozen.base_commit,
+            caller: frozen.caller,
+            cancel: cancel_for_thread,
+        };
+        Engine::new(cfg, ws, runner, SystemClock::new())
+            .with_model_sources(frozen.model_sources)
+            .with_preflight(frozen.preflight)
+            .with_extra_secrets(secrets_for_thread)
+            .with_on_final(move |st| {
+                if let Ok(store) = OrchStore::open(&orch_db_path) {
+                    let _ = store.record_loop_final(&st.run_id, st.status.as_str(), unix_now_ms());
+                }
+            })
+            .run()
+    })
+    .await
+    .map_err(|e| LoopError::err(format!("falha interna no motor do loop: {e}")))?;
+
+    if let Ok(store) = OrchStore::open(&paths.orch_db_file()) {
+        let _ = store.record_loop_final(
+            &final_state.run_id,
+            final_state.status.as_str(),
+            unix_now_ms(),
+        );
+    }
+    let req = IpcRequest {
+        op: IpcOp::OrchWake,
+        terminal: None,
+        include_all: false,
+    };
+    let _ = crate::daemon::query_socket_once::<Value>(&paths.socket_file(), &req).await;
+
+    println!("{}", format_result(&final_state));
+    Ok(final_state.status.exit_code())
+}
+
+async fn cmd_engine(paths: &CockpitPaths, run_id: String) -> Result<i32, LoopError> {
+    validate_run_id(&run_id).map_err(LoopError::usage)?;
+    let rec = registered_run(&run_id, paths)?;
+    if rec.status != "RUNNING" {
+        return Err(LoopError::err(format!(
+            "execução '{run_id}' já terminou ({})",
+            rec.status
+        )));
+    }
+    let run_dir = PathBuf::from(&rec.dir);
+    if rec.engine_pid.is_some() && !FlockGuard::is_locked(&run_dir.join("engine.lock")) {
+        return Err(LoopError::err(format!(
+            "o motor da execução '{run_id}' já foi iniciado e não pode recomeçar"
+        )));
+    }
+    let cancel = install_cancel_signal_flag();
+    run_frozen_engine_with_cancel(&run_dir, paths, cancel, false).await
+}
+
+fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<(), LoopError> {
+    let (resolved_id, run_dir) = find_run_dir(run_id, paths)?;
+    match load_state(&run_dir) {
+        Ok(state) => {
+            if json {
+                let out = serde_json::to_string_pretty(&state)
+                    .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                println!("{out}");
+            } else {
+                println!(
+                    "STATUS: {} | LOOP: {} | CICLOS: {}/{}",
+                    state.status, state.workflow, state.current_cycle, state.max_cycles
+                );
+                println!("RUN_ID: {}", state.run_id);
+                if let Some(branch) = &state.branch {
+                    println!("BRANCH: {branch}");
+                }
+                if let Some(reason) = &state.reason {
+                    println!("MOTIVO: {reason}");
+                }
+                println!("ETAPAS EXECUTADAS: {}", state.executions.len());
+            }
+            Ok(())
+        }
+        Err(_) => {
+            let store = OrchStore::open(&paths.orch_db_file())
+                .map_err(|e| LoopError::err(format!("{e:#}")))?;
+            let Some(rec) = store
+                .get_loop(&resolved_id)
+                .map_err(|e| LoopError::err(format!("{e:#}")))?
+            else {
+                return Err(LoopError::err(format!(
+                    "estado da execução '{resolved_id}' ainda indisponível"
+                )));
+            };
+            if json {
+                let val = serde_json::json!({
+                    "run_id": rec.run_id,
+                    "workflow": rec.workflow,
+                    "status": rec.status,
+                    "notify_state": rec.notify_state,
+                    "dir": rec.dir,
+                });
+                println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
+            } else {
+                println!("STATUS: {} | LOOP: {}", rec.status, rec.workflow);
+                println!("RUN_ID: {}", rec.run_id);
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_result(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopError> {
+    let (id, run_dir) = find_run_dir(run_id, paths)?;
+    match load_state(&run_dir) {
+        Ok(state) => println!("{}", format_result(&state)),
+        // The engine ended before writing anything: the record still says how.
+        Err(_) => {
+            let rec = registered_run(&id, paths)?;
+            println!(
+                "STATUS: {} | LOOP: {} | CICLOS: 0/0\nRUN_ID: {}\nBRANCH: (nenhuma)\nARQUIVOS: (nenhum)\nRESUMO: sem estado gravado; o motor não chegou a iniciar ou foi removido",
+                rec.status, rec.workflow, rec.run_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Values to hide when showing files of a run.
+fn secrets_of_run(run_dir: &Path) -> Vec<String> {
+    let key = read_regular_file_nofollow(&run_dir.join("frozen.json"), MAX_FROZEN_BYTES)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<FrozenRunConfig>(&raw).ok())
+        .and_then(|frozen| opencode_key_for(&frozen.workflow));
+    collect_extra_secrets(key.as_deref())
+}
+
+fn cmd_logs(
+    paths: &CockpitPaths,
+    run_id: Option<&str>,
+    stage_filter: Option<&str>,
+) -> Result<(), LoopError> {
+    let (_, run_dir) = find_run_dir(run_id, paths)?;
+    let logs_dir = run_dir.join("logs");
+    if !logs_dir.is_dir() {
+        println!("Nenhum log encontrado em {}.", logs_dir.display());
+        return Ok(());
+    }
+    let mut entries: Vec<String> = fs::read_dir(&logs_dir)
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.ends_with(".log"))
+        .collect();
+    entries.sort();
+    if let Some(filter) = stage_filter {
+        entries.retain(|name| {
+            name.strip_suffix(".log")
+                .map(|stem| stem.split('-').skip(2).collect::<Vec<_>>().join("-"))
+                .as_deref()
+                == Some(filter)
+                || name.contains(filter)
+        });
+    }
+    if entries.is_empty() {
+        println!("Nenhum log correspondente encontrado.");
+        return Ok(());
+    }
+    let extra = secrets_of_run(&run_dir);
+    for name in entries {
+        println!("=== {} ===", for_terminal(&name, &extra));
+        let raw = read_regular_bytes_nofollow(&logs_dir.join(&name), MAX_LOG_PRINT_BYTES)
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        println!("{}", for_terminal(&String::from_utf8_lossy(&raw), &extra));
+    }
+    Ok(())
+}
+
+fn cmd_report(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopError> {
+    let (_, run_dir) = find_run_dir(run_id, paths)?;
+    let extra = secrets_of_run(&run_dir);
+    let extra_refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+    let report_path = run_dir.join("report.md");
+    if report_path.exists() {
+        let md = read_regular_file_nofollow(&report_path, MAX_LOG_PRINT_BYTES)
+            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        println!("{}", for_terminal(&md, &extra));
+        return Ok(());
+    }
+    let state = load_state(&run_dir).map_err(|e| LoopError::err(format!("{e:#}")))?;
+    print!(
+        "{}",
+        render_report_with_secrets(&state, &run_dir, &extra_refs)
+    );
+    Ok(())
+}
+
+fn cmd_stop(paths: &CockpitPaths, run_id: &str) -> Result<(), LoopError> {
+    let rec = registered_run(run_id, paths)?;
+    if rec.status != "RUNNING" {
+        println!("Loop '{run_id}' já finalizado ({}).", rec.status);
+        return Ok(());
+    }
+    // Only the identity the engine registered: the pid in `state.json` could be anyone's.
+    let (Some(pid), Some(ticks)) = (rec.engine_pid, rec.engine_start_ticks) else {
+        return Err(LoopError::err(format!(
+            "o motor do loop '{run_id}' ainda não iniciou"
+        )));
+    };
+    if !LinuxProcTable.is_alive(pid, Some(ticks)) {
+        return Err(LoopError::err(format!(
+            "motor do loop '{run_id}' (PID {pid}) não está mais em execução"
+        )));
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(LoopError::err(format!(
+            "falha ao enviar SIGINT para PID {pid}: {err}"
+        )));
+    }
+    println!("Sinal de cancelamento enviado ao loop '{run_id}' (PID {pid}).");
+    Ok(())
+}
+
+/// The run's own directory, if it is exactly `<repo>/.loops/runs/<id>` with no link on the way.
+fn removable_run_dir(rec: &LoopRunRecord) -> Option<PathBuf> {
+    let dir = PathBuf::from(&rec.dir);
+    let repo = dir.parent()?.parent()?.parent()?;
+    let expected = fs::canonicalize(repo)
+        .ok()?
+        .join(".loops/runs")
+        .join(&rec.run_id);
+    (validate_run_id(&rec.run_id).is_ok() && fs::canonicalize(&dir).ok()? == expected)
+        .then_some(expected)
+}
+
+/// The directory of the run's workspace, if it is a real directory.
+fn removable_workspace(run_id: &str, paths: &CockpitPaths) -> Option<PathBuf> {
+    let dir = paths.state_dir.join("loops").join(run_id);
+    fs::symlink_metadata(&dir)
+        .is_ok_and(|meta| meta.is_dir())
+        .then_some(dir)
+}
+
+fn cmd_clean(paths: &CockpitPaths, run_id: Option<&str>, yes: bool) -> Result<(), LoopError> {
+    let records = match run_id {
+        Some(id) => {
+            let rec = registered_run(id, paths)?;
+            if is_active(&rec) {
+                return Err(LoopError::err(format!(
+                    "execução '{id}' está ativa e não pode ser removida (use 'tchelvis loop stop {id}' antes)"
+                )));
+            }
+            vec![rec]
+        }
+        None => {
+            let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+            let runs = repo.join(".loops/runs");
+            OrchStore::open(&paths.orch_db_file())
+                .and_then(|store| store.list_loops())
+                .map_err(|e| LoopError::err(format!("{e:#}")))?
+                .into_iter()
+                .filter(|rec| Path::new(&rec.dir).parent() == Some(runs.as_path()))
+                .filter(|rec| !is_active(rec))
+                .collect()
+        }
+    };
+    let targets: Vec<(String, Option<PathBuf>, Option<PathBuf>)> = records
+        .iter()
+        .map(|rec| {
+            (
+                rec.run_id.clone(),
+                removable_run_dir(rec),
+                removable_workspace(&rec.run_id, paths),
+            )
+        })
+        .filter(|(_, run, ws)| run.is_some() || ws.is_some())
+        .collect();
+
+    if targets.is_empty() {
+        println!("Nenhuma execução finalizada para limpar.");
+        return Ok(());
+    }
+
+    println!("Diretórios que serão removidos (branches git serão mantidas):");
+    for (id, run_dir, ws_parent) in &targets {
+        println!("  [{id}]");
+        for dir in [run_dir, ws_parent].into_iter().flatten() {
+            println!("    - {}", dir.display());
+        }
+    }
+
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(LoopError::err(
+                "recusando limpeza sem --yes fora de terminal interativo",
+            ));
+        }
+        eprint!("Confirmar remoção? [y/N]: ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err()
+            || !matches!(
+                answer.trim().to_ascii_lowercase().as_str(),
+                "y" | "yes" | "s" | "sim"
+            )
+        {
+            println!("Limpeza cancelada.");
+            return Ok(());
+        }
+    }
+
+    for dir in targets
+        .into_iter()
+        .flat_map(|(_, run, ws)| [run, ws])
+        .flatten()
+    {
+        fs::remove_dir_all(&dir)
+            .map_err(|e| LoopError::err(format!("falha ao remover {}: {e:#}", dir.display())))?;
+    }
+    println!("Limpeza concluída.");
+    Ok(())
+}
+
+pub async fn execute_loop_command(cmd: LoopCommands, paths: &CockpitPaths) -> i32 {
+    let extra = collect_extra_secrets(None);
+    let result: Result<i32, LoopError> = match cmd {
+        LoopCommands::Init => cmd_init(paths).map(|()| EXIT_PASS),
+        LoopCommands::New { name, stages } => cmd_new(paths, &name, &stages).map(|()| EXIT_PASS),
+        LoopCommands::List { runs } => cmd_list(paths, runs).map(|()| EXIT_PASS),
+        LoopCommands::Check {
+            workflow,
+            live,
+            use_overrides,
+        } => cmd_check(paths, &workflow, live, &use_overrides).map(|()| EXIT_PASS),
+        LoopCommands::Models { action, workflow } => {
+            cmd_models(paths, action, workflow).map(|()| EXIT_PASS)
+        }
+        LoopCommands::Auth { action } => cmd_auth(paths, action).await.map(|()| EXIT_PASS),
+        LoopCommands::Run {
+            workflow,
+            prompt,
+            input_file,
+            from_head,
+            max_cycles,
+            use_overrides,
+            detach,
+            verbose,
+        } => {
+            cmd_run(
+                paths,
+                workflow,
+                prompt,
+                input_file,
+                from_head,
+                max_cycles,
+                use_overrides,
+                detach,
+                verbose,
+            )
+            .await
+        }
+        LoopCommands::Status { run_id, json } => {
+            cmd_status(paths, run_id.as_deref(), json).map(|()| EXIT_PASS)
+        }
+        LoopCommands::Result { run_id } => cmd_result(paths, run_id.as_deref()).map(|()| EXIT_PASS),
+        LoopCommands::Logs { run_id, stage } => {
+            cmd_logs(paths, run_id.as_deref(), stage.as_deref()).map(|()| EXIT_PASS)
+        }
+        LoopCommands::Report { run_id } => cmd_report(paths, run_id.as_deref()).map(|()| EXIT_PASS),
+        LoopCommands::Stop { run_id } => cmd_stop(paths, &run_id).map(|()| EXIT_PASS),
+        LoopCommands::Clean { run_id, yes } => {
+            cmd_clean(paths, run_id.as_deref(), yes).map(|()| EXIT_PASS)
+        }
+        LoopCommands::Engine { run_id } => cmd_engine(paths, run_id).await,
+    };
+
+    match result {
+        Ok(code) => code,
+        Err(err) => {
+            eprint_redacted(&format!("Erro: {}", err.message), &extra);
+            err.code
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loops::workflow::{RoleDefault, RoleDefaults};
+    use tempfile::TempDir;
+
+    fn all_defaults() -> RoleDefaults {
+        let mut map = BTreeMap::new();
+        for role in [
+            "designer", "planner", "worker", "tester", "reviewer", "critic", "auditor",
+        ] {
+            map.insert(
+                role.to_string(),
+                RoleDefault {
+                    provider: Provider::Claude,
+                    model: Some("sonnet".to_string()),
+                },
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn opencode_key_resolution_ignores_shell_startup_noise_and_handles_slow_or_failing_shells() {
+        let tmp = TempDir::new().unwrap();
+
+        // Direct env wins without invoking shell.
+        assert_eq!(
+            resolve_opencode_api_key_with(
+                Some("env-key-123"),
+                Some(std::ffi::OsStr::new("/nonexistent/shell")),
+                Duration::from_millis(200),
+            ),
+            Some("env-key-123".to_string())
+        );
+
+        // Shell with startup noise + exported OPENCODE_API_KEY
+        let noisy_shell = tmp.path().join("noisy-sh");
+        crate::test_support::write_executable(
+            &noisy_shell,
+            "#!/usr/bin/env sh\n\
+             echo 'welcome to interactive shell'\n\
+             echo 'some MOTD banner line' >&2\n\
+             export OPENCODE_API_KEY='shell-secret-999'\n\
+             shift\n\
+             sh -c \"$1\"\n",
+        );
+        assert_eq!(
+            resolve_opencode_api_key_with(
+                None,
+                Some(noisy_shell.as_os_str()),
+                Duration::from_secs(2),
+            ),
+            Some("shell-secret-999".to_string())
+        );
+
+        // Failing shell -> None ("absent", not error)
+        let failing_shell = tmp.path().join("fail-sh");
+        crate::test_support::write_executable(&failing_shell, "#!/usr/bin/env sh\nexit 1\n");
+        assert_eq!(
+            resolve_opencode_api_key_with(
+                None,
+                Some(failing_shell.as_os_str()),
+                Duration::from_secs(1),
+            ),
+            None
+        );
+
+        // Slow shell -> times out cleanly -> None ("absent", not error)
+        let slow_shell = tmp.path().join("slow-sh");
+        crate::test_support::write_executable(&slow_shell, "#!/usr/bin/env sh\nsleep 5\n");
+        let started = Instant::now();
+        assert_eq!(
+            resolve_opencode_api_key_with(
+                None,
+                Some(slow_shell.as_os_str()),
+                Duration::from_millis(120),
+            ),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn loop_new_generates_preset_shapes_repeated_roles_and_unknown_roles_that_validate() {
+        let defaults = all_defaults();
+
+        let shapes: Vec<(&str, &[&str])> = vec![
+            ("wrc", &["worker", "reviewer", "critic"]),
+            ("dwr", &["designer", "worker", "reviewer"]),
+            ("pwtc", &["planner", "worker", "tester", "critic"]),
+            ("fwr", &["worker", "reviewer"]),
+            (
+                "custom-shape",
+                &["planner", "worker", "worker", "auditor", "reviewer"],
+            ),
+        ];
+
+        for (name, raw_stages) in shapes {
+            let stages: Vec<String> = raw_stages.iter().map(|s| (*s).to_string()).collect();
+            let (toml, roles) = build_generated_workflow_and_roles(name, &stages).unwrap();
+            let unresolved = parse_workflow_unresolved(&toml).expect("valid unresolved workflow");
+            let res = resolve_workflow(unresolved, WorkflowOrigin::Repo, &[], None, &defaults)
+                .expect("resolves cleanly");
+            assert_eq!(res.workflow.stages.len(), stages.len());
+
+            if name == "custom-shape" {
+                assert!(roles.contains_key("auditor"));
+                let stage_ids: Vec<&str> =
+                    res.workflow.stages.iter().map(|s| s.id.as_str()).collect();
+                assert_eq!(
+                    stage_ids,
+                    ["planner", "worker", "worker-2", "auditor", "reviewer"]
+                );
+                assert_eq!(res.workflow.stages[1].on_retry, None);
+                assert_eq!(res.workflow.stages[4].on_retry.as_deref(), Some("worker"));
+                // First editing stage receives reads from later stages
+                assert!(res.workflow.stages[1]
+                    .reads
+                    .contains(&"auditor.md".to_string()));
+                assert!(res.workflow.stages[1]
+                    .reads
+                    .contains(&"review.md".to_string()));
+                assert_eq!(res.workflow.stages[3].writes.as_deref(), Some("auditor.md"));
+            }
+        }
+    }
+
+    #[test]
+    fn loop_new_rejects_invalid_shapes_and_writes_nothing() {
+        // No editing stage
+        assert!(build_generated_workflow_and_roles(
+            "no-edit",
+            &["planner".into(), "reviewer".into()]
+        )
+        .is_err());
+
+        // Editing stage last
+        assert!(build_generated_workflow_and_roles(
+            "edit-last",
+            &["planner".into(), "worker".into()]
+        )
+        .is_err());
+        assert!(build_generated_workflow_and_roles(
+            "tester-last",
+            &["worker".into(), "tester".into()]
+        )
+        .is_err());
+
+        // Invalid role name
+        assert!(build_generated_workflow_and_roles(
+            "bad-role",
+            &["worker".into(), "BadRole!".into()]
+        )
+        .is_err());
+
+        // Invalid workflow name
+        assert!(build_generated_workflow_and_roles(
+            "../escape",
+            &["worker".into(), "reviewer".into()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn validate_run_id_rejects_path_traversal_and_special_chars() {
+        assert!(validate_run_id("20261123-182500-a1b2").is_ok());
+        assert!(validate_run_id("run_01").is_ok());
+        for bad in ["../x", "a/b", ".hidden", "", "a\\b", "id with spaces"] {
+            assert!(validate_run_id(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn only_opencode_go_needs_the_key() {
+        assert!(needs_opencode_key(Some("opencode-go/hy4-flash-free")));
+        for other in [
+            Some("opencode/deepseek-free"),
+            Some("openrouter/x:free"),
+            None,
+        ] {
+            assert!(!needs_opencode_key(other), "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_shell_that_leaves_a_process_holding_its_output_does_not_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = tmp.path().join("sh");
+        crate::test_support::write_executable(
+            &shell,
+            "#!/bin/sh\nsetsid sleep 20 &\nOPENCODE_API_KEY=k1 /bin/sh -c \"$2\"\n",
+        );
+        let start = Instant::now();
+        let key =
+            resolve_opencode_api_key_with(None, Some(shell.as_os_str()), Duration::from_secs(5));
+        assert_eq!(key.as_deref(), Some("k1"));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+}

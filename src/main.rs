@@ -194,6 +194,11 @@ enum Commands {
         #[command(subcommand)]
         action: tchelvis::orch::cli::OrchCommands,
     },
+    /// Execute and manage declarative multi-agent loops in sandbox
+    Loop {
+        #[command(subcommand)]
+        action: tchelvis::loops::cli::LoopCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1550,6 +1555,13 @@ async fn main() -> Result<()> {
         }
         Commands::Orch { action } => {
             tchelvis::orch::cli::execute_orch_command(action, &cfg, &paths).await
+        }
+        Commands::Loop { action } => {
+            let code = tchelvis::loops::cli::execute_loop_command(action, &paths).await;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
     }
 }

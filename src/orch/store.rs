@@ -2184,8 +2184,31 @@ impl OrchStore {
     }
 
     pub fn register_loop(&self, rec: &LoopRunRecord) -> Result<()> {
+        self.register_loop_limited(rec, usize::MAX, &|_| false)
+            .map(|_| ())
+    }
+
+    /// Registers the loop unless `max` active ones already exist. Counting and inserting are one
+    /// transaction, so two loops starting together cannot both take the last slot.
+    pub fn register_loop_limited(
+        &self,
+        rec: &LoopRunRecord,
+        max: usize,
+        is_active: &dyn Fn(&LoopRunRecord) -> bool,
+    ) -> Result<bool> {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let running = tx
+            .prepare(
+                "SELECT run_id, dir, workflow, status, caller_terminal, caller_created_ms,
+                        engine_pid, engine_start_ticks, orch_run_id, notify_state, created_at_ms, updated_at_ms
+                 FROM loop_runs WHERE status = 'RUNNING'",
+            )?
+            .query_map([], Self::map_loop_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        if running.iter().filter(|r| is_active(r)).count() >= max {
+            return Ok(false);
+        }
         tx.execute(
             "INSERT INTO loop_runs (
                 run_id, dir, workflow, status, caller_terminal, caller_created_ms,
@@ -2207,7 +2230,7 @@ impl OrchStore {
             ],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn get_loop(&self, run_id: &str) -> Result<Option<LoopRunRecord>> {
@@ -2349,6 +2372,17 @@ impl OrchStore {
             tx.commit()?;
             Ok(None)
         }
+    }
+
+    pub fn mark_loop_launch_failed(&self, run_id: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        conn.execute(
+            "UPDATE loop_runs
+             SET status = 'ERROR', notify_state = 'none', updated_at_ms = ?2
+             WHERE run_id = ?1 AND status = 'RUNNING'",
+            params![run_id, now_ms],
+        )?;
+        Ok(())
     }
 
     pub fn mark_loop_undelivered(&self, run_id: &str, now_ms: i64) -> Result<bool> {

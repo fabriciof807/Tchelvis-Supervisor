@@ -307,6 +307,37 @@ tchelvis orch send --type worker_done --outcome succeeded --dispatch-id <dispatc
 tchelvis orch ask --dispatch-id <dispatch_id> --question "Should token expiry default to 15m or 1h?"
 ```
 
+#### Declarative Multi-Agent Loops (`tchelvis loop`)
+
+Run fixed, repeatable multi-agent topologies (such as `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic`, or `fast-worker-reviewer`) in clean headless CLI sessions inside a mandatory sandbox. The caller spawns `--detach` in one Herdr terminal, ends its turn, and `tchelvis daemon` wakes the caller **once** via `orch.db` when the loop finishes (`PASS`, `ERROR`, `ESCALATE`, or `CANCELLED`).
+
+- **Built-in presets and custom workflows:** Four presets (`worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic`, `fast-worker-reviewer`) work even without a `.loops/` folder; `tchelvis loop init` scaffolds `~/.config/tchelvis/loops.toml` (`0600`) and `<repo>/.loops/`, and `tchelvis loop new <name> --stages ...` creates a validated workflow TOML plus any missing custom role files.
+- **Model precedence & repository confirmation:** Stage `provider` and `model` come together from one level (never mixed across levels): (1) `--use <stage>=<cli>[:<model>]`, (2) `[stages.<workflow>.<stage>]` in `.loops/models.toml`, (3) the workflow TOML stage, (4) `[defaults.<role>]` in `.loops/models.toml`, (5) `[defaults.<role>]` in `~/.config/tchelvis/loops.toml`. Any choice coming from repository files requires explicit confirmation (`tchelvis loop models confirm <workflow>` for `--detach` or non-interactive use), tracked by canonical repo path + content hash in `~/.local/state/tchelvis/loops/confirmed.json`.
+- **Important operational guarantees & security notes:**
+  - **The loop never merges or pushes:** each run clones an isolated workspace at `HEAD` into `~/.local/state/tchelvis/loops/<run-id>/workspace` and commits final changes only to a local `loop/<workflow>-<run-id>` branch, leaving your checkout and `.gitignore` untouched.
+  - **`auto_approve_in_sandbox` must be turned on by the user:** `~/.config/tchelvis/loops.toml` defaults to `auto_approve_in_sandbox = false`; `tchelvis loop run` refuses until you review the sandbox boundary and set `auto_approve_in_sandbox = true`. `loops.toml` is only read from `~/.config/tchelvis/`, never from the repository.
+  - **`bwrap` shares the network and localhost:** `bubblewrap` (`bwrap`) is the default sandbox (never silently replaced; `inherited` is opt-in inside an existing container and `incus` is planned). `bwrap` keeps `/` read-only, mounts clean `$HOME` / `/tmp` / `/run`, isolates PID/IPC/UTS namespaces, and binds only the run workspace writable, **but network access, `localhost` services, and abstract sockets remain shared**.
+  - **Every model is really called once before a loop starts and that spends tokens:** after account/git read-only checks pass and before any workspace, branch, or Herdr terminal is created, `tchelvis loop run` (and `tchelvis loop check --live`) sends `Reply with exactly: OK` once in parallel to every distinct `provider:model` pair in the workflow (using `--tools ""` on `claude`), spending real API tokens/quota to catch bad model names, missing auth, or sandbox failures upfront.
+  - **An exported `OPENCODE_API_KEY` is visible to every program started from that shell:** `tchelvis` never reads the OpenCode database or saves keys on disk; it resolves `OPENCODE_API_KEY` from the environment (or interactive `$SHELL -ic`), passes it via process environment only to `opencode` stages and probes, and redacts it from `state.json`, `report.md`, and errors—however, exporting `OPENCODE_API_KEY` in a shell exposes it to any child program started from that shell.
+
+| Subcommand | Purpose & Key Flags |
+| :--- | :--- |
+| `tchelvis loop init` | Initialize `~/.config/tchelvis/loops.toml` (`0600`) and `<repo>/.loops/` (preserves edited files) |
+| `tchelvis loop new <name> --stages <csv>` | Generate a validated `.loops/workflows/<name>.toml` and missing custom role `.md` files |
+| `tchelvis loop list [--runs]` | List available workflows (repo > global > preset) or recorded loop runs in `orch.db` |
+| `tchelvis loop check <workflow> [--live] [--use ...]` | Validate workflow, config, sandbox, accounts, and `models.toml` references (`--live` also probes models) |
+| `tchelvis loop models <workflow>` | Show resolved CLI, model, and source level for every stage |
+| `tchelvis loop models set <role>=<cli[:model]> (--project\|--global)` | Update `.loops/models.toml` or `~/.config/tchelvis/loops.toml` preserving comments |
+| `tchelvis loop models confirm <workflow>` | Record confirmation for repository-sourced model choices |
+| `tchelvis loop auth` / `auth login <cli>` | Check CLI credentials (`claude`, `agy`, `opencode`) or open login in a Herdr terminal |
+| `tchelvis loop run <workflow> [prompt \| --input-file <path>]` | Probe models and run headless stages (`[--from-head] [--max-cycles N] [--use ...] [--detach] [--verbose]`) |
+| `tchelvis loop status [run_id] [--json]` | Inspect current or final run state (`PASS`/`ERROR`/`ESCALATE`/`CANCELLED`) |
+| `tchelvis loop result [run_id]` | Print the canonical 5-line run summary (exit `0`=PASS, `1`=ERROR, `2`=usage, `3`=ESCALATE, `4`=CANCELLED) |
+| `tchelvis loop logs [run_id] [--stage <id>]` | Print sanitized per-stage logs |
+| `tchelvis loop report [run_id]` | Print sanitized `report.md` (with preflight probes, usage totals, timeline, and sandbox disclosures) |
+| `tchelvis loop stop <run_id>` | Send `SIGINT` to cancel an active loop cleanly |
+| `tchelvis loop clean [run_id] [--yes]` | Remove finished run directories and clones while keeping `loop/*` git branches |
+
 ### 4. GPU offload
 
 Run `tchelvis supervisor gpu on|off`, or click the `num_gpu` pill in the top bar, to switch between CPU-only inference (`-ngl 0`, the default, zero VRAM) and full GPU offload (`-ngl 99` with the CUDA image).

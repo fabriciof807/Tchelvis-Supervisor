@@ -1,6 +1,5 @@
-use crate::logging::redact_secrets;
 use crate::loops::artifacts::MAX_ARTIFACT_BYTES;
-use crate::loops::state::{sanitize_single_line, sum_usage, RunState};
+use crate::loops::state::{redact_loop_text, sanitize_single_line, sum_usage, RunState};
 use crate::loops::verdict::MAX_SUMMARY_CHARS;
 use regex::Regex;
 use std::ffi::CString;
@@ -16,9 +15,9 @@ static ANSI_CSI_RE: LazyLock<Regex> =
 static ANSI_OSC_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)").expect("valid OSC regex"));
 
-fn sanitize_line(raw: &str, max_chars: Option<usize>) -> String {
+fn sanitize_line(raw: &str, max_chars: Option<usize>, extra_secrets: &[&str]) -> String {
     let single = sanitize_single_line(raw, max_chars);
-    let redacted = redact_secrets(&single);
+    let redacted = redact_loop_text(&single, extra_secrets);
     match max_chars {
         Some(limit) => redacted
             .chars()
@@ -30,7 +29,7 @@ fn sanitize_line(raw: &str, max_chars: Option<usize>) -> String {
     }
 }
 
-fn sanitize_multiline(raw: &str) -> String {
+pub(crate) fn sanitize_multiline(raw: &str, extra_secrets: &[&str]) -> String {
     let without_osc = ANSI_OSC_RE.replace_all(raw, "");
     let without_csi = ANSI_CSI_RE.replace_all(&without_osc, "");
     let mut clean = String::with_capacity(without_csi.len());
@@ -46,7 +45,7 @@ fn sanitize_multiline(raw: &str) -> String {
             clean.push(ch);
         }
     }
-    redact_secrets(&clean).trim().to_string()
+    redact_loop_text(&clean, extra_secrets).trim().to_string()
 }
 
 fn escape_table_cell(raw: &str) -> String {
@@ -152,14 +151,18 @@ fn fence_for(content: &str) -> String {
 }
 
 pub fn render_report(state: &RunState, dir: &Path) -> String {
+    render_report_with_secrets(state, dir, &[])
+}
+
+pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &[&str]) -> String {
     let mut out = String::new();
-    let workflow = sanitize_line(&state.workflow, None);
-    let run_id = sanitize_line(&state.run_id, None);
-    let sandbox = sanitize_line(&state.sandbox, None);
+    let workflow = sanitize_line(&state.workflow, None, extra_secrets);
+    let run_id = sanitize_line(&state.run_id, None, extra_secrets);
+    let sandbox = sanitize_line(&state.sandbox, None, extra_secrets);
     let branch = state
         .branch
         .as_deref()
-        .map(|b| sanitize_line(b, None))
+        .map(|b| sanitize_line(b, None, extra_secrets))
         .filter(|b| !b.is_empty())
         .unwrap_or_else(|| "(nenhuma)".to_string());
 
@@ -181,7 +184,11 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
     );
     let _ = writeln!(out, "- **Branch:** `{branch}`");
     if let Some(base) = &state.base_commit {
-        let _ = writeln!(out, "- **Commit base:** `{}`", sanitize_line(base, None));
+        let _ = writeln!(
+            out,
+            "- **Commit base:** `{}`",
+            sanitize_line(base, None, extra_secrets)
+        );
     }
     let _ = writeln!(
         out,
@@ -195,17 +202,17 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
         let exposures: Vec<String> = state
             .sandbox_exposures
             .iter()
-            .map(|e| sanitize_line(e, None))
+            .map(|e| sanitize_line(e, None, extra_secrets))
             .collect();
         let _ = writeln!(out, "- **Exposições do sandbox:** {}", exposures.join("; "));
     }
     if let Some(reason) = &state.reason {
-        let clean_reason = sanitize_line(reason, None);
+        let clean_reason = sanitize_line(reason, None, extra_secrets);
         if !clean_reason.is_empty() {
             let _ = writeln!(out, "- **Motivo:** {clean_reason}");
         }
     }
-    let clean_summary = sanitize_line(&state.summary, Some(MAX_SUMMARY_CHARS));
+    let clean_summary = sanitize_line(&state.summary, Some(MAX_SUMMARY_CHARS), extra_secrets);
     if !clean_summary.is_empty() {
         let _ = writeln!(out, "- **Resumo final:** {clean_summary}");
     }
@@ -247,7 +254,7 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
             let model = probe
                 .model
                 .as_deref()
-                .map(|m| escape_table_cell(&sanitize_line(m, None)))
+                .map(|m| escape_table_cell(&sanitize_line(m, None, extra_secrets)))
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "-".to_string());
             let turns = probe
@@ -290,7 +297,7 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
         let _ = writeln!(out, "(nenhum)");
     } else {
         for f in &state.files {
-            let clean = sanitize_line(f, None);
+            let clean = sanitize_line(f, None, extra_secrets);
             if !clean.is_empty() {
                 let _ = writeln!(out, "- `{clean}`");
             }
@@ -307,17 +314,17 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
         );
         let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
         for exec in &state.executions {
-            let stage_id = escape_table_cell(&sanitize_line(&exec.stage_id, None));
-            let role = escape_table_cell(&sanitize_line(&exec.role, None));
+            let stage_id = escape_table_cell(&sanitize_line(&exec.stage_id, None, extra_secrets));
+            let role = escape_table_cell(&sanitize_line(&exec.role, None, extra_secrets));
             let model = exec
                 .model
                 .as_deref()
-                .map(|m| escape_table_cell(&sanitize_line(m, None)))
+                .map(|m| escape_table_cell(&sanitize_line(m, None, extra_secrets)))
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| "-".to_string());
             let source = exec
                 .model_source
-                .map(|s| escape_table_cell(&sanitize_line(s.as_str(), None)))
+                .map(|s| escape_table_cell(&sanitize_line(s.as_str(), None, extra_secrets)))
                 .unwrap_or_else(|| "-".to_string());
             let turns = exec
                 .usage
@@ -346,14 +353,14 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
                 .map(|c| format!("${c:.4}"))
                 .unwrap_or_else(|| "N/A".to_string());
             let dur = format_duration_ms(exec.duration_ms);
-            let mut outcome = escape_table_cell(&sanitize_line(&exec.outcome, None));
+            let mut outcome = escape_table_cell(&sanitize_line(&exec.outcome, None, extra_secrets));
             if let Some(v) = exec.verdict {
                 if !outcome.contains(v.as_str()) {
                     outcome = format!("{outcome} ({v})");
                 }
             }
             if let Some(err) = &exec.error {
-                let clean_err = escape_table_cell(&sanitize_line(err, Some(160)));
+                let clean_err = escape_table_cell(&sanitize_line(err, Some(160), extra_secrets));
                 if !clean_err.is_empty() {
                     outcome = format!("{outcome}: {clean_err}");
                 }
@@ -382,7 +389,7 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
     for filename in artifact_names(dir) {
         let heading = format!("`{filename}`");
         if let Some(raw) = read_artifact_safe(dir, &filename) {
-            let clean = sanitize_multiline(&raw);
+            let clean = sanitize_multiline(&raw, extra_secrets);
             if clean.is_empty() {
                 continue;
             }
@@ -633,5 +640,43 @@ mod tests {
             ["input.md", "critic.md", "notas.md", "c1-critic.md"]
         );
         assert!(read_artifact_safe(tmp.path(), "x.md").is_none());
+    }
+
+    #[test]
+    fn report_redacts_extra_exact_secrets_in_fields_and_artifacts() {
+        let tmp = TempDir::new().unwrap();
+        let secret = "my-raw-opencode-key-value-777";
+        std::fs::write(
+            tmp.path().join("input.md"),
+            format!("prompt using {secret}"),
+        )
+        .unwrap();
+        let state = RunState {
+            schema_version: 1,
+            run_id: "r1".to_string(),
+            workflow: "w".to_string(),
+            status: RunStatus::Error,
+            reason: Some(format!("failed with {secret}")),
+            sandbox: "inherited".to_string(),
+            sandbox_exposures: vec![],
+            preflight: vec![],
+            current_cycle: 1,
+            max_cycles: 3,
+            branch: None,
+            base_commit: None,
+            engine_pid: None,
+            engine_start_ticks: None,
+            caller: None,
+            heartbeat_at_ms: 100,
+            last_activity_at_ms: 100,
+            started_at_ms: 100,
+            finished_at_ms: Some(200),
+            executions: vec![],
+            files: vec![],
+            summary: format!("summary saw {secret}"),
+        };
+        let md = render_report_with_secrets(&state, tmp.path(), &[secret]);
+        assert!(!md.contains(secret), "secret leaked in report:\n{md}");
+        assert!(md.contains("[REDACTED]"));
     }
 }

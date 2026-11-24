@@ -118,6 +118,25 @@ When spawned or attached as an orchestrated worker, follow the `[TCHELVIS ORCHES
 - Report completion and stop immediately (no further turns unless woken by a coordinator directive): `tchelvis orch send --type worker_done --outcome succeeded --dispatch-id <dispatch_id> --body "<summary>"`
 - Report failure and stop immediately (no further turns): `tchelvis orch send --type worker_done --outcome failed --dispatch-id <dispatch_id> --body "<reason>"`
 - Ask a blocking question (then end your turn immediately): `tchelvis orch ask --dispatch-id <dispatch_id> --question "<question>"`
+
+## Declarative Multi-Agent Loops (`tchelvis loop`)
+
+For repeatable fixed topologies (`designer` / `planner` -> `worker` -> `tester` / `reviewer` -> `critic`), run a headless loop in one Herdr terminal and wake once on completion:
+
+```bash
+tchelvis loop check <workflow>
+tchelvis loop run <workflow> "Implement and verify X..." --detach
+# End your turn; when `[tchelvis] You have N orchestration message(s)...` wakes you:
+tchelvis orch check --run <orch_run_id>
+tchelvis loop result <run_id>
+```
+
+Operational limits and guarantees to know before launching or advising a user:
+- **Never merges or pushes:** the loop commits only to a new local `loop/<workflow>-<run-id>` branch and never touches the user's checkout or `.gitignore`.
+- **`auto_approve_in_sandbox` must be turned on by the user:** `~/.config/tchelvis/loops.toml` ships with `auto_approve_in_sandbox = false`; `tchelvis loop run` refuses until the user explicitly sets it to `true`.
+- **`bwrap` shares the network and localhost:** `bubblewrap` is the default sandbox (no silent fallback); it blocks outside filesystem writes/reads and clean-mounts `$HOME`, but network access, `localhost` services, and abstract sockets remain reachable.
+- **Every model is really called once before a loop starts and that spends tokens:** prior to creating the workspace, branch, or terminal, `run` (and `check --live`) sends `Reply with exactly: OK` to each distinct `provider:model` pair across all stages (unless read-only git/config/account checks already failed). Repo-defined model choices also require prior confirmation (`tchelvis loop models confirm <workflow>` when running with `--detach` or non-interactively).
+- **An exported `OPENCODE_API_KEY` is visible to every program started from that shell:** `tchelvis` never saves keys to disk; inside the loop it forwards `OPENCODE_API_KEY` only to `opencode` stages and probes, though exporting it in an interactive shell exposes it to any child process spawned from that shell.
 "#
 }
 

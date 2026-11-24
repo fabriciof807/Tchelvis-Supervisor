@@ -188,6 +188,16 @@ pub struct RunState {
     pub summary: String,
 }
 
+pub fn redact_loop_text(raw: &str, extra_secrets: &[&str]) -> String {
+    let mut out = crate::logging::redact_secrets(raw);
+    for secret in extra_secrets {
+        if !secret.is_empty() {
+            out = out.replace(secret, "[REDACTED]");
+        }
+    }
+    out
+}
+
 pub fn sanitize_single_line(raw: &str, max_chars: Option<usize>) -> String {
     let single = raw.replace(['\r', '\n'], " ");
     let cleaned = sanitize_terminal_text(&single);

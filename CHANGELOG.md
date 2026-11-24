@@ -8,6 +8,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 ## [Unreleased]
 
 ### Added
+- **Declarative multi-agent loops (`tchelvis loop`, M11 phase A).**
+  - Fixed multi-agent TOML workflows (`worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic`, `fast-worker-reviewer`, plus `tchelvis loop new <name> --stages ...`) running clean headless `claude`, `agy`, and `opencode` (`--standalone`) sessions, exchanging artifacts only through symlink-safe `.tchelvis-loop/{in,out}` directories, snapshotting git via isolated `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE`, generating `report.md`, and writing a single wake message to `orch.db` when finished or when the engine dies.
+  - CLI subcommands: `init`, `new`, `list [--runs]`, `check <workflow> [--live] [--use ...]`, `models [<workflow>|set|confirm]`, `auth [login <cli>]`, `run`, `status [--json]`, `result`, `logs [--stage]`, `report`, `stop`, and `clean [--yes]` (exit codes: `0` PASS, `1` ERROR, `2` usage, `3` ESCALATE, `4` CANCELLED; 5-line `stdout` on `result` and non-verbose `run`).
+  - **Safety & operational notes:**
+    - **The loop never merges or pushes:** it creates an isolated clone and commits final work only to a local `loop/<workflow>-<run-id>` branch, leaving the user's checkout and `.gitignore` untouched.
+    - **`auto_approve_in_sandbox` must be turned on by the user:** `~/.config/tchelvis/loops.toml` defaults to `false`, is never read from the repository, and refuses to run workflows until explicitly set to `true`.
+    - **`bwrap` shares the network and localhost:** `bubblewrap` is the default sandbox (no silent fallback) and isolates the filesystem, `$HOME`, PID, IPC, and UTS namespaces, while network access, `localhost` services, and abstract sockets remain shared (`inherited` requires a container marker; `incus` is planned).
+    - **Every model is really called once before a loop starts and that spends tokens:** after read-only git, config, confirmation, and account checks pass, `run` (and `check --live`) sends `Reply with exactly: OK` in parallel to each distinct `provider:model` pair across all stages (creating nothing if any probe fails), which consumes real API tokens/quota.
+    - **An exported `OPENCODE_API_KEY` is visible to every program started from that shell:** `tchelvis` never stores or reads keys from the OpenCode database and forwards `OPENCODE_API_KEY` solely to `opencode` stages and probes via environment while redacting it from state, reports, and errors—though exporting it in your shell exposes it to any program launched from that shell.
 - **Configurable supervisor `[guardrails]` (M10).**
   - Optional `[guardrails]` table in `~/.config/tchelvis/supervisor.toml` (`allow_commands`, `deny_commands`, `deny_paths`, `allow_tools`, `builtin_read_only`, `builtin_build_test`, `llm_auto_reply`), reloaded on every watcher tick and parsed independently from other settings.
   - Fixed decision order (`floor` → `deny_*` → built-ins / `allow_*` → LLM) with an immutable safety floor (also refusing dot-segment globs such as `cat .e*`).

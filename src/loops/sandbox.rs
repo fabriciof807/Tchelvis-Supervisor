@@ -37,6 +37,26 @@ pub trait Sandbox {
     fn kind(&self) -> &'static str;
     fn check(&self, workspace: &Path) -> Result<Vec<String>>;
     fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand>;
+    fn wrap_with_extra_env(
+        &self,
+        argv: &[OsString],
+        workspace: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Result<SandboxedCommand> {
+        let mut cmd = self.wrap(argv, workspace)?;
+        apply_extra_env(&mut cmd.env, extra_env);
+        Ok(cmd)
+    }
+}
+
+fn apply_extra_env(env: &mut Vec<(OsString, OsString)>, extra_env: &[(&str, &str)]) {
+    for &(k, v) in extra_env {
+        if let Some(entry) = env.iter_mut().find(|(ek, _)| ek == std::ffi::OsStr::new(k)) {
+            entry.1 = OsString::from(v);
+        } else {
+            env.push((OsString::from(k), OsString::from(v)));
+        }
+    }
 }
 
 fn current_env_pairs() -> Vec<(OsString, OsString)> {
@@ -140,13 +160,20 @@ fn probe_workspace_writable(workspace: &Path) -> Result<()> {
 pub struct InheritedSandbox {
     pub env_pass: Vec<String>,
     pub root: PathBuf,
+    pub test_container_marker: bool,
 }
 
 impl InheritedSandbox {
     pub fn new(env_pass: Vec<String>) -> Self {
+        #[cfg(debug_assertions)]
+        let test_container_marker =
+            std::env::var_os("TCHELVIS_TEST_CONTAINER").is_some_and(|v| !v.is_empty());
+        #[cfg(not(debug_assertions))]
+        let test_container_marker = false;
         Self {
             env_pass,
             root: PathBuf::from("/"),
+            test_container_marker,
         }
     }
 
@@ -247,7 +274,11 @@ impl Sandbox for InheritedSandbox {
             self.root.join(".dockerenv"),
             self.root.join("run/.containerenv"),
         ];
-        if !markers.iter().any(|p| p.exists()) {
+        #[cfg(debug_assertions)]
+        let marker_ok = self.test_container_marker || markers.iter().any(|p| p.exists());
+        #[cfg(not(debug_assertions))]
+        let marker_ok = markers.iter().any(|p| p.exists());
+        if !marker_ok {
             bail!(
                 "sandbox 'inherited' exige execução dentro de um container (/run/systemd/container, /.dockerenv ou /run/.containerenv não encontrado)"
             );
@@ -632,6 +663,18 @@ impl Sandbox for BwrapSandbox {
         let clean_env = build_clean_env(&self.env_pass, &env_pairs);
         self.wrap_clean(argv, workspace, clean_env)
     }
+
+    fn wrap_with_extra_env(
+        &self,
+        argv: &[OsString],
+        workspace: &Path,
+        extra_env: &[(&str, &str)],
+    ) -> Result<SandboxedCommand> {
+        let env_pairs = current_env_pairs();
+        let mut clean_env = build_clean_env(&self.env_pass, &env_pairs);
+        apply_extra_env(&mut clean_env, extra_env);
+        self.wrap_clean(argv, workspace, clean_env)
+    }
 }
 
 #[cfg(test)]
@@ -976,5 +1019,59 @@ mod tests {
         assert_eq!(read(".claude/.credentials.json"), "cred");
         assert!(!read(".local/bin/claude").ends_with("x\n"));
         assert!(!home.join(".bashrc").exists());
+    }
+
+    #[test]
+    fn wrap_with_extra_env_passes_key_only_through_process_env_not_bwrap_argv() {
+        let sb = BwrapSandbox::new(vec![], vec![]);
+        let cmd = sb
+            .wrap_with_extra_env(
+                &[OsString::from("opencode"), OsString::from("run")],
+                Path::new("/tmp/ws"),
+                &[
+                    ("HOME", "/tmp/home"),
+                    ("PATH", "/usr/bin"),
+                    ("OPENCODE_API_KEY", "sk-opencode-secret-999"),
+                ],
+            )
+            .unwrap();
+        let argv_joined: String = cmd
+            .argv
+            .iter()
+            .map(|a| a.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !argv_joined.contains("sk-opencode-secret-999"),
+            "secret leaked into bwrap argv: {argv_joined}"
+        );
+        assert!(
+            !cmd.argv.iter().any(|a| a == "--setenv"),
+            "bwrap must never pass secrets via --setenv"
+        );
+        assert!(cmd
+            .env
+            .iter()
+            .any(|(k, v)| k == "OPENCODE_API_KEY" && v == "sk-opencode-secret-999"));
+    }
+
+    #[test]
+    fn inherited_sandbox_debug_test_marker_allows_container_detection() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("root");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        let sb = InheritedSandbox {
+            env_pass: vec![],
+            root,
+            test_container_marker: true,
+        };
+        if cfg!(debug_assertions) {
+            assert!(sb.check(&ws).is_ok());
+        } else {
+            assert!(sb.check(&ws).is_err());
+        }
     }
 }

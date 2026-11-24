@@ -1,4 +1,3 @@
-use crate::logging::redact_secrets;
 use crate::loops::adapters::{command as adapter_command, EventParser};
 use crate::loops::models::ModelChoice;
 use crate::loops::process::{run_process, Clock, Limits, Outcome, SystemClock};
@@ -132,9 +131,9 @@ pub fn probe_targets(workflow: &Workflow) -> Vec<ProbeTarget> {
     targets
 }
 
-fn sanitize_probe_reason(raw: &str) -> String {
+fn sanitize_probe_reason(raw: &str, extra_secrets: &[&str]) -> String {
     let single = sanitize_single_line(raw, None);
-    let redacted = redact_secrets(&single);
+    let redacted = crate::loops::state::redact_loop_text(&single, extra_secrets);
     let truncated: String = redacted
         .chars()
         .take(MAX_PROBE_REASON_CHARS)
@@ -154,11 +153,16 @@ fn probe_one(
     dir: &Path,
     cancel: &AtomicBool,
     clock: &(dyn Clock + Sync),
+    opencode_api_key: Option<&str>,
 ) -> Result<ProbeRecord, ProbeFailure> {
+    let extra_secrets: Vec<&str> = opencode_api_key
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
     let fail = |raw_reason: String| ProbeFailure {
         choice: target.choice.clone(),
         stage_ids: target.stage_ids.clone(),
-        reason: sanitize_probe_reason(&raw_reason),
+        reason: sanitize_probe_reason(&raw_reason, &extra_secrets),
     };
 
     let probe_ws = ProbeTempDir::new_in(dir, "tchelvis-probe-ws-")
@@ -179,9 +183,17 @@ fn probe_one(
         cmd.argv.push(OsString::from(""));
     }
 
-    let sandboxed = sandbox
-        .wrap(&cmd.argv, probe_ws.path())
-        .map_err(|e| fail(format!("{e:#}")))?;
+    let mut sandboxed = match (target.choice.provider, opencode_api_key) {
+        (Provider::Opencode, Some(key)) => sandbox
+            .wrap_with_extra_env(&cmd.argv, probe_ws.path(), &[("OPENCODE_API_KEY", key)])
+            .map_err(|e| fail(format!("{e:#}")))?,
+        _ => sandbox
+            .wrap(&cmd.argv, probe_ws.path())
+            .map_err(|e| fail(format!("{e:#}")))?,
+    };
+    if target.choice.provider != Provider::Opencode {
+        sandboxed.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
+    }
 
     let mut parser = EventParser::new(target.choice.provider);
     let start_mono = clock.monotonic_ms();
@@ -243,7 +255,7 @@ pub fn run_preflight(
     cancel: &AtomicBool,
 ) -> Result<Vec<ProbeRecord>, Vec<ProbeFailure>> {
     let clock = SystemClock::new();
-    run_preflight_with_clock(targets, sandbox, dir, cancel, &clock)
+    run_preflight_with_options(targets, sandbox, dir, cancel, &clock, None)
 }
 
 pub fn run_preflight_with_clock(
@@ -253,6 +265,17 @@ pub fn run_preflight_with_clock(
     cancel: &AtomicBool,
     clock: &(dyn Clock + Sync),
 ) -> Result<Vec<ProbeRecord>, Vec<ProbeFailure>> {
+    run_preflight_with_options(targets, sandbox, dir, cancel, clock, None)
+}
+
+pub fn run_preflight_with_options(
+    targets: &[ProbeTarget],
+    sandbox: &(dyn Sandbox + Sync),
+    dir: &Path,
+    cancel: &AtomicBool,
+    clock: &(dyn Clock + Sync),
+    opencode_api_key: Option<&str>,
+) -> Result<Vec<ProbeRecord>, Vec<ProbeFailure>> {
     if targets.is_empty() {
         return Ok(Vec::new());
     }
@@ -260,7 +283,10 @@ pub fn run_preflight_with_clock(
     let results: Vec<Result<ProbeRecord, ProbeFailure>> = std::thread::scope(|scope| {
         let handles: Vec<_> = targets
             .iter()
-            .map(|target| scope.spawn(move || probe_one(target, sandbox, dir, cancel, clock)))
+            .map(|target| {
+                scope
+                    .spawn(move || probe_one(target, sandbox, dir, cancel, clock, opencode_api_key))
+            })
             .collect();
         handles
             .into_iter()
@@ -791,5 +817,83 @@ echo $$ > "{}"
         assert_eq!(failures[0].choice, target.choice);
         assert_eq!(failures[0].stage_ids, target.stage_ids);
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn opencode_api_key_reaches_only_opencode_and_is_redacted_from_failure_reasons() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let probe_root = tmp.path().join("probes");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&probe_root).unwrap();
+        let claude_saw = tmp.path().join("claude_saw_key");
+        let opencode_saw = tmp.path().join("opencode_saw_key");
+
+        crate::test_support::write_executable(
+            bin_dir.join("claude"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf '%s' \"${{OPENCODE_API_KEY:-ABSENT}}\" > \"{}\"\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"is_error\":false,\"num_turns\":1,\"result\":\"OK\"}}'\n",
+                claude_saw.display()
+            ),
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("opencode"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf '%s' \"${{OPENCODE_API_KEY:-ABSENT}}\" > \"{}\"\n\
+                 printf '%s\\n' '{{\"type\":\"error\",\"error\":{{\"message\":\"rejected key secret-oc-key-42\"}}}}'\n\
+                 exit 1\n",
+                opencode_saw.display()
+            ),
+        );
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        // Intentionally also pass OPENCODE_API_KEY via FakeSandbox env to ensure claude strips it.
+        let sb = FakeSandbox::new()
+            .with_env("PATH", &test_path)
+            .with_env("OPENCODE_API_KEY", "secret-oc-key-42");
+
+        let targets = vec![
+            ProbeTarget {
+                choice: ModelChoice {
+                    provider: Provider::Claude,
+                    model: None,
+                },
+                stage_ids: vec!["review".into()],
+            },
+            ProbeTarget {
+                choice: ModelChoice {
+                    provider: Provider::Opencode,
+                    model: Some("zai/glm".into()),
+                },
+                stage_ids: vec!["implement".into()],
+            },
+        ];
+
+        let failures = run_preflight_with_options(
+            &targets,
+            &sb,
+            &probe_root,
+            &AtomicBool::new(false),
+            &SystemClock::new(),
+            Some("secret-oc-key-42"),
+        )
+        .unwrap_err();
+
+        assert_eq!(fs::read_to_string(&claude_saw).unwrap(), "ABSENT");
+        assert_eq!(
+            fs::read_to_string(&opencode_saw).unwrap(),
+            "secret-oc-key-42"
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(
+            !failures[0].reason.contains("secret-oc-key-42"),
+            "secret leaked in probe failure: {}",
+            failures[0].reason
+        );
+        assert!(failures[0].reason.contains("[REDACTED]"));
     }
 }

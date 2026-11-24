@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
@@ -12,6 +13,28 @@ pub trait Workspace {
     fn changed_files(&self, tree: &str) -> Result<Vec<String>>;
     fn publish(&mut self, tree: &str, message: &str) -> Result<()>;
     fn path(&self) -> &Path;
+}
+
+#[derive(Debug, Clone)]
+pub struct RepoPreflightInfo {
+    pub repo_root: PathBuf,
+    pub main_git_dir: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+    pub base_tree: String,
+    pub disabled_filters: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrozenWorkspaceMeta {
+    pub main_git_dir: PathBuf,
+    pub workspace_path: PathBuf,
+    pub index_file: PathBuf,
+    pub branch: String,
+    pub base_commit: String,
+    pub base_tree: String,
+    pub base_gitlinks: BTreeMap<String, String>,
+    pub disabled_filters: Vec<String>,
 }
 
 pub struct GitWorkspace {
@@ -256,7 +279,12 @@ fn set_disabled_filters(cmd: &mut Command, filters: &[String]) {
 }
 
 impl GitWorkspace {
-    pub fn create(repo: &Path, run_dir: &Path, branch: &str, from_head: bool) -> Result<Self> {
+    /// Read-only validation of the repository and branch target. Creates no directories or refs.
+    pub fn preflight_check_repo(
+        repo: &Path,
+        branch: &str,
+        from_head: bool,
+    ) -> Result<RepoPreflightInfo> {
         if !repo.is_dir() {
             bail!(
                 "caminho do repositório não é um diretório: {}",
@@ -332,10 +360,32 @@ impl GitWorkspace {
 
         let disabled_filters = filters_to_disable(&main_git_dir, &repo_root)?;
 
+        Ok(RepoPreflightInfo {
+            repo_root,
+            main_git_dir,
+            branch: branch.to_string(),
+            base_commit,
+            base_tree,
+            disabled_filters,
+        })
+    }
+
+    pub fn create_in(
+        info: RepoPreflightInfo,
+        run_dir: &Path,
+        workspace_path: &Path,
+    ) -> Result<Self> {
         fs::create_dir_all(run_dir)
             .with_context(|| format!("falha ao criar diretório da run {}", run_dir.display()))?;
-        let workspace_path = run_dir.join("workspace");
-        if fs::symlink_metadata(&workspace_path).is_ok() {
+        if let Some(ws_parent) = workspace_path.parent() {
+            fs::create_dir_all(ws_parent).with_context(|| {
+                format!(
+                    "falha ao criar diretório pai do workspace {}",
+                    ws_parent.display()
+                )
+            })?;
+        }
+        if fs::symlink_metadata(workspace_path).is_ok() {
             bail!(
                 "workspace já existe em {}; use outro run_id",
                 workspace_path.display()
@@ -344,7 +394,7 @@ impl GitWorkspace {
         let index_file = run_dir.join("engine.index");
 
         let mut clone_cmd = git();
-        set_disabled_filters(&mut clone_cmd, &disabled_filters);
+        set_disabled_filters(&mut clone_cmd, &info.disabled_filters);
         clone_cmd
             .args([
                 "clone",
@@ -353,20 +403,20 @@ impl GitWorkspace {
                 "--template=",
                 "--no-checkout",
             ])
-            .arg(&repo_root)
-            .arg(&workspace_path);
+            .arg(&info.repo_root)
+            .arg(workspace_path);
         run_git_checked(clone_cmd, "falha ao clonar repositório para o workspace")?;
 
         // The only commands that use the workspace's own .git, before any agent runs.
         let own_git = || {
             let mut cmd = git();
-            set_disabled_filters(&mut cmd, &disabled_filters);
+            set_disabled_filters(&mut cmd, &info.disabled_filters);
             cmd.env("GIT_DIR", workspace_path.join(".git"))
-                .env("GIT_WORK_TREE", &workspace_path);
+                .env("GIT_WORK_TREE", workspace_path);
             cmd
         };
         let mut co_cmd = own_git();
-        co_cmd.args(["checkout", "-q", "--detach", &base_commit]);
+        co_cmd.args(["checkout", "-q", "--detach", &info.base_commit]);
         run_git_checked(
             co_cmd,
             "falha ao fazer checkout de base_commit no workspace",
@@ -375,20 +425,20 @@ impl GitWorkspace {
         remote_cmd.args(["remote", "remove", "origin"]);
         run_git_checked(remote_cmd, "falha ao remover remote origin do workspace")?;
 
-        let mut ls_tree_cmd = main_git_dir_cmd(&main_git_dir);
-        ls_tree_cmd.args(["ls-tree", "-r", "-z", &base_tree]);
+        let mut ls_tree_cmd = main_git_dir_cmd(&info.main_git_dir);
+        ls_tree_cmd.args(["ls-tree", "-r", "-z", &info.base_tree]);
         let ls_tree_out = run_git_checked(ls_tree_cmd, "falha ao inspecionar árvore base")?;
         let base_gitlinks = parse_gitlinks_from_ls_tree(&ls_tree_out.stdout);
 
         let ws = Self {
-            main_git_dir,
-            workspace_path,
+            main_git_dir: info.main_git_dir,
+            workspace_path: workspace_path.to_path_buf(),
             index_file,
-            branch: branch.to_string(),
-            base_commit,
-            base_tree,
+            branch: info.branch,
+            base_commit: info.base_commit,
+            base_tree: info.base_tree,
             base_gitlinks,
-            disabled_filters,
+            disabled_filters: info.disabled_filters,
         };
 
         let mut init_idx = ws.engine_git();
@@ -396,6 +446,37 @@ impl GitWorkspace {
         run_git_checked(init_idx, "falha ao inicializar índice da run")?;
 
         Ok(ws)
+    }
+
+    pub fn create(repo: &Path, run_dir: &Path, branch: &str, from_head: bool) -> Result<Self> {
+        let info = Self::preflight_check_repo(repo, branch, from_head)?;
+        Self::create_in(info, run_dir, &run_dir.join("workspace"))
+    }
+
+    pub fn to_frozen(&self) -> FrozenWorkspaceMeta {
+        FrozenWorkspaceMeta {
+            main_git_dir: self.main_git_dir.clone(),
+            workspace_path: self.workspace_path.clone(),
+            index_file: self.index_file.clone(),
+            branch: self.branch.clone(),
+            base_commit: self.base_commit.clone(),
+            base_tree: self.base_tree.clone(),
+            base_gitlinks: self.base_gitlinks.clone(),
+            disabled_filters: self.disabled_filters.clone(),
+        }
+    }
+
+    pub fn from_frozen(meta: FrozenWorkspaceMeta) -> Self {
+        Self {
+            main_git_dir: meta.main_git_dir,
+            workspace_path: meta.workspace_path,
+            index_file: meta.index_file,
+            branch: meta.branch,
+            base_commit: meta.base_commit,
+            base_tree: meta.base_tree,
+            base_gitlinks: meta.base_gitlinks,
+            disabled_filters: meta.disabled_filters,
+        }
     }
 
     pub fn base_commit(&self) -> &str {
@@ -1032,5 +1113,40 @@ mod tests {
         assert!(diff.len() <= MAX_DIFF_BYTES + 100);
         assert!(diff.ends_with("[tchelvis: diff truncado]\n"));
         assert_eq!(ws.changed_files(&tree).unwrap(), ["big.txt"]);
+    }
+
+    #[test]
+    fn preflight_check_creates_nothing_and_create_in_separates_workspace_from_run_dir() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, run_dir) = new_repo(&tmp);
+        let ws_dir = tmp.path().join("state/loops/run1/workspace");
+
+        // Dirty repo fails read-only preflight without creating run_dir or ws_dir
+        fs::write(repo.join("keep.txt"), "dirty\n").unwrap();
+        assert!(GitWorkspace::preflight_check_repo(&repo, "loop/sep", false).is_err());
+        assert!(!run_dir.exists());
+        assert!(!ws_dir.exists());
+
+        // Restore clean state, run preflight -> still creates nothing
+        fs::write(repo.join("keep.txt"), "keep\n").unwrap();
+        let info = GitWorkspace::preflight_check_repo(&repo, "loop/sep", false).unwrap();
+        assert!(!run_dir.exists());
+        assert!(!ws_dir.exists());
+
+        // create_in places workspace separately from run_dir and FrozenWorkspaceMeta works without repo .loops
+        let ws = GitWorkspace::create_in(info, &run_dir, &ws_dir).unwrap();
+        assert_eq!(ws.path(), ws_dir.as_path());
+        assert!(ws_dir.join("keep.txt").is_file());
+        assert!(run_dir.join("engine.index").is_file());
+        assert!(!run_dir.join("workspace").exists());
+
+        let frozen = ws.to_frozen();
+        let mut ws2 = GitWorkspace::from_frozen(frozen);
+        fs::write(ws2.path().join("added.txt"), "hi\n").unwrap();
+        let tree = ws2.snapshot().unwrap();
+        ws2.publish(&tree, "loop test").unwrap();
+
+        let head_branch = git_ok(&repo, &["rev-parse", "--verify", "loop/sep"]);
+        assert!(!head_branch.trim().is_empty());
     }
 }

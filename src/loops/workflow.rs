@@ -207,7 +207,7 @@ pub(crate) fn validate_model_name(model: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_valid_stage_id(id: &str) -> bool {
+pub(crate) fn is_valid_stage_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 32
         && id != "done"
@@ -217,7 +217,7 @@ fn is_valid_stage_id(id: &str) -> bool {
 }
 
 /// `[a-z0-9-]`, not starting with `-`: safe as a path, a branch component and an argument.
-fn is_valid_slug(name: &str, max_len: usize) -> bool {
+pub(crate) fn is_valid_slug(name: &str, max_len: usize) -> bool {
     !name.is_empty()
         && name.len() <= max_len
         && !name.starts_with('-')
@@ -226,7 +226,7 @@ fn is_valid_slug(name: &str, max_len: usize) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
-fn is_valid_role_name(role: &str) -> bool {
+pub(crate) fn is_valid_role_name(role: &str) -> bool {
     is_valid_slug(role, 32)
 }
 

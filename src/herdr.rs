@@ -1233,7 +1233,9 @@ impl HerdrClient {
         for tok in agent_argv {
             args.push(tok.into());
         }
-        args.push(first_message.into());
+        if !first_message.is_empty() {
+            args.push(first_message.into());
+        }
         Ok(args)
     }
 

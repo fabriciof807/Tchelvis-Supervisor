@@ -1,17 +1,16 @@
-use crate::logging::redact_secrets;
 use crate::loops::adapters::{build_prompt, command as adapter_command, EventParser};
 use crate::loops::artifacts::{collect_output, prepare_exchange};
 use crate::loops::models::ModelSource;
 use crate::loops::preflight::ProbeRecord;
 use crate::loops::process::{run_process, Clock, Limits, Outcome};
-use crate::loops::report::render_report;
+use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::Sandbox;
 use crate::loops::state::{
-    sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus, Usage,
-    LOOP_STATE_SCHEMA_VERSION,
+    redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
+    Usage, LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::loops::verdict::{parse_verdict, summary_line, MAX_SUMMARY_CHARS};
-use crate::loops::workflow::{Stage, Workflow};
+use crate::loops::workflow::{Provider, Stage, Workflow};
 use crate::loops::workspace::Workspace;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -74,10 +73,34 @@ pub trait StageRunner {
 pub struct ProcessStageRunner<'a> {
     pub sandbox: &'a dyn Sandbox,
     pub clock: &'a dyn Clock,
+    pub opencode_api_key: Option<String>,
+    pub extra_secrets: Vec<String>,
+}
+
+impl<'a> ProcessStageRunner<'a> {
+    pub fn new(sandbox: &'a dyn Sandbox, clock: &'a dyn Clock) -> Self {
+        Self {
+            sandbox,
+            clock,
+            opencode_api_key: None,
+            extra_secrets: Vec::new(),
+        }
+    }
+
+    pub fn with_opencode_api_key(mut self, key: Option<String>) -> Self {
+        self.opencode_api_key = key.filter(|k| !k.is_empty());
+        self
+    }
+
+    pub fn with_extra_secrets(mut self, extra_secrets: Vec<String>) -> Self {
+        self.extra_secrets = extra_secrets;
+        self
+    }
 }
 
 impl<'a> StageRunner for ProcessStageRunner<'a> {
     fn run(&mut self, req: StageRequest<'_>) -> StageResult {
+        let extra_refs: Vec<&str> = self.extra_secrets.iter().map(|s| s.as_str()).collect();
         let cmd = match adapter_command(req.stage.provider, req.stage.model.as_deref(), req.prompt)
         {
             Ok(c) => c,
@@ -85,18 +108,33 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 return StageResult {
                     outcome: StageOutcome::Error,
                     usage: Usage::default(),
-                    error: Some(sanitize_reason(&format!("{e:#}"))),
+                    error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                 };
             }
         };
 
-        let sandboxed = match self.sandbox.wrap(&cmd.argv, req.workspace) {
-            Ok(s) => s,
-            Err(e) => {
+        let sandboxed = match (req.stage.provider, self.opencode_api_key.as_deref()) {
+            (Provider::Opencode, Some(key)) => self.sandbox.wrap_with_extra_env(
+                &cmd.argv,
+                req.workspace,
+                &[("OPENCODE_API_KEY", key)],
+            ),
+            _ => self.sandbox.wrap(&cmd.argv, req.workspace),
+        }
+        .map_err(|e| sanitize_reason(&format!("{e:#}"), &extra_refs));
+
+        let sandboxed = match sandboxed {
+            Ok(mut s) => {
+                if req.stage.provider != Provider::Opencode {
+                    s.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
+                }
+                s
+            }
+            Err(reason) => {
                 return StageResult {
                     outcome: StageOutcome::Error,
                     usage: Usage::default(),
-                    error: Some(sanitize_reason(&format!("{e:#}"))),
+                    error: Some(reason),
                 };
             }
         };
@@ -128,18 +166,19 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
         );
 
         let parsed = parser.finish();
+        let parsed_error = parsed.error.map(|e| sanitize_reason(&e, &extra_refs));
         match proc_res {
             Err(e) => StageResult {
                 outcome: StageOutcome::Error,
                 usage: parsed.usage,
-                error: Some(sanitize_reason(&format!("{e:#}"))),
+                error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
             },
             Ok(Outcome::Exited(0)) => {
-                if parsed.error.is_some() {
+                if parsed_error.is_some() {
                     StageResult {
                         outcome: StageOutcome::Error,
                         usage: parsed.usage,
-                        error: parsed.error,
+                        error: parsed_error,
                     }
                 } else {
                     StageResult {
@@ -152,31 +191,29 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
             Ok(Outcome::Exited(code)) => StageResult {
                 outcome: StageOutcome::NonZeroExit(code),
                 usage: parsed.usage,
-                error: parsed
-                    .error
+                error: parsed_error
                     .or_else(|| Some(format!("processo retornou código de saída {code}"))),
             },
             Ok(Outcome::Signaled(sig)) => StageResult {
                 outcome: StageOutcome::Signaled(sig),
                 usage: parsed.usage,
-                error: parsed
-                    .error
+                error: parsed_error
                     .or_else(|| Some(format!("processo encerrado pelo sinal {sig}"))),
             },
             Ok(Outcome::TimedOut) => StageResult {
                 outcome: StageOutcome::TimedOut,
                 usage: parsed.usage,
-                error: parsed.error,
+                error: parsed_error,
             },
             Ok(Outcome::Stalled) => StageResult {
                 outcome: StageOutcome::Stalled,
                 usage: parsed.usage,
-                error: parsed.error,
+                error: parsed_error,
             },
             Ok(Outcome::Cancelled) => StageResult {
                 outcome: StageOutcome::Cancelled,
                 usage: parsed.usage,
-                error: parsed.error,
+                error: parsed_error,
             },
         }
     }
@@ -319,6 +356,8 @@ pub struct EngineConfig {
     pub cancel: Arc<AtomicBool>,
 }
 
+pub type FinalHook = Box<dyn FnOnce(&RunState) + Send>;
+
 pub struct Engine<W: Workspace, R: StageRunner, C: Clock> {
     config: EngineConfig,
     workspace: W,
@@ -326,11 +365,13 @@ pub struct Engine<W: Workspace, R: StageRunner, C: Clock> {
     clock: C,
     model_sources: BTreeMap<String, ModelSource>,
     preflight: Vec<ProbeRecord>,
+    extra_secrets: Vec<String>,
+    on_final: Option<FinalHook>,
 }
 
-fn sanitize_text(raw: &str, max_chars: Option<usize>) -> String {
+fn sanitize_text(raw: &str, max_chars: Option<usize>, extra_secrets: &[&str]) -> String {
     let single = sanitize_single_line(raw, max_chars);
-    let redacted = redact_secrets(&single);
+    let redacted = redact_loop_text(&single, extra_secrets);
     match max_chars {
         Some(limit) => redacted
             .chars()
@@ -342,8 +383,8 @@ fn sanitize_text(raw: &str, max_chars: Option<usize>) -> String {
     }
 }
 
-fn sanitize_reason(raw: &str) -> String {
-    let s = sanitize_text(raw, Some(MAX_REASON_CHARS));
+fn sanitize_reason(raw: &str, extra_secrets: &[&str]) -> String {
+    let s = sanitize_text(raw, Some(MAX_REASON_CHARS), extra_secrets);
     if s.is_empty() {
         "erro desconhecido".to_string()
     } else {
@@ -401,6 +442,8 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             clock,
             model_sources: BTreeMap::new(),
             preflight: Vec::new(),
+            extra_secrets: Vec::new(),
+            on_final: None,
         }
     }
 
@@ -414,7 +457,22 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
         self
     }
 
+    pub fn with_extra_secrets(mut self, extra_secrets: Vec<String>) -> Self {
+        self.extra_secrets = extra_secrets;
+        self
+    }
+
+    pub fn with_on_final<F>(mut self, hook: F) -> Self
+    where
+        F: FnOnce(&RunState) + Send + 'static,
+    {
+        self.on_final = Some(Box::new(hook));
+        self
+    }
+
     pub fn run(mut self) -> RunState {
+        let extra_refs: Vec<&str> = self.extra_secrets.iter().map(|s| s.as_str()).collect();
+        let extra_secrets = extra_refs.as_slice();
         let start_now_ms = self.clock.now_ms();
         let start_mono_ms = self.clock.monotonic_ms();
         let logs_dir = self.config.run_dir.join("logs");
@@ -462,9 +520,10 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 guard.state.heartbeat_at_ms = self.clock.now_ms();
                 if guard.state.status == RunStatus::Running && guard.write_error.is_none() {
                     if let Err(e) = save_state(&guard.run_dir, &guard.state) {
-                        guard.write_error = Some(sanitize_reason(&format!(
-                            "falha ao gravar state.json: {e:#}"
-                        )));
+                        guard.write_error = Some(sanitize_reason(
+                            &format!("falha ao gravar state.json: {e:#}"),
+                            extra_secrets,
+                        ));
                     }
                 }
             }
@@ -478,8 +537,9 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             let now_mono = self.clock.monotonic_ms();
             guard.last_heartbeat_mono_ms = now_mono;
             guard.state.heartbeat_at_ms = self.clock.now_ms();
-            save_state(&guard.run_dir, &guard.state)
-                .map_err(|e| sanitize_reason(&format!("falha ao gravar state.json: {e:#}")))
+            save_state(&guard.run_dir, &guard.state).map_err(|e| {
+                sanitize_reason(&format!("falha ao gravar state.json: {e:#}"), extra_secrets)
+            })
         };
 
         // A function, so the lock is released before the caller acts on the error.
@@ -521,10 +581,10 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.state.status = status;
                 if let Some(r) = reason {
-                    guard.state.reason = Some(sanitize_reason(&r));
+                    guard.state.reason = Some(sanitize_reason(&r, extra_secrets));
                 }
                 if let Some(s) = summary {
-                    guard.state.summary = sanitize_text(&s, Some(MAX_SUMMARY_CHARS));
+                    guard.state.summary = sanitize_text(&s, Some(MAX_SUMMARY_CHARS), extra_secrets);
                 }
             };
 
@@ -771,7 +831,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 }
 
                 let push_exec = |outcome: &str, verdict: Option<_>, err: Option<String>| {
-                    let clean_err = err.map(|e| sanitize_reason(&e));
+                    let clean_err = err.map(|e| sanitize_reason(&e, extra_secrets));
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                     guard.state.executions.push(Execution {
                         cycle: current_cycle,
@@ -1047,7 +1107,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 Ok(files) => {
                     final_state.files = files
                         .into_iter()
-                        .map(|f| sanitize_text(&f, None))
+                        .map(|f| sanitize_text(&f, None, extra_secrets))
                         .filter(|f| !f.is_empty())
                         .collect();
                     if !final_state.files.is_empty() || cur != base {
@@ -1060,10 +1120,13 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                                 final_state.branch = Some(self.config.branch.clone());
                             }
                             Err(e) => {
-                                let pub_err = sanitize_reason(&format!(
-                                    "falha ao publicar branch '{}': {e:#}",
-                                    self.config.branch
-                                ));
+                                let pub_err = sanitize_reason(
+                                    &format!(
+                                        "falha ao publicar branch '{}': {e:#}",
+                                        self.config.branch
+                                    ),
+                                    extra_secrets,
+                                );
                                 if final_state.status == RunStatus::Pass {
                                     final_state.status = RunStatus::Error;
                                     final_state.reason = Some(pub_err);
@@ -1075,8 +1138,10 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                     }
                 }
                 Err(e) => {
-                    let diff_err =
-                        sanitize_reason(&format!("falha ao listar arquivos alterados: {e:#}"));
+                    let diff_err = sanitize_reason(
+                        &format!("falha ao listar arquivos alterados: {e:#}"),
+                        extra_secrets,
+                    );
                     if final_state.status == RunStatus::Pass {
                         final_state.status = RunStatus::Error;
                         final_state.reason = Some(diff_err);
@@ -1093,17 +1158,24 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
         final_state.finished_at_ms = Some(finished_now);
         final_state.heartbeat_at_ms = finished_now;
 
+        let report_md =
+            render_report_with_secrets(&final_state, &self.config.run_dir, extra_secrets);
+        let _ = write_text_file(&self.config.run_dir.join("report.md"), &report_md);
+
         if let Err(e) = save_state(&self.config.run_dir, &final_state) {
             final_state.status = RunStatus::Error;
             if final_state.reason.is_none() {
-                final_state.reason = Some(sanitize_reason(&format!(
-                    "falha ao gravar state.json final: {e:#}"
-                )));
+                final_state.reason = Some(sanitize_reason(
+                    &format!("falha ao gravar state.json final: {e:#}"),
+                    extra_secrets,
+                ));
             }
         }
 
-        let report_md = render_report(&final_state, &self.config.run_dir);
-        let _ = write_text_file(&self.config.run_dir.join("report.md"), &report_md);
+        // Only now: whoever is told must find the result on disk.
+        if let Some(hook) = self.on_final.take() {
+            hook(&final_state);
+        }
 
         final_state
     }
@@ -1113,6 +1185,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
 mod tests {
     use super::*;
     use crate::loops::artifacts::{EXCHANGE_DIR, IN_DIR, OUT_DIR};
+    use crate::loops::process::SystemClock;
     use crate::loops::state::{load_state, sum_usage, Total};
     use crate::loops::workflow::{parse_workflow, Provider, RoleDefault, RoleDefaults};
     use anyhow::Result;
@@ -2190,50 +2263,47 @@ on_retry = "implement"
         assert!(!sampler.sample_throttled());
     }
 
+    struct PassthroughSandbox {
+        bin_dir: PathBuf,
+    }
+
+    impl crate::loops::sandbox::Sandbox for PassthroughSandbox {
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+
+        fn check(&self, _workspace: &Path) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn wrap(
+            &self,
+            argv: &[std::ffi::OsString],
+            workspace: &Path,
+        ) -> Result<crate::loops::sandbox::SandboxedCommand> {
+            let mut new_argv = argv.to_vec();
+            new_argv[0] = self.bin_dir.join(&argv[0]).into_os_string();
+            Ok(crate::loops::sandbox::SandboxedCommand {
+                argv: new_argv,
+                env: vec![
+                    (
+                        std::ffi::OsString::from("PATH"),
+                        std::env::var_os("PATH")
+                            .unwrap_or_else(|| std::ffi::OsString::from("/usr/bin:/bin")),
+                    ),
+                    (
+                        std::ffi::OsString::from("HOME"),
+                        std::env::var_os("HOME")
+                            .unwrap_or_else(|| std::ffi::OsString::from("/tmp")),
+                    ),
+                ],
+                cwd: workspace.to_path_buf(),
+            })
+        }
+    }
+
     #[test]
     fn process_stage_runner_cleans_up_child_on_error() {
-        use crate::loops::process::SystemClock;
-        use crate::loops::sandbox::{Sandbox, SandboxedCommand};
-
-        struct PassthroughSandbox {
-            bin_dir: PathBuf,
-        }
-
-        impl Sandbox for PassthroughSandbox {
-            fn kind(&self) -> &'static str {
-                "test"
-            }
-
-            fn check(&self, _workspace: &Path) -> Result<Vec<String>> {
-                Ok(Vec::new())
-            }
-
-            fn wrap(
-                &self,
-                argv: &[std::ffi::OsString],
-                workspace: &Path,
-            ) -> Result<SandboxedCommand> {
-                let mut new_argv = argv.to_vec();
-                new_argv[0] = self.bin_dir.join(&argv[0]).into_os_string();
-                Ok(SandboxedCommand {
-                    argv: new_argv,
-                    env: vec![
-                        (
-                            std::ffi::OsString::from("PATH"),
-                            std::env::var_os("PATH")
-                                .unwrap_or_else(|| std::ffi::OsString::from("/usr/bin:/bin")),
-                        ),
-                        (
-                            std::ffi::OsString::from("HOME"),
-                            std::env::var_os("HOME")
-                                .unwrap_or_else(|| std::ffi::OsString::from("/tmp")),
-                        ),
-                    ],
-                    cwd: workspace.to_path_buf(),
-                })
-            }
-        }
-
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
@@ -2253,10 +2323,7 @@ on_retry = "implement"
         let ws = FakeWorkspace::new(tmp.path().join("ws"));
         let sb = PassthroughSandbox { bin_dir };
         let clock = SystemClock::new();
-        let runner = ProcessStageRunner {
-            sandbox: &sb,
-            clock: &clock,
-        };
+        let runner = ProcessStageRunner::new(&sb, &clock);
         let cfg = make_config(&tmp, wrc_workflow(3));
         let state = Engine::new(cfg, ws, runner, SystemClock::new()).run();
         assert_eq!(state.status, RunStatus::Error);
@@ -2338,5 +2405,80 @@ on_retry = "implement"
         assert!(report.contains("Pré-teste de modelos"));
         assert!(report.contains("--use"));
         assert!(report.contains("projeto (.loops/models.toml etapa)"));
+    }
+
+    #[test]
+    fn engine_passes_opencode_api_key_only_to_opencode_and_redacts_from_state_errors_and_report() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let secret = "sk-engine-opencode-topsecret-888";
+        let opencode_saw = tmp.path().join("opencode_env_key");
+        let claude_saw = tmp.path().join("claude_env_key");
+
+        crate::test_support::write_executable(
+            bin_dir.join("opencode"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf '%s' \"${{OPENCODE_API_KEY:-ABSENT}}\" > \"{}\"\n\
+                 printf '%s\\n' '{{\"type\":\"step_finish\",\"part\":{{\"tokens\":{{\"input\":5,\"output\":5,\"cache\":{{\"read\":0}}}},\"cost\":0.0}}}}'\n\
+                 printf 'done\\n' > \"$PWD/.tchelvis-loop/out/review.md\" 2>/dev/null || true\n",
+                opencode_saw.display()
+            ),
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("claude"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf '%s' \"${{OPENCODE_API_KEY:-ABSENT}}\" > \"{}\"\n\
+                 printf '%s\\n' '{{\"type\":\"result\",\"is_error\":true,\"num_turns\":1,\"result\":\"bad key {secret}\"}}'\n\
+                 exit 1\n",
+                claude_saw.display()
+            ),
+        );
+
+        let mut wf = wrc_workflow(2);
+        wf.stages[0].provider = crate::loops::workflow::Provider::Opencode;
+        wf.stages[0].model = Some("zai/glm".into());
+        wf.stages[1].provider = crate::loops::workflow::Provider::Claude;
+
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let sb = PassthroughSandbox { bin_dir };
+        let clock = SystemClock::new();
+        let runner =
+            ProcessStageRunner::new(&sb, &clock).with_opencode_api_key(Some(secret.into()));
+        let cfg = make_config(&tmp, wf);
+        let state = Engine::new(cfg, ws, runner, SystemClock::new())
+            .with_extra_secrets(vec![secret.to_string()])
+            .run();
+
+        assert_eq!(state.status, RunStatus::Error);
+        assert_eq!(fs::read_to_string(&opencode_saw).unwrap(), secret);
+        assert_eq!(fs::read_to_string(&claude_saw).unwrap(), "ABSENT");
+
+        let raw_state = fs::read_to_string(tmp.path().join("run/state.json")).unwrap();
+        assert!(!raw_state.contains(secret), "secret leaked into state.json");
+        assert!(raw_state.contains("[REDACTED]"));
+
+        let raw_report = fs::read_to_string(tmp.path().join("run/report.md")).unwrap();
+        assert!(!raw_report.contains(secret), "secret leaked into report.md");
+        assert!(raw_report.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn the_result_is_on_disk_before_anyone_is_told() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = make_config(&tmp, wrc_workflow(1));
+        cfg.cancel.store(true, Ordering::Relaxed);
+        let dir = cfg.run_dir.clone();
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        Engine::new(cfg, ws, ScriptedRunner::new(), FakeClock::new())
+            .with_on_final(move |_| {
+                *sink.lock().unwrap() = load_state(&dir).ok().map(|s| s.status);
+            })
+            .run();
+        assert_eq!(*seen.lock().unwrap(), Some(RunStatus::Cancelled));
     }
 }

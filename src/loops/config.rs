@@ -187,6 +187,46 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
     })
 }
 
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn check_home_ro_does_not_reach(
+    home: &Path,
+    home_ro: &[String],
+    protected_paths: &[&Path],
+) -> Result<()> {
+    let home_norm = std::fs::canonicalize(home).unwrap_or_else(|_| normalize_lexical(home));
+    for rel in home_ro {
+        let candidate = home.join(rel);
+        let cand_norm =
+            std::fs::canonicalize(&candidate).unwrap_or_else(|_| normalize_lexical(&candidate));
+        if cand_norm == home_norm || !cand_norm.starts_with(&home_norm) {
+            bail!("entrada '{rel}' em home_ro não pode apontar para fora ou raiz do HOME");
+        }
+        for &prot in protected_paths {
+            let prot_norm = std::fs::canonicalize(prot).unwrap_or_else(|_| normalize_lexical(prot));
+            if prot_norm.starts_with(&cand_norm) || cand_norm.starts_with(&prot_norm) {
+                bail!(
+                    "entrada '{rel}' em home_ro alcançaria arquivo protegido do tchelvis ({})",
+                    prot.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

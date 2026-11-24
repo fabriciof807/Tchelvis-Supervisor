@@ -61,7 +61,7 @@ fn caller_is_alive_for_delivery(tracker: &FleetTracker, rec: &LoopRunRecord) -> 
 }
 
 /// How long a registered loop may take to report its engine process.
-const ENGINE_START_GRACE_MS: i64 = 60_000;
+pub const ENGINE_START_GRACE_MS: i64 = 60_000;
 
 pub fn watch_loops(
     store: &OrchStore,

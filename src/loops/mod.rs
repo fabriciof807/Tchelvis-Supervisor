@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod artifacts;
+pub mod cli;
 pub mod config;
 pub mod engine;
 pub mod models;
