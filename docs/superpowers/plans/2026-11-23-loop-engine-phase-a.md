@@ -201,13 +201,25 @@ Per stage: prepare exchange → run → collect `writes` (kept also as `c<cycle>
 
 ### Task 8: CLI, documentation and end-to-end
 
-**Files:** Create `src/loops/cli.rs`, `tests/loop_integration.rs`; Modify `src/main.rs`, `README.md`, `CHANGELOG.md`, `ROADMAP.md`, `src/orch/preamble.rs` (one short section in the skill).
+**Files:** Create `src/loops/{cli,models}.rs`, `tests/loop_integration.rs`; Modify `src/main.rs`, `README.md`, `CHANGELOG.md`, `ROADMAP.md`, `src/orch/preamble.rs` (one short section in the skill).
 
-Commands: `init`, `new`, `list [--runs]`, `check`, `auth` and `auth login <cli>`, `run`, `status [--json]`, `result`, `logs`, `report`, `stop`, `clean [--yes]`, hidden `engine <run-id>`. `--detach` starts `tchelvis loop engine <run-id>` with `hc run --bg --no-notify --outlive-parent` through `build_run_worker_args`. `run` fails before creating anything when the workflow, config, sandbox, `max_concurrent` or git check fails.
+Commands: `init`, `new`, `list [--runs]`, `check`, `models <workflow>`, `models set`, `models confirm`, `auth` and `auth login <cli>`, `run`, `status [--json]`, `result`, `logs`, `report`, `stop`, `clean [--yes]`, hidden `engine <run-id>`. `--detach` starts `tchelvis loop engine <run-id>` with `hc run --bg --no-notify --outlive-parent` through `build_run_worker_args`. `run` fails before creating anything when the workflow, config, sandbox, `max_concurrent` or git check fails.
 
 `OPENCODE_API_KEY` comes from the engine's environment, else from `$SHELL -ic` (5 s, `\x1e` markers, stdin closed); it is never read from or written to a file. It reaches only `opencode` stages, through the environment; its exact value is redacted from state, report and errors. `run` refuses to start when an account the workflow uses is missing (`opencode/` free models need none). Tests: shell noise ignored; slow or failing shell is "absent", not an error; value in no argv; other providers' stages do not get it.
 
-- [ ] **Step 1: Failing tests** (binary, temporary `HOME`, fake CLIs on `PATH`, fake `hc`, container marker injected by a test-only environment variable compiled under `debug_assertions`): PASS with branch created and checkout untouched; 5-line stdout and exit code for PASS, ERROR, ESCALATE and CANCELLED (SIGINT); `--detach` returns only `RUN_ID` and one message appears; `--detach` without Herdr, missing `auto_approve_in_sandbox`, `prompt` with `--input-file`, `--model` with an unknown stage → exit 2; `max_concurrent` refused; `clean` refuses an active run, shows what it deletes and keeps the branch; `init` twice keeps edited files; a path-like run id (`../x`) is refused everywhere.
+**Models** (spec section "Modelos"): create `src/loops/models.rs`, pure, also modifying `workflow.rs` and `state.rs`:
+```rust
+pub struct ModelChoice { pub provider: Provider, pub model: Option<String> }
+pub enum ModelSource { RunFlag, ProjectStage, Workflow, ProjectDefault, GlobalDefault }
+pub struct ProjectModels { pub defaults: RoleDefaults, pub stages: BTreeMap<String, BTreeMap<String, ModelChoice>> }
+pub fn parse_project_models(raw: &str) -> Result<ProjectModels>;
+pub fn parse_use_flag(raw: &str) -> Result<(String, ModelChoice)>; // first '=', then first ':'
+```
+Resolution happens before the workflow is accepted, so `parse_workflow` must keep a stage without provider until the levels are applied (change its signature as needed; existing tests keep their assertions). `Execution` gains `model_source` (`serde(default)`, so old states load). Confirmation: `<state>/tchelvis/loops/confirmed.json` (`0600`, atomic), canonical repository path → SHA-256 of the choices that came from the repository. Tests: each level beats the next one; CLI and model never mix levels; `model` without `provider` is an error in every file; unknown key or `[sandbox]` in `models.toml` is an error; model names with `/` and `:` survive `--use`; `set` preserves comments and other keys (`toml_edit`) and refuses a symlink; unknown stage or workflow in `models.toml` is reported by `check`; repository choice needs confirmation, asks again after it changes, and `--detach` refuses with the command; `--use`/global choices ask nothing; `models.toml` in the workspace is ignored.
+
+**`new`** (spec, after the presets). Artifact names: `designer`/`planner` → `design.md`, `reviewer` → `review.md`, `tester` → `test-report.md`, other role → `<role>.md`; the worker writes none. Each stage reads `input.md`, every earlier artifact, and `current.diff` once an editing stage came before it; the retry target also reads every later artifact. Repeated role → id `<role>-2`, and its artifact likewise. Tests: the four preset shapes and an unknown role parse with `parse_workflow`; no editing stage, editing stage last, bad role name, existing file → error and nothing written.
+
+- [ ] **Step 1: Failing tests** (binary, temporary `HOME`, fake CLIs on `PATH`, fake `hc`, container marker injected by a test-only environment variable compiled under `debug_assertions`): PASS with branch created and checkout untouched; 5-line stdout and exit code for PASS, ERROR, ESCALATE and CANCELLED (SIGINT); `--detach` returns only `RUN_ID` and one message appears; `--detach` without Herdr, missing `auto_approve_in_sandbox`, `prompt` with `--input-file`, `--use` with an unknown stage, unknown CLI or bad syntax → exit 2; `max_concurrent` refused; `clean` refuses an active run, shows what it deletes and keeps the branch; `init` twice keeps edited files; a path-like run id (`../x`) is refused everywhere.
 - [ ] **Steps 2–4.** **Step 5: Commit** `feat(cli): tchelvis loop`
 
 ---

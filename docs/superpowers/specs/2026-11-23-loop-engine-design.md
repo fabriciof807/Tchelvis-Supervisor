@@ -39,6 +39,7 @@ Orquestradores queimam contexto e perdem qualidade ao gerenciar cada turno entre
 ```text
 <repo>/.loops/
 ├── workflows/*.toml
+├── models.toml               # CLI e modelo deste projeto (opcional; versionar ou não é escolha do usuário)
 ├── roles/*.md
 └── runs/                     # com um .gitignore próprio contendo "*"
     └── <run-id>/             # state.json, input.md, artefatos, report.md, logs/
@@ -162,7 +163,25 @@ on_retry = "implement"
 
 Destinos são sempre **ids de etapa** ou `done`. Chave desconhecida é erro. Antes de iniciar, o motor recusa: id repetido ou inválido; destino inexistente; etapa inalcançável; nenhum caminho até `done`; ciclo sem `verdict_gate`; gate sem `writes`; `next` junto com gate; nome de artefato com `/`, `..` ou reservado; `reads` que ninguém produz; provider fora da lista ou ausente no sandbox. Só o `on_pass` de um gate leva a `done`, e o grafo sem `on_retry` não pode ter ciclos, porque só `RETRY` conta como ciclo. Nomes de workflow e role usam `[a-z0-9-]`; `max_cycles` vai até 20 e os tempos, até 7 dias. `home_ro` não pode alcançar os arquivos do próprio `tchelvis`. O modelo é opcional.
 
-**Presets:** `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic` e `fast-worker-reviewer`. Como os modelos mudam, os presets não fixam provider nem modelo: vêm de `[defaults.<role>]` em `loops.toml`, e faltar é erro claro.
+**Presets:** `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic` e `fast-worker-reviewer`. Como os modelos mudam, os presets não fixam provider nem modelo: vêm dos níveis de "Modelos", e faltar é erro claro.
+
+**`loop new <nome> --stages a,b,c`** (aprovado em 2026-11-24): encadeia as etapas na ordem; só `worker` e `tester` recebem `edits = true`; a última etapa é o portão, com `on_pass = "done"` e `on_retry` na primeira etapa que edita. Papel desconhecido é só leitura e ganha um `.md` inicial. É erro não haver etapa que edita, ou a última ser uma que edita. Nunca sobrescreve; mostra o TOML gerado e o valida antes de gravar.
+
+## Modelos
+
+Aprovado em 2026-11-24. CLI e modelo de cada etapa vêm **sempre juntos do mesmo nível**; um `model` sem `provider` é erro em qualquer nível. Do mais forte ao mais fraco:
+
+1. `--use etapa=cli[:modelo]` na execução (só daquela vez; sem modelo, vale o padrão do CLI)
+2. `[stages.<workflow>.<etapa>]` em `.loops/models.toml`
+3. a etapa no TOML do workflow
+4. `[defaults.<role>]` em `.loops/models.toml`
+5. `[defaults.<role>]` em `~/.config/tchelvis/loops.toml`
+
+- `.loops/models.toml` aceita só `provider` e `model`; qualquer outra chave é erro. É lido do repositório principal, nunca do workspace.
+- `loop models <workflow>` mostra CLI, modelo e nível de origem de cada etapa. `loop models set <role>=cli[:modelo] --project|--global` grava, preservando o resto do arquivo.
+- O efetivo e a origem ficam no `state.json` e no relatório.
+- **Confirmação:** um repositório pode escolher para qual provedor o código vai. Se algum CLI ou modelo vier de arquivo do repositório (níveis 2, 3 de workflow local, ou 4), a primeira execução, e toda execução depois de essa escolha mudar, mostra os modelos e pede confirmação. Sem terminal interativo ou com `--detach`, recusa e mostra `tchelvis loop models confirm <workflow>`. A confirmação é guardada fora do repositório, por caminho canônico e conteúdo da escolha. `--use` e o arquivo global não pedem confirmação.
+- O nome do modelo não é validado antes; um nome errado falha na etapa. Conferir pelas listas dos CLIs fica para a fase B.
 
 ## Veredito, ciclos e fim
 
@@ -214,8 +233,8 @@ No máximo 10 arquivos; nomes e resumo têm caracteres de controle removidos. O 
 
 | Comando | Fase |
 |---|---|
-| `loop init`, `new`, `list [--runs]`, `check <workflow>` | A |
-| `loop run <workflow> [prompt] [--input-file] [--from-head] [--max-cycles] [--model etapa=modelo] [--detach] [--verbose]` | A |
+| `loop init`, `new`, `list [--runs]`, `check <workflow>`, `models <workflow>`, `models set`, `models confirm` | A |
+| `loop run <workflow> [prompt] [--input-file] [--from-head] [--max-cycles] [--use etapa=cli[:modelo]] [--detach] [--verbose]` | A |
 | `loop status [run-id] [--json]`, `result`, `logs`, `report`, `stop`, `clean` | A |
 | `loop resume <run-id>`, `report --html` | B |
 
