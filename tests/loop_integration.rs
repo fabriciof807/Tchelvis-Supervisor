@@ -156,7 +156,7 @@ impl LoopHarness {
         let body = format!(
             "max_concurrent = {max_concurrent}\n\
              auto_approve_in_sandbox = {auto_approve}\n\
-             env_pass = [\"LOOP_TEST_TRACE_DIR\", \"LOOP_TEST_CLAUDE_FAIL\", \"LOOP_TEST_CLAUDE_FAIL_PROBE\", \"LOOP_TEST_PROBE_READY_FILE\", \"LOOP_TEST_PROBE_SLEEP_SECS\", \"LOOP_TEST_AGY_FAIL_PROBE\", \"LOOP_TEST_AGY_FAIL\", \"LOOP_TEST_AGY_MALFORMED_VERDICT\", \"LOOP_TEST_AGY_MISSING_OUT\", \"LOOP_TEST_AGY_MODELS_SLEEP_SECS\", \"LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS\", \"LOOP_TEST_CHECK_EVIDENCE_PATH\", \"LOOP_TEST_CHECK_EVIDENCE_OUT\", \"LOOP_TEST_OPENCODE_FAIL_PROBE\", \"LOOP_TEST_GATE_VERDICT\", \"LOOP_TEST_EDIT_WORKSPACE\", \"LOOP_TEST_READY_FILE\", \"LOOP_TEST_SLEEP_SECS\", \"LOOP_TEST_LEAK_SECRET\", \"LOOP_TEST_ESCAPE_ANSI\", \"LOOP_TEST_SPAWN_SETSID_PIDFILE\"]\n\
+             env_pass = [\"LOOP_TEST_TRACE_DIR\", \"LOOP_TEST_CLAUDE_FAIL\", \"LOOP_TEST_CLAUDE_FAIL_PROBE\", \"LOOP_TEST_PROBE_READY_FILE\", \"LOOP_TEST_PROBE_SLEEP_SECS\", \"LOOP_TEST_AGY_FAIL_PROBE\", \"LOOP_TEST_AGY_FAIL\", \"LOOP_TEST_AGY_MALFORMED_VERDICT\", \"LOOP_TEST_AGY_MISSING_OUT\", \"LOOP_TEST_AGY_MODELS_SLEEP_SECS\", \"LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS\", \"LOOP_TEST_CLAUDE_NO_PROFILE\", \"LOOP_TEST_CHECK_EVIDENCE_PATH\", \"LOOP_TEST_CHECK_EVIDENCE_OUT\", \"LOOP_TEST_OPENCODE_FAIL_PROBE\", \"LOOP_TEST_GATE_VERDICT\", \"LOOP_TEST_EDIT_WORKSPACE\", \"LOOP_TEST_READY_FILE\", \"LOOP_TEST_SLEEP_SECS\", \"LOOP_TEST_LEAK_SECRET\", \"LOOP_TEST_ESCAPE_ANSI\", \"LOOP_TEST_SPAWN_SETSID_PIDFILE\"]\n\
              \n\
              [sandbox]\n\
              kind = \"{sandbox_kind}\"\n\
@@ -202,14 +202,17 @@ if argv[:2] == ["auth", "status"]:
         time.sleep(float(os.environ["LOOP_TEST_CLAUDE_AUTH_SLEEP_SECS"]))
     cred = pathlib.Path(os.environ.get("HOME", "")) / ".claude" / ".credentials.json"
     logged_in = cred.is_file() and cred.stat().st_size > 0
+    # The real CLI does not know the profile inside the sandbox.
+    profile = os.environ.get("LOOP_TEST_CLAUDE_NO_PROFILE") != "1"
     if logged_in:
         print(json.dumps({
             "loggedIn": True,
             "authMethod": "claude.ai",
             "apiProvider": "firstParty",
-            "email": "fake-user@example.com",
-            "orgId": "org-secret-999",
-            "orgName": "SecretFakeOrg",
+            "email": "fake-user@example.com" if profile else None,
+            "orgId": "org-secret-999" if profile else None,
+            "orgName": "SecretFakeOrg" if profile else None,
+            "loginExpiresAt": "2026-12-09T01:02:03.456Z",
         }))
     else:
         print(json.dumps({"loggedIn": False, "authMethod": "none"}))
@@ -2601,4 +2604,24 @@ fn a_failed_probe_discards_the_evidence_of_its_own_pair() {
     );
     assert_eq!(count_probe_traces(&h, "claude"), 0);
     assert_eq!(count_probe_traces(&h, "agy"), 1);
+}
+
+#[test]
+fn claude_evidence_is_kept_without_the_profile_hidden_by_the_sandbox() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+    let run = |args: &[&str]| {
+        h.cmd()
+            .env("LOOP_TEST_CLAUDE_NO_PROFILE", "1")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let live = run(&["loop", "check", "fast-worker-reviewer", "--live"]);
+    assert_eq!(live.status.code(), Some(0));
+    h.clear_traces();
+    let out = run(&["loop", "run", "fast-worker-reviewer", "x"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(count_probe_traces(&h, "claude"), 0);
 }

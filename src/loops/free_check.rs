@@ -48,6 +48,9 @@ pub enum ClaudeStatus {
         email: Option<String>,
         org_id: Option<String>,
         org_name: Option<String>,
+        /// The only field of these that tells accounts apart inside the sandbox, where the CLI
+        /// sees its credential but not its profile.
+        login_expires_at: Option<String>,
     },
     LoggedOut,
     Unknown(String),
@@ -83,6 +86,7 @@ pub fn inspect_claude_status(raw: &str) -> ClaudeStatus {
             email: non_empty_string_field(&val, "email"),
             org_id: non_empty_string_field(&val, "orgId"),
             org_name: non_empty_string_field(&val, "orgName"),
+            login_expires_at: non_empty_string_field(&val, "loginExpiresAt"),
         },
         Some(false) => ClaudeStatus::LoggedOut,
         None => {
@@ -476,6 +480,8 @@ mod tests {
     use tempfile::TempDir;
 
     const FIX_CLAUDE_OK: &str = include_str!("../../tests/fixtures/loop/free_claude_status.txt");
+    const FIX_CLAUDE_SANDBOX: &str =
+        include_str!("../../tests/fixtures/loop/free_claude_status_sandbox.txt");
     const FIX_CLAUDE_OUT: &str =
         include_str!("../../tests/fixtures/loop/free_claude_logged_out.txt");
     const FIX_AGY_MODELS: &str = include_str!("../../tests/fixtures/loop/free_agy_models.txt");
@@ -571,6 +577,16 @@ mod tests {
                 email: Some("user@example.com".to_string()),
                 org_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
                 org_name: Some("Example".to_string()),
+                login_expires_at: Some("2026-12-09T00:00:00Z".to_string()),
+            }
+        );
+        assert_eq!(
+            inspect_claude_status(FIX_CLAUDE_SANDBOX),
+            ClaudeStatus::LoggedIn {
+                email: None,
+                org_id: None,
+                org_name: None,
+                login_expires_at: Some("2026-12-09T01:02:03.456Z".to_string()),
             }
         );
 

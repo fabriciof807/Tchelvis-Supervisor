@@ -923,14 +923,18 @@ fn build_cli_identity_for_provider(
                 email,
                 org_id,
                 org_name,
-            }) if org_id.is_some() || email.is_some() => compute_account_identity(
-                salt,
-                AccountIdentityInput::ClaudeKnown {
-                    org_id: org_id.as_deref(),
-                    org_name: org_name.as_deref(),
-                    email: email.as_deref(),
-                },
-            ),
+                login_expires_at,
+            }) if org_id.is_some() || email.is_some() || login_expires_at.is_some() => {
+                compute_account_identity(
+                    salt,
+                    AccountIdentityInput::ClaudeKnown {
+                        org_id: org_id.as_deref(),
+                        org_name: org_name.as_deref(),
+                        email: email.as_deref(),
+                        login_expires_at: login_expires_at.as_deref(),
+                    },
+                )
+            }
             // No known account: evidence would be shared by every account.
             _ => return None,
         },
@@ -3484,18 +3488,19 @@ mod tests {
                 None,
             )
         };
-        let logged_in = |email: Option<&str>| {
+        let logged_in = |expires: Option<&str>| {
             Some(ClaudeStatus::LoggedIn {
-                email: email.map(str::to_string),
+                email: None,
                 org_id: None,
                 org_name: None,
+                login_expires_at: expires.map(str::to_string),
             })
         };
         assert!(identity(None).is_none());
         assert!(identity(Some(ClaudeStatus::Unknown("hang".into()))).is_none());
         assert!(identity(logged_in(None)).is_none());
-        let a = identity(logged_in(Some("a@example.com"))).unwrap();
-        let b = identity(logged_in(Some("b@example.com"))).unwrap();
+        let a = identity(logged_in(Some("2026-12-09T01:02:03.456Z"))).unwrap();
+        let b = identity(logged_in(Some("2026-12-09T01:02:03.457Z"))).unwrap();
         assert_ne!(a.account, b.account);
     }
 }

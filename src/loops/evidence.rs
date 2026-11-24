@@ -32,6 +32,7 @@ pub enum AccountIdentityInput<'a> {
         org_id: Option<&'a str>,
         org_name: Option<&'a str>,
         email: Option<&'a str>,
+        login_expires_at: Option<&'a str>,
     },
     OpencodeKey(Option<&'a str>),
     AgyTokenPresent(bool),
@@ -562,10 +563,11 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
             org_id,
             org_name,
             email,
+            login_expires_at,
         } => {
             let mut msg = Vec::new();
             msg.extend_from_slice(b"claude\0");
-            for field in [org_id, org_name, email] {
+            for field in [org_id, org_name, email, login_expires_at] {
                 match field {
                     Some(v) => {
                         msg.push(1);
@@ -665,6 +667,7 @@ mod tests {
                 org_id: Some(org_id),
                 org_name: Some(org_name),
                 email: Some(email),
+                login_expires_at: None,
             },
         );
         let c2 = compute_account_identity(
@@ -673,6 +676,7 @@ mod tests {
                 org_id: Some(org_id),
                 org_name: Some(org_name),
                 email: Some(email),
+                login_expires_at: None,
             },
         );
         assert_ne!(c1, c2, "claude account digest must be salted per store");
