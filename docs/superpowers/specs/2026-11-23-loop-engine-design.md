@@ -54,8 +54,10 @@ Cada run tem um **clone separado** (`git clone --no-hardlinks`) no commit `HEAD`
 
 **Regra:** fora do sandbox, o `tchelvis` nunca executa git usando o `.git` do workspace. Verificado em 2026-11-23: um `git status` ali executou um hook e um `core.fsmonitor` plantados. O motor usa o repositório principal como `GIT_DIR`, o workspace como `GIT_WORK_TREE` e um índice próprio da run, com `core.hooksPath=/dev/null`, `core.fsmonitor=false`, `--no-ext-diff` e `--no-textconv`; no mesmo teste, nada foi executado.
 
-- **Snapshot:** depois de cada etapa, `add -A` (sem `.tchelvis-loop/`) e `write-tree`. Independe de o agente ter feito commit e inclui arquivos novos, respeitando o `.gitignore`.
-- **`current.diff`:** commit-base contra o último snapshot.
+- **Filtros git** (`clean`/`smudge`) executam fora do sandbox com o workspace como diretório. Só o Git LFS é aceito, e só onde o repositório já o usa; os demais são desligados, e um repositório que dependa de um é recusado.
+- **Variáveis `GIT_*`** de quem chamou são descartadas, exceto configuração e identidade.
+- **Snapshot:** sem cache de estado, porque tamanho e horário podem ser forjados; depois de cada etapa, `add -A` (sem `.tchelvis-loop/`) e `write-tree`. Independe de o agente ter feito commit e inclui arquivos novos, respeitando o `.gitignore`.
+- **`current.diff`:** commit-base contra o último snapshot, até 2 MiB.
 - **Etapas sem `edits = true`:** se a árvore mudar, a etapa falha e o workspace volta ao snapshot anterior.
 - **Resultado:** `commit-tree` na branch `loop/<workflow>-<run-id>` do repositório principal, sem mexer no checkout. A branch nunca pode já existir; o `tchelvis` não faz merge nem push.
 - **Repositório com mudanças não commitadas:** erro, a menos que se passe `--from-head` (elas ficam de fora).
@@ -80,7 +82,6 @@ env_pass = []
 kind = "inherited"               # inherited | bwrap | incus
 
 [sandbox.bwrap]
-home_rw = [".claude", ".local/share/opencode"]
 home_ro = [".cargo", ".rustup"]
 
 [sandbox.incus]
@@ -91,7 +92,7 @@ user = "ubuntu"
 | Ordem | Tipo | Como | Protege |
 |---|---|---|---|
 | 1 | `inherited` | O `tchelvis` já roda em um container; exige detecção e escolha explícita | O host, só na medida do container. **Nada dentro dele** |
-| 2 | `bwrap` | `/` somente leitura, `$HOME` e `/run` vazios, só workspace e `home_rw` graváveis, PID próprio; funciona dentro de um container | Também o repositório principal, outros projetos, sockets e o Herdr |
+| 2 | `bwrap` | `/` somente leitura, `$HOME` e `/run` vazios, só o workspace gravável, PID próprio; funciona dentro de um container | Também o repositório principal, outros projetos, sockets e o Herdr |
 | 3 | `incus` | `incus exec` na instância, a partir do host; o workspace precisa estar montado nela | O host |
 
 - **Limite do `inherited`:** o agente tem os mesmos poderes do usuário do container. Se houver `sudo` sem senha, acesso ao Docker ou ao Incus, pastas do host graváveis ou `hc`, ele alcança tudo isso, e também o repositório principal, o `state.json` e os outros terminais. `loop check` lista o que encontrou, e cada relatório registra o tipo de sandbox usado. O git seguro continua valendo contra execução acidental, mas não é uma fronteira nesse modo.
@@ -100,6 +101,7 @@ user = "ubuntu"
 - **`bwrap` e `incus`:** o ambiente é limpo (passam `PATH`, `HOME`, `LANG`, `TERM` e `env_pass`) e não há sockets do Docker, do Herdr, do SSH ou do D-Bus. No `inherited`, o ambiente é limpo do mesmo jeito, mas os sockets continuam alcançáveis.
 - **Nada pode rodar em serviço externo:** `opencode run` usa por padrão um serviço em segundo plano, que ficaria fora do sandbox; o adapter sempre usa `--standalone`. Todo adapter precisa passar por um teste real: pedir uma escrita fora do workspace, em `bwrap`, e confirmar que ela não acontece.
 - **Limite comum:** a rede fica aberta para a API, e o agente enxerga a própria credencial.
+- **Nada do `$HOME` é gravável.** Um `home_rw` com `.claude` deixaria o agente plantar um hook que rodaria depois, fora do sandbox. Cada etapa vê só o executável e a credencial do próprio CLI, em leitura: `.claude/.credentials.json` (Claude), o token do `antigravity-cli` (`agy`), nada (`opencode`). Medido em 2026-11-23 com os três CLIs: funcionam, e uma escrita pedida fora do workspace não aconteceu. Consequências: uma renovação de token dentro do sandbox não é gravada, e provedores pagos do `opencode`, que guarda credenciais no próprio banco, ainda não foram testados.
 - **`bwrap` não é total:** a rede é compartilhada, então serviços em `localhost` e sockets abstratos continuam alcançáveis.
 - **Recomendado para uso normal: `bwrap` dentro do container.** Medido em 2026-11-23 (bubblewrap 0.9.0 em um container Incus sem privilégios): cerca de 8 ms a mais por processo iniciado, pagos uma vez por etapa; criação de 3.000 arquivos e `cargo check` sem perda mensurável. Escrita fora do workspace, leitura de um arquivo-sentinela, `sudo`, sockets do Docker e do Incus, `hc` e pasta compartilhada do host ficaram inacessíveis. O DNS exige montar `/run/systemd/resolve` somente leitura.
 - `bwrap` exige o pacote `bubblewrap`. `incus` só pode ser validado no host.
@@ -155,7 +157,7 @@ on_pass = "done"
 on_retry = "implement"
 ```
 
-Destinos são sempre **ids de etapa** ou `done`. Chave desconhecida é erro. Antes de iniciar, o motor recusa: id repetido ou inválido; destino inexistente; etapa inalcançável; nenhum caminho até `done`; ciclo sem `verdict_gate`; gate sem `writes`; `next` junto com gate; nome de artefato com `/`, `..` ou reservado; `reads` que ninguém produz; provider fora da lista ou ausente no sandbox. Só o `on_pass` de um gate leva a `done`, e o grafo sem `on_retry` não pode ter ciclos, porque só `RETRY` conta como ciclo. Nomes de workflow e role usam `[a-z0-9-]`; `max_cycles` vai até 20 e os tempos, até 7 dias. `home_rw` e `home_ro` não podem alcançar os arquivos do próprio `tchelvis`. O modelo é opcional.
+Destinos são sempre **ids de etapa** ou `done`. Chave desconhecida é erro. Antes de iniciar, o motor recusa: id repetido ou inválido; destino inexistente; etapa inalcançável; nenhum caminho até `done`; ciclo sem `verdict_gate`; gate sem `writes`; `next` junto com gate; nome de artefato com `/`, `..` ou reservado; `reads` que ninguém produz; provider fora da lista ou ausente no sandbox. Só o `on_pass` de um gate leva a `done`, e o grafo sem `on_retry` não pode ter ciclos, porque só `RETRY` conta como ciclo. Nomes de workflow e role usam `[a-z0-9-]`; `max_cycles` vai até 20 e os tempos, até 7 dias. `home_ro` não pode alcançar os arquivos do próprio `tchelvis`. O modelo é opcional.
 
 **Presets:** `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic` e `fast-worker-reviewer`. Como os modelos mudam, os presets não fixam provider nem modelo: vêm de `[defaults.<role>]` em `loops.toml`, e faltar é erro claro.
 

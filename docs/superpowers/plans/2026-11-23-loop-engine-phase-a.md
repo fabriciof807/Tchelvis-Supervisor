@@ -62,7 +62,7 @@ pub struct Workflow { pub name: String, pub description: String, pub max_cycles:
 pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Vec<String>>; // every problem, not the first
 pub struct LoopsConfig { pub max_concurrent: u32, pub auto_approve_in_sandbox: bool, pub env_pass: Vec<String>,
     pub sandbox: SandboxConfig, pub defaults: RoleDefaults }
-pub enum SandboxConfig { Inherited, Bwrap { home_rw: Vec<String>, home_ro: Vec<String> } }
+pub enum SandboxConfig { Inherited, Bwrap { home_ro: Vec<String> } }
 pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig>;
 ```
 Defaults: `max_cycles 3`, `stage_timeout_secs 1800`, `stall_secs 600`, `max_duration_secs 7200`, `max_concurrent 2`. `[sandbox] kind` is required; `incus` gives "ainda não suportado nesta versão". `home_*` entries: relative, no `..`.
@@ -141,7 +141,7 @@ pub fn run_process(cmd: SandboxedCommand, stdin: &[u8], log: &Path, limits: Limi
     cancel: &AtomicBool, on_line: &mut dyn FnMut(&str), probe_activity: &mut dyn FnMut() -> bool) -> Result<Outcome>;
 ```
 - `inherited`: container when `/run/systemd/container`, `/.dockerenv` or `/run/.containerenv` exists (root injected for tests). Exposures: writable Docker/Incus sockets, `sudo -n true`, `hc` on PATH, writable mounts shared from outside.
-- `bwrap` argv: `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts --new-session --ro-bind / / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp --tmpfs $HOME`, `--ro-bind` for existing `home_ro`, the directory of each adapter binary under `$HOME`, `--bind` for `home_rw` and the workspace, `--clearenv` + `--setenv`, `--chdir`. Network stays. `--ro-bind-try /run/systemd/resolve` (without it DNS fails). Verified on bubblewrap 0.9.0 inside an unprivileged Incus container; `home_rw`/`home_ro` entries may be files as well as directories. `check` reports that the network, `localhost` services and abstract sockets are shared.
+- `bwrap` argv: `--die-with-parent --unshare-pid --unshare-ipc --unshare-uts --new-session --ro-bind / / --dev /dev --proc /proc --tmpfs /run --tmpfs /tmp --tmpfs $HOME`, `--ro-bind` for existing `home_ro` and for the executable and credential of the CLI in use, `--bind` for the workspace only, `--clearenv` + `--setenv`, `--chdir`. Network stays. `--ro-bind-try /run/systemd/resolve` (without it DNS fails). Verified on bubblewrap 0.9.0 inside an unprivileged Incus container; `home_ro` entries may be files as well as directories. `check` reports that the network, `localhost` services and abstract sockets are shared.
 - The engine is a child subreaper (`PR_SET_CHILD_SUBREAPER`). Ending a stage: SIGTERM to the group, 5 s, SIGKILL to group and every descendant until none.
 - Lines over 1 MiB are truncated for parsing; the log keeps at most 64 MiB with a note. Activity = output bytes or `probe_activity`.
 

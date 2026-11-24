@@ -15,10 +15,7 @@ const TCHELVIS_HOME_DIRS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxConfig {
     Inherited,
-    Bwrap {
-        home_rw: Vec<String>,
-        home_ro: Vec<String>,
-    },
+    Bwrap { home_ro: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,8 +58,6 @@ struct RawSandbox {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBwrap {
-    #[serde(default)]
-    home_rw: Vec<String>,
     #[serde(default)]
     home_ro: Vec<String>,
 }
@@ -146,9 +141,6 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
     }
 
     if let Some(bwrap) = &parsed.sandbox.bwrap {
-        for p in &bwrap.home_rw {
-            validate_home_relative_path(p, "sandbox.bwrap.home_rw")?;
-        }
         for p in &bwrap.home_ro {
             validate_home_relative_path(p, "sandbox.bwrap.home_ro")?;
         }
@@ -158,10 +150,7 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
         "inherited" => SandboxConfig::Inherited,
         "bwrap" => {
             let b = parsed.sandbox.bwrap.unwrap_or_default();
-            SandboxConfig::Bwrap {
-                home_rw: b.home_rw,
-                home_ro: b.home_ro,
-            }
+            SandboxConfig::Bwrap { home_ro: b.home_ro }
         }
         "incus" => {
             let _ = parsed.sandbox.incus;
@@ -212,7 +201,6 @@ auto_approve_in_sandbox = false
 kind = "bwrap"
 
 [sandbox.bwrap]
-home_rw = [".claude", ".local/share/opencode"]
 home_ro = [".cargo", ".rustup"]
 "#;
         let cfg = parse_loops_config(valid_bwrap).expect("valid bwrap config");
@@ -221,7 +209,6 @@ home_ro = [".cargo", ".rustup"]
         assert_eq!(
             cfg.sandbox,
             SandboxConfig::Bwrap {
-                home_rw: vec![".claude".into(), ".local/share/opencode".into()],
                 home_ro: vec![".cargo".into(), ".rustup".into()],
             }
         );
@@ -273,12 +260,12 @@ max_concurrent = 2
 [sandbox]
 kind = "bwrap"
 [sandbox.bwrap]
-home_rw = ["{bad_path}"]
+home_ro = ["{bad_path}"]
 "#
             );
             assert!(
                 parse_loops_config(&cfg_rw).is_err(),
-                "expected home_rw='{bad_path}' to be rejected"
+                "expected home_ro='{bad_path}' to be rejected"
             );
 
             let cfg_ro = format!(
@@ -308,10 +295,18 @@ home_ro = ["{bad_path}"]
             ".local/share/tchelvis",
         ] {
             let raw =
-                format!("[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_rw = [{bad:?}]\n");
+                format!("[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_ro = [{bad:?}]\n");
             assert!(parse_loops_config(&raw).is_err(), "{bad}");
         }
-        let ok = "[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_rw = [\".claude\", \".claude.json\", \".local/share/opencode\"]\n";
+        let ok = "[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_ro = [\".cargo\", \".rustup\", \".gitconfig\"]\n";
         assert!(parse_loops_config(ok).is_ok());
+    }
+
+    #[test]
+    fn no_home_path_can_be_writable() {
+        // Anything writable there (hooks, plugins, shell files) would later run outside.
+        let raw = "[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_rw = [\".claude\"]\n";
+        let err = format!("{:#}", parse_loops_config(raw).unwrap_err());
+        assert!(err.contains("home_rw"), "{err}");
     }
 }

@@ -1,0 +1,988 @@
+use crate::loops::process::{run_process, Limits, Outcome, SystemClock};
+use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
+use std::ffi::{CString, OsString};
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const BASE_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TERM"];
+/// The one file each CLI needs from the home directory, always read-only. Measured on 2026-11-23.
+const ADAPTER_CREDENTIALS: &[(&str, Option<&str>)] = &[
+    ("claude", Some(".claude/.credentials.json")),
+    (
+        "agy",
+        Some(".gemini/antigravity-cli/antigravity-oauth-token"),
+    ),
+    ("opencode", None),
+];
+const TCHELVIS_HOME_DIRS: &[&str] = &[
+    ".config/tchelvis",
+    ".local/share/tchelvis",
+    ".local/state/tchelvis",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxedCommand {
+    pub argv: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
+    pub cwd: PathBuf,
+}
+
+pub trait Sandbox {
+    fn kind(&self) -> &'static str;
+    fn check(&self, workspace: &Path) -> Result<Vec<String>>;
+    fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand>;
+}
+
+fn current_env_pairs() -> Vec<(OsString, OsString)> {
+    std::env::vars_os().collect()
+}
+
+fn build_clean_env<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(
+    env_pass: &[String],
+    source: &[(K, V)],
+) -> Vec<(OsString, OsString)> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut result = Vec::new();
+
+    let lookup = |name: &str| -> Option<OsString> {
+        source.iter().find_map(|(k, v)| {
+            if k.as_ref() == std::ffi::OsStr::new(name) {
+                Some(v.as_ref().to_os_string())
+            } else {
+                None
+            }
+        })
+    };
+
+    for &name in BASE_ALLOWED_ENV {
+        if seen.insert(name.to_string()) {
+            if let Some(val) = lookup(name) {
+                result.push((OsString::from(name), val));
+            }
+        }
+    }
+    for name in env_pass {
+        if seen.insert(name.clone()) {
+            if let Some(val) = lookup(name) {
+                result.push((OsString::from(name), val));
+            }
+        }
+    }
+    result
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    meta.is_file() && (meta.permissions().mode() & 0o111) != 0
+}
+
+fn find_in_path(bin: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path_var = path_var?;
+    for dir in std::env::split_paths(path_var) {
+        let candidate = dir.join(bin);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_path_writable_by_current_user(path: &Path) -> bool {
+    let Some(s) = path.to_str() else {
+        return false;
+    };
+    let Ok(c) = CString::new(s) else {
+        return false;
+    };
+    // SAFETY: c is a NUL-terminated path string; access(W_OK) queries permissions only.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}
+
+fn probe_workspace_writable(workspace: &Path) -> Result<()> {
+    if !workspace.is_dir() {
+        bail!(
+            "workspace não existe ou não é diretório: {}",
+            workspace.display()
+        );
+    }
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let probe_path = workspace.join(format!(
+        ".tchelvis-sandbox-probe-{}-{nanos}",
+        std::process::id()
+    ));
+    let token = format!("probe-{nanos}");
+    fs::write(&probe_path, &token).with_context(|| {
+        format!(
+            "falha ao escrever sonda no workspace {}",
+            workspace.display()
+        )
+    })?;
+    let read_back = fs::read_to_string(&probe_path);
+    let _ = fs::remove_file(&probe_path);
+    let read_back = read_back.context("falha ao ler sonda no workspace")?;
+    if read_back != token {
+        bail!("conteúdo inesperado na sonda do workspace");
+    }
+    Ok(())
+}
+
+pub struct InheritedSandbox {
+    pub env_pass: Vec<String>,
+    pub root: PathBuf,
+}
+
+impl InheritedSandbox {
+    pub fn new(env_pass: Vec<String>) -> Self {
+        Self {
+            env_pass,
+            root: PathBuf::from("/"),
+        }
+    }
+
+    pub fn wrap_with_env<K: AsRef<str>, V: AsRef<str>>(
+        &self,
+        argv: &[OsString],
+        workspace: &Path,
+        env_source: &[(K, V)],
+    ) -> Result<SandboxedCommand> {
+        if argv.is_empty() {
+            bail!("comando vazio");
+        }
+        let source: Vec<(&str, &str)> = env_source
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        Ok(SandboxedCommand {
+            argv: argv.to_vec(),
+            env: build_clean_env(&self.env_pass, &source),
+            cwd: workspace.to_path_buf(),
+        })
+    }
+
+    fn detect_shared_writable_mounts(&self) -> Vec<String> {
+        let mountinfo_path = self.root.join("proc/self/mountinfo");
+        let Ok(raw) = fs::read_to_string(&mountinfo_path) else {
+            return Vec::new();
+        };
+        let mut exposures = Vec::new();
+        for line in raw.lines() {
+            let Some((left, right)) = line.split_once(" - ") else {
+                continue;
+            };
+            let left_fields: Vec<&str> = left.split_whitespace().collect();
+            let right_fields: Vec<&str> = right.split_whitespace().collect();
+            if left_fields.len() < 6 || right_fields.is_empty() {
+                continue;
+            }
+            let mount_root = left_fields[3];
+            let mount_point = left_fields[4];
+            let options = left_fields[5];
+            let fstype = right_fields[0];
+
+            if !options.split(',').any(|o| o == "rw") {
+                continue;
+            }
+            if mount_point == "/"
+                || mount_point.starts_with("/dev")
+                || mount_point.starts_with("/proc")
+                || mount_point.starts_with("/sys")
+                || mount_point.starts_with("/run")
+                || mount_point.starts_with("/tmp")
+            {
+                continue;
+            }
+            if matches!(
+                fstype,
+                "proc"
+                    | "sysfs"
+                    | "tmpfs"
+                    | "devtmpfs"
+                    | "devpts"
+                    | "cgroup"
+                    | "cgroup2"
+                    | "pstore"
+                    | "efivarfs"
+                    | "securityfs"
+                    | "debugfs"
+                    | "tracefs"
+                    | "configfs"
+                    | "fusectl"
+                    | "mqueue"
+                    | "hugetlbfs"
+                    | "ramfs"
+                    | "autofs"
+            ) {
+                continue;
+            }
+            let is_external_share = mount_root != "/"
+                || options.split(',').any(|o| o == "idmapped")
+                || matches!(fstype, "virtiofs" | "9p" | "nfs" | "nfs4" | "cifs");
+            if is_external_share {
+                exposures.push(format!("montagem gravável compartilhada: {mount_point}"));
+            }
+        }
+        exposures
+    }
+}
+
+impl Sandbox for InheritedSandbox {
+    fn kind(&self) -> &'static str {
+        "inherited"
+    }
+
+    fn check(&self, workspace: &Path) -> Result<Vec<String>> {
+        let markers = [
+            self.root.join("run/systemd/container"),
+            self.root.join(".dockerenv"),
+            self.root.join("run/.containerenv"),
+        ];
+        if !markers.iter().any(|p| p.exists()) {
+            bail!(
+                "sandbox 'inherited' exige execução dentro de um container (/run/systemd/container, /.dockerenv ou /run/.containerenv não encontrado)"
+            );
+        }
+
+        probe_workspace_writable(workspace)?;
+
+        let mut exposures = Vec::new();
+
+        for rel in [
+            "var/run/docker.sock",
+            "run/docker.sock",
+            "var/lib/incus/unix.socket",
+            "run/incus/unix.socket",
+        ] {
+            let p = self.root.join(rel);
+            if fs::symlink_metadata(&p).is_ok() && is_path_writable_by_current_user(&p) {
+                exposures.push(format!("socket gravável acessível: /{rel}"));
+            }
+        }
+
+        if self.root == Path::new("/") {
+            if let Some(sudo_bin) = find_in_path("sudo", std::env::var_os("PATH").as_deref()) {
+                let ok = Command::new(sudo_bin)
+                    .args(["-n", "true"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if ok {
+                    exposures.push("sudo sem senha disponível (sudo -n true)".to_string());
+                }
+            }
+            if find_in_path("hc", std::env::var_os("PATH").as_deref()).is_some() {
+                exposures.push("hc disponível no PATH (acesso a outros terminais)".to_string());
+            }
+        }
+
+        exposures.extend(self.detect_shared_writable_mounts());
+        Ok(exposures)
+    }
+
+    fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand> {
+        if argv.is_empty() {
+            bail!("comando vazio");
+        }
+        let env_pairs = current_env_pairs();
+        Ok(SandboxedCommand {
+            argv: argv.to_vec(),
+            env: build_clean_env(&self.env_pass, &env_pairs),
+            cwd: workspace.to_path_buf(),
+        })
+    }
+}
+
+pub struct BwrapSandbox {
+    pub home_ro: Vec<String>,
+    pub env_pass: Vec<String>,
+}
+
+impl BwrapSandbox {
+    pub fn new(home_ro: Vec<String>, env_pass: Vec<String>) -> Self {
+        Self { home_ro, env_pass }
+    }
+
+    fn is_under_tchelvis_home(home: &Path, path: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(home) else {
+            return false;
+        };
+        for own in TCHELVIS_HOME_DIRS {
+            let own = Path::new(own);
+            if rel.starts_with(own) || own.starts_with(rel) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// What the CLI named by `program` needs from the home directory, as `(source, destination)`
+    /// read-only binds: its own executable and its credential, never the directories around them.
+    fn adapter_binds(
+        program: &std::ffi::OsStr,
+        home: &Path,
+        path_var: Option<&std::ffi::OsStr>,
+    ) -> Vec<(PathBuf, PathBuf)> {
+        let Some((name, credential)) = ADAPTER_CREDENTIALS
+            .iter()
+            .find(|(name, _)| program == std::ffi::OsStr::new(name))
+        else {
+            return Vec::new();
+        };
+        let mut binds = Vec::new();
+        if let Some(bin) = find_in_path(name, path_var) {
+            let real = fs::canonicalize(&bin).unwrap_or_else(|_| bin.clone());
+            let path_dirs: Vec<PathBuf> = path_var
+                .map(|p| std::env::split_paths(p).collect())
+                .unwrap_or_default();
+            if real != bin && real.starts_with(home) && !Self::is_under_tchelvis_home(home, &real) {
+                // The directory of the real executable may hold files it loads; a directory of the
+                // PATH holds unrelated programs.
+                match real.parent() {
+                    Some(dir) if dir != home && !path_dirs.iter().any(|p| p == dir) => {
+                        binds.push((dir.to_path_buf(), dir.to_path_buf()));
+                    }
+                    _ => binds.push((real.clone(), real.clone())),
+                }
+            }
+            if bin.starts_with(home) {
+                binds.push((real, bin));
+            }
+        }
+        if let Some(rel) = credential {
+            let file = home.join(rel);
+            if file.is_file() {
+                binds.push((file.clone(), file));
+            }
+        }
+        binds
+    }
+
+    fn wrap_clean(
+        &self,
+        argv: &[OsString],
+        workspace: &Path,
+        clean_env: Vec<(OsString, OsString)>,
+    ) -> Result<SandboxedCommand> {
+        if argv.is_empty() {
+            bail!("comando vazio");
+        }
+        let home = clean_env
+            .iter()
+            .find(|(k, _)| k == std::ffi::OsStr::new("HOME"))
+            .map(|(_, v)| PathBuf::from(v))
+            .filter(|p| !p.as_os_str().is_empty())
+            .context("variável de ambiente HOME ausente para sandbox bwrap")?;
+
+        let path_var = clean_env
+            .iter()
+            .find(|(k, _)| k == std::ffi::OsStr::new("PATH"))
+            .map(|(_, v)| v.as_os_str());
+
+        let mut binds: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for rel in &self.home_ro {
+            let full = home.join(rel);
+            if let Ok(real) = fs::canonicalize(&full) {
+                if Self::is_under_tchelvis_home(&home, &real) {
+                    bail!("'{rel}' em home_ro aponta para os arquivos do tchelvis");
+                }
+                binds.push((full.clone(), full));
+            }
+        }
+        binds.extend(Self::adapter_binds(&argv[0], &home, path_var));
+
+        let mut wrapped = vec![
+            OsString::from("bwrap"),
+            OsString::from("--die-with-parent"),
+            OsString::from("--unshare-pid"),
+            OsString::from("--unshare-ipc"),
+            OsString::from("--unshare-uts"),
+            OsString::from("--new-session"),
+            OsString::from("--ro-bind"),
+            OsString::from("/"),
+            OsString::from("/"),
+            OsString::from("--dev"),
+            OsString::from("/dev"),
+            OsString::from("--proc"),
+            OsString::from("/proc"),
+            OsString::from("--tmpfs"),
+            OsString::from("/run"),
+            OsString::from("--tmpfs"),
+            OsString::from("/tmp"),
+            OsString::from("--ro-bind-try"),
+            OsString::from("/run/systemd/resolve"),
+            OsString::from("/run/systemd/resolve"),
+            OsString::from("--tmpfs"),
+            home.as_os_str().to_os_string(),
+        ];
+
+        for (src, dst) in &binds {
+            wrapped.push(OsString::from("--ro-bind"));
+            wrapped.push(src.as_os_str().to_os_string());
+            wrapped.push(dst.as_os_str().to_os_string());
+        }
+
+        wrapped.push(OsString::from("--bind"));
+        wrapped.push(workspace.as_os_str().to_os_string());
+        wrapped.push(workspace.as_os_str().to_os_string());
+
+        wrapped.push(OsString::from("--clearenv"));
+        for (k, v) in &clean_env {
+            wrapped.push(OsString::from("--setenv"));
+            wrapped.push(k.clone());
+            wrapped.push(v.clone());
+        }
+
+        wrapped.push(OsString::from("--chdir"));
+        wrapped.push(workspace.as_os_str().to_os_string());
+        wrapped.push(OsString::from("--"));
+        wrapped.extend(argv.iter().cloned());
+
+        Ok(SandboxedCommand {
+            argv: wrapped,
+            env: clean_env,
+            cwd: workspace.to_path_buf(),
+        })
+    }
+
+    pub fn wrap_with_env<K: AsRef<str>, V: AsRef<str>>(
+        &self,
+        argv: &[OsString],
+        workspace: &Path,
+        env_source: &[(K, V)],
+    ) -> Result<SandboxedCommand> {
+        let source: Vec<(&str, &str)> = env_source
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        let clean_env = build_clean_env(&self.env_pass, &source);
+        self.wrap_clean(argv, workspace, clean_env)
+    }
+
+    fn check_clean(
+        &self,
+        workspace: &Path,
+        clean_env: Vec<(OsString, OsString)>,
+    ) -> Result<Vec<String>> {
+        if !workspace.is_dir() {
+            bail!(
+                "workspace não existe ou não é diretório: {}",
+                workspace.display()
+            );
+        }
+
+        let home = clean_env
+            .iter()
+            .find(|(k, _)| k == std::ffi::OsStr::new("HOME"))
+            .map(|(_, v)| PathBuf::from(v))
+            .filter(|p| !p.as_os_str().is_empty())
+            .context("variável de ambiente HOME ausente para sandbox bwrap")?;
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let pid = std::process::id();
+        let probe_token = format!("tchelvis-bwrap-probe-{pid}-{nanos}");
+        let sentinel_secret = format!("tchelvis-sentinel-secret-{pid}-{nanos}");
+
+        let probe_in = workspace.join(format!(".tchelvis-bwrap-probe-in-{pid}-{nanos}"));
+        let probe_out = workspace.join(format!(".tchelvis-bwrap-probe-out-{pid}-{nanos}"));
+        let probe_log = workspace.join(format!(".tchelvis-bwrap-probe-log-{pid}-{nanos}"));
+
+        struct CleanupFiles(Vec<PathBuf>);
+        impl Drop for CleanupFiles {
+            fn drop(&mut self) {
+                for p in &self.0 {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+        let sentinel_dir = if home.is_dir() {
+            home.clone()
+        } else {
+            std::env::temp_dir()
+        };
+        let sentinel_path = sentinel_dir.join(format!(".tchelvis-sentinel-{pid}-{nanos}"));
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut sentinel = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&sentinel_path)
+                .context("falha ao criar arquivo sentinela fora do workspace")?;
+            sentinel.write_all(sentinel_secret.as_bytes())?;
+            sentinel.flush()?;
+        }
+        let _cleanup = CleanupFiles(vec![
+            probe_in.clone(),
+            probe_out.clone(),
+            probe_log.clone(),
+            sentinel_path.clone(),
+        ]);
+
+        fs::write(&probe_in, &probe_token)
+            .context("falha ao gravar arquivo de sonda no workspace")?;
+
+        let script = "val=$(cat \"$1\") || exit 11\n\
+             printf '%s' \"$val\" > \"$2\" || exit 12\n\
+             if cat \"$3\" 2>/dev/null; then exit 13; fi\n\
+             echo tampered >> \"$3\" 2>/dev/null || true\n\
+             printf '%s' \"$val\"\n";
+
+        let wrapped = self.wrap_clean(
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+                OsString::from("bwrap-probe"),
+                probe_in.as_os_str().to_os_string(),
+                probe_out.as_os_str().to_os_string(),
+                sentinel_path.as_os_str().to_os_string(),
+            ],
+            workspace,
+            clean_env,
+        )?;
+
+        let clock = SystemClock::new();
+        let cancel = AtomicBool::new(false);
+        let mut lines = Vec::new();
+        let outcome = run_process(
+            wrapped,
+            b"",
+            &probe_log,
+            Limits {
+                timeout: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+            &clock,
+            &cancel,
+            &mut |l| lines.push(l.to_string()),
+            &mut || false,
+        )
+        .context("falha ao executar sonda do sandbox bwrap (bubblewrap instalado e funcional?)")?;
+
+        if outcome != Outcome::Exited(0) {
+            let log_tail = fs::read_to_string(&probe_log).unwrap_or_default();
+            bail!(
+                "sonda do sandbox bwrap falhou ({outcome:?}): {}",
+                log_tail.trim()
+            );
+        }
+
+        let joined = lines.join("\n");
+        if !joined.contains(&probe_token) {
+            bail!("sonda bwrap não conseguiu ler o arquivo de entrada no workspace");
+        }
+        if joined.contains(&sentinel_secret) {
+            bail!("sonda bwrap vazou conteúdo do arquivo sentinela externo");
+        }
+        let written_out = fs::read_to_string(&probe_out)
+            .context("sonda bwrap não conseguiu gravar no workspace")?;
+        if written_out != probe_token {
+            bail!("sonda bwrap gravou conteúdo divergente no workspace");
+        }
+        let sentinel_after = fs::read_to_string(&sentinel_path)
+            .context("falha ao verificar arquivo sentinela após sonda bwrap")?;
+        if sentinel_after != sentinel_secret {
+            bail!("sonda bwrap alterou arquivo sentinela fora do workspace");
+        }
+
+        Ok(vec![
+            "rede compartilhada com o host/container".to_string(),
+            "serviços em localhost e sockets abstratos compartilhados".to_string(),
+        ])
+    }
+
+    pub fn check_with_env<K: AsRef<str>, V: AsRef<str>>(
+        &self,
+        workspace: &Path,
+        env_source: &[(K, V)],
+    ) -> Result<Vec<String>> {
+        let source: Vec<(&str, &str)> = env_source
+            .iter()
+            .map(|(k, v)| (k.as_ref(), v.as_ref()))
+            .collect();
+        let clean_env = build_clean_env(&self.env_pass, &source);
+        self.check_clean(workspace, clean_env)
+    }
+}
+
+impl Sandbox for BwrapSandbox {
+    fn kind(&self) -> &'static str {
+        "bwrap"
+    }
+
+    fn check(&self, workspace: &Path) -> Result<Vec<String>> {
+        let env_pairs = current_env_pairs();
+        let clean_env = build_clean_env(&self.env_pass, &env_pairs);
+        self.check_clean(workspace, clean_env)
+    }
+
+    fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand> {
+        let env_pairs = current_env_pairs();
+        let clean_env = build_clean_env(&self.env_pass, &env_pairs);
+        self.wrap_clean(argv, workspace, clean_env)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::loops::process::{run_process, Limits, Outcome, SystemClock};
+    use std::collections::BTreeSet;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    fn bwrap_available() -> bool {
+        Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--dev", "/dev", "--", "/bin/true"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn bwrap_argv_is_exact() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/.credentials.json"), "{}").unwrap();
+        fs::create_dir_all(home.join(".cargo")).unwrap();
+        fs::create_dir_all(home.join(".local/bin")).unwrap();
+        let versions = home.join(".local/share/claude/versions");
+        fs::create_dir_all(&versions).unwrap();
+        crate::test_support::write_executable(versions.join("1.0"), "#!/bin/sh\n");
+        std::os::unix::fs::symlink(versions.join("1.0"), home.join(".local/bin/claude")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        let path_var = format!("{}:/usr/bin:/bin", home.join(".local/bin").display());
+
+        let env_map = [
+            ("PATH", path_var.as_str()),
+            ("HOME", home.to_str().unwrap()),
+            ("LANG", "C.UTF-8"),
+            ("TERM", "xterm-256color"),
+            ("CUSTOM_KEY", "secret-val"),
+            ("IGNORED_SECRET", "must-not-leak"),
+        ];
+
+        let sb = BwrapSandbox::new(
+            vec![".cargo".into(), ".missing_ro".into()],
+            vec!["CUSTOM_KEY".into()],
+        );
+        let cmd = sb
+            .wrap_with_env(
+                &[OsString::from("claude"), OsString::from("--version")],
+                &ws,
+                &env_map,
+            )
+            .unwrap();
+
+        let expected_argv: Vec<OsString> = vec![
+            "bwrap".into(),
+            "--die-with-parent".into(),
+            "--unshare-pid".into(),
+            "--unshare-ipc".into(),
+            "--unshare-uts".into(),
+            "--new-session".into(),
+            "--ro-bind".into(),
+            "/".into(),
+            "/".into(),
+            "--dev".into(),
+            "/dev".into(),
+            "--proc".into(),
+            "/proc".into(),
+            "--tmpfs".into(),
+            "/run".into(),
+            "--tmpfs".into(),
+            "/tmp".into(),
+            "--ro-bind-try".into(),
+            "/run/systemd/resolve".into(),
+            "/run/systemd/resolve".into(),
+            "--tmpfs".into(),
+            home.as_os_str().to_os_string(),
+            "--ro-bind".into(),
+            home.join(".cargo").into_os_string(),
+            home.join(".cargo").into_os_string(),
+            "--ro-bind".into(),
+            versions.clone().into_os_string(),
+            versions.clone().into_os_string(),
+            "--ro-bind".into(),
+            versions.join("1.0").into_os_string(),
+            home.join(".local/bin/claude").into_os_string(),
+            "--ro-bind".into(),
+            home.join(".claude/.credentials.json").into_os_string(),
+            home.join(".claude/.credentials.json").into_os_string(),
+            "--bind".into(),
+            ws.as_os_str().to_os_string(),
+            ws.as_os_str().to_os_string(),
+            "--clearenv".into(),
+            "--setenv".into(),
+            "PATH".into(),
+            path_var.clone().into(),
+            "--setenv".into(),
+            "HOME".into(),
+            home.as_os_str().to_os_string(),
+            "--setenv".into(),
+            "LANG".into(),
+            "C.UTF-8".into(),
+            "--setenv".into(),
+            "TERM".into(),
+            "xterm-256color".into(),
+            "--setenv".into(),
+            "CUSTOM_KEY".into(),
+            "secret-val".into(),
+            "--chdir".into(),
+            ws.as_os_str().to_os_string(),
+            "--".into(),
+            "claude".into(),
+            "--version".into(),
+        ];
+
+        assert_eq!(cmd.argv, expected_argv);
+        assert_eq!(cmd.cwd, ws);
+    }
+
+    #[test]
+    fn environment_contains_only_allowed_names() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        let env_map = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", home.to_str().unwrap()),
+            ("LANG", "C.UTF-8"),
+            ("TERM", "xterm"),
+            ("ALLOWED_API_KEY", "abc"),
+            ("AWS_SECRET_ACCESS_KEY", "nope"),
+            ("HC_SOCKET", "/tmp/hc.sock"),
+        ];
+
+        let allowed: BTreeSet<&str> = ["PATH", "HOME", "LANG", "TERM", "ALLOWED_API_KEY"]
+            .into_iter()
+            .collect();
+
+        let inherited = InheritedSandbox::new(vec!["ALLOWED_API_KEY".into()]);
+        let cmd_inh = inherited
+            .wrap_with_env(&[OsString::from("/bin/true")], &ws, &env_map)
+            .unwrap();
+        let names_inh: BTreeSet<String> = cmd_inh
+            .env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names_inh,
+            allowed
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+
+        let bwrap = BwrapSandbox::new(vec![], vec!["ALLOWED_API_KEY".into()]);
+        let cmd_bw = bwrap
+            .wrap_with_env(&[OsString::from("/bin/true")], &ws, &env_map)
+            .unwrap();
+        let names_bw: BTreeSet<String> = cmd_bw
+            .env
+            .iter()
+            .map(|(k, _)| k.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names_bw,
+            allowed
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+    }
+
+    #[test]
+    fn bwrap_check_blocks_outside_reads_and_writes() {
+        if !bwrap_available() {
+            println!("SKIPPED: bwrap unavailable");
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        let sentinel = home.join("sentinel.secret");
+        fs::write(&sentinel, "do-not-read-me").unwrap();
+
+        let env_map = [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", home.to_str().unwrap()),
+            ("LANG", "C.UTF-8"),
+            ("TERM", "xterm"),
+        ];
+
+        let sb = BwrapSandbox::new(vec![], vec![]);
+        let exposures = sb.check_with_env(&ws, &env_map).unwrap();
+        assert!(exposures
+            .iter()
+            .any(|e| e.contains("rede") || e.contains("localhost")));
+
+        let cmd = sb
+            .wrap_with_env(
+                &[
+                    OsString::from("/bin/sh"),
+                    OsString::from("-c"),
+                    OsString::from(format!(
+                        "if cat '{}' 2>/dev/null; then echo LEAKED; fi; echo hacked > '{}' 2>/dev/null || true; echo inside > '{}/ok.txt'",
+                        sentinel.display(),
+                        sentinel.display(),
+                        ws.display()
+                    )),
+                ],
+                &ws,
+                &env_map,
+            )
+            .unwrap();
+
+        let mut lines = Vec::new();
+        let clock = SystemClock::new();
+        let cancel = AtomicBool::new(false);
+        let outcome = run_process(
+            cmd,
+            b"",
+            &tmp.path().join("bwrap.log"),
+            Limits {
+                timeout: Duration::from_secs(5),
+                stall: Duration::from_secs(5),
+            },
+            &clock,
+            &cancel,
+            &mut |l| lines.push(l.to_string()),
+            &mut || false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert!(!lines
+            .iter()
+            .any(|l| l.contains("do-not-read-me") || l.contains("LEAKED")));
+        assert_eq!(fs::read_to_string(&sentinel).unwrap(), "do-not-read-me");
+        assert_eq!(fs::read_to_string(ws.join("ok.txt")).unwrap(), "inside\n");
+    }
+
+    #[test]
+    fn inherited_requires_a_container() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("rootfs");
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        let mut sb = InheritedSandbox::new(vec![]);
+        sb.root = root.clone();
+
+        // No marker file -> must error
+        assert!(sb.check(&ws).is_err());
+
+        // Creating /.dockerenv enables inherited
+        fs::write(root.join(".dockerenv"), "").unwrap();
+        let exposures = sb.check(&ws).unwrap();
+        assert!(exposures.is_empty(), "unexpected exposures: {exposures:?}");
+
+        // Inject a shared writable mount in fake /proc/self/mountinfo -> detected as exposure
+        fs::create_dir_all(root.join("proc/self")).unwrap();
+        fs::write(
+            root.join("proc/self/mountinfo"),
+            "1229 1210 0:37 /@home/host/shared /home/user/shared rw,noatime,idmapped - btrfs /dev/nvme0n1p2 rw\n",
+        )
+        .unwrap();
+        let exposures = sb.check(&ws).unwrap();
+        assert!(
+            exposures.iter().any(|e| e.contains("/home/user/shared")),
+            "expected shared mount exposure, got: {exposures:?}"
+        );
+    }
+
+    #[test]
+    fn a_stage_sees_only_its_own_cli_and_credential_and_leaves_nothing_behind() {
+        if !bwrap_available() {
+            println!("SKIPPED: bwrap unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (home, ws) = (tmp.path().join("home"), tmp.path().join("ws"));
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::create_dir_all(home.join(".gemini/antigravity-cli")).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(home.join(".claude/.credentials.json"), "cred").unwrap();
+        fs::write(home.join(".claude/settings.json"), "original").unwrap();
+        fs::write(
+            home.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+            "outro",
+        )
+        .unwrap();
+        crate::test_support::write_executable(bin.join("hc"), "#!/bin/sh\n");
+        crate::test_support::write_executable(
+            bin.join("claude"),
+            "#!/bin/sh\ncd \"$HOME\" && find . -type f | sort\n\
+             echo hook > .claude/settings.json\necho x > .bashrc\n\
+             echo x >> .claude/.credentials.json\necho x >> .local/bin/claude\nexit 0\n",
+        );
+        let path_var = format!("{}:/usr/bin:/bin", bin.display());
+        let cmd = BwrapSandbox::new(vec![], vec![])
+            .wrap_with_env(
+                &[OsString::from("claude")],
+                &ws,
+                &[
+                    ("PATH", path_var.as_str()),
+                    ("HOME", home.to_str().unwrap()),
+                ],
+            )
+            .unwrap();
+        let mut lines = Vec::new();
+        run_process(
+            cmd,
+            b"",
+            &tmp.path().join("l.log"),
+            Limits {
+                timeout: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |l| lines.push(l.to_string()),
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            ["./.claude/.credentials.json", "./.local/bin/claude"]
+        );
+        let read = |rel: &str| fs::read_to_string(home.join(rel)).unwrap();
+        assert_eq!(read(".claude/settings.json"), "original");
+        assert_eq!(read(".claude/.credentials.json"), "cred");
+        assert!(!read(".local/bin/claude").ends_with("x\n"));
+        assert!(!home.join(".bashrc").exists());
+    }
+}
