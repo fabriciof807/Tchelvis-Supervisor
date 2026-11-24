@@ -50,6 +50,7 @@ A coordinator agent running inside a Herdr terminal can delegate work to paralle
 - Invoke **`/orchestration-tchelvis`** inside Claude Code, OpenCode, Pi, Codex, or Gemini CLI (or run `tchelvis orch skill`) to launch workers in one command (`tchelvis orch launch`), define DAG tasks, and manage recovery (`send -> retry -> stop`) in shared or isolated git worktrees (`--worktree current|new-child`).
 - `tchelvis daemon` manages `orch.db` (SQLite WAL) and wakes coordinators or workers atomically via `hc send --if idle`—including a `1500 ms` post-turn silent-stop safety net and a `3000 ms` blocked-prompt fallback that work even when the local supervisor LLM is unloaded.
 - Coordinators with active child dispatches surface as **`Waiting on children (N)`** in `tchelvis status` and the Herdr Desktop mod.
+- Step-by-step guide for newcomers, with the full command reference: [`docs/TCHELVIS-ORCH.md`](docs/TCHELVIS-ORCH.md).
 
 ---
 
@@ -283,7 +284,7 @@ tchelvis orch launch --agent "agy --model 'GPT-OSS 120B (Medium)'" --prompt "...
 
 `agy`/`antigravity` get `-i` appended when it is missing, because agy only reads the prompt through `-i`. Any other command, including a wrapper script with its own name, receives the worker prompt as its last positional argument.
 
-All mutating `tchelvis orch` subcommands also accept `--request-id <id>` (idempotency receipt) and `--json`:
+Mutating `tchelvis orch` subcommands accept `--json`; all of them except `release` also accept `--request-id <id>` (idempotency receipt):
 
 ```bash
 # Coordinator: quick one-shot launch in an isolated git worktree, then end turn
@@ -309,6 +310,8 @@ tchelvis orch ask --dispatch-id <dispatch_id> --question "Should token expiry de
 
 #### Declarative Multi-Agent Loops (`tchelvis loop`)
 
+For how loops and `orch` fit together, and troubleshooting, see [`docs/TCHELVIS-ORCH.md`](docs/TCHELVIS-ORCH.md).
+
 Run fixed, repeatable multi-agent topologies (such as `worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic`, or `fast-worker-reviewer`) in clean headless CLI sessions inside a mandatory sandbox. The caller spawns `--detach` in one Herdr terminal, ends its turn, and `tchelvis daemon` wakes the caller **once** via `orch.db` when the loop finishes (`PASS`, `ERROR`, `ESCALATE`, or `CANCELLED`).
 
 - **Built-in presets and custom workflows:** Four presets (`worker-reviewer-critic`, `designer-worker-reviewer`, `planner-worker-tester-critic`, `fast-worker-reviewer`) work even without a `.loops/` folder; `tchelvis loop init` scaffolds `~/.config/tchelvis/loops.toml` (`0600`) and `<repo>/.loops/`, and `tchelvis loop new <name> --stages ...` creates a validated workflow TOML plus any missing custom role files.
@@ -331,9 +334,9 @@ Run fixed, repeatable multi-agent topologies (such as `worker-reviewer-critic`, 
 | `tchelvis loop models set <role>=<cli[:model]> (--project\|--global)` | Update `.loops/models.toml` or `~/.config/tchelvis/loops.toml` preserving comments |
 | `tchelvis loop models confirm <workflow>` | Record confirmation for repository-sourced model choices |
 | `tchelvis loop auth` / `auth login <cli>` | Run sandboxed free CLI checks (`claude`, `agy`, `opencode`) or open login in a Herdr terminal |
-| `tchelvis loop run <workflow> [prompt \| --input-file <path>]` | Run 3-level preflight and headless stages (`[--from-head] [--max-cycles N] [--use ...] [--detach] [--verbose]`) |
+| `tchelvis loop run <workflow> [prompt \| --input-file <path>]` | Run 3-level preflight and headless stages (`[--from-head] [--max-cycles N] [--use ...] [--detach] [--verbose]`); exit `0`=PASS, `1`=ERROR, `2`=usage, `3`=ESCALATE, `4`=CANCELLED |
 | `tchelvis loop status [run_id] [--json]` | Inspect current or final run state (`PASS`/`ERROR`/`ESCALATE`/`CANCELLED`) |
-| `tchelvis loop result [run_id]` | Print the canonical 5-line run summary (exit `0`=PASS, `1`=ERROR, `2`=usage, `3`=ESCALATE, `4`=CANCELLED) |
+| `tchelvis loop result [run_id]` | Print the canonical 5-line run summary |
 | `tchelvis loop logs [run_id] [--stage <id>]` | Print sanitized per-stage logs |
 | `tchelvis loop report [run_id]` | Print sanitized `report.md` (with preflight probes, usage totals, timeline, and sandbox disclosures) |
 | `tchelvis loop stop [run_id]` | Send `SIGINT` to cancel an active loop (auto-selects when the current repo has one active loop) |
