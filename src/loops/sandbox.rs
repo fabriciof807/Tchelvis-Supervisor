@@ -438,13 +438,8 @@ impl BwrapSandbox {
         wrapped.push(workspace.as_os_str().to_os_string());
         wrapped.push(workspace.as_os_str().to_os_string());
 
-        wrapped.push(OsString::from("--clearenv"));
-        for (k, v) in &clean_env {
-            wrapped.push(OsString::from("--setenv"));
-            wrapped.push(k.clone());
-            wrapped.push(v.clone());
-        }
-
+        // The environment is already clean (`run_process` starts from an empty one) and is inherited:
+        // `--setenv` would show its values to every process that can read the command line.
         wrapped.push(OsString::from("--chdir"));
         wrapped.push(workspace.as_os_str().to_os_string());
         wrapped.push(OsString::from("--"));
@@ -733,22 +728,6 @@ mod tests {
             "--bind".into(),
             ws.as_os_str().to_os_string(),
             ws.as_os_str().to_os_string(),
-            "--clearenv".into(),
-            "--setenv".into(),
-            "PATH".into(),
-            path_var.clone().into(),
-            "--setenv".into(),
-            "HOME".into(),
-            home.as_os_str().to_os_string(),
-            "--setenv".into(),
-            "LANG".into(),
-            "C.UTF-8".into(),
-            "--setenv".into(),
-            "TERM".into(),
-            "xterm-256color".into(),
-            "--setenv".into(),
-            "CUSTOM_KEY".into(),
-            "secret-val".into(),
             "--chdir".into(),
             ws.as_os_str().to_os_string(),
             "--".into(),
@@ -758,6 +737,19 @@ mod tests {
 
         assert_eq!(cmd.argv, expected_argv);
         assert_eq!(cmd.cwd, ws);
+        let expected_env = [
+            ("PATH", path_var.as_str()),
+            ("HOME", home.to_str().unwrap()),
+            ("LANG", "C.UTF-8"),
+            ("TERM", "xterm-256color"),
+            ("CUSTOM_KEY", "secret-val"),
+        ]
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)));
+        assert_eq!(cmd.env, expected_env);
+        assert!(!cmd
+            .argv
+            .iter()
+            .any(|a| a.to_string_lossy().contains("secret-val")));
     }
 
     #[test]
