@@ -127,7 +127,7 @@ nosso link.
 ## Limites conhecidos
 
 - O `PASS` é a opinião do revisor; o comando de verificação só é garantido com os `checks` da fase B.
-- O loop só usa `claude`, `agy` e `opencode`.
+- O loop só usa `claude`, `agy`, `opencode` e `pi` (este a partir da spec `2026-11-24-loop-phase-b-pi-adapter-design.md`).
 - O worktree e os registros das execuções em `.loops/runs` dele somem juntos.
 
 ## Validação
