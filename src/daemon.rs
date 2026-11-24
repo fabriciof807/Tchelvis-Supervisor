@@ -531,6 +531,16 @@ pub async fn run_daemon(
             }
             Some(()) = orch_wake_rx.recv() => {
                 let ts_ms = chrono::Utc::now().timestamp_millis();
+                if herdr_connected {
+                    if let Err(err) = crate::loops::watch::watch_loops(
+                        &orch_store,
+                        &tracker,
+                        &crate::loops::watch::LinuxProcTable,
+                        ts_ms,
+                    ) {
+                        tracing::warn!("loop watch failed (wake): {err:#}");
+                    }
+                }
                 let (reconcile_outcome, schedule_outcome) = run_orch_cycle(
                     &orch_store,
                     &herdr,
@@ -714,6 +724,14 @@ pub async fn run_daemon(
                     Ok(terms) => {
                         herdr_connected = true;
                         tracker.apply_snapshot(terms, ts_ms);
+                        if let Err(err) = crate::loops::watch::watch_loops(
+                            &orch_store,
+                            &tracker,
+                            &crate::loops::watch::LinuxProcTable,
+                            ts_ms,
+                        ) {
+                            tracing::warn!("loop watch failed (reconcile): {err:#}");
+                        }
                         let _ = run_orch_cycle(
                             &orch_store,
                             &herdr,
@@ -1468,5 +1486,99 @@ mod tests {
         // Verify process is reaped (kill(pid, 0) fails with ESRCH).
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         assert_eq!(rc, -1);
+    }
+
+    #[tokio::test]
+    async fn test_watch_loops_before_orch_cycle_blocks_reused_caller_and_catches_dead_engine() {
+        let tmp = tempfile::tempdir().unwrap();
+        let orch_store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+        let herdr = HerdrClient::new("/nonexistent-hc");
+        let mut delivery_scheduler = DeliveryScheduler::new(herdr.clone());
+        let mut tracker = FleetTracker::new();
+
+        // t1 was reused (created_ms changed from 1_000 to 9_000).
+        tracker.apply_snapshot(
+            vec![crate::herdr::HcTerminal {
+                address: "t1".to_string(),
+                state: "running".to_string(),
+                created_ms: Some(9_000),
+                status: Some(crate::herdr::HcStatus {
+                    state: "idle".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            10_000,
+        );
+
+        let dead_dir = tmp.path().join("dead-loop");
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        let st = crate::loops::state::RunState {
+            schema_version: crate::loops::state::LOOP_STATE_SCHEMA_VERSION,
+            run_id: "loop-dead".to_string(),
+            workflow: "worker-reviewer-critic".to_string(),
+            status: crate::loops::state::RunStatus::Running,
+            reason: None,
+            sandbox: "bwrap".to_string(),
+            sandbox_exposures: vec![],
+            preflight: vec![],
+            current_cycle: 1,
+            max_cycles: 3,
+            branch: None,
+            base_commit: None,
+            engine_pid: Some(u32::MAX),
+            engine_start_ticks: Some(123),
+            caller: Some(crate::loops::state::CallerInfo {
+                terminal: "t1".to_string(),
+                created_ms: 1_000,
+            }),
+            heartbeat_at_ms: 1_000,
+            last_activity_at_ms: 1_000,
+            started_at_ms: 1_000,
+            finished_at_ms: None,
+            executions: vec![],
+            files: vec![],
+            summary: String::new(),
+        };
+        crate::loops::state::save_state(&dead_dir, &st).unwrap();
+        orch_store
+            .register_loop(&crate::orch::store::LoopRunRecord {
+                run_id: "loop-dead".to_string(),
+                dir: dead_dir.display().to_string(),
+                workflow: "worker-reviewer-critic".to_string(),
+                status: "RUNNING".to_string(),
+                caller_terminal: Some("t1".to_string()),
+                caller_created_ms: Some(1_000),
+                engine_pid: Some(u32::MAX),
+                engine_start_ticks: Some(123),
+                orch_run_id: None,
+                notify_state: "pending".to_string(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+
+        let updates = crate::loops::watch::watch_loops(
+            &orch_store,
+            &tracker,
+            &crate::loops::watch::LinuxProcTable,
+            10_000,
+        )
+        .unwrap();
+        assert!(updates >= 1);
+
+        let (_reconcile, schedule) = run_orch_cycle(
+            &orch_store,
+            &herdr,
+            &mut delivery_scheduler,
+            &tracker,
+            10_000,
+            "reconcile",
+        )
+        .await;
+        assert_eq!(schedule.spawned_count, 0);
+        let rec = orch_store.get_loop("loop-dead").unwrap().unwrap();
+        assert_eq!(rec.status, "ERROR");
+        assert_eq!(rec.notify_state, "undelivered");
     }
 }

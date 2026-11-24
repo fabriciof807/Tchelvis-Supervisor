@@ -147,6 +147,66 @@ pub struct Workflow {
     pub stages: Vec<Stage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedStage {
+    pub id: String,
+    pub role: String,
+    pub provider: Option<Provider>,
+    pub model: Option<String>,
+    pub reads: Vec<String>,
+    pub writes: Option<String>,
+    pub edits: bool,
+    pub next: Option<String>,
+    pub verdict_gate: bool,
+    pub on_pass: Option<String>,
+    pub on_retry: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnresolvedWorkflow {
+    pub name: String,
+    pub description: String,
+    pub max_cycles: u32,
+    pub stage_timeout_secs: u64,
+    pub stall_secs: u64,
+    pub max_duration_secs: u64,
+    pub stages: Vec<UnresolvedStage>,
+}
+
+pub(crate) fn line_at(raw: &str, offset: usize) -> usize {
+    let end = offset.min(raw.len());
+    raw.as_bytes()[..end]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+/// Formats a TOML parse error using only line number and reason, never raw source text.
+pub(crate) fn toml_error_reason(raw: &str, err: &toml::de::Error) -> String {
+    let line = err
+        .span()
+        .map(|span| format!("linha {}: ", line_at(raw, span.start)))
+        .unwrap_or_default();
+    format!("{line}{}", err.message())
+}
+
+/// A model name is an argument of a CLI: it must not look like an option nor hide characters.
+/// Inner spaces are valid (`GPT-OSS 120B (Medium)`).
+pub(crate) fn validate_model_name(model: &str) -> Result<(), String> {
+    if model.trim().is_empty() {
+        return Err("'model' não pode ser vazio".to_string());
+    }
+    if model.len() > 200
+        || model.starts_with('-')
+        || model.trim() != model
+        || model.chars().any(char::is_control)
+    {
+        return Err(format!("'model' inválido: {model:?}"));
+    }
+    Ok(())
+}
+
 fn is_valid_stage_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 32
@@ -237,10 +297,51 @@ fn read_positive_u64(
     }
 }
 
+pub fn parse_workflow_unresolved(raw: &str) -> Result<UnresolvedWorkflow, Vec<String>> {
+    parse_workflow_inner(raw, None)
+}
+
 pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Vec<String>> {
+    let unresolved = parse_workflow_inner(raw, Some(defaults))?;
+    Ok(Workflow {
+        name: unresolved.name,
+        description: unresolved.description,
+        max_cycles: unresolved.max_cycles,
+        stage_timeout_secs: unresolved.stage_timeout_secs,
+        stall_secs: unresolved.stall_secs,
+        max_duration_secs: unresolved.max_duration_secs,
+        stages: unresolved
+            .stages
+            .into_iter()
+            .map(|s| Stage {
+                id: s.id,
+                role: s.role,
+                provider: s.provider.expect("parse_workflow_inner resolved provider"),
+                model: s.model,
+                reads: s.reads,
+                writes: s.writes,
+                edits: s.edits,
+                next: s.next,
+                verdict_gate: s.verdict_gate,
+                on_pass: s.on_pass,
+                on_retry: s.on_retry,
+            })
+            .collect(),
+    })
+}
+
+fn parse_workflow_inner(
+    raw: &str,
+    defaults: Option<&RoleDefaults>,
+) -> Result<UnresolvedWorkflow, Vec<String>> {
     let root: toml::Value = match toml::from_str(raw) {
         Ok(v) => v,
-        Err(e) => return Err(vec![format!("TOML inválido no workflow: {e}")]),
+        Err(e) => {
+            return Err(vec![format!(
+                "TOML inválido no workflow ({})",
+                toml_error_reason(raw, &e)
+            )])
+        }
     };
 
     let Some(table) = root.as_table() else {
@@ -338,7 +439,7 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
     };
 
     struct ParsedStageMeta {
-        stage: Stage,
+        stage: UnresolvedStage,
         valid_id: bool,
         valid_reads: Vec<String>,
     }
@@ -399,11 +500,12 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
             }
         };
 
+        let mut model_invalid_or_missing_provider = false;
         let stage_model = match st.get("model") {
             None => None,
             Some(toml::Value::String(s)) => {
-                if s.trim().is_empty() {
-                    errors.push(format!("etapa '{label}': 'model' não pode ser vazio"));
+                if let Err(e) = validate_model_name(s) {
+                    errors.push(format!("etapa '{label}': {e}"));
                     None
                 } else {
                     Some(s.clone())
@@ -413,32 +515,40 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
                 errors.push(format!(
                     "etapa '{label}': campo 'model' deve ser uma string"
                 ));
+                model_invalid_or_missing_provider = true;
                 None
             }
         };
 
         let (provider, model) = match st.get("provider") {
             Some(toml::Value::String(s)) => match Provider::from_str(s) {
-                Ok(p) => (p, stage_model),
+                Ok(p) => (Some(p), stage_model),
                 Err(msg) => {
                     errors.push(format!("etapa '{label}': {msg}"));
-                    (Provider::Claude, stage_model)
+                    (Some(Provider::Claude), stage_model)
                 }
             },
             Some(_) => {
                 errors.push(format!(
                     "etapa '{label}': campo 'provider' deve ser uma string"
                 ));
-                (Provider::Claude, stage_model)
+                (Some(Provider::Claude), stage_model)
             }
             None => {
-                if let Some(def) = defaults.get(&role) {
-                    (def.provider, stage_model.or_else(|| def.model.clone()))
+                if stage_model.is_some() && !model_invalid_or_missing_provider {
+                    errors.push(format!("etapa '{label}': 'model' informado sem 'provider'"));
+                    (Some(Provider::Claude), stage_model)
+                } else if let Some(defs) = defaults {
+                    if let Some(def) = defs.get(&role) {
+                        (Some(def.provider), def.model.clone())
+                    } else {
+                        errors.push(format!(
+                            "etapa '{label}': provider ausente e sem padrão em [defaults.{role}] para o role '{role}'"
+                        ));
+                        (Some(Provider::Claude), None)
+                    }
                 } else {
-                    errors.push(format!(
-                        "etapa '{label}': provider ausente e sem padrão em [defaults.{role}] para o role '{role}'"
-                    ));
-                    (Provider::Claude, stage_model)
+                    (None, None)
                 }
             }
         };
@@ -556,7 +666,7 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
         }
 
         parsed_stages.push(ParsedStageMeta {
-            stage: Stage {
+            stage: UnresolvedStage {
                 id: raw_id,
                 role,
                 provider,
@@ -622,7 +732,7 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
     }
 
     if !parsed_stages.is_empty() && !valid_stage_ids.is_empty() {
-        let mut stage_by_id: BTreeMap<&str, &Stage> = BTreeMap::new();
+        let mut stage_by_id: BTreeMap<&str, &UnresolvedStage> = BTreeMap::new();
         for meta in &parsed_stages {
             if meta.valid_id {
                 stage_by_id.insert(meta.stage.id.as_str(), &meta.stage);
@@ -759,7 +869,7 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
     }
 
     if errors.is_empty() {
-        Ok(Workflow {
+        Ok(UnresolvedWorkflow {
             name,
             description,
             max_cycles,
@@ -1482,5 +1592,43 @@ on_retry = "a"
             let key = limit.split(' ').next().unwrap();
             assert!(errors(&raw).contains(key), "{limit}");
         }
+    }
+
+    #[test]
+    fn model_without_provider_is_rejected_and_unresolved_keeps_missing_provider() {
+        let missing_provider_for_model = r#"
+name = "w"
+[[stages]]
+id = "a"
+role = "worker"
+model = "claude-sonnet-4"
+edits = true
+next = "b"
+[[stages]]
+id = "b"
+role = "critic"
+provider = "claude"
+writes = "critic.md"
+verdict_gate = true
+on_pass = "done"
+on_retry = "a"
+"#;
+        let errs = parse_workflow_unresolved(missing_provider_for_model).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("model") && e.contains("provider")),
+            "expected error about model without provider, got: {errs:?}"
+        );
+        let errs2 = parse_workflow(missing_provider_for_model, &full_defaults()).unwrap_err();
+        assert!(
+            errs2
+                .iter()
+                .any(|e| e.contains("model") && e.contains("provider")),
+            "expected parse_workflow error about model without provider, got: {errs2:?}"
+        );
+
+        let preset = PRESET_WORKFLOWS[0].1;
+        let unresolved = parse_workflow_unresolved(preset).expect("preset parses unresolved");
+        assert!(unresolved.stages.iter().all(|s| s.provider.is_none()));
     }
 }

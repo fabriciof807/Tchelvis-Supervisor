@@ -1,5 +1,5 @@
 use crate::loops::workflow::RoleDefaults;
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -127,7 +127,12 @@ fn validate_home_relative_path(entry: &str, field: &str) -> Result<()> {
 }
 
 pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
-    let parsed: RawLoopsConfig = toml::from_str(raw).context("configuração loops.toml inválida")?;
+    let parsed: RawLoopsConfig = toml::from_str(raw).map_err(|e| {
+        anyhow::anyhow!(
+            "configuração loops.toml inválida ({})",
+            crate::loops::workflow::toml_error_reason(raw, &e)
+        )
+    })?;
 
     if parsed.max_concurrent == 0 {
         bail!("'max_concurrent' deve ser maior que zero");
@@ -149,9 +154,8 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
             bail!("nome de role inválido em [defaults.{role}]");
         }
         if let Some(model) = &def.model {
-            if model.trim().is_empty() {
-                bail!("'model' em [defaults.{role}] não pode ser vazio");
-            }
+            crate::loops::workflow::validate_model_name(model)
+                .map_err(|e| anyhow::anyhow!("[defaults.{role}]: {e}"))?;
         }
     }
 
@@ -353,5 +357,15 @@ home_ro = ["{bad_path}"]
         }
         let inherited = parse_loops_config("[sandbox]\nkind = \"inherited\"").unwrap();
         assert_eq!(inherited.sandbox, SandboxConfig::Inherited);
+    }
+
+    #[test]
+    fn defaults_model_without_provider_is_rejected() {
+        let raw = r#"
+[defaults.worker]
+model = "claude-sonnet-4"
+"#;
+        let err = parse_loops_config(raw).unwrap_err();
+        assert!(err.to_string().contains("provider"), "got: {err}");
     }
 }

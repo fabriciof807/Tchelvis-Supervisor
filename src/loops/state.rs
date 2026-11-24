@@ -1,3 +1,5 @@
+use crate::loops::models::ModelSource;
+use crate::loops::preflight::ProbeRecord;
 use crate::loops::verdict::{Verdict, MAX_SUMMARY_CHARS};
 use crate::loops::workflow::Provider;
 use crate::model::sanitize_terminal_text;
@@ -134,6 +136,8 @@ pub struct Execution {
     pub role: String,
     pub provider: Provider,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<ModelSource>,
     pub started_at_ms: i64,
     pub finished_at_ms: Option<i64>,
     pub duration_ms: u64,
@@ -157,6 +161,8 @@ pub struct RunState {
     pub sandbox: String,
     #[serde(default)]
     pub sandbox_exposures: Vec<String>,
+    #[serde(default)]
+    pub preflight: Vec<ProbeRecord>,
     pub current_cycle: u32,
     pub max_cycles: u32,
     #[serde(default)]
@@ -353,6 +359,7 @@ mod tests {
             reason: Some("motivo de teste".to_string()),
             sandbox: "bwrap".to_string(),
             sandbox_exposures: vec![],
+            preflight: vec![],
             current_cycle: 2,
             max_cycles: 3,
             branch: Some("loop/worker-reviewer-critic-20261123-182500-a1b2".to_string()),
@@ -430,6 +437,7 @@ mod tests {
                 role: "worker".into(),
                 provider: Provider::Opencode,
                 model: None,
+                model_source: None,
                 started_at_ms: 1,
                 finished_at_ms: Some(2),
                 duration_ms: 1,
@@ -451,6 +459,7 @@ mod tests {
                 role: "reviewer".into(),
                 provider: Provider::Agy,
                 model: None,
+                model_source: None,
                 started_at_ms: 2,
                 finished_at_ms: Some(3),
                 duration_ms: 1,
@@ -517,5 +526,80 @@ mod tests {
         std::fs::write(dir.path().join("state.json"), r#"{"schema_version": 0}"#).unwrap();
         let err = load_state(dir.path()).unwrap_err();
         assert!(err.to_string().contains("schema_version"), "got: {err}");
+    }
+
+    #[test]
+    fn old_state_json_without_model_source_or_preflight_loads_and_new_fields_round_trip() {
+        let legacy_json = r#"{
+  "schema_version": 1,
+  "run_id": "20261123-182500-a1b2",
+  "workflow": "worker-reviewer-critic",
+  "status": "PASS",
+  "sandbox": "bwrap",
+  "current_cycle": 1,
+  "max_cycles": 3,
+  "heartbeat_at_ms": 2000,
+  "last_activity_at_ms": 2000,
+  "started_at_ms": 1000,
+  "executions": [
+    {
+      "cycle": 1,
+      "stage_id": "implement",
+      "role": "worker",
+      "provider": "claude",
+      "model": null,
+      "started_at_ms": 1000,
+      "finished_at_ms": 1500,
+      "duration_ms": 500,
+      "usage": {
+        "turns": 1,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "cache_read_tokens": 0,
+        "cost_usd": 0.01
+      },
+      "verdict": null,
+      "outcome": "OK"
+    }
+  ]
+}"#;
+        let legacy =
+            parse_state(legacy_json).expect("legacy JSON without model_source/preflight must load");
+        assert!(legacy.preflight.is_empty());
+        assert_eq!(legacy.executions[0].model_source, None);
+
+        let mut modern = sample_state(RunStatus::Pass);
+        modern.preflight.push(ProbeRecord {
+            provider: Provider::Claude,
+            model: Some("haiku".to_string()),
+            usage: Usage {
+                turns: Some(1),
+                input_tokens: Some(3500),
+                output_tokens: Some(10),
+                cache_read_tokens: Some(0),
+                cost_usd: Some(0.0006),
+            },
+            duration_ms: 2400,
+        });
+        modern.executions.push(Execution {
+            cycle: 1,
+            stage_id: "implement".into(),
+            role: "worker".into(),
+            provider: Provider::Claude,
+            model: Some("haiku".into()),
+            model_source: Some(ModelSource::ProjectStage),
+            started_at_ms: 1000,
+            finished_at_ms: Some(2000),
+            duration_ms: 1000,
+            usage: Usage::default(),
+            verdict: None,
+            outcome: "OK".into(),
+            error: None,
+            log_file: None,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        save_state(dir.path(), &modern).unwrap();
+        let reloaded = load_state(dir.path()).unwrap();
+        assert_eq!(reloaded, modern);
     }
 }

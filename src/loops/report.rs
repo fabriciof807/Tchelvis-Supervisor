@@ -233,6 +233,58 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
         .unwrap_or_else(|| "N/A".to_string());
     let _ = writeln!(out, "- **Custo estimado:** {cost_str}");
 
+    if !state.preflight.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n### Pré-teste de modelos (fora dos totais do loop)\n"
+        );
+        let _ = writeln!(
+            out,
+            "| Provider | Modelo | Turnos | Tokens (In / Out / Cache) | Custo | Duração |"
+        );
+        let _ = writeln!(out, "|---|---|---|---|---|---|");
+        for probe in &state.preflight {
+            let model = probe
+                .model
+                .as_deref()
+                .map(|m| escape_table_cell(&sanitize_line(m, None)))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            let turns = probe
+                .usage
+                .turns
+                .map(|t| t.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+            let tok_in = probe
+                .usage
+                .input_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+            let tok_out = probe
+                .usage
+                .output_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+            let tok_cache = probe
+                .usage
+                .cache_read_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "N/A".to_string());
+            let cost = probe
+                .usage
+                .cost_usd
+                .filter(|c| c.is_finite())
+                .map(|c| format!("${c:.4}"))
+                .unwrap_or_else(|| "N/A".to_string());
+            let dur = format_duration_ms(probe.duration_ms);
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} / {} / {} | {} | {} |",
+                probe.provider, model, turns, tok_in, tok_out, tok_cache, cost, dur
+            );
+        }
+    }
+
     let _ = writeln!(out, "\n## Arquivos alterados\n");
     if state.files.is_empty() {
         let _ = writeln!(out, "(nenhum)");
@@ -251,9 +303,9 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
     } else {
         let _ = writeln!(
             out,
-            "| Ciclo | Estágio | Role | Provider | Modelo | Turnos | Tokens (In / Out / Cache) | Custo | Duração | Resultado |"
+            "| Ciclo | Estágio | Role | Provider | Modelo | Origem | Turnos | Tokens (In / Out / Cache) | Custo | Duração | Resultado |"
         );
-        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|");
+        let _ = writeln!(out, "|---|---|---|---|---|---|---|---|---|---|---|");
         for exec in &state.executions {
             let stage_id = escape_table_cell(&sanitize_line(&exec.stage_id, None));
             let role = escape_table_cell(&sanitize_line(&exec.role, None));
@@ -262,6 +314,10 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
                 .as_deref()
                 .map(|m| escape_table_cell(&sanitize_line(m, None)))
                 .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "-".to_string());
+            let source = exec
+                .model_source
+                .map(|s| escape_table_cell(&sanitize_line(s.as_str(), None)))
                 .unwrap_or_else(|| "-".to_string());
             let turns = exec
                 .usage
@@ -304,12 +360,13 @@ pub fn render_report(state: &RunState, dir: &Path) -> String {
             }
             let _ = writeln!(
                 out,
-                "| {} | `{}` | {} | {} | {} | {} | {} / {} / {} | {} | {} | {} |",
+                "| {} | `{}` | {} | {} | {} | {} | {} | {} / {} / {} | {} | {} | {} |",
                 exec.cycle,
                 stage_id,
                 role,
                 exec.provider,
                 model,
+                source,
                 turns,
                 tok_in,
                 tok_out,
@@ -375,6 +432,7 @@ mod tests {
                 "rede compartilhada com o host/container".to_string(),
                 "serviços em localhost e sockets abstratos compartilhados".to_string(),
             ],
+            preflight: vec![],
             current_cycle: 2,
             max_cycles: 3,
             branch: Some("loop/worker-reviewer-critic-20261123-182500-a1b2".to_string()),
@@ -396,6 +454,7 @@ mod tests {
                     role: "worker".to_string(),
                     provider: Provider::Opencode,
                     model: Some("zai/glm-5.3-flash".to_string()),
+                    model_source: Some(crate::loops::models::ModelSource::ProjectStage),
                     started_at_ms: 1000,
                     finished_at_ms: Some(5000),
                     duration_ms: 4000,
@@ -417,6 +476,7 @@ mod tests {
                     role: "critic".to_string(),
                     provider: Provider::Claude,
                     model: None,
+                    model_source: None,
                     started_at_ms: 5000,
                     finished_at_ms: Some(10000),
                     duration_ms: 5000,
@@ -438,6 +498,7 @@ mod tests {
                     role: "critic".to_string(),
                     provider: Provider::Claude,
                     model: None,
+                    model_source: None,
                     started_at_ms: 10000,
                     finished_at_ms: Some(15000),
                     duration_ms: 5000,
@@ -470,6 +531,7 @@ mod tests {
         assert!(md.contains("implement"));
         assert!(md.contains("audit"));
         assert!(md.contains("RETRY"));
+        assert!(md.contains("projeto (.loops/models.toml etapa)"));
         // Partial totals
         assert!(md.contains("≥ 18.920"));
         assert!(md.contains("≥ 1.200"));
@@ -480,6 +542,75 @@ mod tests {
         assert!(!md.contains('\x1b'));
         assert!(md.contains("[REDACTED]"));
         assert!(md.contains("src/a.rs"));
+    }
+
+    #[test]
+    fn report_renders_preflight_and_model_source_apart_from_loop_totals() {
+        let tmp = TempDir::new().unwrap();
+        let state = RunState {
+            schema_version: LOOP_STATE_SCHEMA_VERSION,
+            run_id: "20261123-182500-a1b2".to_string(),
+            workflow: "fast-worker-reviewer".to_string(),
+            status: RunStatus::Pass,
+            reason: None,
+            sandbox: "bwrap".to_string(),
+            sandbox_exposures: vec![],
+            preflight: vec![crate::loops::preflight::ProbeRecord {
+                provider: Provider::Claude,
+                model: Some("haiku".to_string()),
+                usage: Usage {
+                    turns: Some(1),
+                    input_tokens: Some(9_000),
+                    output_tokens: Some(50),
+                    cache_read_tokens: Some(0),
+                    cost_usd: Some(0.5000),
+                },
+                duration_ms: 2500,
+            }],
+            current_cycle: 1,
+            max_cycles: 3,
+            branch: Some("loop/fast-worker-reviewer-20261123-182500-a1b2".to_string()),
+            base_commit: Some("deadbeef".to_string()),
+            engine_pid: None,
+            engine_start_ticks: None,
+            caller: None,
+            heartbeat_at_ms: 2000,
+            last_activity_at_ms: 2000,
+            started_at_ms: 1000,
+            finished_at_ms: Some(3000),
+            executions: vec![Execution {
+                cycle: 1,
+                stage_id: "implement".to_string(),
+                role: "worker".to_string(),
+                provider: Provider::Claude,
+                model: Some("haiku".to_string()),
+                model_source: Some(crate::loops::models::ModelSource::RunFlag),
+                started_at_ms: 1000,
+                finished_at_ms: Some(3000),
+                duration_ms: 2000,
+                usage: Usage {
+                    turns: Some(2),
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cache_read_tokens: Some(0),
+                    cost_usd: Some(0.0100),
+                },
+                verdict: Some(Verdict::Pass),
+                outcome: "PASS".to_string(),
+                error: None,
+                log_file: None,
+            }],
+            files: vec![],
+            summary: "ok".to_string(),
+        };
+
+        let md = render_report(&state, tmp.path());
+        assert!(md.contains("Pré-teste de modelos"));
+        assert!(md.contains("$0.5000"));
+        assert!(md.contains("- **Turnos:** 2\n"));
+        assert!(md.contains("- **Tokens de entrada:** 100\n"));
+        assert!(md.contains("- **Custo estimado:** $0.0100\n"));
+        assert!(md.contains("| --use |"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 use crate::logging::redact_secrets;
 use crate::loops::adapters::{build_prompt, command as adapter_command, EventParser};
 use crate::loops::artifacts::{collect_output, prepare_exchange};
+use crate::loops::models::ModelSource;
+use crate::loops::preflight::ProbeRecord;
 use crate::loops::process::{run_process, Clock, Limits, Outcome};
 use crate::loops::report::render_report;
 use crate::loops::sandbox::Sandbox;
@@ -322,6 +324,8 @@ pub struct Engine<W: Workspace, R: StageRunner, C: Clock> {
     workspace: W,
     runner: R,
     clock: C,
+    model_sources: BTreeMap<String, ModelSource>,
+    preflight: Vec<ProbeRecord>,
 }
 
 fn sanitize_text(raw: &str, max_chars: Option<usize>) -> String {
@@ -395,7 +399,19 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             workspace,
             runner,
             clock,
+            model_sources: BTreeMap::new(),
+            preflight: Vec::new(),
         }
+    }
+
+    pub fn with_model_sources(mut self, model_sources: BTreeMap<String, ModelSource>) -> Self {
+        self.model_sources = model_sources;
+        self
+    }
+
+    pub fn with_preflight(mut self, preflight: Vec<ProbeRecord>) -> Self {
+        self.preflight = preflight;
+        self
     }
 
     pub fn run(mut self) -> RunState {
@@ -411,6 +427,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             reason: None,
             sandbox: self.config.sandbox_kind.clone(),
             sandbox_exposures: self.config.sandbox_exposures.clone(),
+            preflight: self.preflight.clone(),
             current_cycle: 1,
             max_cycles: self.config.workflow.max_cycles,
             branch: None,
@@ -728,6 +745,8 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                     }
                 }
 
+                let model_source = self.model_sources.get(&stage.id).copied();
+
                 if let Some(err) = write_error() {
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                     guard.state.executions.push(Execution {
@@ -736,6 +755,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         role: stage.role.clone(),
                         provider: stage.provider,
                         model: stage.model.clone(),
+                        model_source,
                         started_at_ms: stage_started_now,
                         finished_at_ms: Some(stage_finished_now),
                         duration_ms: stage_duration_ms,
@@ -759,6 +779,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         role: stage.role.clone(),
                         provider: stage.provider,
                         model: stage.model.clone(),
+                        model_source,
                         started_at_ms: stage_started_now,
                         finished_at_ms: Some(stage_finished_now),
                         duration_ms: stage_duration_ms,
@@ -2265,5 +2286,57 @@ on_retry = "implement"
                 panic!("background process {pid} survived engine exit");
             }
         }
+    }
+
+    #[test]
+    fn engine_persists_model_sources_and_preflight_in_state_and_report() {
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let mut runner = ScriptedRunner::new();
+        runner.push(|_req| StageResult::default());
+        runner.push(|req| {
+            write_out(req.workspace, "review.md", "ok\n");
+            StageResult::default()
+        });
+        runner.push(|req| {
+            write_out(req.workspace, "critic.md", "aprovado\nVERDICT: PASS\n");
+            StageResult::default()
+        });
+
+        let mut sources = BTreeMap::new();
+        sources.insert("implement".to_string(), ModelSource::RunFlag);
+        sources.insert("audit".to_string(), ModelSource::ProjectStage);
+
+        let probes = vec![ProbeRecord {
+            provider: crate::loops::workflow::Provider::Claude,
+            model: Some("haiku".to_string()),
+            usage: Usage {
+                turns: Some(1),
+                input_tokens: Some(400),
+                output_tokens: Some(20),
+                cache_read_tokens: Some(0),
+                cost_usd: Some(0.002),
+            },
+            duration_ms: 1200,
+        }];
+
+        let cfg = make_config(&tmp, wrc_workflow(3));
+        let state = Engine::new(cfg, ws, runner, FakeClock::new())
+            .with_model_sources(sources)
+            .with_preflight(probes.clone())
+            .run();
+
+        assert_eq!(state.status, RunStatus::Pass);
+        assert_eq!(state.preflight, probes);
+        assert_eq!(state.executions[0].model_source, Some(ModelSource::RunFlag));
+        assert_eq!(state.executions[1].model_source, None);
+        assert_eq!(
+            state.executions[2].model_source,
+            Some(ModelSource::ProjectStage)
+        );
+        let report = fs::read_to_string(tmp.path().join("run/report.md")).unwrap();
+        assert!(report.contains("Pré-teste de modelos"));
+        assert!(report.contains("--use"));
+        assert!(report.contains("projeto (.loops/models.toml etapa)"));
     }
 }

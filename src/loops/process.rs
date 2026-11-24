@@ -3,11 +3,11 @@ use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -21,31 +21,168 @@ const TREE_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to read what is left in the pipes after the stage ended.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-static ACTIVE_STAGE_PIDS: OnceLock<Mutex<HashSet<i32>>> = OnceLock::new();
+static NEXT_STAGE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn active_stage_pids() -> &'static Mutex<HashSet<i32>> {
-    ACTIVE_STAGE_PIDS.get_or_init(|| Mutex::new(HashSet::new()))
+struct ActiveStageEntry {
+    root_pid: Option<(i32, Option<u64>)>,
+    cwd: PathBuf,
+    marker_inode: u64,
+    owned_pids: HashMap<i32, u64>,
 }
 
-struct ActiveStageGuard(i32);
+static ACTIVE_STAGES: OnceLock<Mutex<HashMap<u64, ActiveStageEntry>>> = OnceLock::new();
+
+fn active_stages() -> &'static Mutex<HashMap<u64, ActiveStageEntry>> {
+    ACTIVE_STAGES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct ActiveStageGuard {
+    id: u64,
+}
 
 impl ActiveStageGuard {
-    fn register(pid: i32) -> Self {
-        let mut set = active_stage_pids()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set.insert(pid);
-        Self(pid)
+    fn register_pending(cwd: &Path, marker_inode: u64) -> Self {
+        let id = NEXT_STAGE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        let mut map = active_stages().lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(
+            id,
+            ActiveStageEntry {
+                root_pid: None,
+                cwd: cwd.to_path_buf(),
+                marker_inode,
+                owned_pids: HashMap::new(),
+            },
+        );
+        Self { id }
+    }
+
+    fn set_root(&self, root_pid: i32, root_start_ticks: Option<u64>) {
+        let mut map = active_stages().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&self.id) {
+            entry.root_pid = Some((root_pid, root_start_ticks));
+        }
+    }
+
+    fn update_owned(&self, owned: &HashMap<i32, u64>) {
+        let mut map = active_stages().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = map.get_mut(&self.id) {
+            entry.owned_pids = owned.clone();
+        }
     }
 }
 
 impl Drop for ActiveStageGuard {
     fn drop(&mut self) {
-        let mut set = active_stage_pids()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        set.remove(&self.0);
+        let mut map = active_stages().lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&self.id);
     }
+}
+
+struct StageMarker {
+    stage_id: u64,
+    expected_write_fd: RawFd,
+    inode: u64,
+}
+
+struct OtherStagesSnapshot {
+    count: usize,
+    roots: Vec<(i32, Option<u64>)>,
+    owned_pids: HashMap<i32, u64>,
+    marker_inodes: Vec<u64>,
+    shares_cwd: bool,
+}
+
+fn snapshot_other_stages(self_id: Option<u64>, cwd: &Path) -> OtherStagesSnapshot {
+    let map = active_stages().lock().unwrap_or_else(|e| e.into_inner());
+    let mut snap = OtherStagesSnapshot {
+        count: 0,
+        roots: Vec::new(),
+        owned_pids: HashMap::new(),
+        marker_inodes: Vec::new(),
+        shares_cwd: false,
+    };
+    for (&id, entry) in map.iter() {
+        if Some(id) == self_id {
+            continue;
+        }
+        snap.count += 1;
+        if let Some(root) = entry.root_pid {
+            snap.roots.push(root);
+        }
+        for (&pid, &ticks) in &entry.owned_pids {
+            snap.owned_pids.insert(pid, ticks);
+        }
+        snap.marker_inodes.push(entry.marker_inode);
+        if entry.cwd == cwd {
+            snap.shares_cwd = true;
+        }
+    }
+    snap
+}
+
+fn create_stage_marker() -> Result<(OwnedFd, OwnedFd, u64)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: fds points to a 2-element c_int array; O_CLOEXEC avoids fd leaks across exec.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("pipe2 falhou ao criar marcador de processo");
+    }
+    // SAFETY: pipe2 succeeded and returned two newly opened file descriptors.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: write end of the same pipe.
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: read_fd is a valid open file descriptor.
+    if unsafe { libc::fstat(read_fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("fstat falhou no marcador de processo");
+    }
+    Ok((read_fd, write_fd, st.st_ino as u64))
+}
+
+fn pid_has_pipe_inode(pid: i32, expected_fd: RawFd, inode: u64) -> bool {
+    let target = format!("pipe:[{inode}]");
+    let fast_path = format!("/proc/{pid}/fd/{expected_fd}");
+    if let Ok(link) = fs::read_link(&fast_path) {
+        if link.to_string_lossy() == target {
+            return true;
+        }
+    }
+    let fd_dir = format!("/proc/{pid}/fd");
+    if let Ok(entries) = fs::read_dir(&fd_dir) {
+        for entry in entries.flatten() {
+            if let Ok(link) = fs::read_link(entry.path()) {
+                if link.to_string_lossy() == target {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn pid_has_any_pipe_inode(pid: i32, inodes: &[u64]) -> bool {
+    if inodes.is_empty() {
+        return false;
+    }
+    let fd_dir = format!("/proc/{pid}/fd");
+    let Ok(entries) = fs::read_dir(&fd_dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if let Ok(link) = fs::read_link(entry.path()) {
+            let s = link.to_string_lossy();
+            if let Some(rest) = s.strip_prefix("pipe:[").and_then(|r| r.strip_suffix(']')) {
+                if let Ok(ino) = rest.parse::<u64>() {
+                    if inodes.contains(&ino) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 pub trait Clock: Send + Sync {
@@ -166,7 +303,31 @@ struct TreeContext<'a> {
     observed: &'a mut HashMap<i32, u64>,
 }
 
+fn belongs_to_other(st: &ProcStat, other: &OtherStagesSnapshot) -> bool {
+    if other
+        .roots
+        .iter()
+        .any(|&(rpid, rticks)| st.pid == rpid && rticks.is_none_or(|t| st.start_ticks == t))
+    {
+        return true;
+    }
+    if other.owned_pids.get(&st.pid) == Some(&st.start_ticks) {
+        return true;
+    }
+    false
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 fn collect_tree_pids(ctx: &mut TreeContext<'_>) -> Vec<i32> {
+    collect_tree_pids_marked(ctx, None, None)
+}
+
+fn collect_tree_pids_marked(
+    ctx: &mut TreeContext<'_>,
+    marker: Option<&StageMarker>,
+    guard: Option<&ActiveStageGuard>,
+) -> Vec<i32> {
+    let other = snapshot_other_stages(marker.map(|m| m.stage_id), ctx.cwd);
     let stats = scan_proc_stats();
     let mut by_ppid: HashMap<i32, Vec<i32>> = HashMap::new();
     let mut stat_by_pid: HashMap<i32, ProcStat> = HashMap::new();
@@ -174,13 +335,6 @@ fn collect_tree_pids(ctx: &mut TreeContext<'_>) -> Vec<i32> {
         by_ppid.entry(st.ppid).or_default().push(st.pid);
         stat_by_pid.insert(st.pid, *st);
     }
-
-    let active_roots: HashSet<i32> = {
-        let guard = active_stage_pids()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.clone()
-    };
 
     let mut queue: VecDeque<i32> = VecDeque::new();
     let mut visited: HashSet<i32> = HashSet::new();
@@ -192,33 +346,57 @@ fn collect_tree_pids(ctx: &mut TreeContext<'_>) -> Vec<i32> {
     }
     for (&pid, &start_ticks) in ctx.observed.iter() {
         if let Some(st) = stat_by_pid.get(&pid) {
-            if st.state != 'Z' && st.start_ticks == start_ticks && visited.insert(pid) {
+            if st.state != 'Z'
+                && st.start_ticks == start_ticks
+                && !belongs_to_other(st, &other)
+                && visited.insert(pid)
+            {
                 queue.push_back(pid);
             }
         }
     }
     for st in &stats {
+        if st.pid == ctx.our_pid || belongs_to_other(st, &other) {
+            continue;
+        }
         if st.pgrp == ctx.root_pid
-            && st.pid != ctx.our_pid
             && ctx.root_start_ticks.is_none_or(|t| st.start_ticks >= t)
             && visited.insert(st.pid)
         {
             queue.push_back(st.pid);
+            continue;
         }
         // Catch grandchildren that called setsid() and were reparented to us via PR_SET_CHILD_SUBREAPER.
         if st.ppid == ctx.our_pid
             && st.pid != ctx.root_pid
             && st.state != 'Z'
             && st.session != ctx.our_sid
-            && !active_roots.contains(&st.pid)
             && ctx.root_start_ticks.is_none_or(|t| st.start_ticks >= t)
         {
-            let matches_cwd = fs::read_link(format!("/proc/{}/cwd", st.pid))
-                .ok()
-                .is_some_and(|p| p == ctx.cwd);
-            if (ctx.observed.contains_key(&st.pid) || matches_cwd || active_roots.len() <= 1)
-                && visited.insert(st.pid)
-            {
+            let is_ours = if ctx.observed.get(&st.pid) == Some(&st.start_ticks) {
+                true
+            } else if let Some(m) = marker {
+                if pid_has_pipe_inode(st.pid, m.expected_write_fd, m.inode) {
+                    true
+                } else if pid_has_any_pipe_inode(st.pid, &other.marker_inodes) {
+                    false
+                } else if other.count == 0 {
+                    // Nobody else could have left it behind.
+                    true
+                } else if !other.shares_cwd {
+                    fs::read_link(format!("/proc/{}/cwd", st.pid))
+                        .ok()
+                        .is_some_and(|p| p == ctx.cwd)
+                } else {
+                    false
+                }
+            } else {
+                other.count == 0
+                    || fs::read_link(format!("/proc/{}/cwd", st.pid))
+                        .ok()
+                        .is_some_and(|p| p == ctx.cwd)
+            };
+            if is_ours && visited.insert(st.pid) {
                 queue.push_back(st.pid);
             }
         }
@@ -227,7 +405,12 @@ fn collect_tree_pids(ctx: &mut TreeContext<'_>) -> Vec<i32> {
     while let Some(pid) = queue.pop_front() {
         if let Some(children) = by_ppid.get(&pid) {
             for &child in children {
-                if child != ctx.our_pid && visited.insert(child) {
+                if child != ctx.our_pid
+                    && stat_by_pid
+                        .get(&child)
+                        .is_some_and(|st| !belongs_to_other(st, &other))
+                    && visited.insert(child)
+                {
                     queue.push_back(child);
                 }
             }
@@ -244,6 +427,9 @@ fn collect_tree_pids(ctx: &mut TreeContext<'_>) -> Vec<i32> {
                 }
             }
         }
+    }
+    if let Some(g) = guard {
+        g.update_owned(ctx.observed);
     }
     live
 }
@@ -266,8 +452,10 @@ fn terminate_process_tree(
     child: &mut Child,
     child_exited: &mut Option<std::process::ExitStatus>,
     ctx: &mut TreeContext<'_>,
+    marker: Option<&StageMarker>,
+    guard: Option<&ActiveStageGuard>,
 ) {
-    let live = collect_tree_pids(ctx);
+    let live = collect_tree_pids_marked(ctx, marker, guard);
     if child_exited.is_some() && live.is_empty() {
         reap_reparented(ctx.observed, ctx.root_pid);
         return;
@@ -292,8 +480,9 @@ fn terminate_process_tree(
             }
         }
         reap_reparented(ctx.observed, ctx.root_pid);
-        let remaining = collect_tree_pids(ctx);
+        let remaining = collect_tree_pids_marked(ctx, marker, guard);
         if child_exited.is_some() && remaining.is_empty() {
+            reap_reparented(ctx.observed, ctx.root_pid);
             return;
         }
         if Instant::now() >= deadline {
@@ -308,7 +497,7 @@ fn terminate_process_tree(
         unsafe {
             libc::kill(-ctx.root_pid, libc::SIGKILL);
         }
-        let remaining = collect_tree_pids(ctx);
+        let remaining = collect_tree_pids_marked(ctx, marker, guard);
         for &pid in &remaining {
             // SAFETY: escalating to SIGKILL on each surviving descendant.
             unsafe {
@@ -321,8 +510,9 @@ fn terminate_process_tree(
             }
         }
         reap_reparented(ctx.observed, ctx.root_pid);
-        let after = collect_tree_pids(ctx);
+        let after = collect_tree_pids_marked(ctx, marker, guard);
         if child_exited.is_some() && after.is_empty() {
+            reap_reparented(ctx.observed, ctx.root_pid);
             return;
         }
         thread::sleep(Duration::from_millis(15));
@@ -491,6 +681,15 @@ pub fn run_process(
         libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
     }
 
+    let (_marker_read_fd, marker_write_fd, marker_inode) = create_stage_marker()?;
+    let marker_write_raw = marker_write_fd.as_raw_fd();
+    let _active_guard = ActiveStageGuard::register_pending(&cmd.cwd, marker_inode);
+    let marker = StageMarker {
+        stage_id: _active_guard.id,
+        expected_write_fd: marker_write_raw,
+        inode: marker_inode,
+    };
+
     let mut command = Command::new(prog);
     command
         .args(args)
@@ -501,14 +700,26 @@ pub fn run_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // SAFETY: setpgid and prctl are async-signal-safe. The stage gets its own process group and
-    // dies with the engine even when the engine is killed.
+    // SAFETY: setpgid, prctl, and fcntl are async-signal-safe. The stage gets its own process
+    // group, dies with the engine even when killed, and keeps the stage marker fd open across exec.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fd_flags = libc::fcntl(marker_write_raw, libc::F_GETFD);
+            if fd_flags < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(
+                marker_write_raw,
+                libc::F_SETFD,
+                fd_flags & !libc::FD_CLOEXEC,
+            ) != 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -518,10 +729,11 @@ pub fn run_process(
     let mut child = command
         .spawn()
         .with_context(|| format!("falha ao iniciar processo {}", prog.to_string_lossy()))?;
+    drop(marker_write_fd);
 
     let root_pid = child.id() as i32;
-    let _active_guard = ActiveStageGuard::register(root_pid);
     let root_start_ticks = read_proc_stat(root_pid).map(|s| s.start_ticks);
+    _active_guard.set_root(root_pid, root_start_ticks);
     let our_pid = std::process::id() as i32;
     // SAFETY: getsid(0) queries our own session id.
     let our_sid = unsafe { libc::getsid(0) };
@@ -724,7 +936,8 @@ pub fn run_process(
 
             // Sample descendants while their parents are alive.
             if Instant::now() >= next_scan {
-                let _ = collect_tree_pids(&mut tree_ctx);
+                let _ =
+                    collect_tree_pids_marked(&mut tree_ctx, Some(&marker), Some(&_active_guard));
                 next_scan = Instant::now() + TREE_SCAN_INTERVAL;
             }
 
@@ -733,7 +946,13 @@ pub fn run_process(
                     child_exited = Some(st);
                     // The stage ended: a background process must neither survive nor, by holding the
                     // pipes open, delay the result.
-                    terminate_process_tree(&mut child, &mut child_exited, &mut tree_ctx);
+                    terminate_process_tree(
+                        &mut child,
+                        &mut child_exited,
+                        &mut tree_ctx,
+                        Some(&marker),
+                        Some(&_active_guard),
+                    );
                     drain_deadline = Some(Instant::now() + DRAIN_GRACE);
                 }
             }
@@ -767,7 +986,13 @@ pub fn run_process(
         }
     };
     let watched = watch();
-    terminate_process_tree(&mut child, &mut child_exited, &mut tree_ctx);
+    terminate_process_tree(
+        &mut child,
+        &mut child_exited,
+        &mut tree_ctx,
+        Some(&marker),
+        Some(&_active_guard),
+    );
     let _ = log_file.flush();
     if let Some(outcome) = watched? {
         return Ok(outcome);
@@ -1292,5 +1517,184 @@ mod tests {
         let _ = other.wait();
         assert_eq!(same, [pid]);
         assert!(reused.is_empty());
+    }
+
+    #[test]
+    fn concurrent_runs_keep_other_setsid_trees_alive_and_clean_up_their_own() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        // Scenario 1: B spawns a setsid grandchild in the shared cwd; A times out in the same cwd
+        // and must kill A's setsid grandchild without killing B's grandchild or root.
+        let gpid_a_file = dir.join("gpid_a.pid");
+        let gpid_b_file = dir.join("gpid_b.pid");
+        let root_b_file = dir.join("root_b.pid");
+        let release_b = dir.join("release_b");
+
+        let script_a = dir.join("stage_a.sh");
+        crate::test_support::write_executable(
+            &script_a,
+            format!(
+                "#!/usr/bin/env sh\nsetsid sh -c 'cd /; echo $$ > \"{}\"; exec sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 60\n",
+                gpid_a_file.display()
+            ),
+        );
+
+        let script_b = dir.join("stage_b.sh");
+        crate::test_support::write_executable(
+            &script_b,
+            format!(
+                "#!/usr/bin/env sh\necho $$ > \"{}\"\nsetsid sh -c 'echo $$ > \"{}\"; while [ ! -f \"{}\" ]; do sleep 0.05; done' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f \"{}\" ]; do sleep 0.05; done\nexit 0\n",
+                root_b_file.display(),
+                gpid_b_file.display(),
+                release_b.display(),
+                release_b.display(),
+            ),
+        );
+
+        let mut gpid_a_guard = PidGuard(None);
+        let mut gpid_b_guard = PidGuard(None);
+
+        std::thread::scope(|s| {
+            let b_handle = s.spawn(|| {
+                run_process(
+                    script_cmd(&script_b, &[], dir),
+                    b"",
+                    &dir.join("b.log"),
+                    Limits {
+                        timeout: Duration::from_secs(15),
+                        stall: Duration::from_secs(15),
+                    },
+                    &SystemClock::new(),
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                    &mut || false,
+                )
+            });
+
+            // Wait until B's setsid grandchild is running before launching A.
+            let gpid_b = read_pid_file(&gpid_b_file);
+            let root_b = read_pid_file(&root_b_file);
+
+            let out_a = run_process(
+                script_cmd(&script_a, &[], dir),
+                b"",
+                &dir.join("a.log"),
+                Limits {
+                    timeout: Duration::from_millis(250),
+                    stall: Duration::from_secs(10),
+                },
+                &SystemClock::new(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+                &mut || false,
+            )
+            .unwrap();
+            assert_eq!(out_a, Outcome::TimedOut);
+
+            let gpid_a = read_pid_file(&gpid_a_file);
+            assert!(
+                wait_pid_gone(gpid_a),
+                "A's setsid grandchild {gpid_a} survived A's timeout"
+            );
+            assert!(
+                pid_is_alive(root_b),
+                "A's cleanup killed concurrent stage B root {root_b}"
+            );
+            assert!(
+                pid_is_alive(gpid_b),
+                "A's cleanup killed concurrent stage B setsid grandchild {gpid_b}"
+            );
+
+            fs::write(&release_b, "go").unwrap();
+            let out_b = b_handle.join().unwrap().unwrap();
+            assert_eq!(out_b, Outcome::Exited(0));
+            assert!(
+                wait_pid_gone(gpid_b),
+                "B's setsid grandchild {gpid_b} survived B's exit"
+            );
+        });
+
+        // Scenario 2: A's parent exits immediately while spawning a setsid grandchild that `cd /`s,
+        // concurrently with B staying alive in another thread.
+        let gpid_a2_file = dir.join("gpid_a2.pid");
+        let gpid_b2_file = dir.join("gpid_b2.pid");
+        let release_b2 = dir.join("release_b2");
+
+        let script_a2 = dir.join("stage_a2.sh");
+        crate::test_support::write_executable(
+            &script_a2,
+            format!(
+                "#!/usr/bin/env sh\nsetsid sh -c 'cd /; echo $$ > \"{}\"; exec sleep 60' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f \"{}\" ]; do sleep 0.01; done\nexit 0\n",
+                gpid_a2_file.display(),
+                gpid_a2_file.display()
+            ),
+        );
+
+        let script_b2 = dir.join("stage_b2.sh");
+        crate::test_support::write_executable(
+            &script_b2,
+            format!(
+                "#!/usr/bin/env sh\nsetsid sh -c 'cd /; echo $$ > \"{}\"; exec sleep 60' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f \"{}\" ]; do sleep 0.05; done\nexit 0\n",
+                gpid_b2_file.display(),
+                release_b2.display(),
+            ),
+        );
+
+        std::thread::scope(|s| {
+            let b2_handle = s.spawn(|| {
+                run_process(
+                    script_cmd(&script_b2, &[], dir),
+                    b"",
+                    &dir.join("b2.log"),
+                    Limits {
+                        timeout: Duration::from_secs(15),
+                        stall: Duration::from_secs(15),
+                    },
+                    &SystemClock::new(),
+                    &AtomicBool::new(false),
+                    &mut |_| {},
+                    &mut || false,
+                )
+            });
+
+            let gpid_b2 = read_pid_file(&gpid_b2_file);
+            gpid_b_guard.0 = Some(gpid_b2);
+
+            let out_a2 = run_process(
+                script_cmd(&script_a2, &[], dir),
+                b"",
+                &dir.join("a2.log"),
+                Limits {
+                    timeout: Duration::from_secs(10),
+                    stall: Duration::from_secs(10),
+                },
+                &SystemClock::new(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+                &mut || false,
+            )
+            .unwrap();
+            assert_eq!(out_a2, Outcome::Exited(0));
+
+            let gpid_a2 = read_pid_file(&gpid_a2_file);
+            gpid_a_guard.0 = Some(gpid_a2);
+            assert!(
+                wait_pid_gone(gpid_a2),
+                "A2's fast-reparented cd-/ setsid grandchild {gpid_a2} leaked during concurrent B2"
+            );
+            assert!(
+                pid_is_alive(gpid_b2),
+                "A2's cleanup killed concurrent B2 setsid grandchild {gpid_b2}"
+            );
+
+            fs::write(&release_b2, "go").unwrap();
+            let out_b2 = b2_handle.join().unwrap().unwrap();
+            assert_eq!(out_b2, Outcome::Exited(0));
+            assert!(
+                wait_pid_gone(gpid_b2),
+                "B2's setsid grandchild {gpid_b2} survived B2's exit"
+            );
+        });
     }
 }

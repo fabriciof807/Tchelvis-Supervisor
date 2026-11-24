@@ -22,6 +22,22 @@ const MESSAGE_SELECT: &str =
      FROM messages m \
      LEFT JOIN question_threads qt ON qt.question_msg_id = m.id";
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LoopRunRecord {
+    pub run_id: String,
+    pub dir: String,
+    pub workflow: String,
+    pub status: String,
+    pub caller_terminal: Option<String>,
+    pub caller_created_ms: Option<i64>,
+    pub engine_pid: Option<u32>,
+    pub engine_start_ticks: Option<u64>,
+    pub orch_run_id: Option<String>,
+    pub notify_state: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
 #[derive(Clone)]
 pub struct OrchStore {
     conn: Arc<Mutex<Connection>>,
@@ -131,10 +147,26 @@ impl OrchStore {
                 response_json TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS loop_runs (
+                run_id TEXT PRIMARY KEY,
+                dir TEXT NOT NULL,
+                workflow TEXT NOT NULL,
+                status TEXT NOT NULL,
+                caller_terminal TEXT,
+                caller_created_ms INTEGER,
+                engine_pid INTEGER,
+                engine_start_ticks INTEGER,
+                orch_run_id TEXT,
+                notify_state TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_tasks_run_status ON tasks(run_id, status);
             CREATE INDEX IF NOT EXISTS idx_dispatches_status ON dispatch_contexts(status);
             CREATE INDEX IF NOT EXISTS idx_dispatches_assignee ON dispatch_contexts(assignee_terminal, status);
             CREATE INDEX IF NOT EXISTS idx_messages_target_pointer ON messages(target_terminal, pointer_state, run_id);
+            CREATE INDEX IF NOT EXISTS idx_loop_runs_status ON loop_runs(status);
+            CREATE INDEX IF NOT EXISTS idx_loop_runs_notify ON loop_runs(notify_state);
             ",
         )?;
         Ok(())
@@ -2130,6 +2162,248 @@ impl OrchStore {
             ],
         )?;
         Ok(())
+    }
+
+    fn map_loop_row(r: &Row<'_>) -> rusqlite::Result<LoopRunRecord> {
+        let pid_opt: Option<i64> = r.get(6)?;
+        let ticks_opt: Option<i64> = r.get(7)?;
+        Ok(LoopRunRecord {
+            run_id: r.get(0)?,
+            dir: r.get(1)?,
+            workflow: r.get(2)?,
+            status: r.get(3)?,
+            caller_terminal: r.get(4)?,
+            caller_created_ms: r.get(5)?,
+            engine_pid: pid_opt.and_then(|v| u32::try_from(v).ok()),
+            engine_start_ticks: ticks_opt.map(|v| v as u64),
+            orch_run_id: r.get(8)?,
+            notify_state: r.get(9)?,
+            created_at_ms: r.get(10)?,
+            updated_at_ms: r.get(11)?,
+        })
+    }
+
+    pub fn register_loop(&self, rec: &LoopRunRecord) -> Result<()> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO loop_runs (
+                run_id, dir, workflow, status, caller_terminal, caller_created_ms,
+                engine_pid, engine_start_ticks, orch_run_id, notify_state, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                rec.run_id,
+                rec.dir,
+                rec.workflow,
+                rec.status,
+                rec.caller_terminal,
+                rec.caller_created_ms,
+                rec.engine_pid.map(i64::from),
+                rec.engine_start_ticks.map(|v| v as i64),
+                rec.orch_run_id,
+                rec.notify_state,
+                rec.created_at_ms,
+                rec.updated_at_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_loop(&self, run_id: &str) -> Result<Option<LoopRunRecord>> {
+        let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT run_id, dir, workflow, status, caller_terminal, caller_created_ms,
+                        engine_pid, engine_start_ticks, orch_run_id, notify_state, created_at_ms, updated_at_ms
+                 FROM loop_runs WHERE run_id = ?1",
+                params![run_id],
+                Self::map_loop_row,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_loops(&self) -> Result<Vec<LoopRunRecord>> {
+        let conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT run_id, dir, workflow, status, caller_terminal, caller_created_ms,
+                    engine_pid, engine_start_ticks, orch_run_id, notify_state, created_at_ms, updated_at_ms
+             FROM loop_runs
+             ORDER BY created_at_ms ASC, run_id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], Self::map_loop_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_loop_engine_identity(
+        &self,
+        run_id: &str,
+        pid: u32,
+        start_ticks: Option<u64>,
+        now_ms: i64,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE loop_runs
+             SET engine_pid = ?2, engine_start_ticks = ?3, updated_at_ms = ?4
+             WHERE run_id = ?1",
+            params![
+                run_id,
+                i64::from(pid),
+                start_ticks.map(|v| v as i64),
+                now_ms
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_loop_final(
+        &self,
+        run_id: &str,
+        status: &str,
+        now_ms: i64,
+    ) -> Result<Option<OrchMessage>> {
+        if !matches!(status, "PASS" | "ERROR" | "ESCALATE" | "CANCELLED") {
+            bail!("invalid final loop status '{status}'");
+        }
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let row: LoopRunRecord = tx
+            .query_row(
+                "SELECT run_id, dir, workflow, status, caller_terminal, caller_created_ms,
+                        engine_pid, engine_start_ticks, orch_run_id, notify_state, created_at_ms, updated_at_ms
+                 FROM loop_runs WHERE run_id = ?1",
+                params![run_id],
+                Self::map_loop_row,
+            )
+            .optional()?
+            .with_context(|| format!("loop run '{run_id}' not found"))?;
+
+        if row.status != "RUNNING" {
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        if let (Some(caller_term), Some(caller_created_ms)) =
+            (row.caller_terminal.as_deref(), row.caller_created_ms)
+        {
+            let orch_run_id = format!("loop_{run_id}");
+            let msg_id = format!("msg_loop_{run_id}");
+            let run_title = format!("Loop {run_id}");
+            let from_handle = format!("loop:{run_id}");
+            let body = format!("Loop {run_id}: {status}. Rode: tchelvis loop result {run_id}");
+
+            tx.execute(
+                "INSERT OR IGNORE INTO runs (
+                    id, title, coordinator_terminal, coordinator_created_ms, status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'completed', ?5, ?5)",
+                params![orch_run_id, run_title, caller_term, caller_created_ms, now_ms],
+            )?;
+
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO messages (
+                    id, run_id, task_id, dispatch_id, from_handle, to_handle, target_terminal,
+                    msg_type, outcome, body, pointer_state, pointer_terminal, delivery_attempts,
+                    next_retry_at_ms, delivered_at_ms, acknowledged_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, NULL, NULL, ?3, ?4, ?4, 'status', ?5, ?6, 'pending', NULL, 0, NULL, NULL, NULL, ?7)",
+                params![
+                    msg_id,
+                    orch_run_id,
+                    from_handle,
+                    caller_term,
+                    status,
+                    body,
+                    now_ms,
+                ],
+            )?;
+
+            tx.execute(
+                "UPDATE loop_runs
+                 SET status = ?2, orch_run_id = ?3, notify_state = 'pending', updated_at_ms = ?4
+                 WHERE run_id = ?1",
+                params![run_id, status, orch_run_id, now_ms],
+            )?;
+
+            if inserted == 0 {
+                tx.commit()?;
+                return Ok(None);
+            }
+
+            let query = format!("{MESSAGE_SELECT} WHERE m.id = ?1");
+            let msg = tx.query_row(&query, params![msg_id], Self::map_message_row)?;
+            tx.commit()?;
+            Ok(Some(msg))
+        } else {
+            tx.execute(
+                "UPDATE loop_runs
+                 SET status = ?2, notify_state = 'none', updated_at_ms = ?3
+                 WHERE run_id = ?1",
+                params![run_id, status, now_ms],
+            )?;
+            tx.commit()?;
+            Ok(None)
+        }
+    }
+
+    pub fn mark_loop_undelivered(&self, run_id: &str, now_ms: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE loop_runs
+             SET notify_state = 'undelivered', updated_at_ms = ?2
+             WHERE run_id = ?1 AND notify_state = 'pending'",
+            params![run_id, now_ms],
+        )?;
+        let msg_id = format!("msg_loop_{run_id}");
+        tx.execute(
+            "UPDATE messages
+             SET pointer_state = 'delivery_stalled'
+             WHERE id = ?1 AND pointer_state = 'pending'",
+            params![msg_id],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
+    pub fn sync_loop_notify_state(&self, run_id: &str, now_ms: i64) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let msg_id = format!("msg_loop_{run_id}");
+        let ptr_state: Option<String> = tx
+            .query_row(
+                "SELECT pointer_state FROM messages WHERE id = ?1",
+                params![msg_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(ptr_state) = ptr_state else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let target_notify = match ptr_state.as_str() {
+            "pending" => "pending",
+            "delivered" => "delivered",
+            "acknowledged" => "acknowledged",
+            "delivery_stalled" => "undelivered",
+            _ => {
+                tx.commit()?;
+                return Ok(false);
+            }
+        };
+        let changed = tx.execute(
+            "UPDATE loop_runs
+             SET notify_state = ?2, updated_at_ms = ?3
+             WHERE run_id = ?1 AND notify_state != ?2",
+            params![run_id, target_notify, now_ms],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
     }
 }
 
