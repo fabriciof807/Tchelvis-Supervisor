@@ -36,6 +36,7 @@ struct RawLoopsConfig {
     auto_approve_in_sandbox: bool,
     #[serde(default)]
     env_pass: Vec<String>,
+    #[serde(default)]
     sandbox: RawSandbox,
     #[serde(default)]
     defaults: RoleDefaults,
@@ -45,14 +46,28 @@ fn default_max_concurrent() -> u32 {
     DEFAULT_MAX_CONCURRENT
 }
 
+/// The strongest sandbox available today. It is only what an absent `kind` means: a sandbox whose
+/// check fails is never replaced by another one.
+fn default_sandbox_kind() -> String {
+    "bwrap".to_string()
+}
+
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 struct RawSandbox {
     kind: String,
-    #[serde(default)]
     bwrap: Option<RawBwrap>,
-    #[serde(default)]
     incus: Option<RawIncus>,
+}
+
+impl Default for RawSandbox {
+    fn default() -> Self {
+        Self {
+            kind: default_sandbox_kind(),
+            bwrap: None,
+            incus: None,
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,12 +263,6 @@ kind = "bwrap"
 extra = []
 "#;
         assert!(parse_loops_config(unknown_bwrap).is_err());
-
-        let missing_sandbox = r#"
-max_concurrent = 2
-"#;
-        assert!(parse_loops_config(missing_sandbox).is_err());
-
         for bad_path in ["/etc/passwd", "../secret", "a/../../b", "~/ssh", "", "."] {
             let cfg_rw = format!(
                 r#"
@@ -308,5 +317,41 @@ home_ro = ["{bad_path}"]
         let raw = "[sandbox]\nkind = \"bwrap\"\n[sandbox.bwrap]\nhome_rw = [\".claude\"]\n";
         let err = format!("{:#}", parse_loops_config(raw).unwrap_err());
         assert!(err.contains("home_rw"), "{err}");
+    }
+
+    #[test]
+    fn bwrap_is_the_default_sandbox() {
+        for raw in [
+            "",
+            "max_concurrent = 1",
+            "[sandbox]",
+            "[sandbox]\nkind = \"bwrap\"",
+        ] {
+            let config = parse_loops_config(raw).unwrap();
+            assert_eq!(
+                config.sandbox,
+                SandboxConfig::Bwrap { home_ro: vec![] },
+                "{raw:?}"
+            );
+            // The default never turns automatic approval on.
+            assert!(!config.auto_approve_in_sandbox, "{raw:?}");
+        }
+        let config = parse_loops_config("[sandbox.bwrap]\nhome_ro = [\".cargo\"]").unwrap();
+        assert_eq!(
+            config.sandbox,
+            SandboxConfig::Bwrap {
+                home_ro: vec![".cargo".into()]
+            }
+        );
+        // A wrong value is an error, never the default.
+        for raw in [
+            "[sandbox]\nkind = \"\"",
+            "[sandbox]\nkind = \"Bwrap\"",
+            "[sandbox]\nknd = \"inherited\"",
+        ] {
+            assert!(parse_loops_config(raw).is_err(), "{raw:?}");
+        }
+        let inherited = parse_loops_config("[sandbox]\nkind = \"inherited\"").unwrap();
+        assert_eq!(inherited.sandbox, SandboxConfig::Inherited);
     }
 }

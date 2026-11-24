@@ -23,7 +23,8 @@ Orquestradores queimam contexto e perdem qualidade ao gerenciar cada turno entre
 3. Sandbox com **Incus** ou outra ferramenta, não ai-jail.
 4. Workflows em **TOML**.
 5. Depois do M10.
-6. Primeiro com o `tchelvis` **dentro do container** (`inherited`); depois, do host pelo Incus.
+6. Com o `tchelvis` **dentro do container**; depois, do host pelo Incus.
+7. **`bwrap` é o sandbox padrão** (2026-11-24).
 
 ## Abordagens
 
@@ -79,7 +80,7 @@ auto_approve_in_sandbox = true   # obrigatório: autoriza os CLIs a agir sem per
 env_pass = []
 
 [sandbox]
-kind = "inherited"               # inherited | bwrap | incus
+kind = "bwrap"                   # padrão; bwrap | inherited | incus
 
 [sandbox.bwrap]
 home_ro = [".cargo", ".rustup"]
@@ -91,13 +92,13 @@ user = "ubuntu"
 
 | Ordem | Tipo | Como | Protege |
 |---|---|---|---|
-| 1 | `inherited` | O `tchelvis` já roda em um container; exige detecção e escolha explícita | O host, só na medida do container. **Nada dentro dele** |
-| 2 | `bwrap` | `/` somente leitura, `$HOME` e `/run` vazios, só o workspace gravável, PID próprio; funciona dentro de um container | Também o repositório principal, outros projetos, sockets e o Herdr |
+| 1 | `bwrap` (padrão) | `/` somente leitura, `$HOME` e `/run` vazios, só o workspace gravável, PID próprio; funciona dentro de um container | Também o repositório principal, outros projetos, sockets e o Herdr |
+| 2 | `inherited` | O `tchelvis` já roda em um container; exige detecção e escolha explícita | O host, só na medida do container. **Nada dentro dele** |
 | 3 | `incus` | `incus exec` na instância, a partir do host; o workspace precisa estar montado nela | O host |
 
 - **Limite do `inherited`:** o agente tem os mesmos poderes do usuário do container. Se houver `sudo` sem senha, acesso ao Docker ou ao Incus, pastas do host graváveis ou `hc`, ele alcança tudo isso, e também o repositório principal, o `state.json` e os outros terminais. `loop check` lista o que encontrou, e cada relatório registra o tipo de sandbox usado. O git seguro continua valendo contra execução acidental, mas não é uma fronteira nesse modo.
 - **Sem as opções de aprovação, os CLIs podem agir mesmo assim:** em teste de 2026-11-23, `opencode` e `agy` criaram arquivos sem nenhuma delas, por configuração do usuário. O sandbox é a única barreira.
-- **Sonda antes da primeira etapa:** em `bwrap` e `incus`, o motor grava um valor aleatório no workspace e o lê dentro do sandbox, confirma que consegue escrever ali e que **não** lê um arquivo-sentinela criado fora dele. No `inherited`, confirma apenas que está em container. Falhou: o loop não inicia. Nunca há troca automática de tipo.
+- **Sonda antes da primeira etapa:** em `bwrap` e `incus`, o motor grava um valor aleatório no workspace e o lê dentro do sandbox, confirma que consegue escrever ali e que **não** lê um arquivo-sentinela criado fora dele. No `inherited`, confirma apenas que está em container. Falhou: o loop não inicia. Nunca há troca automática de tipo: o padrão só define o que significa não informar `kind`.
 - **`bwrap` e `incus`:** o ambiente é limpo (passam `PATH`, `HOME`, `LANG`, `TERM` e `env_pass`) e não há sockets do Docker, do Herdr, do SSH ou do D-Bus. No `inherited`, o ambiente é limpo do mesmo jeito, mas os sockets continuam alcançáveis.
 - **Nada pode rodar em serviço externo:** `opencode run` usa por padrão um serviço em segundo plano, que ficaria fora do sandbox; o adapter sempre usa `--standalone`. Todo adapter precisa passar por um teste real: pedir uma escrita fora do workspace, em `bwrap`, e confirmar que ela não acontece.
 - **Limite comum:** a rede fica aberta para a API, e o agente enxerga a própria credencial.
@@ -105,7 +106,7 @@ user = "ubuntu"
 - **`opencode-go`:** usa a variável oficial `OPENCODE_API_KEY`, e o `tchelvis` nunca lê nem grava a chave em arquivo. O motor procura a variável no próprio ambiente e, se faltar, no shell do usuário (`$SHELL -ic`, até 5 s, valor entre marcadores para ignorar o que o arquivo do shell imprimir), porque um terminal aberto pelo Herdr não herda o shell de quem chamou. É passada só às etapas do `opencode`, pelo ambiente e nunca por argumento, e apagada de estado, relatório e erros. Testado em 2026-11-24 dentro do `bwrap` com dois modelos gratuitos do Go (`hy4-flash-free`, `beam-free`): a etapa completa, a chave não aparece na saída e uma escrita pedida fora do workspace não aconteceu.
 - **Contas:** `tchelvis loop auth` mostra a situação de cada CLI (comandos oficiais de status onde existem) e `loop auth login <cli>` abre o login oficial em um terminal Herdr. O loop não inicia se faltar uma conta usada pelo workflow.
 - **`bwrap` não é total:** a rede é compartilhada, então serviços em `localhost` e sockets abstratos continuam alcançáveis.
-- **Recomendado para uso normal: `bwrap` dentro do container.** Medido em 2026-11-23 (bubblewrap 0.9.0 em um container Incus sem privilégios): cerca de 8 ms a mais por processo iniciado, pagos uma vez por etapa; criação de 3.000 arquivos e `cargo check` sem perda mensurável. Escrita fora do workspace, leitura de um arquivo-sentinela, `sudo`, sockets do Docker e do Incus, `hc` e pasta compartilhada do host ficaram inacessíveis. O DNS exige montar `/run/systemd/resolve` somente leitura.
+- **Padrão: `bwrap` dentro do container.** Vale quando `kind` não é informado. Medido em 2026-11-23 (bubblewrap 0.9.0 em um container Incus sem privilégios): cerca de 8 ms a mais por processo iniciado, pagos uma vez por etapa; criação de 3.000 arquivos e `cargo check` sem perda mensurável. Escrita fora do workspace, leitura de um arquivo-sentinela, `sudo`, sockets do Docker e do Incus, `hc` e pasta compartilhada do host ficaram inacessíveis. O DNS exige montar `/run/systemd/resolve` somente leitura.
 - `bwrap` exige o pacote `bubblewrap`. `incus` só pode ser validado no host.
 
 ## Adapters

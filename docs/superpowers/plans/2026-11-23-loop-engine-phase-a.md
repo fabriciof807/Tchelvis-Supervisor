@@ -65,7 +65,7 @@ pub struct LoopsConfig { pub max_concurrent: u32, pub auto_approve_in_sandbox: b
 pub enum SandboxConfig { Inherited, Bwrap { home_ro: Vec<String> } }
 pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig>;
 ```
-Defaults: `max_cycles 3`, `stage_timeout_secs 1800`, `stall_secs 600`, `max_duration_secs 7200`, `max_concurrent 2`. `[sandbox] kind` is required; `incus` gives "ainda não suportado nesta versão". `home_*` entries: relative, no `..`.
+Defaults: `max_cycles 3`, `stage_timeout_secs 1800`, `stall_secs 600`, `max_duration_secs 7200`, `max_concurrent 2`. `[sandbox] kind` defaults to `bwrap`; `incus` gives "ainda não suportado nesta versão". `home_*` entries: relative, no `..`.
 
 - [ ] **Step 1: Failing tests.** `valid_example_parses` (the spec's example verbatim). `each_rule_is_reported`, one table row per rule and the id it must mention: duplicate id; id not `[a-z0-9-]{1,32}`; unknown `next`/`on_pass`/`on_retry`; unreachable stage; no path to `done`; cycle without a gate; gate without `writes`; gate with `next`; non-gate with `on_pass`/`on_retry`; non-gate without `next`; artifact name with `/`, `..`, leading `.`, or reserved (`input.md`, `current.diff`, `state.json`, `report.md`); `reads` nobody produces; unknown provider; provider missing with no default; unknown key; zero limits. `two_problems_are_both_reported`. `presets_validate_with_defaults` and `presets_without_defaults_name_the_missing_role`. `config_rejects_incus_unknown_keys_and_escaping_home_paths`.
 - [ ] **Step 2:** run → FAIL. **Step 3:** implement. **Step 4:** validation → PASS.
