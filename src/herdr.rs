@@ -250,7 +250,32 @@ pub struct HcTerminal {
 }
 
 impl HcTerminal {
+    pub fn loop_run_id(&self) -> Option<&str> {
+        self.labels
+            .get("cockpit.loop_run")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    pub fn is_attach_client(&self) -> bool {
+        let (fg_name, fg_argv) = match &self.foreground {
+            Some(fg) => (fg.name.as_deref(), fg.argv.as_slice()),
+            None => (None, &[][..]),
+        };
+        crate::agents::is_attach_client_invocation(fg_name, fg_argv)
+            || crate::agents::is_attach_client_invocation(None, &self.argv)
+    }
+
     pub fn display_name(&self) -> String {
+        if let Some(run_id) = self.loop_run_id().filter(|_| !self.is_attach_client()) {
+            if let Some(name) = self.name.as_deref().filter(|n| !n.is_empty()) {
+                if name.contains(run_id) {
+                    return name.to_string();
+                }
+            }
+            return format!("loop-{run_id}");
+        }
         self.name
             .as_deref()
             .filter(|n| !n.is_empty())
@@ -337,7 +362,11 @@ impl HcTerminal {
             }
             return AttentionState::Done { message: None };
         }
-        if self.is_plain_shell_foreground() {
+        if self.is_attach_client() {
+            return AttentionState::Idle;
+        }
+        let loop_run = self.loop_run_id();
+        if loop_run.is_none() && self.is_plain_shell_foreground() {
             return AttentionState::Idle;
         }
         if let Some(st) = &self.status {
@@ -360,11 +389,16 @@ impl HcTerminal {
                         since_ms: self.status_ms.unwrap_or(now_ms),
                     };
                 }
-                "working" => return AttentionState::Working { message: msg },
+                "working" => {
+                    return AttentionState::Working {
+                        message: msg.or_else(|| loop_run.map(|id| format!("loop {id}"))),
+                    };
+                }
                 "done" => return AttentionState::Done { message: msg },
                 "error" | "failed" => return AttentionState::Error { message: msg },
                 "" | "idle" => {}
-                _ => return AttentionState::Idle,
+                _ if loop_run.is_none() => return AttentionState::Idle,
+                _ => {}
             }
         }
 
@@ -394,11 +428,21 @@ impl HcTerminal {
                         since_ms: self.status_ms.unwrap_or(now_ms),
                     };
                 }
-                "working" => return AttentionState::Working { message: msg },
+                "working" => {
+                    return AttentionState::Working {
+                        message: msg.or_else(|| loop_run.map(|id| format!("loop {id}"))),
+                    };
+                }
                 "done" => return AttentionState::Done { message: msg },
                 "error" | "failed" => return AttentionState::Error { message: msg },
                 _ => {}
             }
+        }
+
+        if let Some(run_id) = loop_run {
+            return AttentionState::Working {
+                message: Some(format!("loop {run_id}")),
+            };
         }
 
         AttentionState::Idle
@@ -1212,6 +1256,24 @@ impl HerdrClient {
         agent_argv: &[String],
         first_message: &str,
     ) -> Result<Vec<OsString>> {
+        Self::build_run_worker_args_with_name(
+            parent_terminal,
+            cwd,
+            labels,
+            agent_argv,
+            first_message,
+            None,
+        )
+    }
+
+    pub fn build_run_worker_args_with_name(
+        parent_terminal: &str,
+        cwd: &Path,
+        labels: &[(&str, &str)],
+        agent_argv: &[String],
+        first_message: &str,
+        name: Option<&str>,
+    ) -> Result<Vec<OsString>> {
         if agent_argv.is_empty() || agent_argv[0].is_empty() {
             bail!("agent_cmd cannot be empty");
         }
@@ -1225,6 +1287,10 @@ impl HerdrClient {
             "--cwd".into(),
             cwd.as_os_str().to_os_string(),
         ];
+        if let Some(trimmed) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            args.push("--name".into());
+            args.push(trimmed.into());
+        }
         for (k, v) in labels {
             args.push("--label".into());
             args.push(format!("{k}={v}").into());
@@ -1239,6 +1305,14 @@ impl HerdrClient {
         Ok(args)
     }
 
+    /// Only the refusal `hc` gives before starting anything (measured on 0.1.21). A taken name is
+    /// not one of them: that terminal may already be this worker.
+    pub fn is_hc_name_rejection_error(err: &HcRunError) -> bool {
+        parse_hc_json_error(err.stdout.as_bytes(), err.stderr.as_bytes()).is_some_and(|info| {
+            info.kind.as_deref() == Some("invalid_params") && info.message.starts_with("bad name ")
+        })
+    }
+
     pub async fn run_worker(
         &self,
         parent_terminal: &str,
@@ -1249,8 +1323,50 @@ impl HerdrClient {
     ) -> Result<HcTerminal> {
         let args =
             Self::build_run_worker_args(parent_terminal, cwd, labels, agent_argv, first_message)?;
+        self.run_worker_with_args(&args).await
+    }
+
+    pub async fn run_worker_named(
+        &self,
+        parent_terminal: &str,
+        cwd: &Path,
+        labels: &[(&str, &str)],
+        agent_argv: &[String],
+        first_message: &str,
+        name: Option<&str>,
+    ) -> Result<HcTerminal> {
+        let args = Self::build_run_worker_args_with_name(
+            parent_terminal,
+            cwd,
+            labels,
+            agent_argv,
+            first_message,
+            name,
+        )?;
+        match self.run_worker_with_args(&args).await {
+            Ok(term) => Ok(term),
+            Err(err)
+                if name.is_some()
+                    && err
+                        .downcast_ref::<HcRunError>()
+                        .is_some_and(Self::is_hc_name_rejection_error) =>
+            {
+                let fallback_args = Self::build_run_worker_args(
+                    parent_terminal,
+                    cwd,
+                    labels,
+                    agent_argv,
+                    first_message,
+                )?;
+                self.run_worker_with_args(&fallback_args).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn run_worker_with_args(&self, args: &[OsString]) -> Result<HcTerminal> {
         let mut cmd = Command::new(&self.hc_bin);
-        cmd.args(&args);
+        cmd.args(args);
         cmd.stdin(Stdio::null());
 
         let out = tokio::time::timeout(Duration::from_secs(30), cmd.output())
@@ -2045,6 +2161,62 @@ mod tests {
         assert!(matches!(
             res_timeout,
             GuardedSendOutcome::Deferred { ref reason, .. } if reason == "send_timeout"
+        ));
+    }
+
+    #[test]
+    fn test_build_run_worker_args_with_name_and_name_rejection_filter() {
+        let args = HerdrClient::build_run_worker_args_with_name(
+            "t1",
+            Path::new("/repo"),
+            &[("cockpit.loop_run", "20261124-193000-cafe")],
+            &["tchelvis".into(), "loop".into(), "engine".into()],
+            "20261124-193000-cafe",
+            Some("loop-20261124-193000-cafe"),
+        )
+        .unwrap();
+        let strs: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let name_pos = strs.iter().position(|s| s == "--name").unwrap();
+        assert_eq!(strs[name_pos + 1], "loop-20261124-193000-cafe");
+
+        // Real hc JSON invalid_params for --name -> retries safely
+        let valid_name_err = HcRunError {
+            exit_code: Some(6),
+            stderr: String::new(),
+            stdout: r#"{"error":{"hint":"see `hc schema`","kind":"invalid_params","message":"bad name \"foo\": use 1-32"}}"#.into(),
+            message: "hc run failed".into(),
+        };
+        assert!(HerdrClient::is_hc_name_rejection_error(&valid_name_err));
+
+        // Ambiguous/internal error -> NEVER retries
+        let internal_err = HcRunError {
+            exit_code: Some(1),
+            stderr: "daemon timeout".into(),
+            stdout: String::new(),
+            message: "hc run failed".into(),
+        };
+        assert!(!HerdrClient::is_hc_name_rejection_error(&internal_err));
+
+        let name_taken = HcRunError {
+            exit_code: Some(1),
+            stderr: String::new(),
+            stdout: r#"{"error":{"hint":"pick another name, or kill the one holding it","kind":"name_taken","message":"a live terminal is already named \"loop-x\""}}"#.into(),
+            message: "hc run failed".into(),
+        };
+        assert!(!HerdrClient::is_hc_name_rejection_error(&name_taken));
+
+        let non_name_invalid_params = HcRunError {
+            exit_code: Some(6),
+            stderr: String::new(),
+            stdout: r#"{"error":{"kind":"invalid_params","message":"unknown parent terminal"}}"#
+                .into(),
+            message: "hc run failed".into(),
+        };
+        assert!(!HerdrClient::is_hc_name_rejection_error(
+            &non_name_invalid_params
         ));
     }
 }

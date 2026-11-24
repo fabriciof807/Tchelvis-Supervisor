@@ -81,3 +81,41 @@ test("supervisor programs are excluded by isPlainShellRow", () => {
     );
   }
 });
+
+test("cockpit.loop_run terminal is not hidden by isPlainShellRow even as tchelvis", () => {
+  const labels = { "cockpit.loop_run": "20261124-193000-a1b2" };
+  const term = {
+    address: "t5",
+    name: "loop-20261124-193000-a1b2",
+    state: "live",
+    program: "tchelvis",
+    foreground: { name: "tchelvis", argv: ["tchelvis", "loop", "engine", "20261124-193000-a1b2"] },
+    labels,
+  };
+  assert.equal(
+    mod.isPlainShellRow("loop-20261124-193000-a1b2", "tchelvis", labels, term),
+    false
+  );
+  // Empty label still stays hidden
+  assert.equal(
+    mod.isPlainShellRow("tchelvis", "tchelvis", { "cockpit.loop_run": "   " }, { ...term, labels: {} }),
+    true
+  );
+});
+
+test("hc attach client stays hidden even with cockpit.loop_run label", () => {
+  const labels = { "cockpit.loop_run": "20261124-193000-a1b2" };
+  const attachTerm = {
+    address: "t6",
+    state: "live",
+    program: "hc",
+    argv: ["hc", "attach", "t5"],
+    foreground: { name: "hc", argv: ["hc", "attach", "t5"] },
+    labels,
+  };
+  assert.equal(
+    mod.isPlainShellRow("t5", "hc", labels, attachTerm),
+    true
+  );
+});
+

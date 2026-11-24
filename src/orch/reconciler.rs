@@ -550,4 +550,43 @@ mod tests {
             "body missing exit_code=127: {body}"
         );
     }
+
+    #[tokio::test]
+    async fn test_reconciler_ignores_loop_run_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls_log = tmp.path().join("hc_calls.log");
+        let fake_hc = tmp.path().join("fake-hc");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             echo \"$*\" >> \"{}\"\n\
+             exit 0\n",
+            calls_log.display()
+        );
+        crate::test_support::write_executable(&fake_hc, script);
+        let herdr = HerdrClient::new(fake_hc.to_string_lossy().to_string());
+
+        let store = OrchStore::open_in_memory().unwrap();
+        let mut tracker = FleetTracker::new();
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert("cockpit.loop_run".into(), "20261124-193000-cafe".into());
+        tracker.apply_snapshot(
+            vec![HcTerminal {
+                address: "t-loop".into(),
+                name: Some("loop-20261124-193000-cafe".into()),
+                state: "live".into(),
+                created_ms: Some(2_000),
+                labels,
+                ..Default::default()
+            }],
+            3_000,
+        );
+
+        let out = OrchReconciler::reconcile_active_dispatches(&store, &herdr, &tracker, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(out.stop_escalations, 0);
+        assert_eq!(out.block_escalations, 0);
+        assert!(!out.state_changed);
+        assert!(!calls_log.exists());
+    }
 }

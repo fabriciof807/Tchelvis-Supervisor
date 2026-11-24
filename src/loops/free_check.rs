@@ -14,6 +14,7 @@ use std::time::Duration;
 
 pub const FREE_CHECK_TIMEOUT_SECS: u64 = 15;
 const MAX_FREE_OUTPUT_BYTES: usize = 1024 * 1024;
+pub const AGY_ABSENT_REASON: &str = "conta do 'agy' ausente no arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token — o login pode estar no chaveiro do sistema, mas o loop usa o arquivo; rode 'tchelvis loop auth login agy'";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listed {
@@ -385,13 +386,7 @@ fn run_one_free_check(
                         &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
                     )
                 {
-                    return fallback(
-                        Err(
-                            "conta do 'agy' ausente (~/.gemini/antigravity-cli/antigravity-oauth-token); rode 'tchelvis loop auth login agy'"
-                                .to_string(),
-                        ),
-                        None,
-                    );
+                    return fallback(Err(AGY_ABSENT_REASON.to_string()), None);
                 }
             }
             fallback(Ok(()), None)

@@ -1495,9 +1495,23 @@ function isPlainShellOrSupervisor(token) {
   return PLAIN_SHELLS.has(norm) || SUPERVISOR_PROGRAMS.has(norm);
 }
 
+function loopRunIdFromLabels(labels, term = null) {
+  return String((labels ?? term?.labels)?.["cockpit.loop_run"] ?? "").trim();
+}
+
+function resolveLoopDisplayName(displayName, labels, term = null) {
+  const loopRunId = loopRunIdFromLabels(labels, term);
+  if (!loopRunId) return displayName;
+  if (String(displayName ?? "").includes(loopRunId)) return displayName;
+  return `loop-${loopRunId}`;
+}
+
 export function isPlainShellRow(_name, programName, labels, term = null) {
   if (extractAttachTargetFromTerminal(term, programName) !== null) {
     return true;
+  }
+  if (loopRunIdFromLabels(labels, term)) {
+    return false;
   }
 
   const fgName = normProgToken(term?.foreground?.name);
@@ -1707,7 +1721,12 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       rowLabels,
       enriched?.agent_kind
     );
-    const displayName = resolveDisplayName(rawName, projectName, a.address);
+    const loopRunId = loopRunIdFromLabels(rowLabels, term);
+    const displayName = resolveLoopDisplayName(
+      resolveDisplayName(rawName, projectName, a.address),
+      rowLabels,
+      term
+    );
     const isFinished =
       term?.state === "finished" || enriched?.lifecycle?.state === "finished";
     const baseStatus =
@@ -1721,7 +1740,9 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       ? "done"
       : sup?.action_card
         ? "blocked"
-        : baseStatus;
+        : loopRunId && (!baseStatus || baseStatus === "idle")
+          ? "working"
+          : baseStatus;
     rows.push({
       address: a.address,
       pane: a.pane ?? pane?.pane ?? null,
@@ -1744,7 +1765,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
         term?.report?.msg ??
         term?.status?.msg ??
         sup?.action_card?.reason_for_operator ??
-        null,
+        (loopRunId ? `loop ${loopRunId}` : null),
       program: rowProgram,
       branch:
         pane?.branch ??
@@ -1782,7 +1803,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     const term = termMap.get(sa.address) ?? {};
     const sup = supMap.get(sa.address) ?? null;
     const rawName = sa.name || sup?.session_name || sa.address;
-    const rowLabels = term?.labels ?? {};
+    const rowLabels = term?.labels ?? sa?.labels ?? {};
     const isFinished =
       sa?.lifecycle?.state === "finished" || term?.state === "finished";
     if (!isFinished && isPlainShellRow(rawName, term.program, rowLabels, term)) {
@@ -1805,13 +1826,20 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       rowLabels,
       sa?.agent_kind
     );
-    const displayName = resolveDisplayName(rawName, projectName, sa.address);
+    const loopRunId = loopRunIdFromLabels(rowLabels, term);
+    const displayName = resolveLoopDisplayName(
+      resolveDisplayName(rawName, projectName, sa.address),
+      rowLabels,
+      term
+    );
     const baseStatus = sa?.attention_state?.state ?? "idle";
     const status = isFinished
       ? "done"
       : sup?.action_card
         ? "blocked"
-        : baseStatus;
+        : loopRunId && (!baseStatus || baseStatus === "idle")
+          ? "working"
+          : baseStatus;
     rows.push({
       address: sa.address,
       pane: pane?.pane ?? null,
@@ -1830,7 +1858,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       message:
         sa?.attention_state?.message ??
         sup?.action_card?.reason_for_operator ??
-        null,
+        (loopRunId ? `loop ${loopRunId}` : null),
       program: term.program ?? null,
       branch: sa?.workspace?.git_branch ?? pane?.branch ?? null,
       cwd: resolvedCwd,
@@ -1892,7 +1920,12 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     const resolvedCwd = term?.cwd ?? pane?.cwd ?? null;
     const projectName = extractRepoName(resolvedCwd, "") || rawName;
     const programLabel = resolveProgramName(rowProgram, rowLabels, null);
-    const displayName = resolveDisplayName(rawName, projectName, sup.agent_id);
+    const loopRunId = loopRunIdFromLabels(rowLabels, term);
+    const displayName = resolveLoopDisplayName(
+      resolveDisplayName(rawName, projectName, sup.agent_id),
+      rowLabels,
+      term
+    );
     rows.push({
       address: sup.agent_id,
       pane: pane?.pane ?? null,
@@ -1905,7 +1938,9 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       program_label: programLabel,
       status: sup.action_card ? "blocked" : "working",
       kind: sup.action_card ? "permission" : null,
-      message: sup.action_card?.reason_for_operator ?? null,
+      message:
+        sup.action_card?.reason_for_operator ??
+        (loopRunId ? `loop ${loopRunId}` : null),
       program: rowProgram,
       branch: pane?.branch ?? null,
       cwd: resolvedCwd,
@@ -1952,14 +1987,23 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
     const resolvedCwd = term?.cwd ?? pane?.cwd ?? null;
     const projectName = extractRepoName(resolvedCwd, "") || rawName;
     const programLabel = resolveProgramName(rowProgram, rowLabels, null);
-    const displayName = resolveDisplayName(rawName, projectName, addr);
+    const loopRunId = loopRunIdFromLabels(rowLabels, term);
+    const displayName = resolveLoopDisplayName(
+      resolveDisplayName(rawName, projectName, addr),
+      rowLabels,
+      term
+    );
     const rawTermStatus =
       typeof term?.status === "string" ? term.status : term?.status?.state;
-    const status =
+    const rawStatus =
       rawTermStatus ||
       term?.report?.state ||
       rowLabels?.["cockpit.state"] ||
       "idle";
+    const status =
+      loopRunId && (!rawStatus || rawStatus === "idle")
+        ? "working"
+        : rawStatus;
     rows.push({
       address: addr,
       pane: pane?.pane ?? null,
@@ -1972,7 +2016,10 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       program_label: programLabel,
       status,
       kind: term?.report?.kind ?? term?.status?.kind ?? null,
-      message: term?.report?.msg ?? term?.status?.msg ?? null,
+      message:
+        term?.report?.msg ??
+        term?.status?.msg ??
+        (loopRunId ? `loop ${loopRunId}` : null),
       program: rowProgram,
       branch: pane?.branch ?? null,
       cwd: resolvedCwd,

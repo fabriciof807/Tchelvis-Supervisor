@@ -11,7 +11,7 @@ use crate::loops::evidence::{
 };
 use crate::loops::free_check::{
     is_model_listed, plan_preflight, run_free_checks_with_options, ClaudeStatus, FreeCheck, Listed,
-    PlanAction, PlannedCheck, ProviderFreeOutcome,
+    PlanAction, PlannedCheck, ProviderFreeOutcome, AGY_ABSENT_REASON,
 };
 use crate::loops::models::{
     check_project_models_references, is_confirmed, load_project_models_from_repo, parse_use_flag,
@@ -83,11 +83,14 @@ pub enum LoopCommands {
         #[arg(long, required = true, value_delimiter = ',')]
         stages: Vec<String>,
     },
-    /// Lista workflows disponíveis ou execuções registradas (--runs)
+    /// Lista workflows disponíveis ou execuções registradas (--runs / --active)
     List {
         /// Lista execuções registradas em vez de workflows
         #[arg(long)]
         runs: bool,
+        /// Lista apenas execuções ativas no momento
+        #[arg(long)]
+        active: bool,
     },
     /// Valida workflow, configuração, modelos e sandbox (sem gastar tokens, salvo --live)
     Check {
@@ -167,8 +170,8 @@ pub enum LoopCommands {
     },
     /// Solicita o cancelamento de uma execução em andamento (SIGINT ao motor)
     Stop {
-        /// ID da execução
-        run_id: String,
+        /// ID da execução (opcional; sem ID, usa a única execução ativa do repositório atual)
+        run_id: Option<String>,
     },
     /// Remove artefatos de disco e workspaces de execuções finalizadas (mantém branches)
     Clean {
@@ -1028,10 +1031,7 @@ fn build_free_checks_for_targets(
                     &home_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
                 );
                 let account_ok = if !token_present {
-                    Err(
-                        "conta do 'agy' ausente (~/.gemini/antigravity-cli/antigravity-oauth-token); rode 'tchelvis loop auth login agy'"
-                            .to_string(),
-                    )
+                    Err(AGY_ABSENT_REASON.to_string())
                 } else if let Some(out) = outcome {
                     out.account_ok.clone()
                 } else {
@@ -1654,19 +1654,27 @@ fn collect_workflow_catalog(
     Ok(catalog)
 }
 
-fn cmd_list(paths: &CockpitPaths, runs: bool) -> Result<(), LoopError> {
-    if runs {
+fn cmd_list(paths: &CockpitPaths, runs: bool, active: bool) -> Result<(), LoopError> {
+    if runs || active {
+        let empty_msg = if active {
+            "Nenhum loop em execução."
+        } else {
+            "Nenhuma execução registrada."
+        };
         let db_path = paths.orch_db_file();
         if !db_path.exists() {
-            println!("Nenhuma execução registrada.");
+            println!("{empty_msg}");
             return Ok(());
         }
         let store = OrchStore::open(&db_path).map_err(|e| LoopError::err(format!("{e:#}")))?;
-        let items = store
+        let mut items = store
             .list_loops()
             .map_err(|e| LoopError::err(format!("{e:#}")))?;
+        if active {
+            items.retain(is_active);
+        }
         if items.is_empty() {
-            println!("Nenhuma execução registrada.");
+            println!("{empty_msg}");
             return Ok(());
         }
         for rec in items {
@@ -1943,15 +1951,14 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                     format!("agy:      autenticado ({count} modelo(s) listado(s) por 'agy models')")
                 }
                 Some(out) if out.account_ok.is_err() || !agy_cred => {
-                    "agy:      ausente (rode 'tchelvis loop auth login agy')".to_string()
+                    format!("agy:      ausente ({AGY_ABSENT_REASON})")
                 }
                 _ => {
                     if agy_cred {
                         "agy:      autenticado (token presente; lista indisponível em 'agy models')"
                             .to_string()
                     } else {
-                        "agy:      ausente (arquivo ~/.gemini/antigravity-cli/antigravity-oauth-token)"
-                            .to_string()
+                        format!("agy:      ausente ({AGY_ABSENT_REASON})")
                     }
                 }
             };
@@ -1977,17 +1984,11 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
             Ok(())
         }
         Some(AuthSubcommand::Login { cli }) => {
-            let argv: Vec<String> = match cli.as_str() {
-                "claude" => vec!["claude".into(), "auth".into(), "login".into()],
-                // It has no login command: started alone, it asks to sign in.
-                "agy" => vec!["agy".into()],
-                "opencode" => vec!["opencode".into(), "auth".into(), "login".into()],
-                other => {
-                    return Err(LoopError::usage(format!(
-                        "CLI desconhecido '{other}' (use claude, agy ou opencode)"
-                    )));
-                }
-            };
+            if !matches!(cli.as_str(), "claude" | "agy" | "opencode") {
+                return Err(LoopError::usage(format!(
+                    "CLI desconhecido '{cli}' (use claude, agy ou opencode)"
+                )));
+            }
             let herdr = HerdrClient::default();
             let caller_id = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
             if caller_id.trim().is_empty() {
@@ -1995,6 +1996,24 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                     "HC_TERMINAL_ID ausente: execute 'tchelvis loop auth login' a partir de um terminal Herdr",
                 ));
             }
+            let argv: Vec<String> = match cli.as_str() {
+                "claude" => vec!["claude".into(), "auth".into(), "login".into()],
+                // Force file-based OAuth storage (never keyring / D-Bus session bus) so the
+                // bwrap sandbox receives ~/.gemini/antigravity-cli/antigravity-oauth-token.
+                "agy" => {
+                    let runtime_dir = ensure_private_agy_runtime_dir(&paths.state_dir)
+                        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                    vec![
+                        "/usr/bin/env".into(),
+                        "-u".into(),
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("XDG_RUNTIME_DIR={}", runtime_dir.display()),
+                        "agy".into(),
+                    ]
+                }
+                "opencode" => vec!["opencode".into(), "auth".into(), "login".into()],
+                _ => unreachable!(),
+            };
             let cwd = std::env::current_dir().unwrap_or_else(|_| paths.home_dir.clone());
             let term = herdr
                 .run_worker(&caller_id, &cwd, &[], &argv, "")
@@ -2003,9 +2022,114 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                     LoopError::err(format!("falha ao abrir terminal de login via Herdr: {e:#}"))
                 })?;
             println!("Terminal de login aberto para '{cli}': {}", term.address);
+            if cli == "agy" {
+                println!(
+                    "Esse login é só do loop (salvo em arquivo, sem chaveiro); se o navegador não abrir, copie a URL exibida no terminal."
+                );
+            }
+            println!("Para abrir o terminal: hc attach {}", term.address);
             Ok(())
         }
     }
+}
+
+fn ensure_private_agy_runtime_dir(state_dir: &Path) -> Result<PathBuf> {
+    match fs::symlink_metadata(state_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "'{}' é um link simbólico e foi recusado",
+                    state_dir.display()
+                );
+            }
+            if !meta.file_type().is_dir() {
+                bail!("'{}' já existe e não é um diretório", state_dir.display());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(state_dir)
+                .with_context(|| format!("falha ao criar diretório {}", state_dir.display()))?;
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("falha ao verificar {}", state_dir.display()));
+        }
+    }
+    let loops_dir = ensure_dir_no_symlink(state_dir, &["loops"])?;
+    let runtime_dir = loops_dir.join("agy-runtime");
+    match fs::symlink_metadata(&runtime_dir) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                bail!(
+                    "'{}' é um link simbólico e foi recusado",
+                    runtime_dir.display()
+                );
+            }
+            if !meta.file_type().is_dir() {
+                bail!("'{}' já existe e não é um diretório", runtime_dir.display());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(&runtime_dir)
+                .with_context(|| format!("falha ao criar diretório {}", runtime_dir.display()))?;
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("falha ao verificar {}", runtime_dir.display()));
+        }
+    }
+    let raw = runtime_dir.to_str().context("caminho não UTF-8")?;
+    let c_path = CString::new(raw)?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            bail!(
+                "'{}' é um link simbólico e foi recusado",
+                runtime_dir.display()
+            );
+        }
+        return Err(err).with_context(|| format!("falha ao abrir '{}'", runtime_dir.display()));
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(owned.as_raw_fd(), &mut st) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("falha ao inspecionar '{}'", runtime_dir.display()));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+        bail!("'{}' não é um diretório", runtime_dir.display());
+    }
+    let my_uid = unsafe { libc::geteuid() };
+    if st.st_uid != my_uid {
+        bail!(
+            "'{}' pertence a outro usuário (uid {}; esperado {my_uid})",
+            runtime_dir.display(),
+            st.st_uid
+        );
+    }
+    if unsafe { libc::fchmod(owned.as_raw_fd(), 0o700) } < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "falha ao ajustar permissões 0700 de '{}'",
+                runtime_dir.display()
+            )
+        });
+    }
+    if fs::symlink_metadata(runtime_dir.join("bus")).is_ok() {
+        bail!(
+            "'{}' contém socket/entrada 'bus' inesperada",
+            runtime_dir.display()
+        );
+    }
+    Ok(runtime_dir)
 }
 
 fn check_project_models_warnings(
@@ -2722,13 +2846,15 @@ async fn cmd_run(
             .into_owned();
         let herdr = HerdrClient::default();
         let argv = vec![exe, "loop".to_string(), "engine".to_string()];
+        let term_name = loop_terminal_name(&run_id);
         if let Err(e) = herdr
-            .run_worker(
+            .run_worker_named(
                 caller_term,
                 &repo,
                 &[("cockpit.loop_run", run_id.as_str())],
                 &argv,
                 &run_id,
+                term_name.as_deref(),
             )
             .await
         {
@@ -2743,7 +2869,22 @@ async fn cmd_run(
         return Ok(EXIT_PASS);
     }
 
+    eprintln!("RUN_ID: {run_id}");
     run_frozen_engine_with_cancel(&run_dir, paths, cancel, verbose).await
+}
+
+fn loop_terminal_name(run_id: &str) -> Option<String> {
+    let candidate = format!("loop-{run_id}");
+    let valid = (1..=32).contains(&candidate.len())
+        && candidate.bytes().enumerate().all(|(idx, b)| {
+            let is_alnum = b.is_ascii_lowercase() || b.is_ascii_digit();
+            if idx == 0 {
+                is_alnum
+            } else {
+                is_alnum || matches!(b, b'-' | b'_' | b'.')
+            }
+        });
+    valid.then_some(candidate)
 }
 
 /// Only registered runs: files under `.loops/runs` may come with a cloned repository.
@@ -2755,13 +2896,15 @@ fn find_run_dir(
         let rec = registered_run(id, paths)?;
         return Ok((rec.run_id, PathBuf::from(rec.dir)));
     }
-    OrchStore::open(&paths.orch_db_file())
+    let loops = OrchStore::open(&paths.orch_db_file())
         .and_then(|store| store.list_loops())
-        .map_err(|e| LoopError::err(format!("{e:#}")))?
-        .into_iter()
+        .map_err(|e| LoopError::err(format!("{e:#}")))?;
+    loops
+        .iter()
         .rev()
         .find(|r| Path::new(&r.dir).is_dir())
-        .map(|r| (r.run_id, PathBuf::from(r.dir)))
+        .or_else(|| loops.last())
+        .map(|r| (r.run_id.clone(), PathBuf::from(&r.dir)))
         .ok_or_else(|| LoopError::err("nenhuma execução encontrada"))
 }
 
@@ -2936,6 +3079,19 @@ async fn cmd_engine(paths: &CockpitPaths, run_id: String) -> Result<i32, LoopErr
     run_frozen_engine_with_cancel(&run_dir, paths, cancel, false).await
 }
 
+fn run_dir_missing(dir: &Path) -> bool {
+    matches!(
+        fs::symlink_metadata(dir),
+        Err(ref err) if err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn removed_records_message(run_id: &str, status: &str) -> String {
+    format!(
+        "os registros da execução '{run_id}' foram removidos (loop clean); status registrado: {status}"
+    )
+}
+
 fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<(), LoopError> {
     let (resolved_id, run_dir) = find_run_dir(run_id, paths)?;
     match load_state(&run_dir) {
@@ -2971,18 +3127,32 @@ fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<
                     "estado da execução '{resolved_id}' ainda indisponível"
                 )));
             };
+            let removed = run_dir_missing(&run_dir);
             if json {
-                let val = serde_json::json!({
+                let mut val = serde_json::json!({
                     "run_id": rec.run_id,
                     "workflow": rec.workflow,
                     "status": rec.status,
                     "notify_state": rec.notify_state,
                     "dir": rec.dir,
                 });
+                if removed {
+                    let msg = removed_records_message(&rec.run_id, &rec.status);
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("records_removed".to_string(), Value::Bool(true));
+                        obj.insert("message".to_string(), Value::String(msg));
+                    }
+                }
                 println!("{}", serde_json::to_string_pretty(&val).unwrap_or_default());
             } else {
                 println!("STATUS: {} | LOOP: {}", rec.status, rec.workflow);
                 println!("RUN_ID: {}", rec.run_id);
+                if removed {
+                    println!(
+                        "AVISO: {}",
+                        removed_records_message(&rec.run_id, &rec.status)
+                    );
+                }
             }
             Ok(())
         }
@@ -2993,12 +3163,17 @@ fn cmd_result(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopErro
     let (id, run_dir) = find_run_dir(run_id, paths)?;
     match load_state(&run_dir) {
         Ok(state) => println!("{}", format_result(&state)),
-        // The engine ended before writing anything: the record still says how.
+        // The engine ended before writing anything (or disk files were cleaned): the record still says how.
         Err(_) => {
             let rec = registered_run(&id, paths)?;
+            let summary = if run_dir_missing(&run_dir) {
+                removed_records_message(&rec.run_id, &rec.status)
+            } else {
+                "sem estado gravado; o motor não chegou a iniciar".to_string()
+            };
             println!(
-                "STATUS: {} | LOOP: {} | CICLOS: 0/0\nRUN_ID: {}\nBRANCH: (nenhuma)\nARQUIVOS: (nenhum)\nRESUMO: sem estado gravado; o motor não chegou a iniciar ou foi removido",
-                rec.status, rec.workflow, rec.run_id
+                "STATUS: {} | LOOP: {} | CICLOS: 0/0\nRUN_ID: {}\nBRANCH: (nenhuma)\nARQUIVOS: (nenhum)\nRESUMO: {}",
+                rec.status, rec.workflow, rec.run_id, summary
             );
         }
     }
@@ -3019,7 +3194,14 @@ fn cmd_logs(
     run_id: Option<&str>,
     stage_filter: Option<&str>,
 ) -> Result<(), LoopError> {
-    let (_, run_dir) = find_run_dir(run_id, paths)?;
+    let (id, run_dir) = find_run_dir(run_id, paths)?;
+    if run_dir_missing(&run_dir) {
+        let rec = registered_run(&id, paths)?;
+        return Err(LoopError::err(removed_records_message(
+            &rec.run_id,
+            &rec.status,
+        )));
+    }
     let logs_dir = run_dir.join("logs");
     if !logs_dir.is_dir() {
         println!("Nenhum log encontrado em {}.", logs_dir.display());
@@ -3056,7 +3238,14 @@ fn cmd_logs(
 }
 
 fn cmd_report(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopError> {
-    let (_, run_dir) = find_run_dir(run_id, paths)?;
+    let (id, run_dir) = find_run_dir(run_id, paths)?;
+    if run_dir_missing(&run_dir) {
+        let rec = registered_run(&id, paths)?;
+        return Err(LoopError::err(removed_records_message(
+            &rec.run_id,
+            &rec.status,
+        )));
+    }
     let extra = secrets_of_run(&run_dir);
     let extra_refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
     let report_path = run_dir.join("report.md");
@@ -3074,7 +3263,47 @@ fn cmd_report(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopErro
     Ok(())
 }
 
-fn cmd_stop(paths: &CockpitPaths, run_id: &str) -> Result<(), LoopError> {
+fn resolve_stop_run_id(paths: &CockpitPaths, run_id: Option<&str>) -> Result<String, LoopError> {
+    if let Some(id) = run_id {
+        return Ok(id.to_string());
+    }
+    let repo = find_git_repo_root().map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    let db_path = paths.orch_db_file();
+    if !db_path.exists() {
+        return Err(LoopError::err(
+            "nenhum loop ativo no repositório atual (0 em execução)",
+        ));
+    }
+    let store = OrchStore::open(&db_path).map_err(|e| LoopError::err(format!("{e:#}")))?;
+    // Exact, as in `clean`: following a link in `.loops` would reach another repository's loops.
+    let runs = repo.join(".loops/runs");
+    let active: Vec<LoopRunRecord> = store
+        .list_loops()
+        .map_err(|e| LoopError::err(format!("{e:#}")))?
+        .into_iter()
+        .filter(|rec| Path::new(&rec.dir).parent() == Some(runs.as_path()) && is_active(rec))
+        .collect();
+    match active.len() {
+        0 => Err(LoopError::err(
+            "nenhum loop ativo no repositório atual (0 em execução)",
+        )),
+        1 => Ok(active[0].run_id.clone()),
+        _ => {
+            let ids = active
+                .iter()
+                .map(|r| format!("{} ({})", r.run_id, r.workflow))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(LoopError::err(format!(
+                "múltiplos loops ativos no repositório atual: {ids}; especifique o RUN_ID em 'tchelvis loop stop <RUN_ID>'"
+            )))
+        }
+    }
+}
+
+fn cmd_stop(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopError> {
+    let resolved_id = resolve_stop_run_id(paths, run_id)?;
+    let run_id = resolved_id.as_str();
     let rec = registered_run(run_id, paths)?;
     if rec.status != "RUNNING" {
         println!("Loop '{run_id}' já finalizado ({}).", rec.status);
@@ -3207,7 +3436,7 @@ pub async fn execute_loop_command(cmd: LoopCommands, paths: &CockpitPaths) -> i3
     let result: Result<i32, LoopError> = match cmd {
         LoopCommands::Init => cmd_init(paths).map(|()| EXIT_PASS),
         LoopCommands::New { name, stages } => cmd_new(paths, &name, &stages).map(|()| EXIT_PASS),
-        LoopCommands::List { runs } => cmd_list(paths, runs).map(|()| EXIT_PASS),
+        LoopCommands::List { runs, active } => cmd_list(paths, runs, active).map(|()| EXIT_PASS),
         LoopCommands::Check {
             workflow,
             live,
@@ -3248,7 +3477,7 @@ pub async fn execute_loop_command(cmd: LoopCommands, paths: &CockpitPaths) -> i3
             cmd_logs(paths, run_id.as_deref(), stage.as_deref()).map(|()| EXIT_PASS)
         }
         LoopCommands::Report { run_id } => cmd_report(paths, run_id.as_deref()).map(|()| EXIT_PASS),
-        LoopCommands::Stop { run_id } => cmd_stop(paths, &run_id).map(|()| EXIT_PASS),
+        LoopCommands::Stop { run_id } => cmd_stop(paths, run_id.as_deref()).map(|()| EXIT_PASS),
         LoopCommands::Clean { run_id, yes } => {
             cmd_clean(paths, run_id.as_deref(), yes).map(|()| EXIT_PASS)
         }

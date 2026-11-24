@@ -319,12 +319,13 @@ Run fixed, repeatable multi-agent topologies (such as `worker-reviewer-critic`, 
   - **`bwrap` shares the network and localhost:** `bubblewrap` (`bwrap`) is the default sandbox (never silently replaced; `inherited` is opt-in inside an existing container and `incus` is planned). `bwrap` keeps `/` read-only, mounts clean `$HOME` / `/tmp` / `/run`, isolates PID/IPC/UTS namespaces, and binds only the run workspace writable, **but network access, `localhost` services, and abstract sockets remain shared**.
   - **Three-level preflight avoids spending tokens on every run:** after read-only git checks pass and before any workspace, branch, or Herdr terminal is created, `tchelvis loop run` verifies every distinct `provider:model` pair across all stages in three levels: (1) free sandboxed CLI checks (`claude auth status`, `agy models`, `opencode models --standalone`; 15 s cap, `OPENCODE_API_KEY` isolated to `opencode`), (2) cached evidence in `~/.local/state/tchelvis/loops/model_evidence.json` (`0600`, HMAC-salted binary/account/sandbox identity, default `12` h, updated on stage success and invalidated per pair on failure), and (3) lean `Reply with exactly: OK` probes (`--tools ""` and brief system prompt on `claude`, 60 s cap) only without valid evidence. Configure `[preflight]` (`mode = "auto" | "always" | "free"`, `valid_hours = 1..=168`) in `~/.config/tchelvis/loops.toml`; `tchelvis loop check` previews what would run without tokens, `--live` probes all and renews evidence, and `report.md` renders each model's verification method (`probe`, `evidência`, or `gratuito`).
   - **An exported `OPENCODE_API_KEY` is visible to every program started from that shell:** `tchelvis` never reads the OpenCode database or saves keys on disk; it resolves `OPENCODE_API_KEY` from the environment (or interactive `$SHELL -ic`), passes it via process environment only to `opencode` stages and probes, and redacts it from `state.json`, `report.md`, and errors—however, exporting `OPENCODE_API_KEY` in a shell exposes it to any child program started from that shell.
+  - **`agy` login for loops uses file storage, never the system keyring:** when a D-Bus session bus is available, `agy` normally stores credentials in the system keyring instead of `~/.gemini/antigravity-cli/antigravity-oauth-token`, whereas loop sandboxes have no D-Bus and read only the token file. Running `tchelvis loop auth login agy` launches `agy` in a Herdr terminal without D-Bus (`DBUS_SESSION_BUS_ADDRESS` unset and a private `0700` `XDG_RUNTIME_DIR` without a `bus` socket) so the OAuth token is saved directly to the file for loops only (open with `hc attach <addr>` and copy the URL if a browser does not open).
 
 | Subcommand | Purpose & Key Flags |
 | :--- | :--- |
 | `tchelvis loop init` | Initialize `~/.config/tchelvis/loops.toml` (`0600`) and `<repo>/.loops/` (preserves edited files) |
 | `tchelvis loop new <name> --stages <csv>` | Generate a validated `.loops/workflows/<name>.toml` and missing custom role `.md` files |
-| `tchelvis loop list [--runs]` | List available workflows (repo > global > preset) or recorded loop runs in `orch.db` |
+| `tchelvis loop list [--runs \| --active]` | List available workflows, recorded runs (`--runs`), or active runs (`--active`) in `orch.db` |
 | `tchelvis loop check <workflow> [--live] [--use ...]` | Validate workflow, config, sandbox, free checks, and evidence plan (`--live` probes all models) |
 | `tchelvis loop models <workflow>` | Show resolved CLI, model, and source level for every stage |
 | `tchelvis loop models set <role>=<cli[:model]> (--project\|--global)` | Update `.loops/models.toml` or `~/.config/tchelvis/loops.toml` preserving comments |
@@ -335,7 +336,7 @@ Run fixed, repeatable multi-agent topologies (such as `worker-reviewer-critic`, 
 | `tchelvis loop result [run_id]` | Print the canonical 5-line run summary (exit `0`=PASS, `1`=ERROR, `2`=usage, `3`=ESCALATE, `4`=CANCELLED) |
 | `tchelvis loop logs [run_id] [--stage <id>]` | Print sanitized per-stage logs |
 | `tchelvis loop report [run_id]` | Print sanitized `report.md` (with preflight probes, usage totals, timeline, and sandbox disclosures) |
-| `tchelvis loop stop <run_id>` | Send `SIGINT` to cancel an active loop cleanly |
+| `tchelvis loop stop [run_id]` | Send `SIGINT` to cancel an active loop (auto-selects when the current repo has one active loop) |
 | `tchelvis loop clean [run_id] [--yes]` | Remove finished run directories and clones while keeping `loop/*` git branches |
 
 ### 4. GPU offload

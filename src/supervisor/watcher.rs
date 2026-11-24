@@ -2552,4 +2552,50 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].rule_id.as_deref(), Some("guardrails_invalid"));
     }
+
+    #[test]
+    fn watcher_never_reads_evaluates_or_replies_to_loop_run_terminal() {
+        use crate::supervisor::hc::HcCliAdapter;
+
+        let dir = tempdir().unwrap();
+        let cfg = test_config(&dir);
+        let calls_log = dir.path().join("hc_calls.log");
+        let fake_hc = dir.path().join("fake-hc");
+        let script = format!(
+            "#!/usr/bin/env bash\n\
+             echo \"$*\" >> \"{}\"\n\
+             if [ \"$1\" = \"ls\" ]; then\n\
+               cat <<'JSON'\n\
+{{\"terminals\":[{{\"address\":\"t-loop\",\"name\":\"loop-20261124-193000-cafe\",\"state\":\"live\",\"reported\":true,\"status\":{{\"state\":\"blocked\",\"kind\":\"permission\",\"msg\":\"Allow bash?\",\"app\":\"claude\"}},\"foreground\":{{\"name\":\"claude\",\"argv\":[\"claude\"]}},\"argv\":[\"tchelvis\",\"loop\",\"engine\",\"20261124-193000-cafe\"],\"labels\":{{\"cockpit.loop_run\":\"20261124-193000-cafe\",\"cockpit.agent\":\"claude\"}}}}]}}\n\
+JSON\n\
+               exit 0\n\
+             fi\n\
+             exit 1\n",
+            calls_log.display()
+        );
+        crate::test_support::write_executable(&fake_hc, script);
+
+        let mut hc_cfg = cfg.clone();
+        hc_cfg.hc.hc_bin = fake_hc.to_string_lossy().to_string();
+        let store = DurableStateStore::load_or_init(&hc_cfg.state_file_path).unwrap();
+        let hc = HcCliAdapter::new(hc_cfg.hc.clone());
+        let eval_calls = std::sync::Arc::new(Mutex::new(0usize));
+        let cognitive = SharedFakeCognitive {
+            eval_calls: std::sync::Arc::clone(&eval_calls),
+            model: "fake-model".to_string(),
+            next_eval: auto_reply_eval(),
+            next_error: None,
+        };
+        let mut engine = WatcherEngine::new(hc_cfg, store, hc, cognitive);
+
+        let outcome = engine.tick(1000).unwrap();
+        assert_eq!(outcome.active_sessions, 0);
+        assert!(outcome.auto_replied_agents.is_empty());
+        assert!(outcome.alerted_agents.is_empty());
+        assert_eq!(*eval_calls.lock().unwrap(), 0);
+        let log = std::fs::read_to_string(&calls_log).unwrap();
+        assert!(log.contains("ls --json"));
+        assert!(!log.contains("read "));
+        assert!(!log.contains("send "));
+    }
 }

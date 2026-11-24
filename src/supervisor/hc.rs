@@ -382,6 +382,13 @@ pub fn is_coding_agent_terminal(
     status_app: Option<&str>,
     labels: &BTreeMap<String, String>,
 ) -> bool {
+    if labels
+        .get("cockpit.loop_run")
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return false;
+    }
+
     let fg_name = foreground.and_then(|f| f.name.as_deref());
     if agent.is_some_and(crate::agents::is_supervisor_program)
         || name.is_some_and(crate::agents::is_supervisor_program)
@@ -805,5 +812,48 @@ mod tests {
             None,
             &BTreeMap::new(),
         ));
+    }
+
+    #[test]
+    fn test_parse_hc_ls_json_never_evaluates_cockpit_loop_run_terminal() {
+        let mut labels = BTreeMap::new();
+        labels.insert(
+            "cockpit.loop_run".to_string(),
+            "20261124-193000-cafe".to_string(),
+        );
+        labels.insert("cockpit.agent".to_string(), "claude".to_string());
+        assert!(!is_coding_agent_terminal(
+            Some("claude"),
+            Some("loop-20261124-193000-cafe"),
+            Some(&RawHcForeground {
+                name: Some("claude".to_string()),
+                argv: vec!["claude".into(), "-p".into(), "work".into()],
+            }),
+            &["tchelvis".into(), "loop".into(), "engine".into()],
+            true,
+            Some("blocked"),
+            Some("claude"),
+            &labels,
+        ));
+
+        let sample = r#"{
+            "terminals": [
+                {
+                    "address": "t55",
+                    "name": "loop-20261124-193000-cafe",
+                    "state": "live",
+                    "reported": true,
+                    "status": {"state": "blocked", "kind": "permission", "msg": "Allow bash?", "app": "claude"},
+                    "foreground": {"name": "claude", "argv": ["claude"]},
+                    "argv": ["tchelvis", "loop", "engine", "20261124-193000-cafe"],
+                    "labels": {"cockpit.loop_run": "20261124-193000-cafe", "cockpit.agent": "claude"}
+                }
+            ]
+        }"#;
+        let sessions = parse_hc_ls_json(sample, None).unwrap();
+        assert!(
+            sessions.is_empty(),
+            "supervisor must ignore cockpit.loop_run terminals, got {sessions:?}"
+        );
     }
 }

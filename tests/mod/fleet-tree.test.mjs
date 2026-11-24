@@ -251,3 +251,37 @@ test("merge_rows_carry_active_children_and_cockpit_parent_fallback", () => {
   );
 });
 
+test("merge_rows_shows_live_loop_run_as_working_with_run_id_and_excludes_attach_client", () => {
+  const runId = "20261124-193000-dead";
+  const terms = [
+    {
+      address: "t5",
+      state: "live",
+      program: "tchelvis",
+      cwd: "/tmp/repo",
+      foreground: { name: "tchelvis", argv: ["tchelvis", "loop", "engine", runId] },
+      labels: { "cockpit.loop_run": runId },
+    },
+    {
+      address: "t6",
+      state: "live",
+      program: "hc",
+      argv: ["hc", "attach", "t5"],
+      foreground: { name: "hc", argv: ["hc", "attach", "t5"] },
+      labels: { "cockpit.loop_run": runId },
+    },
+  ];
+  const liveAgents = [
+    { address: "t5", program: "tchelvis", status: "idle" },
+    { address: "t6", program: "hc", status: "idle" },
+  ];
+
+  const rows = mergeFleetRows(liveAgents, terms, null, null);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].address, "t5");
+  assert.equal(rows[0].status, "working");
+  assert.ok(rows[0].name.includes(runId), `expected RUN_ID in name, got ${rows[0].name}`);
+  assert.equal(rows[0].attach_target, "t5");
+});
+
+

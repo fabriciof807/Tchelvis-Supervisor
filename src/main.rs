@@ -8,7 +8,9 @@ use tchelvis::doctor::run_doctor;
 use tchelvis::herdr::HerdrClient;
 use tchelvis::home::{self, unix_now_secs, DailyTaskStore, HomeSnapshot, TaskPriority};
 use tchelvis::logging::{init_logging, read_filtered_logs};
-use tchelvis::model::{AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest};
+use tchelvis::model::{
+    AgentRow, AttentionState, CockpitSnapshot, InspectResponse, IpcOp, IpcRequest,
+};
 use tchelvis::providers::ProviderCoordinator;
 use tchelvis::setup::{run_setup, run_uninstall, SetupOptions};
 use tchelvis::store::CacheStore;
@@ -1620,50 +1622,63 @@ fn print_human_status(snap: &CockpitSnapshot) {
     println!("{}", "-".repeat(102));
 
     for row in &snap.agents {
-        let state_str = match &row.attention_state {
-            AttentionState::Blocked { kind, .. } => format!("BLOCKED({})", kind.as_str()),
-            other => {
-                if !row.lifecycle.is_live() {
-                    "finished".to_string()
-                } else if matches!(
-                    row.attention_state,
-                    AttentionState::Idle | AttentionState::Done { .. }
-                ) && !row.active_children.is_empty()
-                {
-                    format!("Waiting on children ({})", row.active_children.len())
-                } else {
-                    other.label().to_string()
-                }
-            }
-        };
-        let branch = row
-            .workspace
-            .git_branch
-            .as_deref()
-            .unwrap_or("Local / No PR");
-        let ticket = row
-            .context
-            .issue
-            .as_ref()
-            .map(|i| format!("{} ({})", i.key, i.status))
-            .or_else(|| row.context.candidate_issues.first().cloned())
-            .unwrap_or_else(|| "-".into());
-        let pr_ci = match (&row.context.pull_request, &row.context.ci) {
-            (Some(pr), Some(ci)) => format!("#{} [{}]", pr.number, ci.overall_state),
-            (Some(pr), None) => format!("#{} ({})", pr.number, pr.state),
-            _ => "-".into(),
-        };
-        println!(
-            "{:<8} {:<14} {:<10} {:<18} {:<22} {:<12} {:<14}",
-            row.address,
-            truncate_col(&row.name, 14),
-            row.agent_kind.as_str(),
-            truncate_col(&state_str, 18),
-            truncate_col(branch, 22),
-            truncate_col(&ticket, 12),
-            truncate_col(&pr_ci, 14),
-        );
+        println!("{}", format_human_status_row(row));
     }
+}
+
+fn format_human_status_row(row: &AgentRow) -> String {
+    let state_str = match &row.attention_state {
+        AttentionState::Blocked { kind, .. } => format!("BLOCKED({})", kind.as_str()),
+        other => {
+            if !row.lifecycle.is_live() {
+                "finished".to_string()
+            } else if matches!(
+                row.attention_state,
+                AttentionState::Idle | AttentionState::Done { .. }
+            ) && !row.active_children.is_empty()
+            {
+                format!("Waiting on children ({})", row.active_children.len())
+            } else {
+                other.label().to_string()
+            }
+        }
+    };
+    let branch = row
+        .workspace
+        .git_branch
+        .as_deref()
+        .unwrap_or("Local / No PR");
+    let ticket = row
+        .context
+        .issue
+        .as_ref()
+        .map(|i| format!("{} ({})", i.key, i.status))
+        .or_else(|| row.context.candidate_issues.first().cloned())
+        .unwrap_or_else(|| "-".into());
+    let pr_ci = match (&row.context.pull_request, &row.context.ci) {
+        (Some(pr), Some(ci)) => format!("#{} [{}]", pr.number, ci.overall_state),
+        (Some(pr), None) => format!("#{} ({})", pr.number, pr.state),
+        _ => "-".into(),
+    };
+    let name_col = if row
+        .labels
+        .get("cockpit.loop_run")
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        row.name.clone()
+    } else {
+        truncate_col(&row.name, 14)
+    };
+    format!(
+        "{:<8} {:<14} {:<10} {:<18} {:<22} {:<12} {:<14}",
+        row.address,
+        name_col,
+        row.agent_kind.as_str(),
+        truncate_col(&state_str, 18),
+        truncate_col(branch, 22),
+        truncate_col(&ticket, 12),
+        truncate_col(&pr_ci, 14),
+    )
 }
 
 fn print_human_inspect(resp: &InspectResponse) {
@@ -2012,5 +2027,38 @@ mod tests {
             "permission"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn format_human_status_row_preserves_loop_run_id() {
+        let mut labels = std::collections::BTreeMap::new();
+        labels.insert(
+            "cockpit.loop_run".to_string(),
+            "20261124-193000-cafe".to_string(),
+        );
+        let row = AgentRow {
+            address: "t-loop".to_string(),
+            name: "loop-20261124-193000-cafe".to_string(),
+            agent_kind: tchelvis::model::AgentKind::PlainShell,
+            lifecycle: tchelvis::model::AgentLifecycle::Live,
+            attention_state: AttentionState::Working {
+                message: Some("loop 20261124-193000-cafe".to_string()),
+            },
+            workspace: Default::default(),
+            correlation_tier: tchelvis::model::CorrelationTier::LocalOnly,
+            context: Default::default(),
+            provenance: vec![],
+            labels,
+            blocked_children: vec![],
+            active_children: vec![],
+            parent: None,
+            prompt_destructive: false,
+            turn: 0,
+            reported: false,
+            updated_at: 0,
+        };
+        let line = format_human_status_row(&row);
+        assert!(line.contains("loop-20261124-193000-cafe"), "{line}");
+        assert!(line.contains("working"), "{line}");
     }
 }

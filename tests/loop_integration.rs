@@ -502,6 +502,7 @@ fi
 
 if [ "${1:-}" = "run" ]; then
   if [ -n "$trace_dir" ]; then
+    printf 'run\n' >> "$trace_dir/hc_run_calls"
     j='['
     f=1
     for a in "$@"; do
@@ -518,6 +519,14 @@ if [ "${1:-}" = "run" ]; then
     done
     printf '%s]\n' "$j" > "$trace_dir/hc_run_argv.json"
   fi
+  if [ "${LOOP_TEST_HC_REJECT_NAME:-}" = "1" ]; then
+    for a in "$@"; do
+      if [ "$a" = "--name" ]; then
+        printf '{"error":{"hint":"see hc schema","kind":"invalid_params","message":"bad name \\"x\\": use 1-32 of a-z 0-9 - _"}}\n'
+        exit 6
+      fi
+    done
+  fi
   if [ "${LOOP_TEST_HC_FAIL:-}" = "1" ]; then
     printf 'fake hc run failure\n' >&2
     exit 1
@@ -528,6 +537,9 @@ if [ "${1:-}" = "run" ]; then
     case "$1" in
       --cwd)
         cwd="$2"
+        shift 2
+        ;;
+      --name)
         shift 2
         ;;
       --json)
@@ -1958,7 +1970,12 @@ fn confirmation_covers_the_repository_choices_whatever_use_overrides() {
         .output()
         .unwrap();
     assert_eq!(ok.status.code(), Some(0));
-    assert_eq!(run(&["--use", &first]), (Some(0), String::new()));
+    let (code, stderr) = run(&["--use", &first]);
+    assert_eq!(code, Some(0));
+    assert!(
+        stderr.starts_with("RUN_ID: ") && stderr.lines().count() == 1,
+        "expected only RUN_ID line on stderr, got: {stderr:?}"
+    );
     assert_eq!(run(&["--use", &second]).0, Some(0));
     assert_eq!(run(&[]).0, Some(0));
 }
@@ -2040,9 +2057,20 @@ fn terminal_output_never_carries_escape_sequences() {
 #[test]
 fn auth_login_opens_the_official_command_and_nothing_else() {
     let h = LoopHarness::new();
+    let expected_runtime_arg = format!(
+        "XDG_RUNTIME_DIR={}",
+        h.state_dir.join("loops/agy-runtime").display()
+    );
+    let agy_expected: Vec<&str> = vec![
+        "/usr/bin/env",
+        "-u",
+        "DBUS_SESSION_BUS_ADDRESS",
+        expected_runtime_arg.as_str(),
+        "agy",
+    ];
     for (cli, expected) in [
         ("claude", &["claude", "auth", "login"][..]),
-        ("agy", &["agy"]),
+        ("agy", agy_expected.as_slice()),
         ("opencode", &["opencode", "auth", "login"]),
     ] {
         let out = h
@@ -2624,4 +2652,481 @@ fn claude_evidence_is_kept_without_the_profile_hidden_by_the_sandbox() {
     let out = run(&["loop", "run", "fast-worker-reviewer", "x"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(count_probe_traces(&h, "claude"), 0);
+}
+
+#[test]
+fn agy_absent_message_mentions_keyring_vs_file_and_matches_between_auth_and_preflight() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    // Write only claude credential so agy is absent (even if present in host keyring, which tests never touch).
+    let claude_cred = h.home.join(".claude/.credentials.json");
+    fs::create_dir_all(claude_cred.parent().unwrap()).unwrap();
+    fs::write(&claude_cred, "{\"token\":\"dummy\"}\n").unwrap();
+
+    let auth_out = h.cmd().args(["loop", "auth"]).output().unwrap();
+    assert_eq!(auth_out.status.code(), Some(0));
+    let auth_stdout = String::from_utf8_lossy(&auth_out.stdout);
+    let agy_line = auth_stdout
+        .lines()
+        .find(|l| l.starts_with("agy:"))
+        .expect("missing agy line");
+    assert!(agy_line.contains("ausente"), "{agy_line}");
+    assert!(agy_line.contains("chaveiro"), "{agy_line}");
+    assert!(
+        agy_line.contains(".gemini/antigravity-cli/antigravity-oauth-token"),
+        "{agy_line}"
+    );
+    assert!(
+        agy_line.contains("tchelvis loop auth login agy"),
+        "{agy_line}"
+    );
+
+    let run_out = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "missing agy"])
+        .output()
+        .unwrap();
+    assert_eq!(run_out.status.code(), Some(1));
+    let run_stderr = String::from_utf8_lossy(&run_out.stderr);
+    // Extract the shared message inside parentheses on `agy:      ausente (<msg>)`
+    let shared_msg = agy_line
+        .split_once('(')
+        .and_then(|(_, r)| r.strip_suffix(')'))
+        .expect("expected parenthesized shared message");
+    assert!(
+        run_stderr.contains(shared_msg),
+        "preflight stderr must contain exact same agy hint '{shared_msg}', got:\n{run_stderr}"
+    );
+}
+
+#[test]
+fn auth_login_agy_sets_private_0700_runtime_dir_rejects_symlink_and_prints_instructions() {
+    let h = LoopHarness::new();
+    let out = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/tmp/nonexistent-bus")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("t-loop-1"), "{stdout}");
+    assert!(
+        stdout.contains("só do loop") || stdout.contains("apenas do loop"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("URL"), "{stdout}");
+    assert!(stdout.contains("hc attach t-loop-1"), "{stdout}");
+
+    let runtime_dir = h.state_dir.join("loops/agy-runtime");
+    let meta = fs::symlink_metadata(&runtime_dir).unwrap();
+    assert!(meta.file_type().is_dir());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+    assert!(!runtime_dir.join("bus").exists());
+
+    // Symlink at agy-runtime must be refused cleanly without launching hc
+    fs::remove_dir(&runtime_dir).unwrap();
+    let decoy = h.tmp.path().join("decoy-runtime");
+    fs::create_dir_all(&decoy).unwrap();
+    std::os::unix::fs::symlink(&decoy, &runtime_dir).unwrap();
+    let sym_out = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "auth", "login", "agy"])
+        .output()
+        .unwrap();
+    assert_ne!(sym_out.status.code(), Some(0));
+}
+
+#[test]
+fn detach_passes_loop_name_and_retries_without_name_only_on_name_rejection() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    // 1. Normal detach passes `--name loop-<RUN_ID>`
+    let ok = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .args(["loop", "run", "fast-worker-reviewer", "named", "--detach"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        ok.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let run_id = String::from_utf8_lossy(&ok.stdout).trim().to_string();
+    let hc_argv: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(h.trace_dir.join("hc_run_argv.json")).unwrap())
+            .unwrap();
+    let expected_name = format!("loop-{run_id}");
+    assert!(
+        hc_argv
+            .windows(2)
+            .any(|w| w == ["--name", expected_name.as_str()]),
+        "expected --name {expected_name} in {hc_argv:?}"
+    );
+    let calls = fs::read_to_string(h.trace_dir.join("hc_run_calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1);
+
+    // Clear the RUNNING row created above (since skip_spawn didn't run engine)
+    let store = OrchStore::open(&h.data_dir.join("orch.db")).unwrap();
+    store.record_loop_final(&run_id, "PASS", 9999).unwrap();
+
+    // 2. When hc rejects `--name` clearly before spawn, retries once without `--name` and succeeds
+    let _ = fs::remove_file(h.trace_dir.join("hc_run_calls"));
+    let retried = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_SKIP_SPAWN", "1")
+        .env("LOOP_TEST_HC_REJECT_NAME", "1")
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "name reject",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        retried.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&retried.stderr)
+    );
+    let retried_id = String::from_utf8_lossy(&retried.stdout).trim().to_string();
+    let hc_argv2: Vec<String> =
+        serde_json::from_str(&fs::read_to_string(h.trace_dir.join("hc_run_argv.json")).unwrap())
+            .unwrap();
+    assert!(!hc_argv2.iter().any(|a| a == "--name"), "{hc_argv2:?}");
+    let calls2 = fs::read_to_string(h.trace_dir.join("hc_run_calls")).unwrap();
+    assert_eq!(calls2.lines().count(), 2);
+    store.record_loop_final(&retried_id, "PASS", 9999).unwrap();
+
+    // 3. Generic failure must NOT retry (must invoke hc run only once -> never 2 engines)
+    let _ = fs::remove_file(h.trace_dir.join("hc_run_calls"));
+    let failed = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t1")
+        .env("LOOP_TEST_HC_FAIL", "1")
+        .args([
+            "loop",
+            "run",
+            "fast-worker-reviewer",
+            "generic fail",
+            "--detach",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1));
+    let calls3 = fs::read_to_string(h.trace_dir.join("hc_run_calls")).unwrap();
+    assert_eq!(calls3.lines().count(), 1);
+}
+
+#[test]
+fn foreground_run_prints_run_id_on_stderr_and_keeps_five_line_stdout() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    let out = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "fg check"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout_lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(stdout_lines.len(), 5, "{stdout}");
+    let run_id = extract_run_id(&out.stdout);
+    assert!(
+        stderr
+            .lines()
+            .any(|l| l.trim() == format!("RUN_ID: {run_id}")),
+        "expected 'RUN_ID: {run_id}' on stderr, got:\n{stderr}"
+    );
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+}
+
+#[test]
+fn list_active_and_optional_stop_respect_current_repo_and_multiplicity() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(4, true);
+    h.write_accounts();
+
+    // No active runs yet -> `Nenhum loop em execução.`
+    let empty_active = h.cmd().args(["loop", "list", "--active"]).output().unwrap();
+    assert_eq!(empty_active.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&empty_active.stdout).trim(),
+        "Nenhum loop em execução."
+    );
+
+    // Outside git repo without RUN_ID -> usage error (exit 2)
+    let outside_dir = h.tmp.path().join("outside-git");
+    fs::create_dir_all(&outside_dir).unwrap();
+    let stop_outside = h
+        .cmd_in(&outside_dir)
+        .args(["loop", "stop"])
+        .output()
+        .unwrap();
+    assert_eq!(stop_outside.status.code(), Some(2));
+
+    // Create a second git repo with 1 active loop; stopping in `h.repo` with 0 active must NEVER touch other repo!
+    let other_repo = h.tmp.path().join("other-repo");
+    fs::create_dir_all(&other_repo).unwrap();
+    let git_other = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&other_repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+    };
+    assert!(git_other(&["init", "-b", "main"]).success());
+    assert!(git_other(&["config", "user.name", "Test User"]).success());
+    assert!(git_other(&["config", "user.email", "test@example.com"]).success());
+    fs::write(other_repo.join("f.txt"), "hi\n").unwrap();
+    assert!(git_other(&["add", "-A"]).success());
+    assert!(git_other(&["commit", "-m", "init"]).success());
+
+    let ready_other = h.tmp.path().join("ready-other");
+    let mut eng_other = h
+        .cmd_in(&other_repo)
+        .env("LOOP_TEST_READY_FILE", &ready_other)
+        .env("LOOP_TEST_SLEEP_SECS", "30")
+        .args(["loop", "run", "fast-worker-reviewer", "other repo loop"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready_other);
+
+    // In h.repo (0 active loops): `loop stop` without ID errors and does not touch eng_other
+    let stop_zero = h.cmd().args(["loop", "stop"]).output().unwrap();
+    assert_eq!(stop_zero.status.code(), Some(1));
+    assert!(eng_other.try_wait().unwrap().is_none());
+
+    // A repository whose `.loops` is a link to the other one owns none of its loops.
+    let linked = h.tmp.path().join("linked-repo");
+    fs::create_dir_all(&linked).unwrap();
+    assert!(Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&linked)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap()
+        .success());
+    std::os::unix::fs::symlink(other_repo.join(".loops"), linked.join(".loops")).unwrap();
+    let stop_linked = h.cmd_in(&linked).args(["loop", "stop"]).output().unwrap();
+    assert_eq!(stop_linked.status.code(), Some(1));
+    assert!(eng_other.try_wait().unwrap().is_none());
+
+    // Start 1st active loop in h.repo
+    let ready1 = h.tmp.path().join("ready1");
+    let mut eng1 = h
+        .cmd()
+        .env("LOOP_TEST_READY_FILE", &ready1)
+        .env("LOOP_TEST_SLEEP_SECS", "30")
+        .args(["loop", "run", "fast-worker-reviewer", "repo loop 1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready1);
+
+    // Wait briefly until engine_pid is recorded in orch.db
+    let store = OrchStore::open(&h.data_dir.join("orch.db")).unwrap();
+    let id1 = loop {
+        let loops = store.list_loops().unwrap();
+        if let Some(rec) = loops.iter().find(|r| {
+            r.dir.starts_with(h.repo.to_string_lossy().as_ref()) && r.engine_pid.is_some()
+        }) {
+            break rec.run_id.clone();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    // Start 2nd active loop in h.repo
+    let ready2 = h.tmp.path().join("ready2");
+    let mut eng2 = h
+        .cmd()
+        .env("LOOP_TEST_READY_FILE", &ready2)
+        .env("LOOP_TEST_SLEEP_SECS", "30")
+        .args(["loop", "run", "fast-worker-reviewer", "repo loop 2"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_file(&ready2);
+    let id2 = loop {
+        let loops = store.list_loops().unwrap();
+        if let Some(rec) = loops.iter().find(|r| {
+            r.run_id != id1
+                && r.dir.starts_with(h.repo.to_string_lossy().as_ref())
+                && r.engine_pid.is_some()
+        }) {
+            break rec.run_id.clone();
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+
+    // `loop list --active` lists all active runs
+    let list_active = h.cmd().args(["loop", "list", "--active"]).output().unwrap();
+    assert_eq!(list_active.status.code(), Some(0));
+    let active_txt = String::from_utf8_lossy(&list_active.stdout);
+    assert!(active_txt.contains(&id1), "{active_txt}");
+    assert!(active_txt.contains(&id2), "{active_txt}");
+
+    // With >1 active loops in h.repo, `loop stop` errors, lists BOTH IDs, and stops neither
+    let stop_multi = h.cmd().args(["loop", "stop"]).output().unwrap();
+    assert_eq!(stop_multi.status.code(), Some(1));
+    let multi_err = String::from_utf8_lossy(&stop_multi.stderr);
+    assert!(multi_err.contains(&id1), "{multi_err}");
+    assert!(multi_err.contains(&id2), "{multi_err}");
+    assert!(eng1.try_wait().unwrap().is_none());
+    assert!(eng2.try_wait().unwrap().is_none());
+
+    // Stop id2 explicitly so exactly 1 active loop (id1) remains in h.repo
+    let stop2 = h.cmd().args(["loop", "stop", &id2]).output().unwrap();
+    assert_eq!(stop2.status.code(), Some(0));
+    let _ = eng2.wait();
+
+    // Now with exact 1 active loop in h.repo, `loop stop` without ID stops id1 and prints id1
+    let stop_single = h.cmd().args(["loop", "stop"]).output().unwrap();
+    assert_eq!(
+        stop_single.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&stop_single.stderr)
+    );
+    let stop_single_out = String::from_utf8_lossy(&stop_single.stdout);
+    assert!(stop_single_out.contains(&id1), "{stop_single_out}");
+    let _ = eng1.wait();
+
+    // Clean up other repo process
+    let _ = eng_other.kill();
+    let _ = eng_other.wait();
+}
+
+#[test]
+fn cleaned_run_commands_report_removed_records_and_preserve_unstarted_message() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+
+    let run = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "to clean"])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0));
+    let run_id = extract_run_id(&run.stdout);
+
+    let clean = h
+        .cmd()
+        .args(["loop", "clean", &run_id, "--yes"])
+        .output()
+        .unwrap();
+    assert_eq!(clean.status.code(), Some(0));
+    assert!(!h.repo.join(".loops/runs").join(&run_id).exists());
+
+    let expected_removed =
+        format!("os registros da execução '{run_id}' foram removidos (loop clean)");
+
+    let rep = h.cmd().args(["loop", "report", &run_id]).output().unwrap();
+    assert_eq!(rep.status.code(), Some(1));
+    let rep_err = String::from_utf8_lossy(&rep.stderr);
+    assert!(rep_err.contains(&expected_removed), "{rep_err}");
+    assert!(rep_err.contains("PASS"), "{rep_err}");
+
+    let logs = h.cmd().args(["loop", "logs", &run_id]).output().unwrap();
+    assert_eq!(logs.status.code(), Some(1));
+    let logs_err = String::from_utf8_lossy(&logs.stderr);
+    assert!(logs_err.contains(&expected_removed), "{logs_err}");
+    assert!(logs_err.contains("PASS"), "{logs_err}");
+
+    let st_txt = h.cmd().args(["loop", "status", &run_id]).output().unwrap();
+    assert_eq!(st_txt.status.code(), Some(0));
+    let st_stdout = String::from_utf8_lossy(&st_txt.stdout);
+    assert!(st_stdout.contains(&expected_removed), "{st_stdout}");
+    assert!(st_stdout.contains("PASS"), "{st_stdout}");
+
+    let st_json = h
+        .cmd()
+        .args(["loop", "status", &run_id, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(st_json.status.code(), Some(0));
+    let val: serde_json::Value = serde_json::from_slice(&st_json.stdout).unwrap();
+    assert_eq!(
+        val.get("records_removed").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(val.get("status").and_then(|v| v.as_str()), Some("PASS"));
+
+    let res = h.cmd().args(["loop", "result", &run_id]).output().unwrap();
+    assert_eq!(res.status.code(), Some(0));
+    let res_stdout = String::from_utf8_lossy(&res.stdout);
+    assert_eq!(res_stdout.lines().count(), 5, "{res_stdout}");
+    assert!(res_stdout.contains(&expected_removed), "{res_stdout}");
+    assert!(res_stdout.contains("PASS"), "{res_stdout}");
+
+    // Existing directory WITHOUT state.json must NEVER say "removidos"
+    let unstarted_dir = h.repo.join(".loops/runs/unstarted-1");
+    fs::create_dir_all(&unstarted_dir).unwrap();
+    register(&h, "unstarted-1", &unstarted_dir, "ERROR", None);
+
+    let res_unstarted = h
+        .cmd()
+        .args(["loop", "result", "unstarted-1"])
+        .output()
+        .unwrap();
+    assert_eq!(res_unstarted.status.code(), Some(0));
+    let res_u_txt = String::from_utf8_lossy(&res_unstarted.stdout);
+    assert_eq!(res_u_txt.lines().count(), 5);
+    assert!(res_u_txt.contains("não chegou a iniciar"), "{res_u_txt}");
+    assert!(!res_u_txt.contains("removido"), "{res_u_txt}");
+
+    let st_u_txt = h
+        .cmd()
+        .args(["loop", "status", "unstarted-1"])
+        .output()
+        .unwrap();
+    assert_eq!(st_u_txt.status.code(), Some(0));
+    assert!(!String::from_utf8_lossy(&st_u_txt.stdout).contains("removido"));
+
+    let st_u_json = h
+        .cmd()
+        .args(["loop", "status", "unstarted-1", "--json"])
+        .output()
+        .unwrap();
+    let u_val: serde_json::Value = serde_json::from_slice(&st_u_json.stdout).unwrap();
+    assert!(u_val.get("records_removed").is_none());
 }

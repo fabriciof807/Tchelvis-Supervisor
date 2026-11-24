@@ -31,6 +31,9 @@ pub fn should_include_terminal(term: &HcTerminal, include_all: bool) -> bool {
     if include_all {
         return true;
     }
+    if term.loop_run_id().is_some() {
+        return !term.is_attach_client();
+    }
     if term.state != "finished" && term.is_plain_shell_foreground() {
         return [
             "cockpit.issue",
@@ -712,5 +715,71 @@ mod tests {
         let row = build_initial_agent_row(&term, AttentionState::Idle, Vec::new(), 1_000);
         assert_eq!(row.parent.as_deref(), Some("t1"));
         assert!(row.active_children.is_empty());
+    }
+
+    #[test]
+    fn test_loop_run_terminal_included_as_working_with_run_id_and_attach_excluded() {
+        use crate::herdr::HcForeground;
+
+        let run_id = "20261124-193000-cafe";
+        let mut labels = BTreeMap::new();
+        labels.insert("cockpit.loop_run".into(), run_id.into());
+
+        // Live loop terminal without explicit status and even without terminal name yet
+        let loop_term = HcTerminal {
+            address: "t40".into(),
+            name: None,
+            state: "live".into(),
+            argv: vec![
+                "/usr/local/bin/tchelvis".into(),
+                "loop".into(),
+                "engine".into(),
+                run_id.into(),
+            ],
+            foreground: Some(HcForeground {
+                name: Some("tchelvis".into()),
+                argv: vec![
+                    "tchelvis".into(),
+                    "loop".into(),
+                    "engine".into(),
+                    run_id.into(),
+                ],
+                ..Default::default()
+            }),
+            labels: labels.clone(),
+            ..Default::default()
+        };
+        assert!(should_include_terminal(&loop_term, false));
+        let att = loop_term.raw_attention_state(1_000);
+        assert!(
+            matches!(att, AttentionState::Working { .. }),
+            "expected Working attention for live loop_run terminal, got {att:?}"
+        );
+        let row = build_initial_agent_row(&loop_term, att, Vec::new(), 1_000);
+        assert!(
+            row.name.contains(run_id),
+            "expected RUN_ID in row.name, got {:?}",
+            row.name
+        );
+
+        // Attach client must remain excluded even if it carries cockpit.loop_run
+        let attach_term = HcTerminal {
+            address: "t41".into(),
+            name: Some("t40".into()),
+            state: "live".into(),
+            argv: vec!["hc".into(), "attach".into(), "t40".into()],
+            foreground: Some(HcForeground {
+                name: Some("hc".into()),
+                argv: vec!["hc".into(), "attach".into(), "t40".into()],
+                ..Default::default()
+            }),
+            labels,
+            ..Default::default()
+        };
+        assert!(!should_include_terminal(&attach_term, false));
+        assert!(matches!(
+            attach_term.raw_attention_state(1_000),
+            AttentionState::Idle
+        ));
     }
 }
