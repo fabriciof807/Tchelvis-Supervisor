@@ -180,7 +180,7 @@ Aprovado em 2026-11-24. CLI e modelo de cada etapa vêm **sempre juntos do mesmo
 - `.loops/models.toml` aceita só `provider` e `model`; qualquer outra chave é erro. É lido do repositório principal, nunca do workspace.
 - `loop models <workflow>` mostra CLI, modelo e nível de origem de cada etapa. `loop models set <role>=cli[:modelo] --project|--global` grava, preservando o resto do arquivo.
 - O efetivo e a origem ficam no `state.json` e no relatório.
-- **Confirmação:** um repositório pode escolher para qual provedor o código vai. Se algum CLI ou modelo vier de arquivo do repositório (níveis 2, 3 de workflow local, ou 4), a primeira execução, e toda execução depois de essa escolha mudar, mostra os modelos e pede confirmação. Sem terminal interativo ou com `--detach`, recusa e mostra `tchelvis loop models confirm <workflow>`. A confirmação é guardada fora do repositório, por caminho canônico e conteúdo da escolha. `--use` e o arquivo global não pedem confirmação.
+- **Confirmação:** um repositório pode escolher para qual provedor o código vai. Se algum CLI ou modelo vier de arquivo do repositório (níveis 2, 3 de workflow local, ou 4), a primeira execução, e toda execução depois de essa escolha mudar, mostra os modelos e pede confirmação. Sem terminal interativo ou com `--detach`, recusa e mostra `tchelvis loop models confirm <workflow>`. A confirmação é guardada fora do repositório, por caminho canônico e conteúdo da escolha. `--use` e o arquivo global não pedem confirmação. `models confirm` **não exige terminal interativo** (decisão do usuário, 2026-11-24), então um agente pode executá-lo; rever se causar problema.
 - **Teste antes de rodar** (exigido pelo usuário em 2026-11-24): um modelo quebrado não pode aparecer só no meio do fluxo. Depois da confirmação e da verificação de contas, e **antes de criar workspace, branch ou terminal**, o `run` envia `Reply with exactly: OK` a cada par CLI + modelo distinto do workflow, **inclusive os de etapas que só rodariam depois**.
   - Usa o mesmo adapter, o mesmo sandbox e as mesmas credenciais da etapa, em uma pasta vazia, sem nada do repositório no pedido. Assim pega nome errado, conta ausente, cota esgotada, rede e sandbox de uma vez. O Claude roda sem ferramentas, para gastar menos.
   - Os testes rodam em paralelo, com até 60 s cada. Passa quem terminar com código 0 e sem evento de erro; o texto da resposta não é comparado.
@@ -251,7 +251,7 @@ No máximo 10 arquivos; nomes e resumo têm caracteres de controle removidos. O 
 | Fase | Entrega |
 |---|---|
 | **A** | Validação, sandbox `inherited` e `bwrap` (Incus em seguida), git seguro, 3 adapters, motor, vigia e aviso único, 5 linhas, `report.md` |
-| **B** | `resume`, `report.html`, `pi` e `codex`, limite de tokens, `checks` determinísticos (ex.: `cargo test`) antes do gate |
+| **B** | `resume`, modelo reserva por etapa (usado se o primeiro falhar no meio do loop, e testado antes como os demais), `report.html`, `pi` e `codex`, limite de tokens, `checks` determinísticos (ex.: `cargo test`) antes do gate |
 | **C** | Aprovação de comandos com `[guardrails]`, `custom`, aba no mod |
 
 ## Mudanças em relação à especificação original
