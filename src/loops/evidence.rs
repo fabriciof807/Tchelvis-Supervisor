@@ -315,6 +315,8 @@ impl DirLockGuard {
     }
 }
 
+/// Not synced to disk, so the lock is held briefly: this is a cache, and a file damaged by a crash
+/// only means a real call.
 fn write_atomic_at(dir_fd: BorrowedFd<'_>, file_name: &str, bytes: &[u8]) -> Result<()> {
     let seq = NEXT_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_name = format!(".{file_name}.tmp.{}.{seq}", std::process::id());
@@ -337,7 +339,7 @@ fn write_atomic_at(dir_fd: BorrowedFd<'_>, file_name: &str, bytes: &[u8]) -> Res
         libc::fchmod(owned.as_raw_fd(), 0o600);
     }
     let mut file = File::from(owned);
-    if let Err(err) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+    if let Err(err) = file.write_all(bytes) {
         unsafe {
             libc::unlinkat(dir_fd.as_raw_fd(), c_tmp.as_ptr(), 0);
         }
@@ -358,9 +360,6 @@ fn write_atomic_at(dir_fd: BorrowedFd<'_>, file_name: &str, bytes: &[u8]) -> Res
             libc::unlinkat(dir_fd.as_raw_fd(), c_tmp.as_ptr(), 0);
         }
         return Err(err).with_context(|| format!("falha ao substituir '{file_name}'"));
-    }
-    unsafe {
-        libc::fsync(dir_fd.as_raw_fd());
     }
     Ok(())
 }
