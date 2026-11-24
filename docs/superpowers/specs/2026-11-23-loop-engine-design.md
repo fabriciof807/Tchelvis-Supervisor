@@ -181,7 +181,13 @@ Aprovado em 2026-11-24. CLI e modelo de cada etapa vêm **sempre juntos do mesmo
 - `loop models <workflow>` mostra CLI, modelo e nível de origem de cada etapa. `loop models set <role>=cli[:modelo] --project|--global` grava, preservando o resto do arquivo.
 - O efetivo e a origem ficam no `state.json` e no relatório.
 - **Confirmação:** um repositório pode escolher para qual provedor o código vai. Se algum CLI ou modelo vier de arquivo do repositório (níveis 2, 3 de workflow local, ou 4), a primeira execução, e toda execução depois de essa escolha mudar, mostra os modelos e pede confirmação. Sem terminal interativo ou com `--detach`, recusa e mostra `tchelvis loop models confirm <workflow>`. A confirmação é guardada fora do repositório, por caminho canônico e conteúdo da escolha. `--use` e o arquivo global não pedem confirmação.
-- O nome do modelo não é validado antes; um nome errado falha na etapa. Conferir pelas listas dos CLIs fica para a fase B.
+- **Teste antes de rodar** (exigido pelo usuário em 2026-11-24): um modelo quebrado não pode aparecer só no meio do fluxo. Depois da confirmação e da verificação de contas, e **antes de criar workspace, branch ou terminal**, o `run` envia `Reply with exactly: OK` a cada par CLI + modelo distinto do workflow, **inclusive os de etapas que só rodariam depois**.
+  - Usa o mesmo adapter, o mesmo sandbox e as mesmas credenciais da etapa, em uma pasta vazia, sem nada do repositório no pedido. Assim pega nome errado, conta ausente, cota esgotada, rede e sandbox de uma vez. O Claude roda sem ferramentas, para gastar menos.
+  - Os testes rodam em paralelo, com até 60 s cada. Passa quem terminar com código 0 e sem evento de erro; o texto da resposta não é comparado.
+  - Se algum falhar, **nada é criado**: o `run` lista **todos** os que falharam, com as etapas afetadas e o motivo, e sai com código 1. Com `--detach`, o teste acontece antes de devolver o controle, e o agente recebe o erro na hora.
+  - Sem opção para pular e sem cache: uma cota pode acabar entre duas execuções. `loop check` continua sem gastar tokens; `loop check --live` faz só este teste.
+  - Medido em 2026-11-24 no `bwrap`: 2,4 a 3,0 s por modelo; cerca de 3,5 mil tokens (US$ 0,0006) no Claude Haiku e 5,9 mil no `opencode` gratuito. O `agy` não foi medido, para não gastar a cota do usuário.
+  - **Limite:** o teste não garante o resto do loop. Se um modelo falhar depois, o loop termina em `ERROR`, o trabalho já feito fica na branch, e retomar depende do `loop resume` (fase B).
 
 ## Veredito, ciclos e fim
 
@@ -233,12 +239,12 @@ No máximo 10 arquivos; nomes e resumo têm caracteres de controle removidos. O 
 
 | Comando | Fase |
 |---|---|
-| `loop init`, `new`, `list [--runs]`, `check <workflow>`, `models <workflow>`, `models set`, `models confirm` | A |
+| `loop init`, `new`, `list [--runs]`, `check <workflow> [--live]`, `models <workflow>`, `models set`, `models confirm` | A |
 | `loop run <workflow> [prompt] [--input-file] [--from-head] [--max-cycles] [--use etapa=cli[:modelo]] [--detach] [--verbose]` | A |
 | `loop status [run-id] [--json]`, `result`, `logs`, `report`, `stop`, `clean` | A |
 | `loop resume <run-id>`, `report --html` | B |
 
-`--input-file` e `[prompt]` são exclusivos. `check` valida workflow, providers e sandbox sem gastar tokens. `clean` mostra o que vai apagar, recusa runs ativas e não apaga a branch. Há uma trava por run, e `max_concurrent` vale para todas.
+`--input-file` e `[prompt]` são exclusivos. `check` valida workflow, providers e sandbox sem gastar tokens; com `--live`, testa também os modelos. `clean` mostra o que vai apagar, recusa runs ativas e não apaga a branch. Há uma trava por run, e `max_concurrent` vale para todas.
 
 ## Fases
 

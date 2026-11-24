@@ -201,7 +201,7 @@ Per stage: prepare exchange → run → collect `writes` (kept also as `c<cycle>
 
 ### Task 8: CLI, documentation and end-to-end
 
-**Files:** Create `src/loops/{cli,models}.rs`, `tests/loop_integration.rs`; Modify `src/main.rs`, `README.md`, `CHANGELOG.md`, `ROADMAP.md`, `src/orch/preamble.rs` (one short section in the skill).
+**Files:** Create `src/loops/{cli,models,preflight}.rs`, `tests/loop_integration.rs`; Modify `src/main.rs`, `README.md`, `CHANGELOG.md`, `ROADMAP.md`, `src/orch/preamble.rs` (one short section in the skill).
 
 Commands: `init`, `new`, `list [--runs]`, `check`, `models <workflow>`, `models set`, `models confirm`, `auth` and `auth login <cli>`, `run`, `status [--json]`, `result`, `logs`, `report`, `stop`, `clean [--yes]`, hidden `engine <run-id>`. `--detach` starts `tchelvis loop engine <run-id>` with `hc run --bg --no-notify --outlive-parent` through `build_run_worker_args`. `run` fails before creating anything when the workflow, config, sandbox, `max_concurrent` or git check fails.
 
@@ -216,6 +216,16 @@ pub fn parse_project_models(raw: &str) -> Result<ProjectModels>;
 pub fn parse_use_flag(raw: &str) -> Result<(String, ModelChoice)>; // first '=', then first ':'
 ```
 Resolution happens before the workflow is accepted, so `parse_workflow` must keep a stage without provider until the levels are applied (change its signature as needed; existing tests keep their assertions). `Execution` gains `model_source` (`serde(default)`, so old states load). Confirmation: `<state>/tchelvis/loops/confirmed.json` (`0600`, atomic), canonical repository path → SHA-256 of the choices that came from the repository. Tests: each level beats the next one; CLI and model never mix levels; `model` without `provider` is an error in every file; unknown key or `[sandbox]` in `models.toml` is an error; model names with `/` and `:` survive `--use`; `set` preserves comments and other keys (`toml_edit`) and refuses a symlink; unknown stage or workflow in `models.toml` is reported by `check`; repository choice needs confirmation, asks again after it changes, and `--detach` refuses with the command; `--use`/global choices ask nothing; `models.toml` in the workspace is ignored.
+
+**Preflight** (spec, "Teste antes de rodar"): `src/loops/preflight.rs`.
+```rust
+pub struct ProbeTarget { pub choice: ModelChoice, pub stage_ids: Vec<String> }
+pub struct ProbeFailure { pub choice: ModelChoice, pub stage_ids: Vec<String>, pub reason: String }
+pub struct ProbeRecord { pub provider: Provider, pub model: Option<String>, pub usage: Usage, pub duration_ms: u64 }
+pub fn probe_targets(workflow: &Workflow) -> Vec<ProbeTarget>;            // distinct pairs, workflow order
+pub fn run_preflight(targets: &[ProbeTarget], sandbox: &(dyn Sandbox + Sync), dir: &Path, cancel: &AtomicBool) -> Result<Vec<ProbeRecord>, Vec<ProbeFailure>>;
+```
+Order in `run`: workflow and config → sandbox check → model confirmation → accounts → preflight → git checks' side effects (workspace, branch, registration, terminal). Read-only git checks come before the preflight, so a dirty repository costs no tokens. One empty directory per probe (removed afterwards); the claude probe adds `--tools ""`; each probe goes through `run_process` (60 s) with the adapter's `EventParser`. Parallel probes need `run_process` to be safe for concurrent stages: its tree cleanup must not end another probe's processes. Reasons are redacted, one line, at most 200 characters. `RunState.preflight: Vec<ProbeRecord>` (`serde(default)`), shown in the report apart from the loop's totals. Tests (fake CLIs): one target per distinct pair; every failure listed with its stages, including a stage only reachable by `RETRY`; a failing probe leaves no workspace, branch, run directory, database row or terminal, and exits 1; a hanging probe ends at 60 s (injected clock) with its processes gone and does not disturb the others; the prompt contains nothing from the repository; `--detach` fails before returning a `RUN_ID`; Ctrl-C during the preflight exits 4; `check` sends nothing and `check --live` probes; a dirty repository is refused without probing.
 
 **`new`** (spec, after the presets). Artifact names: `designer`/`planner` → `design.md`, `reviewer` → `review.md`, `tester` → `test-report.md`, other role → `<role>.md`; the worker writes none. Each stage reads `input.md`, every earlier artifact, and `current.diff` once an editing stage came before it; the retry target also reads every later artifact. Repeated role → id `<role>-2`, and its artifact likewise. Tests: the four preset shapes and an unknown role parse with `parse_workflow`; no editing stage, editing stage last, bad role name, existing file → error and nothing written.
 
