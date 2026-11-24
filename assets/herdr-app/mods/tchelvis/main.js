@@ -492,20 +492,101 @@ function programIcon(prog, size, color) {
     : image(prog.icon).w(size).h(size).flex_none();
 }
 
-function agentGlyph(kindOrLabel, color) {
+function knownAgentGlyph(kindOrLabel) {
   const key = String(kindOrLabel ?? "").trim().toLowerCase();
   const compact = key.replace(/[_-]+/g, "");
-  let glyph = "›_";
-  if (key.includes("claude")) glyph = "✦";
-  else if (key.includes("codex")) glyph = "◎";
-  else if (key === "pi" || key.includes("π")) glyph = "π";
-  else if (compact.includes("opencode")) glyph = "</>";
-  else if (key.includes("antigravity") || key.includes("agy")) glyph = "✧";
+  if (key.includes("claude")) return "✦";
+  if (key.includes("codex")) return "◎";
+  if (key === "pi" || key.includes("π")) return "π";
+  if (compact.includes("opencode")) return "</>";
+  if (key.includes("antigravity") || key.includes("agy")) return "✧";
+  return null;
+}
+
+function agentGlyph(kindOrLabel, color) {
   return div()
     .text_size(11.5)
     .text_color(color)
     .flex_none()
-    .child(glyph);
+    .child(knownAgentGlyph(kindOrLabel) ?? "›_");
+}
+
+// The supervisor's text for "nothing to say yet".
+const SUMMARY_PLACEHOLDER = "Monitorando sessão ativa do agente.";
+
+function fleetCardTitle(row) {
+  return loopRunIdFromLabels(row?.labels)
+    ? row.name
+    : row?.project_name || row?.name || "";
+}
+
+// Addresses of the cards that would look the same: the only ones that show theirs.
+export function duplicateFleetAddresses(rows = []) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = JSON.stringify([
+      fleetCardTitle(row),
+      row.program_label ?? "",
+      row.branch ?? "",
+    ]);
+    groups.set(key, [...(groups.get(key) ?? []), row.address]);
+  }
+  return new Set([...groups.values()].filter((g) => g.length > 1).flat());
+}
+
+// What a Fleet card says, besides its state and its pull request or issue. Text does not clip by
+// itself: the limits are for the default sidebar, where a longer line would wrap.
+export function fleetCardView(
+  row,
+  duplicates = new Set(),
+  { statusLabel = "", isChild = false } = {}
+) {
+  const isFinished =
+    row.lifecycle?.state === "finished" || row.state === "finished";
+  const isLoop = Boolean(loopRunIdFromLabels(row.labels));
+  const needsUser =
+    !isFinished && (row.status === "blocked" || Boolean(row.action_card));
+  const text = String(row.message || row.rolling_summary || "").trim();
+  const isRunIdAgain = isLoop && text === `loop ${loopRunIdFromLabels(row.labels)}`;
+  const summary =
+    text.includes(SUMMARY_PLACEHOLDER) || isRunIdAgain ? "" : text;
+  const { prBadgeText, issueKey } = extractFleetCardSummary(row);
+  const tierBadge =
+    row.correlation_tier === "ambiguous" && !prBadgeText && !issueKey
+      ? "Ambiguous"
+      : null;
+  const hasBadge = Boolean(prBadgeText || issueKey || tierBadge);
+  const branch = row.branch ? `⎇ ${ellipsize(row.branch, 22)}` : "";
+  const detail =
+    [branch, needsUser ? "" : summary].filter(Boolean).join(" · ") ||
+    "Local / No branch";
+  const hasIcon =
+    isLoop || Boolean(row.program?.icon) || knownAgentGlyph(row.program_label);
+  const agentName = hasIcon
+    ? null
+    : ellipsize(row.program_label || "agent", 14);
+  const indent = isChild ? 4 : 0;
+  const titleMax = Math.max(
+    10,
+    Math.floor(30 - statusLabel.length * 0.9) -
+      indent -
+      (agentName?.length ?? 0) +
+      (isLoop ? 2 : 0)
+  );
+  const title = fleetCardTitle(row);
+  const address = duplicates.has(row.address) ? row.address : null;
+  const detailMax = 42 - indent - (hasBadge ? 14 : 0) - (address ? 6 : 0);
+  return {
+    title:
+      isLoop && title.length > titleMax
+        ? `…${title.slice(1 - titleMax)}`
+        : ellipsize(title, titleMax),
+    agentName,
+    detail: ellipsize(detail, detailMax),
+    notice: needsUser && summary ? ellipsize(summary, 52) : null,
+    address,
+    tierBadge,
+  };
 }
 
 function formatTimestamp(ts) {
@@ -4304,6 +4385,7 @@ export default class CockpitMod extends View {
     const live = agents();
     const allTerms = terminals();
     const merged = mergeFleetRows(live, allTerms, snap, supSnap);
+    const duplicates = duplicateFleetAddresses(merged);
     const parts = partitionFleetGroups(groupFleetRows(merged));
     const countRows = (groups) =>
       groups.reduce((sum, g) => sum + 1 + (g.children?.length ?? 0), 0);
@@ -4373,26 +4455,8 @@ export default class CockpitMod extends View {
               ? t.done
               : t.muted;
       const cardSummary = extractFleetCardSummary(a);
-      const pr = cardSummary.pr;
       const issue = cardSummary.issueKey;
-      const tier = a.correlation_tier;
-      const tierLabel =
-        tier === "exact"
-          ? "Exact"
-          : tier === "inferred"
-            ? "Inferred"
-            : tier === "ambiguous"
-              ? "Ambiguous"
-              : "Local";
-      const tierColor =
-        tier === "exact"
-          ? t.done
-          : tier === "inferred"
-            ? t.accent
-            : tier === "ambiguous"
-              ? t.blocked
-              : t.muted;
-      const summaryLine = a.message || a.rolling_summary || "";
+      const view = fleetCardView(a, duplicates, { statusLabel, isChild });
       const cardBorder = isSelected
         ? t.accent
         : isBlocked || hasAlert
@@ -4401,8 +4465,8 @@ export default class CockpitMod extends View {
 
       const cardBase = v_flex()
         .id(`ck-row-${a.address}`)
-        .p(10)
-        .gap(5)
+        .p(7)
+        .gap(3)
         .rounded(8)
         .border(1)
         .border_color(cardBorder)
@@ -4436,7 +4500,7 @@ export default class CockpitMod extends View {
           this.refreshInspector(cx);
           cx.notify();
         })
-        // Row 1: Dot/Spinner + Terminal ID + Program Badge + Status Pill
+        // Row 1: state, agent icon, project and status
         .child(
           h_flex()
             .gap(6)
@@ -4452,41 +4516,39 @@ export default class CockpitMod extends View {
             .when(!isWorking, (el) =>
               el.child(div().size(7).rounded(4).bg(statusColor))
             )
-            .child(
-              div()
-                .text_size(12)
-                .font_semibold()
-                .text_color(t.address ?? t.accent)
-                .child(a.address)
+            .when(!loopRunIdFromLabels(a.labels), (el) =>
+              el.child(
+                programIcon(a.program, 13, t.muted) ??
+                  agentGlyph(a.program_label, t.muted)
+              )
+            )
+            .when(Boolean(view.agentName), (el) =>
+              el.child(
+                div()
+                  .flex_none()
+                  .text_size(11)
+                  .text_color(t.muted)
+                  .child(view.agentName ?? "")
+              )
             )
             .child(
-              programIcon(a.program, 13, t.muted) ??
-                agentGlyph(a.program_label, t.muted)
-            )
-            .child(
               div()
-                .text_size(12)
+                .flex_1()
+                .min_w(0)
+                .text_size(12.5)
                 .font_semibold()
                 .text_color(t.foreground)
-                .child(ellipsize(a.program_label || "agent", 14))
+                .child(view.title)
             )
-            .child(div().flex_1())
             .child(this.pillBadge(t, statusLabel, statusColor))
         )
-        // Row 2: Project & Summary
-        .child(
-          div()
-            .text_size(12.5)
-            .font_semibold()
-            .text_color(t.foreground)
-            .child(ellipsize(a.project_name || a.name, 34))
-        )
-        .when(Boolean(summaryLine), (el) =>
+        // Only when the agent needs the user
+        .when(Boolean(view.notice), (el) =>
           el.child(
             div()
               .text_size(11.5)
-              .text_color(isBlocked ? t.foreground : t.muted)
-              .child(ellipsize(summaryLine, 52))
+              .text_color(t.foreground)
+              .child(view.notice ?? "")
           )
         )
         .when(Boolean(blockedBadge), (el) =>
@@ -4534,29 +4596,26 @@ export default class CockpitMod extends View {
                 )
             )
         )
-        // Row 3: Branch & Correlation Footer
+        // Row 2: branch, summary and the pull request or issue
         .child(
           h_flex()
             .gap(6)
             .items_center()
-            .pt(1)
-            .when(Boolean(a.branch), (el) =>
-              el.child(
-                div()
-                  .flex_1()
-                  .min_w(0)
-                  .text_size(11)
-                  .text_color(t.accent)
-                  .child(`⎇ ${ellipsize(a.branch, 22)}`)
-              )
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(11)
+                .text_color(a.branch ? t.accent : t.dim)
+                .child(view.detail)
             )
-            .when(!a.branch, (el) =>
+            .when(Boolean(view.address), (el) =>
               el.child(
                 div()
-                  .flex_1()
-                  .text_size(11)
+                  .flex_none()
+                  .text_size(10.5)
                   .text_color(t.dim)
-                  .child("Local / No branch")
+                  .child(view.address ?? "")
               )
             )
             .when(Boolean(issue), (el) =>
@@ -4571,8 +4630,8 @@ export default class CockpitMod extends View {
                 )
               )
             )
-            .when(!issue && !pr, (el) =>
-              el.child(this.pillBadge(t, tierLabel, tierColor))
+            .when(Boolean(view.tierBadge), (el) =>
+              el.child(this.pillBadge(t, view.tierBadge ?? "", t.blocked))
             )
         );
     };
