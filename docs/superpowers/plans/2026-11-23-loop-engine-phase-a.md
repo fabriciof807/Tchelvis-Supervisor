@@ -234,6 +234,31 @@ Order in `run`: workflow and config → sandbox check → model confirmation →
 
 ---
 
+### Task 9: Preflight without spending tokens every time (batch D3)
+
+Spec, "Verificação antes de rodar". It replaces Task 8's "every run probes every model"; the rest of Task 8's Preflight text (failure report, nothing created, concurrency, `--detach`, Ctrl-C) still holds.
+
+**Files:** Create `src/loops/{evidence,free_check}.rs`; Modify `config.rs`, `preflight.rs`, `engine.rs`, `state.rs`, `report.rs`, `cli.rs`, `README.md`, `CHANGELOG.md`.
+
+**Produces:**
+```rust
+pub enum PreflightMode { Auto, Always, Free }
+pub struct PreflightConfig { pub mode: PreflightMode, pub valid_hours: u32 }           // [preflight]
+pub struct CliIdentity { pub executable: String, pub account: String, pub sandbox: String } // hashes only
+pub struct EvidenceStore; // open(path); is_valid(&ModelChoice, &CliIdentity, now_ms, valid_hours) -> bool; record(..); discard(&ModelChoice)
+pub enum Listed { Yes, No, Unknown }
+pub struct FreeCheck { pub account_ok: Result<(), String>, pub listed: Listed }
+pub fn parse_claude_status(raw: &str) -> Result<(), String>;
+pub fn parse_model_list(provider: Provider, raw: &str) -> Vec<String>;                  // ids and display names
+pub fn plan_preflight(targets, checks, evidence, config, now_ms) -> Vec<PlannedCheck>;  // pure: Fail | Evidence | Probe | FreeOnly
+```
+Executable identity: canonical path, size and mtime of the CLI found on `PATH`, hashed (no `--version` call). Account identity: claude, hash of the organization and e-mail of `auth status`; opencode, HMAC of `OPENCODE_API_KEY` with a random salt kept in the store; agy, `present`. The store is written with a lock file (two loops at once) and atomically; a corrupt or unreadable store means "no evidence" plus a warning, never an error. `ProbeRecord` gains `method` (`serde(default)` = probe). The engine records evidence through a small trait, best effort: OK stage → record; any other outcome except Cancelled → discard.
+
+- [ ] **Step 1: Failing tests.** `plan_preflight` table: each mode × listed/unlisted/unknown × evidence valid/expired/future/other executable/other account/other sandbox × account missing. Evidence exactly at the limit is expired. One failing stage discards only its own pair. Missing artifact and malformed verdict keep it. Two processes recording at once lose nothing. Corrupt store → probe, not error. The store contains no key, token, e-mail or organization in clear. `free` never starts a probe (fake CLI that records calls). `always` ignores evidence but renews it. `check` starts no probe and says what would run; `check --live` probes all. A free check that hangs ends at 15 s and, in `auto`, leads to a probe. `agy` prefix rule in `free` (`gemini-4-hydrogen` accepted, `gemini-4` with no such id followed by `-` refused). Claude probe argv has the lean flags; stage argv does not. A failed probe still creates nothing.
+- [ ] **Steps 2–4.** **Step 5: Commit** `feat(loop): preflight with free checks and recent evidence`
+
+---
+
 ## Delivery
 
 Four sequential batches, coordinator review after each: **A** = Tasks 1–2, **B** = 3–4, **C** = 5–6, **D** = 7–8. Then an independent review of the whole range before the push.
