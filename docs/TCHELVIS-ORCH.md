@@ -202,7 +202,7 @@ with `/orchestration-tchelvis`:
    `max_concurrent`), and ends its turn.
 3. **Merge and review.** On each wake-up, it checks `tchelvis orch check` and
    `tchelvis loop result`, merges `PASS` branches whose changed files stay
-   inside the ticket's `files` via `git -c core.hooksPath=/dev/null merge --no-ff <branch>`, stops
+   inside the ticket's `files` via `git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff <branch>`, stops
    on out-of-scope edits or failures, and finishes with an independent
    `tchelvis orch launch` review. Merging into `main` is always your call.
 

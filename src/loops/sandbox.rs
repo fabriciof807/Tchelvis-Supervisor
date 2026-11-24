@@ -452,6 +452,8 @@ pub struct BwrapSandbox {
     pub home_ro: Vec<String>,
     pub env_pass: Vec<String>,
     pub state_dir: PathBuf,
+    /// tchelvis' own directories, hidden from every stage wherever they are.
+    private_dirs: Vec<PathBuf>,
 }
 
 impl BwrapSandbox {
@@ -459,30 +461,47 @@ impl BwrapSandbox {
         Self {
             home_ro,
             env_pass,
+            private_dirs: vec![state_dir.clone()],
             state_dir,
         }
     }
 
-    fn is_under_tchelvis_home(home: &Path, path: &Path) -> bool {
-        let Ok(rel) = path.strip_prefix(home) else {
-            return false;
-        };
-        for own in TCHELVIS_HOME_DIRS {
-            let own = Path::new(own);
-            if rel.starts_with(own) || own.starts_with(rel) {
-                return true;
-            }
-        }
-        false
+    pub fn with_private_dirs(mut self, dirs: Vec<PathBuf>) -> Self {
+        self.private_dirs.extend(dirs);
+        self
+    }
+
+    /// Whether `path` is one of tchelvis' own directories, inside one, or above one.
+    fn reaches_tchelvis(&self, home: &Path, path: &Path) -> bool {
+        let touches = |own: &Path| path.starts_with(own) || own.starts_with(path);
+        let default_dirs = TCHELVIS_HOME_DIRS.iter().map(|rel| home.join(rel));
+        (path.starts_with(home) && default_dirs.into_iter().any(|own| touches(&own)))
+            || self
+                .private_dirs
+                .iter()
+                .any(|own| touches(own) || fs::canonicalize(own).is_ok_and(|real| touches(&real)))
+    }
+
+    /// tchelvis' own directories that the replaced home, `/tmp` and `/run` do not already hide.
+    fn exposed_private_dirs(&self, home: &Path) -> BTreeSet<PathBuf> {
+        self.private_dirs
+            .iter()
+            .filter_map(|dir| fs::canonicalize(dir).ok())
+            .filter(|dir| {
+                ![home, Path::new("/tmp"), Path::new("/run")]
+                    .iter()
+                    .any(|hidden| dir.starts_with(hidden))
+            })
+            .collect()
     }
 
     /// What the CLI named by `program` needs from the home directory, as `(source, destination)`
     /// read-only binds: its own executable and its credential, never the directories around them.
     fn adapter_binds(
+        &self,
         program: &std::ffi::OsStr,
         home: &Path,
         path_var: Option<&std::ffi::OsStr>,
-        state_dir: &Path,
     ) -> Vec<(PathBuf, PathBuf)> {
         let Some((name, credential)) = ADAPTER_CREDENTIALS
             .iter()
@@ -496,13 +515,13 @@ impl BwrapSandbox {
             let path_dirs: Vec<PathBuf> = path_var
                 .map(|p| std::env::split_paths(p).collect())
                 .unwrap_or_default();
-            if real != bin && real.starts_with(home) && !Self::is_under_tchelvis_home(home, &real) {
+            if real != bin && real.starts_with(home) && !self.reaches_tchelvis(home, &real) {
                 // The directory of the real executable may hold files it loads; a directory of the
                 // PATH holds unrelated programs, and one above tchelvis' own holds its state.
                 match real.parent() {
                     Some(dir)
                         if !path_dirs.iter().any(|p| p == dir)
-                            && !Self::is_under_tchelvis_home(home, dir) =>
+                            && !self.reaches_tchelvis(home, dir) =>
                     {
                         binds.push((dir.to_path_buf(), dir.to_path_buf()));
                     }
@@ -514,7 +533,7 @@ impl BwrapSandbox {
             }
         }
         if *name == "agy" {
-            if let Some(cred) = resolve_agy_credential(home, Some(state_dir)) {
+            if let Some(cred) = resolve_agy_credential(home, Some(&self.state_dir)) {
                 binds.push((cred.path, home.join(AGY_TOKEN_REL)));
             }
         } else if let Some(rel) = credential {
@@ -551,18 +570,13 @@ impl BwrapSandbox {
         for rel in &self.home_ro {
             let full = home.join(rel);
             if let Ok(real) = fs::canonicalize(&full) {
-                if Self::is_under_tchelvis_home(&home, &real) {
+                if self.reaches_tchelvis(&home, &real) {
                     bail!("'{rel}' em home_ro aponta para os arquivos do tchelvis");
                 }
                 binds.push((full.clone(), full));
             }
         }
-        binds.extend(Self::adapter_binds(
-            &argv[0],
-            &home,
-            path_var,
-            &self.state_dir,
-        ));
+        binds.extend(self.adapter_binds(&argv[0], &home, path_var));
 
         let mut wrapped = vec![
             OsString::from("bwrap"),
@@ -588,6 +602,11 @@ impl BwrapSandbox {
             OsString::from("--tmpfs"),
             home.as_os_str().to_os_string(),
         ];
+
+        for dir in self.exposed_private_dirs(&home) {
+            wrapped.push(OsString::from("--tmpfs"));
+            wrapped.push(dir.into_os_string());
+        }
 
         for (src, dst) in &binds {
             wrapped.push(OsString::from("--ro-bind"));
@@ -1228,11 +1247,10 @@ mod tests {
             let link = bin.join("claude");
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(&real, &link).unwrap();
-            let binds = BwrapSandbox::adapter_binds(
+            let binds = BwrapSandbox::new(vec![], vec![], state_dir.clone()).adapter_binds(
                 std::ffi::OsStr::new("claude"),
                 &home,
                 Some(bin.as_os_str()),
-                &state_dir,
             );
             assert_eq!(
                 binds,
@@ -1475,5 +1493,93 @@ mod tests {
                 "TOKEN=loop-secret-token",
             ]
         );
+    }
+
+    #[test]
+    fn bwrap_hides_tchelvis_directories_outside_home() {
+        if !bwrap_available() {
+            println!("SKIPPED: bwrap unavailable");
+            return;
+        }
+        // Outside /tmp, which the sandbox replaces anyway.
+        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
+        fs::create_dir_all(&target).unwrap();
+        let outside = tempfile::Builder::new()
+            .prefix("sandbox-xdg-")
+            .tempdir_in(&target)
+            .unwrap();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let (state, data) = (
+            outside.path().join("state/tchelvis"),
+            outside.path().join("data/tchelvis"),
+        );
+        let linked_config = home.join(".config/tchelvis");
+        let real_config = outside.path().join("config");
+        let ws = state.join("loops/run/workspace");
+        for dir in [&ws, &data, &real_config, &state.join(AGY_LOGIN_DIR_REL)] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        fs::create_dir_all(linked_config.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real_config, &linked_config).unwrap();
+        let secrets = [
+            state.join(AGY_LOGIN_DIR_REL).join(AGY_TOKEN_FILE),
+            data.join("orch.db"),
+            real_config.join("loops.toml"),
+        ];
+        for file in &secrets {
+            fs::write(file, "private").unwrap();
+        }
+        fs::write(ws.join("visible.txt"), "workspace").unwrap();
+
+        let sb = BwrapSandbox::new(vec![], vec![], state.clone())
+            .with_private_dirs(vec![data.clone(), linked_config.clone()]);
+        let script = secrets
+            .iter()
+            .map(|f| format!("cat '{}' 2>/dev/null;", f.display()))
+            .collect::<String>();
+        let cmd = sb
+            .wrap_with_env(
+                &[
+                    OsString::from("/bin/sh"),
+                    OsString::from("-c"),
+                    OsString::from(format!("{script} cat visible.txt; echo w > new.txt")),
+                ],
+                &ws,
+                &[("PATH", "/usr/bin:/bin"), ("HOME", home.to_str().unwrap())],
+            )
+            .unwrap();
+        let mut out = String::new();
+        run_process(
+            cmd,
+            b"",
+            &tmp.path().join("xdg.log"),
+            Limits {
+                timeout: Duration::from_secs(10),
+                stall: Duration::from_secs(10),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |line| out.push_str(line),
+            &mut || false,
+        )
+        .unwrap();
+        assert!(out.contains("workspace"), "{out}");
+        assert!(!out.contains("private"), "{out}");
+        assert!(ws.join("new.txt").is_file());
+
+        // `home_ro` cannot bring them back.
+        let custom = home.join("xdg/tchelvis");
+        fs::create_dir_all(&custom).unwrap();
+        for rel in ["xdg", "xdg/tchelvis"] {
+            let err = BwrapSandbox::new(vec![rel.into()], vec![], custom.clone())
+                .wrap_with_env(
+                    &[OsString::from("true")],
+                    &ws,
+                    &[("PATH", "/usr/bin"), ("HOME", home.to_str().unwrap())],
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("home_ro"), "{err:#}");
+        }
     }
 }

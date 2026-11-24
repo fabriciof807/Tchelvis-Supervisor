@@ -3673,7 +3673,7 @@ fn agy_evidence_identity_invalidates_when_switching_between_default_and_loop_log
         "{agy_chk2}"
     );
 
-    // 3. Running records evidence for loop login; changing token contents keeps the same identity.
+    // 3. Running records evidence for the loop login, until another login rewrites it.
     let run_loop = h
         .cmd()
         .env("PATH", &path_with_home_bin)
@@ -3682,17 +3682,28 @@ fn agy_evidence_identity_invalidates_when_switching_between_default_and_loop_log
         .unwrap();
     assert_eq!(run_loop.status.code(), Some(0));
 
-    fs::write(&loop_tok, "loop-tok-b-refreshed\n").unwrap();
-    let check_loop_cached = h
-        .cmd()
-        .env("PATH", &path_with_home_bin)
-        .args(["loop", "check", "fast-worker-reviewer"])
-        .output()
-        .unwrap();
-    let chk3 = String::from_utf8_lossy(&check_loop_cached.stdout);
-    let agy_chk3 = chk3
-        .lines()
-        .find(|l| l.trim_start().starts_with("agy:") && l.contains("etapas:"))
-        .unwrap_or_else(|| panic!("agy line missing in:\n{chk3}"));
-    assert!(agy_chk3.contains("evidência recente válida"), "{agy_chk3}");
+    let agy_plan = || {
+        let out = h
+            .cmd()
+            .env("PATH", &path_with_home_bin)
+            .args(["loop", "check", "fast-worker-reviewer"])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.lines()
+            .find(|l| l.trim_start().starts_with("agy:") && l.contains("etapas:"))
+            .unwrap_or_else(|| panic!("agy line missing in:\n{text}"))
+            .to_string()
+    };
+    let plan = agy_plan();
+    assert!(plan.contains("evidência recente válida"), "{plan}");
+
+    let other_login = loop_tok.with_extension("new");
+    fs::write(&other_login, "loop-tok-b\n").unwrap();
+    fs::rename(&other_login, &loop_tok).unwrap();
+    let plan = agy_plan();
+    assert!(
+        plan.contains("chamada real (sem evidência válida)"),
+        "{plan}"
+    );
 }

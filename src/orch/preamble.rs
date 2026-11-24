@@ -143,7 +143,7 @@ Operational limits and guarantees to know before launching or advising a user:
 - **Context:** Read only ticket frontmatter and the 5 lines of `tchelvis loop result <RUN_ID>`. Never read diffs or implementation files, never edit code, and never run the project's build or tests (the final integration ticket runs them in the sandbox).
 - **One upfront approval:** Show the ticket list, branch `integration/<feature>`, and `max_concurrent` (default 2 in `loops.toml`), and ask once to create a dedicated worktree and merge there:
   ```bash
-  git worktree add -b integration/<feature> <worktree_path>
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false worktree add -b integration/<feature> <worktree_path>
   ```
   Never touch `main` and never push.
 - **Worktree preflight:** Run all loop commands from inside the worktree using each ticket's absolute path. Before the first launch, run `tchelvis loop list` and `tchelvis loop check <workflow>` there; if a workflow/team is missing or model confirmation is pending, stop and ask. Never edit `loops.toml`.
@@ -152,13 +152,13 @@ Operational limits and guarantees to know before launching or advising a user:
   ```bash
   tchelvis loop run <workflow> --input-file <abs_ticket_path> --detach
   ```
-  Write `run_id` right after. Repeat for every eligible ticket, then end your turn. If refused by the concurrency limit, set that ticket back to `ready` and end your turn.
-- **On wake-up (one per loop):** Run `tchelvis orch check --run loop_<RUN_ID>` and `tchelvis loop result <RUN_ID>`. On `PASS`, list the changed names in the worktree with `git diff --name-only HEAD...<branch>` (`<branch>` is the `BRANCH:` line; the `ARQUIVOS:` line is shortened when long).
-  - Every name inside the ticket's `files`: run `git -c core.hooksPath=/dev/null merge --no-ff <branch>` in the worktree, set `status: merged`, launch the tickets it unblocked, and end your turn.
+  Write `run_id` right after. Repeat for every eligible ticket, then end your turn. If the launch fails, set that ticket back to `ready`. Refused by the concurrency limit while one of your loops is active: wait for its wake-up. Refused with none of yours active, or for any other reason: stop and report it.
+- **On wake-up (one per loop):** Run `tchelvis orch check --run loop_<RUN_ID>` and `tchelvis loop result <RUN_ID>`. On `PASS`, list the changed names in the worktree with `git diff --name-only --no-renames HEAD...<branch>` (`<branch>` is the `BRANCH:` line; the `ARQUIVOS:` line is shortened when long).
+  - Every name inside the ticket's `files`: run `git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff <branch>` in the worktree, set `status: merged`, launch the tickets it unblocked, and end your turn.
   - `BRANCH: (nenhuma)`: the ticket needed no change; nothing to merge, set `status: merged`.
-  - A name outside `files`: do not merge; stop and ask the user.
+  - A name outside `files`, or any `.gitattributes` or `.gitmodules` (they can run programs during a merge): do not merge; stop and ask the user.
   - Other status or merge conflict (undo with `git merge --abort`): set `status: failed`, launch nothing new, wait for active loops, and report in the user's language in at most 6 lines (ticket, `RUN_ID`, report).
-- **Finish:** Launch an independent review of `integration/<feature>` with `tchelvis orch launch` (outside your context) and report in the user's language; merging into `main` is the user's decision.
+- **Finish:** Launch an independent review of `integration/<feature>` with `tchelvis orch launch` (outside your context). Tell the reviewer to only read and never run the project's code: it is not in the sandbox. Then report in the user's language; merging into `main` is the user's decision.
 - **Lost session:** Rebuild state from ticket frontmatter, `tchelvis loop list --runs`, and `tchelvis loop list --active`. Check `tchelvis loop status <RUN_ID>` for `running` tickets (if `running` has no `run_id`, inspect `tchelvis loop list --active`; if unclear, ask) before any new launch.
 "#
 }
@@ -290,11 +290,11 @@ mod tests {
         );
         for needle in [
             "integration/<feature>",
-            "git worktree add",
+            "git -c core.hooksPath=/dev/null -c core.fsmonitor=false worktree add",
             "--input-file",
             "--detach",
             "loop_<RUN_ID>",
-            "git -c core.hooksPath=/dev/null merge --no-ff",
+            "git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff",
             "git merge --abort",
             "status: running",
             "status: merged",
@@ -304,7 +304,11 @@ mod tests {
             "max_concurrent",
             "ARQUIVOS",
             "BRANCH: (nenhuma)",
-            "git diff --name-only HEAD...<branch>",
+            "git diff --name-only --no-renames HEAD...<branch>",
+            ".gitattributes",
+            ".gitmodules",
+            "any other reason",
+            "never run the project's code",
             "never push",
             "fast-worker-reviewer",
             "worker-reviewer-critic",

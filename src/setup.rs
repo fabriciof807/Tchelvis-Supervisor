@@ -462,7 +462,14 @@ pub fn run_uninstall(
                                 .home_dir
                                 .join(".agents/skills")
                                 .join(TO_TICKETS_SKILL_NAME);
-                            let can_remove = if ft.is_symlink() {
+                            let linked_parent = p
+                                .ancestors()
+                                .skip(1)
+                                .take_while(|dir| *dir != paths.home_dir)
+                                .any(is_symlink_path);
+                            let can_remove = if linked_parent {
+                                false
+                            } else if ft.is_symlink() {
                                 fs::read_link(&p)
                                     .map(|target| {
                                         target == expected_target
@@ -1976,5 +1983,27 @@ mod tests {
             .planned_or_applied
             .iter()
             .any(|l| l.contains("would ask before replacing")));
+    }
+
+    #[test]
+    fn uninstall_never_follows_a_linked_parent_of_to_tickets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        let paths = test_paths(&home);
+        let opts = SetupOptions {
+            only: Some("skills".into()),
+            ..Default::default()
+        };
+        run_setup(&paths, &opts).unwrap();
+
+        let shared = tmp.path().join("shared-agents");
+        fs::rename(home.join(".agents/skills"), &shared).unwrap();
+        std::os::unix::fs::symlink(&shared, home.join(".agents/skills")).unwrap();
+        run_uninstall(&paths, false, false, None).unwrap();
+        assert_eq!(
+            fs::read_to_string(shared.join("to-tickets/SKILL.md")).unwrap(),
+            TO_TICKETS_SKILL
+        );
     }
 }

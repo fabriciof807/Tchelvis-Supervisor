@@ -24,7 +24,8 @@ use crate::loops::preflight::{
 use crate::loops::process::SystemClock;
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{
-    resolve_agy_credential, BwrapSandbox, InheritedSandbox, Sandbox, AGY_TOKEN_FILE,
+    resolve_agy_credential, AgyCredentialSource, BwrapSandbox, InheritedSandbox, Sandbox,
+    AGY_TOKEN_FILE,
 };
 use crate::loops::state::{
     format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState, Usage,
@@ -778,12 +779,13 @@ fn load_roles_for_workflow(
 fn build_sandbox(cfg: &LoopsConfig, paths: &CockpitPaths) -> Box<dyn Sandbox + Sync> {
     match &cfg.sandbox {
         SandboxConfig::Inherited => Box::new(InheritedSandbox::new(cfg.env_pass.clone())),
-        SandboxConfig::Bwrap { home_ro } => Box::new(BwrapSandbox::new(
-            home_ro.clone(),
-            cfg.env_pass.clone(),
-            paths.state_dir.clone(),
-        )),
+        SandboxConfig::Bwrap { home_ro } => Box::new(bwrap_sandbox(home_ro, &cfg.env_pass, paths)),
     }
+}
+
+fn bwrap_sandbox(home_ro: &[String], env_pass: &[String], paths: &CockpitPaths) -> BwrapSandbox {
+    BwrapSandbox::new(home_ro.to_vec(), env_pass.to_vec(), paths.state_dir.clone())
+        .with_private_dirs(vec![paths.config_dir.clone(), paths.data_dir.clone()])
 }
 
 fn ensure_sandbox_prereqs(cfg: &LoopsConfig) -> Result<(), LoopError> {
@@ -961,8 +963,17 @@ fn build_cli_identity_for_provider(
             compute_account_identity(salt, AccountIdentityInput::OpencodeKey(opencode_api_key))
         }
         Provider::Agy => {
-            let source = resolve_agy_credential(home_dir, agy_state_dir).map(|c| c.source);
-            compute_account_identity(salt, AccountIdentityInput::AgyCredential(source))
+            let cred = resolve_agy_credential(home_dir, agy_state_dir);
+            match cred {
+                Some(cred) if cred.source == AgyCredentialSource::LoopLogin => {
+                    let meta = fs::symlink_metadata(&cred.path).ok()?;
+                    compute_account_identity(salt, AccountIdentityInput::AgyLoopLogin(&meta))
+                }
+                cred => compute_account_identity(
+                    salt,
+                    AccountIdentityInput::AgyDefaultFile(cred.is_some()),
+                ),
+            }
         }
     };
     Some(CliIdentity {
@@ -1241,7 +1252,7 @@ impl EvidenceRecorder for StoreEvidenceRecorder {
             provider,
             model: model.map(ToString::to_string),
         };
-        if self.salt.is_none_or(|s| *store.salt() == s) || provider == Provider::Agy {
+        if self.salt.is_none_or(|s| *store.salt() == s) {
             let _ = store.record(&choice, &identity, now_ms);
         }
     }
@@ -3049,15 +3060,13 @@ async fn run_frozen_engine_with_cancel(
     let secrets_for_thread = extra_secrets.clone();
     let orch_db_path = paths.orch_db_file();
     let ev_path = evidence_store_path(paths);
-    let state_dir = paths.state_dir.clone();
+    let sandbox_paths = paths.clone();
     let final_state = tokio::task::spawn_blocking(move || -> RunState {
         let sandbox: Box<dyn Sandbox + Sync> = match &frozen.sandbox {
             SandboxConfig::Inherited => Box::new(InheritedSandbox::new(frozen.env_pass.clone())),
-            SandboxConfig::Bwrap { home_ro } => Box::new(BwrapSandbox::new(
-                home_ro.clone(),
-                frozen.env_pass.clone(),
-                state_dir,
-            )),
+            SandboxConfig::Bwrap { home_ro } => {
+                Box::new(bwrap_sandbox(home_ro, &frozen.env_pass, &sandbox_paths))
+            }
         };
         let clock = SystemClock::new();
         let runner = ProcessStageRunner::new(sandbox.as_ref(), &clock)
@@ -3853,6 +3862,14 @@ mod tests {
         fs::write(&loop_tok, "loop-tok").unwrap();
         let id_loop = id_for(Some(&state));
         assert_ne!(id_default.account, id_loop.account);
+        // Another login rewrites the file: evidence of the first account is not its own.
+        let swapped = loop_tok.with_extension("new");
+        fs::write(&swapped, "loop-tok").unwrap();
+        fs::rename(&swapped, &loop_tok).unwrap();
+        let first_login = id_loop;
+        let id_loop = id_for(Some(&state));
+        assert_ne!(id_loop.account, first_login.account);
+        assert_eq!(id_for(Some(&state)), id_loop);
         assert_ne!(id_none.account, id_loop.account);
 
         // Inherited (state_dir = None) ignores the loop login and still uses the default file.

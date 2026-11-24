@@ -1,5 +1,4 @@
 use crate::loops::models::ModelChoice;
-use crate::loops::sandbox::AgyCredentialSource;
 use crate::loops::workflow::Provider;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -36,7 +35,11 @@ pub enum AccountIdentityInput<'a> {
         login_expires_at: Option<&'a str>,
     },
     OpencodeKey(Option<&'a str>),
-    AgyCredential(Option<AgyCredentialSource>),
+    /// The login of the loop, which only another login rewrites: told apart by metadata, whose
+    /// content is never read.
+    AgyLoopLogin(&'a fs::Metadata),
+    /// The default file changes whenever agy renews its login, so only its presence counts.
+    AgyDefaultFile(bool),
     /// Metadata of the credential file, whose content is never read.
     ClaudeCredentialFile(&'a fs::Metadata),
 }
@@ -560,6 +563,22 @@ pub fn compute_executable_identity(bin: &str, path_var: Option<&OsStr>) -> Strin
     hex_encode(&hasher.finalize())
 }
 
+fn file_identity(salt: &[u8; 32], label: &[u8], meta: &fs::Metadata) -> String {
+    let mut msg = label.to_vec();
+    for part in [meta.dev(), meta.ino(), meta.len()] {
+        msg.extend_from_slice(&part.to_le_bytes());
+    }
+    for part in [
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    ] {
+        msg.extend_from_slice(&part.to_le_bytes());
+    }
+    hex_encode(&hmac_sha256(salt, &msg))
+}
+
 pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>) -> String {
     match input {
         AccountIdentityInput::ClaudeKnown {
@@ -583,19 +602,7 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
             format!("claude:{}", hex_encode(&hmac_sha256(salt, &msg)))
         }
         AccountIdentityInput::ClaudeCredentialFile(meta) => {
-            let mut msg = b"claude-file\0".to_vec();
-            for part in [meta.dev(), meta.ino(), meta.len()] {
-                msg.extend_from_slice(&part.to_le_bytes());
-            }
-            for part in [
-                meta.mtime(),
-                meta.mtime_nsec(),
-                meta.ctime(),
-                meta.ctime_nsec(),
-            ] {
-                msg.extend_from_slice(&part.to_le_bytes());
-            }
-            format!("claude:{}", hex_encode(&hmac_sha256(salt, &msg)))
+            format!("claude:{}", file_identity(salt, b"claude-file\0", meta))
         }
         AccountIdentityInput::OpencodeKey(Some(key)) => {
             let mut msg = Vec::with_capacity(4 + key.len());
@@ -609,13 +616,11 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
                 hex_encode(&hmac_sha256(salt, b"opencode-nokey"))
             )
         }
-        AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::LoopLogin)) => {
-            "loop".to_string()
+        AccountIdentityInput::AgyLoopLogin(meta) => {
+            format!("loop:{}", file_identity(salt, b"agy-loop\0", meta))
         }
-        AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::DefaultFile)) => {
-            "default".to_string()
-        }
-        AccountIdentityInput::AgyCredential(None) => "absent".to_string(),
+        AccountIdentityInput::AgyDefaultFile(true) => "default".to_string(),
+        AccountIdentityInput::AgyDefaultFile(false) => "absent".to_string(),
     }
 }
 
@@ -713,15 +718,15 @@ mod tests {
         assert_ne!(k1, k_none);
         assert!(!k1.contains(oc_key));
 
-        let agy_loop = compute_account_identity(
-            s1.salt(),
-            AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::LoopLogin)),
-        );
-        let agy_default = compute_account_identity(
-            s1.salt(),
-            AccountIdentityInput::AgyCredential(Some(AgyCredentialSource::DefaultFile)),
-        );
-        let agy_no = compute_account_identity(s1.salt(), AccountIdentityInput::AgyCredential(None));
+        let token = tmp.path().join("agy-token");
+        fs::write(&token, "t").unwrap();
+        let meta = fs::metadata(&token).unwrap();
+        let agy_loop =
+            compute_account_identity(s1.salt(), AccountIdentityInput::AgyLoopLogin(&meta));
+        let agy_default =
+            compute_account_identity(s1.salt(), AccountIdentityInput::AgyDefaultFile(true));
+        let agy_no =
+            compute_account_identity(s1.salt(), AccountIdentityInput::AgyDefaultFile(false));
         assert_ne!(agy_loop, agy_default);
         assert_ne!(agy_loop, agy_no);
         assert_ne!(agy_default, agy_no);

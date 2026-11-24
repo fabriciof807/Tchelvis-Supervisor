@@ -88,16 +88,17 @@ Nova seção "Executar tickets com loops". Regras:
   (delicado), `planner-worker-tester-critic` (testes no centro), `designer-worker-reviewer`
   (solução a projetar). Modelos vêm da configuração; o revisor não deve ser mais fraco que o worker.
 - **Ao acordar** (um aviso por loop): `orch check` e `loop result`.
-  - `PASS` e todos os nomes de `git diff --name-only HEAD...<branch>` dentro de `files` (a linha
+  - `PASS` e todos os nomes de `git diff --name-only --no-renames HEAD...<branch>` dentro de `files` (a linha
     `ARQUIVOS` é cortada quando longa): merge com hooks desligados
-    (`git -c core.hooksPath=/dev/null merge --no-ff <branch>`), `status: merged`, dispara os
+    (`git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff <branch>`), `status: merged`, dispara os
     liberados.
-  - `PASS` com arquivo fora de `files`: para e pergunta. Sem branch: nada a juntar, `merged`.
+  - `PASS` com arquivo fora de `files`, `.gitattributes` ou `.gitmodules` (podem executar programas
+    no merge): para e pergunta. Sem branch: nada a juntar, `merged`.
   - Outro status, ou conflito (desfeito com `merge --abort`): `status: failed`, não dispara nada
     novo, espera os ativos e reporta em até 6 linhas (ticket, `RUN_ID`, relatório).
 - **Testes do conjunto** rodam no ticket de integração, dentro do sandbox. O coordenador não os
   executa.
-- **Fim:** revisão independente da branch (`orch launch`, fora do contexto do coordenador) e relato.
+- **Fim:** revisão independente da branch (`orch launch`, fora do contexto do coordenador, **só leitura**: não há sandbox) e relato.
   Juntar na `main` é decisão do usuário.
 - **Sessão perdida:** reconstrói pelos cabeçalhos e por `loop list --runs`; `running` sem loop ativo
   é conferido com `loop status` antes de qualquer novo disparo.
