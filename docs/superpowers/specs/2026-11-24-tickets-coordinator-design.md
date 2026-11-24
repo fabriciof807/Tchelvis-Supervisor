@@ -101,10 +101,15 @@ Nova seção "Executar tickets com loops". Regras:
 
 ## 3. Instalação
 
-`tchelvis setup` instala `to-tickets` onde já instala `orchestration-tchelvis` (mais o comando do
-OpenCode). Hoje o `setup` **sobrescreve** o arquivo de destino. Para `to-tickets` o comportamento é
-outro: se já existe uma que não veio do `tchelvis` (não está no manifesto, ou foi editada depois),
-não toca e avisa. `uninstall` remove só a nossa.
+Skill comum (decisão do usuário, 2026-11-24): o arquivo fica **só** em
+`~/.agents/skills/to-tickets/SKILL.md`, sem cópias nos outros diretórios nem comando do OpenCode.
+Como as demais skills ali, o Claude Code a enxerga por um link em `~/.claude/skills/to-tickets`,
+criado só se `~/.claude` existe e não há nada com esse nome.
+
+`tchelvis setup` **pede confirmação antes de sobrescrever** uma `to-tickets` que não seja a nossa
+versão anterior intacta (padrão: não). Sem terminal interativo, não sobrescreve e avisa. Nunca
+escreve através de um link simbólico. `uninstall` remove só o que é nosso e não foi editado, e só o
+nosso link.
 
 ## Verificado em 2026-11-24
 
@@ -121,5 +126,5 @@ não toca e avisa. `uninstall` remove só a nossa.
 
 ## Validação
 
-Testes de conteúdo da skill e do `setup` (instala, não sobrescreve a do usuário, desinstala). Ensaio
+Testes de conteúdo da skill e do `setup` (instala, pergunta antes de sobrescrever, desinstala). Ensaio
 real: uma spec pequena com 3 tickets, um deles dependente, e um caso de falha.

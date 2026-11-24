@@ -4,7 +4,7 @@
 
 **Goal:** Ship a general `to-tickets` skill and teach `/orchestration-tchelvis` to run those tickets with `tchelvis loop`.
 
-**Architecture:** `to-tickets` is a Markdown asset embedded in the binary and installed by `tchelvis setup`, through a new install path that never replaces a user's file. The coordinator is a new section in the existing orchestration skill. The loop engine does not change.
+**Architecture:** `to-tickets` is a Markdown asset embedded in the binary and installed by `tchelvis setup` in `~/.agents/skills` only, asking before it replaces a user's file. The coordinator is a new section in the existing orchestration skill. The loop engine does not change.
 
 **Tech Stack:** Rust 2021, existing setup manifest (JSON), Markdown. No new dependency.
 
@@ -26,8 +26,8 @@
 
 ## Review Focus
 
-- The user already has a `to-tickets` (theirs or Matt's): `setup` leaves it byte-identical and says so. Task 2.
-- The user edited ours: `setup` and `uninstall` both leave it. Task 2.
+- The user already has a `to-tickets` (theirs or Matt's): `setup` asks; "no", Enter, end of input or no terminal leave it byte-identical and say so. Task 2.
+- The user edited ours: `setup` asks and `uninstall` leaves it. Task 2.
 - `SKILL.md` or its folder is a symlink (including a dangling one): never written through, `setup` does not fail. Task 2.
 - `setup-manifest.json` written by an older version (without the new field) still loads. Task 2.
 - The integration worktree has no untracked `.loops/workflows` or `models.toml`, so a custom team is missing there: the coordinator stops and asks. Task 3.
@@ -42,44 +42,49 @@
 - Test: `src/assets.rs`
 
 **Interfaces:**
-- Produces: `TO_TICKETS_SKILL`, `TO_TICKETS_SKILL_NAME`, and `pub fn to_tickets_opencode_command() -> String` (frontmatter with `description:`, the skill body without its own frontmatter, then `User request: $ARGUMENTS\n`, same shape as `orchestration_opencode_command_markdown`).
+- Produces: `TO_TICKETS_SKILL`, `TO_TICKETS_SKILL_NAME`.
 
-- [ ] **Step 1: Failing test** `to_tickets_skill_states_its_contract`: starts with `---\nname: to-tickets\ndescription: `; contains each of `status: ready`, `blocked_by:`, `files:`, `workflow:`, `run_id:`, `.loops/tickets/<feature>/`, `.tickets/<feature>/`, `integration`, `open decision`, `demo`, `lockfile`, `expand`, `contract`, `approve`; contains none of `claude`, `gemini`, `gpt`, `haiku`, `opus`, `sonnet` (case-insensitive); at most 120 lines. `to_tickets_opencode_command_has_one_frontmatter`: exactly two lines equal to `---`, ends with `User request: $ARGUMENTS\n`.
+- [ ] **Step 1: Failing test** `to_tickets_skill_states_its_contract`: starts with `---\nname: to-tickets\ndescription: `; contains each of `status: ready`, `blocked_by:`, `files:`, `workflow:`, `run_id:`, `.loops/tickets/<feature>/`, `.tickets/<feature>/`, `integration`, `open decision`, `demo`, `lockfile`, `expand`, `contract`, `approve`; contains none of `claude`, `gemini`, `gpt`, `haiku`, `opus`, `sonnet` (case-insensitive); at most 120 lines.
 - [ ] **Step 2: Run** `cargo test --locked --lib to_tickets` → fails to compile.
 - [ ] **Step 3: Write the skill.** Sections, in this order: when not to use it (the change fits one session or loop: say so and stop); read the spec and the code it touches; open decision → ask, never invent; slice rules; dependency rules; the final integration ticket; show the list and what in the spec has no ticket, and wait for approval; write the files; the ticket template. Rules and template are section 1 of the spec, verbatim in meaning. The template's frontmatter keys are exactly those of the spec. State that acceptance criteria must fail before the work, and that each names the command or observation that proves it. After writing, print one table: id, title, blocked by, files.
 - [ ] **Step 4: Run** `cargo test --locked --lib to_tickets` → PASS.
 
-### Task 2: Install without replacing the user's files
+### Task 2: Install in `~/.agents/skills`, asking before replacing
 
 **Files:**
-- Modify: `src/setup.rs` (manifest entry, install, uninstall, purge)
+- Modify: `src/setup.rs` (manifest entry, install, uninstall, purge), `src/main.rs` (the question)
 - Test: `src/setup.rs`
 
 **Interfaces:**
-- Consumes: Task 1 constants and function.
-- Produces: `ManifestEntry.keep_if_modified: bool` with `#[serde(default)]`; `fn apply_owned_file(path: &Path, content: &str, dry_run: bool, manifest: &mut SetupManifest, actions: &mut Vec<String>) -> Result<()>` (mode `0o644`).
+- Consumes: Task 1 constants.
+- Produces: `ManifestEntry.keep_if_modified: bool` with `#[serde(default)]`; `pub fn run_setup_with(paths: &CockpitPaths, opts: &SetupOptions, confirm: &mut dyn FnMut(&Path) -> bool) -> Result<SetupReport>`; `run_setup` keeps its signature and calls it with a `confirm` that always returns `false`. The link is recorded as `ManifestActionKind::CreatedFile` with `keep_if_modified` and the SHA-256 of its target path as `post_sha256`.
 
-Decision table for `apply_owned_file` (first match wins):
+Only under the `skills` target. File: `~/.agents/skills/to-tickets/SKILL.md`, mode `0o644`, folders created if missing. First match wins:
 
 | Destination | Action | `actions` line |
 |---|---|---|
-| file, or its parent folder, is a symlink | leave | `skip <path> (symlink; not managed by tchelvis)` |
+| file, or its folder, is a symlink | leave | `skip <path> (symlink; not managed by tchelvis)` |
 | absent | write, record | `write <path>` |
 | same content as ours | record if missing | `up-to-date <path>` |
 | hash equals the recorded `post_sha256` | write, record | `write <path>` |
-| anything else, or unreadable | leave | `skip <path> (your own file; not replaced)` |
+| anything else | dry run: `would ask before replacing <path>`; else `confirm(path)`: true → write, record; false → leave | `write <path>` / `skip <path> (your own file; not replaced)` |
 
-Uninstall of an entry with `keep_if_modified`: remove only a regular, non-symlink file whose hash equals `post_sha256`; otherwise `keep <path> (modified)`. Purge fallback: remove only when the content equals the embedded one. Destinations: the same seven as the orchestration skill, including the OpenCode command, under the same target conditions.
+Link: `~/.claude/skills/to-tickets` → `~/.agents/skills/to-tickets`, only when `~/.claude` exists, the file above is ours, and `symlink_metadata` finds nothing at the link path. Otherwise leave what is there without asking.
+
+`main.rs`: with a terminal on stdin, `confirm` prints to stderr `'<path>' já existe e não é do tchelvis. Sobrescrever? [y/N]: ` and accepts `y`, `yes`, `s`, `sim`; end of input, a read error or no terminal → `false`.
+
+Uninstall of an entry with `keep_if_modified`: remove a regular file only if its hash equals `post_sha256`, a link only if its target is ours; otherwise `keep <path> (modified)`. Purge fallback: remove the file only if its content is the embedded one, the link only if its target is ours.
 
 - [ ] **Step 1: Failing tests**
-  - `setup_installs_to_tickets_and_uninstall_removes_it`: the seven paths, as `setup_installs_orchestration_skill_and_uninstall_removes_it`.
-  - `setup_never_replaces_a_foreign_to_tickets`: pre-existing `# mine\n` in `.claude/skills/to-tickets/SKILL.md` is byte-identical after setup, after a second setup and after uninstall; no manifest entry for it; the report has `your own file; not replaced`; the other paths are installed.
-  - `setup_updates_its_own_older_to_tickets`: file with content `old\n` and a manifest entry with its hash → replaced by ours.
-  - `an_edited_to_tickets_survives_setup_and_uninstall`.
-  - `a_symlinked_to_tickets_is_left_alone`: (a) `SKILL.md` symlink to a user file, (b) `to-tickets` folder symlink, (c) dangling folder symlink. Setup returns `Ok`, the targets are unchanged, the links still exist.
+  - `setup_installs_to_tickets_only_in_agents_and_uninstall_removes_it`: file and Claude link exist; nothing named `to-tickets` under `.config/opencode`, `.pi`, `.codex`, `.gemini`; after uninstall both are gone.
+  - `setup_asks_before_replacing_a_foreign_to_tickets`: `# mine\n`; `confirm` false → byte-identical, not recorded, report has `your own file; not replaced`, and uninstall leaves it; `confirm` true → ours, recorded.
+  - `setup_updates_its_own_older_to_tickets_without_asking` (`confirm` panics if called).
+  - `an_edited_to_tickets_asks_on_setup_and_survives_uninstall`.
+  - `a_symlinked_to_tickets_is_left_alone`: `SKILL.md` link, folder link, dangling folder link; `Ok`, targets unchanged, links still there, `confirm` not called.
+  - `an_existing_claude_entry_is_left_alone`: a folder, a file and a foreign link at `~/.claude/skills/to-tickets`.
   - `purge_without_a_manifest_removes_only_our_to_tickets`.
   - `a_manifest_without_the_new_field_loads`: JSON literal without `keep_if_modified` → `Ok`, value `false`.
-  - `dry_run_writes_no_to_tickets`.
+  - `dry_run_writes_no_to_tickets_and_never_asks`.
 - [ ] **Step 2: Run** `cargo test --locked --lib setup` → the new ones fail.
 - [ ] **Step 3: Implement** per the table. Use `symlink_metadata`, never `exists()`, to decide.
 - [ ] **Step 4: Run** `cargo test --locked` → PASS, existing setup tests unchanged.
@@ -105,7 +110,7 @@ Uninstall of an entry with `keep_if_modified`: remove only a regular, non-symlin
 **Files:**
 - Modify: `docs/TCHELVIS-ORCH.md`, `README.md`, `CHANGELOG.md` (Unreleased / Added), `docs/agent-install.md` if it lists installed skills
 
-- [ ] **Step 1:** Guide: one section "From a spec to merged branches" (spec → `/to-tickets` → `/orchestration-tchelvis`), with the limits from the spec. README: one bullet in Use Case 5, and `to-tickets` in the sentence about the `skills` target, saying it never replaces the user's own. CHANGELOG: two entries; credit the ideas to Matt Pocock's MIT `to-tickets`.
+- [ ] **Step 1:** Guide: one section "From a spec to merged branches" (spec → `/to-tickets` → `/orchestration-tchelvis`), with the limits from the spec. README: one bullet in Use Case 5, and `to-tickets` in the sentence about the `skills` target: one copy in `~/.agents/skills`, linked for Claude Code, and `setup` asks before replacing the user's own. CHANGELOG: two entries; credit the ideas to Matt Pocock's MIT `to-tickets`.
 - [ ] **Step 2:** Check that every relative link resolves and every command appears in its `--help`. Run `cargo test --locked`.
 
 ### Task 5: Real rehearsal (coordinator, not the implementer)
