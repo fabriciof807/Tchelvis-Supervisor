@@ -1,6 +1,6 @@
 # Tickets e coordenador de loops no modo orchestrator — design
 
-Data: 2026-11-24 · Status: **aguardando aprovação** · Tamanho: pequeno (instruções e instalação; sem mudança no motor)
+Data: 2026-11-24 · Status: aprovado pelo usuário em 2026-11-24 · Tamanho: pequeno (instruções e instalação; sem mudança no motor)
 
 ## Intenção
 
