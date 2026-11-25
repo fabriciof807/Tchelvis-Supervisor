@@ -636,6 +636,23 @@ fn disabled_filter_config(filters: &[String]) -> Vec<(String, String)> {
     config
 }
 
+/// The network settings of git-lfs that must never come from `.lfsconfig`, in this order. They
+/// outrank it, since git config wins over `.lfsconfig`, which the agent controls in the engine's
+/// commands and the repository controls at checkout: without them it could choose an address
+/// (`lfs.url`), leave pointers (`fetchinclude`/`fetchexclude`) or hide the failure
+/// (`skipdownloaderrors`).
+fn lfs_network_config() -> Vec<(String, String)> {
+    [
+        ("lfs.url", "file:///dev/null"),
+        ("lfs.fetchinclude", ""),
+        ("lfs.fetchexclude", ""),
+        ("lfs.skipdownloaderrors", "false"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_string(), value.to_string()))
+    .collect()
+}
+
 /// The settings of the checkout of a repository with the trusted `lfs` filter.
 fn lfs_checkout_config(lfs: &LfsCheckout) -> Vec<(String, String)> {
     let mut config: Vec<(String, String)> = lfs
@@ -645,11 +662,7 @@ fn lfs_checkout_config(lfs: &LfsCheckout) -> Vec<(String, String)> {
         .collect();
     config.push(("filter.lfs.required".to_string(), "true".to_string()));
     config.push(("lfs.storage".to_string(), lfs.storage.display().to_string()));
-    // The three below outrank the repository's `.lfsconfig`, which could otherwise choose an
-    // address (`lfs.url`) or leave pointers in place (`fetchinclude`/`fetchexclude`).
-    config.push(("lfs.url".to_string(), "file:///dev/null".to_string()));
-    config.push(("lfs.fetchinclude".to_string(), String::new()));
-    config.push(("lfs.fetchexclude".to_string(), String::new()));
+    config.extend(lfs_network_config());
     config
 }
 
@@ -918,7 +931,12 @@ impl GitWorkspace {
     /// and a run-private GIT_INDEX_FILE with hooks and fsmonitor disabled.
     fn engine_git(&self) -> Command {
         let mut cmd = git();
-        set_disabled_filters(&mut cmd, &self.disabled_filters);
+        let mut config = disabled_filter_config(&self.disabled_filters);
+        if self.lfs_enabled {
+            // In the same call: a second `set_git_config` would restart at slot 0.
+            config.extend(lfs_network_config());
+        }
+        set_git_config(&mut cmd, &config);
         cmd.args(["-c", "core.sparseCheckout=false"])
             .env("GIT_DIR", &self.main_git_dir)
             .env("GIT_WORK_TREE", &self.workspace_path)
@@ -2129,6 +2147,20 @@ mod tests {
     }
 
     #[test]
+    fn lfs_network_config_is_exact() {
+        let expected: Vec<(String, String)> = [
+            ("lfs.url", "file:///dev/null"),
+            ("lfs.fetchinclude", ""),
+            ("lfs.fetchexclude", ""),
+            ("lfs.skipdownloaderrors", "false"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(lfs_network_config(), expected);
+    }
+
+    #[test]
     fn lfs_checkout_config_is_exact() {
         let lfs = lfs_checkout(
             &[
@@ -2147,6 +2179,7 @@ mod tests {
             ("lfs.url", "file:///dev/null"),
             ("lfs.fetchinclude", ""),
             ("lfs.fetchexclude", ""),
+            ("lfs.skipdownloaderrors", "false"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2292,6 +2325,57 @@ mod tests {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             other => panic!("o checkout não deveria contatar a URL: {other:?}"),
         }
+    }
+
+    #[test]
+    fn engine_git_ignores_the_agents_lfsconfig_url() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = real_lfs_repo(&tmp);
+        let mut ws = GitWorkspace::create(&repo, &run, "loop/lfs", false).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::write(
+            ws.path().join(".lfsconfig"),
+            format!("[lfs]\n\turl = http://127.0.0.1:{port}/x\n"),
+        )
+        .unwrap();
+        let missing = "ab".repeat(32);
+        fs::write(ws.path().join("b.bin"), pointer(&missing, 5)).unwrap();
+        let tree = ws.snapshot().unwrap();
+        fs::remove_file(ws.path().join("b.bin")).unwrap();
+        assert!(
+            ws.restore(&tree).is_err(),
+            "esperava a falha do restore sem o objeto do Git LFS"
+        );
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("o engine não deveria contatar a URL do agente: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn engine_git_ignores_the_agents_fetchexclude() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = real_lfs_repo(&tmp);
+        let mut ws = GitWorkspace::create(&repo, &run, "loop/lfs", false).unwrap();
+        let base_tree = ws.base_tree().to_string();
+        fs::write(
+            ws.path().join(".lfsconfig"),
+            "[lfs]\n\tfetchexclude = *.bin\n",
+        )
+        .unwrap();
+        fs::write(ws.path().join("a.bin"), b"CHANGED").unwrap();
+        ws.restore(&base_tree).unwrap();
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), b"REAL\0CONTENT");
     }
 
     #[test]
