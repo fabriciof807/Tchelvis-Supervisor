@@ -9,7 +9,7 @@ use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{
     redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
-    StopDiagnostic, StopProcess, Usage, LOOP_STATE_SCHEMA_VERSION,
+    StopDiagnostic, StopProcess, ToolSignal, ToolSilence, Usage, LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::loops::verdict::{parse_verdict, summary_line, MAX_SUMMARY_CHARS};
 use crate::loops::workflow::{Provider, Stage, Workflow};
@@ -49,6 +49,8 @@ pub struct StageResult {
     pub error: Option<String>,
     /// Filled only when the engine cut the stage short; see [`StopDiagnostic`].
     pub stop: Option<StopDiagnostic>,
+    /// The longest silence past `stall_secs` that an open tool made acceptable.
+    pub tool_silence: Option<ToolSilence>,
 }
 
 impl Default for StageResult {
@@ -58,6 +60,7 @@ impl Default for StageResult {
             usage: Usage::default(),
             error: None,
             stop: None,
+            tool_silence: None,
         }
     }
 }
@@ -124,6 +127,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     usage: Usage::default(),
                     error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                     stop: None,
+                    tool_silence: None,
                 };
             }
         };
@@ -144,6 +148,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     usage: Usage::default(),
                     error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                     stop: None,
+                    tool_silence: None,
                 };
             }
         };
@@ -192,6 +197,9 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 running_tools: stream.running_tools.clone(),
                 processes: snapshot.processes,
                 processes_total: snapshot.processes_total,
+                limit: None,
+                limit_secs: None,
+                tool_signal: None,
             });
             (
                 AdapterResult {
@@ -211,6 +219,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 usage: parsed.usage,
                 error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                 stop: None,
+                tool_silence: None,
             },
             Ok(Outcome::Exited(0)) => {
                 if parsed_error.is_some() {
@@ -219,6 +228,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                         usage: parsed.usage,
                         error: parsed_error,
                         stop: None,
+                        tool_silence: None,
                     }
                 } else {
                     StageResult {
@@ -226,6 +236,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                         usage: parsed.usage,
                         error: None,
                         stop: None,
+                        tool_silence: None,
                     }
                 }
             }
@@ -235,6 +246,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 error: parsed_error
                     .or_else(|| Some(format!("processo retornou código de saída {code}"))),
                 stop: None,
+                tool_silence: None,
             },
             Ok(Outcome::Signaled(sig)) => StageResult {
                 outcome: StageOutcome::Signaled(sig),
@@ -242,24 +254,28 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 error: parsed_error
                     .or_else(|| Some(format!("processo encerrado pelo sinal {sig}"))),
                 stop: None,
+                tool_silence: None,
             },
             Ok(Outcome::TimedOut) => StageResult {
                 outcome: StageOutcome::TimedOut,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop,
+                tool_silence: None,
             },
             Ok(Outcome::Stalled) => StageResult {
                 outcome: StageOutcome::Stalled,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop,
+                tool_silence: None,
             },
             Ok(Outcome::Cancelled) => StageResult {
                 outcome: StageOutcome::Cancelled,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop: None,
+                tool_silence: None,
             },
         }
     }
@@ -474,6 +490,18 @@ fn sanitize_stop(stop: StopDiagnostic, extra_secrets: &[&str]) -> StopDiagnostic
             })
             .collect(),
         processes_total: stop.processes_total,
+        limit: stop.limit,
+        limit_secs: stop.limit_secs,
+        tool_signal: stop.tool_signal.map(|signal| ToolSignal {
+            source: signal.source,
+            names: signal
+                .names
+                .iter()
+                .take(MAX_STOP_TOOLS)
+                .map(|name| text(name))
+                .filter(|name| !name.is_empty())
+                .collect(),
+        }),
     }
 }
 
@@ -934,6 +962,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                             .stop
                             .clone()
                             .map(|stop| sanitize_stop(stop, extra_secrets)),
+                        tool_silence: result.tool_silence,
                     });
                     drop(guard);
                     end_run(RunStatus::Error, Some(err), None);
@@ -962,6 +991,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                             .clone()
                             .map(|stop| sanitize_stop(stop, extra_secrets)),
                         log_file: Some(log_rel.clone()),
+                        tool_silence: result.tool_silence,
                     });
                 };
 
@@ -1307,7 +1337,7 @@ mod tests {
     use super::*;
     use crate::loops::artifacts::{EXCHANGE_DIR, IN_DIR, OUT_DIR};
     use crate::loops::process::SystemClock;
-    use crate::loops::state::{load_state, sum_usage, Total};
+    use crate::loops::state::{load_state, sum_usage, StopLimit, ToolSource, Total};
     use crate::loops::workflow::{parse_workflow, Provider, RoleDefault, RoleDefaults};
     use anyhow::Result;
     use std::collections::VecDeque;
@@ -1597,6 +1627,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1612,6 +1643,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1631,6 +1663,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
 
@@ -1673,6 +1706,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1688,6 +1722,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1707,6 +1742,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
 
@@ -1724,6 +1760,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1739,6 +1776,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
         runner.push(|req| {
@@ -1754,6 +1792,7 @@ on_retry = "implement"
                 },
                 error: None,
                 stop: None,
+                tool_silence: None,
             }
         });
 
@@ -2687,6 +2726,7 @@ on_retry = "implement"
             usage: Usage::default(),
             error: Some("quota exhausted".into()),
             stop: None,
+            tool_silence: None,
         });
         let events = RecordingEvidence::default();
         let state = Engine::new(make_config(&tmp, wf.clone()), ws, runner, FakeClock::new())
@@ -2710,6 +2750,7 @@ on_retry = "implement"
             usage: Usage::default(),
             error: None,
             stop: None,
+            tool_silence: None,
         });
         let events2 = RecordingEvidence::default();
         let state2 = Engine::new(
@@ -2803,7 +2844,11 @@ on_retry = "implement"
                     after_last_output: true,
                 }],
                 processes_total: 3,
+                limit: None,
+                limit_secs: None,
+                tool_signal: None,
             }),
+            tool_silence: None,
         });
 
         let state = Engine::new(
@@ -2848,6 +2893,43 @@ on_retry = "implement"
             "{raw_report}"
         );
         assert!(raw_report.contains("[REDACTED]"), "{raw_report}");
+    }
+
+    #[test]
+    fn sanitize_stop_cleans_the_tool_signal() {
+        let secret = "sk-signal-secret-1";
+        let mut names: Vec<String> = (0..10).map(|i| format!("tool{i}")).collect();
+        names.push(format!("bash {secret}"));
+        names.push("\n".to_string());
+        let stop = StopDiagnostic {
+            last_event: None,
+            last_output_at_ms: None,
+            silent_ms: 0,
+            cli_alive: true,
+            running_tools: None,
+            processes: Vec::new(),
+            processes_total: 0,
+            limit: Some(StopLimit::ToolStall),
+            limit_secs: Some(1200),
+            tool_signal: Some(ToolSignal {
+                source: ToolSource::Events,
+                names,
+            }),
+        };
+
+        let out = sanitize_stop(stop, &[secret]);
+        let signal = out.tool_signal.expect("the signal survives sanitizing");
+        assert!(signal.names.len() <= MAX_STOP_TOOLS, "{signal:?}");
+        assert!(
+            signal
+                .names
+                .iter()
+                .all(|n| !n.contains(secret) && !n.is_empty()),
+            "{signal:?}"
+        );
+        assert_eq!(out.limit, Some(StopLimit::ToolStall));
+        assert_eq!(out.limit_secs, Some(1200));
+        assert_eq!(signal.source, ToolSource::Events);
     }
 
     #[test]

@@ -617,6 +617,7 @@ mod tests {
                 error: None,
                 log_file: None,
                 stop: None,
+                tool_silence: None,
             }],
             files: vec![],
             summary: "ok".to_string(),
@@ -744,6 +745,7 @@ mod tests {
                     error: None,
                     log_file: Some("logs/c1-01-implement.log".to_string()),
                     stop: None,
+                    tool_silence: None,
                 },
                 Execution {
                     cycle: 1,
@@ -767,6 +769,7 @@ mod tests {
                     error: None,
                     log_file: Some("logs/c1-02-audit.log".to_string()),
                     stop: None,
+                    tool_silence: None,
                 },
                 Execution {
                     cycle: 2,
@@ -790,6 +793,7 @@ mod tests {
                     error: None,
                     log_file: Some("logs/c2-03-audit.log".to_string()),
                     stop: None,
+                    tool_silence: None,
                 },
             ],
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
@@ -842,6 +846,9 @@ mod tests {
                 },
             ],
             processes_total: 5,
+            limit: None,
+            limit_secs: None,
+            tool_signal: None,
         });
 
         let md = render_report(&state, dir);

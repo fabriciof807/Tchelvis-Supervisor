@@ -138,6 +138,46 @@ pub struct StopProcess {
     pub after_last_output: bool,
 }
 
+/// Which silence limit ended a stalled stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopLimit {
+    Stall,
+    ToolStall,
+}
+
+/// How an open tool was seen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSource {
+    Events,
+    Processes,
+}
+
+impl ToolSource {
+    /// Text of the report: "eventos do CLI" or "processos do passo atual".
+    pub fn label_pt(self) -> &'static str {
+        match self {
+            Self::Events => "eventos do CLI",
+            Self::Processes => "processos do passo atual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSignal {
+    pub source: ToolSource,
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+/// The longest silence past `stall_secs` that an open tool made acceptable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSilence {
+    pub longest_ms: u64,
+    pub source: ToolSource,
+}
+
 /// What the loop saw when it cut a stage short, so a wedged run can be diagnosed later.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopDiagnostic {
@@ -152,6 +192,12 @@ pub struct StopDiagnostic {
     #[serde(default)]
     pub processes: Vec<StopProcess>,
     pub processes_total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<StopLimit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_signal: Option<ToolSignal>,
 }
 
 /// Most names shown in one hint line.
@@ -163,6 +209,19 @@ impl StopDiagnostic {
         let tools = unique_names(self.running_tools.iter().flatten().map(|s| s.as_str()));
         if !tools.is_empty() {
             return format!("ferramenta em execução: {}", tools.join(", "));
+        }
+        if let Some(signal) = self
+            .tool_signal
+            .as_ref()
+            .filter(|s| s.source == ToolSource::Processes)
+        {
+            let names = unique_names(signal.names.iter().map(|s| s.as_str()));
+            if !names.is_empty() {
+                return format!(
+                    "possível ferramenta em execução: {} (processos iniciados no passo atual)",
+                    names.join(", ")
+                );
+            }
         }
         let started = unique_names(
             self.processes
@@ -217,6 +276,8 @@ pub struct Execution {
     pub log_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<StopDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_silence: Option<ToolSilence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -558,6 +619,7 @@ mod tests {
                 error: None,
                 log_file: None,
                 stop: None,
+                tool_silence: None,
             },
             Execution {
                 cycle: 1,
@@ -581,6 +643,7 @@ mod tests {
                 error: None,
                 log_file: None,
                 stop: None,
+                tool_silence: None,
             },
         ];
 
@@ -706,6 +769,7 @@ mod tests {
             error: None,
             log_file: None,
             stop: None,
+            tool_silence: None,
         });
         let dir = tempfile::tempdir().unwrap();
         save_state(dir.path(), &modern).unwrap();
@@ -762,6 +826,9 @@ mod tests {
                 },
             ],
             processes_total: 3,
+            limit: None,
+            limit_secs: None,
+            tool_signal: None,
         }
     }
 
@@ -824,6 +891,7 @@ mod tests {
             error: None,
             log_file: Some("implement.log".into()),
             stop: Some(wedged_stop()),
+            tool_silence: None,
         });
 
         let json = serde_json::to_string(&state).unwrap();
@@ -835,5 +903,93 @@ mod tests {
         let json = serde_json::to_string(&clean).unwrap();
         assert!(!json.contains("\"stop\""), "{json}");
         assert_eq!(parse_state(&json).unwrap().executions[0].stop, None);
+    }
+
+    #[test]
+    fn hint_names_processes_of_the_current_step() {
+        let mut stop = wedged_stop();
+        stop.running_tools = None;
+        stop.tool_signal = Some(ToolSignal {
+            source: ToolSource::Processes,
+            names: vec!["run_tests.sh".into(), " ".into(), "run_tests.sh".into()],
+        });
+        assert_eq!(
+            stop.hint(),
+            "possível ferramenta em execução: run_tests.sh (processos iniciados no passo atual)"
+        );
+
+        stop.running_tools = Some(vec!["bash".into()]);
+        assert_eq!(stop.hint(), "ferramenta em execução: bash");
+
+        stop.running_tools = None;
+        stop.tool_signal = Some(ToolSignal {
+            source: ToolSource::Processes,
+            names: Vec::new(),
+        });
+        assert_eq!(
+            stop.hint(),
+            "possível ferramenta em execução: late_tool.sh (processos iniciados depois da última saída)"
+        );
+    }
+
+    #[test]
+    fn tool_stall_fields_round_trip_and_are_absent_when_unset() {
+        let mut state = sample_state(RunStatus::Escalate);
+        let mut stop = wedged_stop();
+        stop.limit = Some(StopLimit::ToolStall);
+        stop.limit_secs = Some(1200);
+        stop.tool_signal = Some(ToolSignal {
+            source: ToolSource::Events,
+            names: vec!["bash".into()],
+        });
+        state.executions.push(Execution {
+            cycle: 1,
+            stage_id: "implement".into(),
+            role: "worker".into(),
+            provider: Provider::Pi,
+            model: None,
+            model_source: None,
+            started_at_ms: 1_000,
+            finished_at_ms: Some(2_500),
+            duration_ms: 1_500,
+            usage: Usage::default(),
+            verdict: None,
+            outcome: "STALLED".into(),
+            error: None,
+            log_file: None,
+            stop: Some(stop),
+            tool_silence: Some(ToolSilence {
+                longest_ms: 700_000,
+                source: ToolSource::Events,
+            }),
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        for needle in [
+            "\"limit\":\"tool_stall\"",
+            "\"limit_secs\":1200",
+            "\"source\":\"events\"",
+            "\"longest_ms\":700000",
+        ] {
+            assert!(json.contains(needle), "missing {needle} in {json}");
+        }
+        assert_eq!(parse_state(&json).unwrap(), state);
+
+        let mut clean = state.clone();
+        let exec = &mut clean.executions[0];
+        exec.stop.as_mut().unwrap().limit = None;
+        exec.stop.as_mut().unwrap().limit_secs = None;
+        exec.stop.as_mut().unwrap().tool_signal = None;
+        exec.tool_silence = None;
+        let json = serde_json::to_string(&clean).unwrap();
+        for needle in [
+            "\"limit\"",
+            "\"limit_secs\"",
+            "\"tool_signal\"",
+            "\"tool_silence\"",
+        ] {
+            assert!(!json.contains(needle), "unexpected {needle} in {json}");
+        }
+        assert_eq!(parse_state(&json).unwrap(), clean);
     }
 }
