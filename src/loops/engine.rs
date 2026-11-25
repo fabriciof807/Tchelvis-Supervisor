@@ -178,6 +178,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     false
                 }
             },
+            None,
             &mut stop_snapshot,
         );
 

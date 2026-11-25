@@ -1,5 +1,6 @@
+use crate::loops::adapters::ToolView;
 use crate::loops::sandbox::SandboxedCommand;
-use crate::loops::state::{StopLimit, StopProcess};
+use crate::loops::state::{StopLimit, StopProcess, ToolSignal, ToolSilence, ToolSource};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -314,6 +315,18 @@ pub struct StopSnapshot {
     pub cli_alive: bool,
     pub processes: Vec<StopProcess>,
     pub processes_total: usize,
+    /// Only for `Stalled`: which silence limit ended the stage.
+    pub limit: Option<StopLimit>,
+    /// The tool open in the iteration that ended the stage, when there was one.
+    pub tool_signal: Option<ToolSignal>,
+}
+
+/// Lets the monitor tolerate a silent open tool. `None` in `run_process_diagnosed` turns it off.
+pub struct ToolWatch<'a> {
+    pub limit: Duration,
+    pub view: &'a mut dyn FnMut() -> ToolView,
+    /// Filled by the monitor, whatever the outcome.
+    pub silence: Option<ToolSilence>,
 }
 
 #[derive(Debug, Clone)]
@@ -620,6 +633,8 @@ fn stop_snapshot(
         cli_alive,
         processes: processes.into_iter().map(|(process, _)| process).collect(),
         processes_total,
+        limit: None,
+        tool_signal: None,
     }
 }
 
@@ -856,6 +871,7 @@ pub fn run_process(
         cancel,
         on_line,
         probe_activity,
+        None,
         &mut stop,
     )
 }
@@ -872,6 +888,7 @@ pub fn run_process_diagnosed(
     cancel: &AtomicBool,
     on_line: &mut dyn FnMut(&str),
     probe_activity: &mut dyn FnMut() -> bool,
+    mut tool: Option<&mut ToolWatch<'_>>,
     stop: &mut Option<StopSnapshot>,
 ) -> Result<Outcome> {
     let Some((prog, args)) = cmd.argv.split_first() else {
@@ -988,12 +1005,15 @@ pub fn run_process_diagnosed(
     };
     let mut child_exited: Option<std::process::ExitStatus> = None;
 
+    // One clock reading for the whole stage: a test clock may advance on every call.
+    let start_ms = clock.monotonic_ms();
+    let tool_limit = tool.as_ref().map_or(limits.stall, |t| t.limit);
+    let mut tracker = StallTracker::new(limits.stall, tool_limit, start_ms);
+
     // Whatever goes wrong while watching (a full disk, for example), the stage must not survive.
     let mut watch = || -> Result<Option<Outcome>> {
         let mut next_scan = Instant::now();
         let mut drain_deadline: Option<Instant> = None;
-        let start_ms = clock.monotonic_ms();
-        let mut last_activity_ms = start_ms;
         let mut watch = StopWatch {
             start_mono_ms: start_ms,
             last_output_mono_ms: None,
@@ -1001,7 +1021,6 @@ pub fn run_process_diagnosed(
             last_output_ticks: None,
         };
         let timeout_ms = limits.timeout.as_millis() as u64;
-        let stall_ms = limits.stall.as_millis() as u64;
 
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -1197,37 +1216,67 @@ pub fn run_process_diagnosed(
             let probed_activity = probe_activity();
             let now = clock.monotonic_ms();
             if saw_io_bytes || probed_activity {
-                last_activity_ms = now;
+                tracker.activity(now);
             }
+            let open_tools = if tracker.tool_enabled() {
+                tool.as_deref_mut().and_then(|t| match (t.view)() {
+                    ToolView::Open(names) => Some(names),
+                    ToolView::NoneOpen | ToolView::Unseen { .. } => None,
+                })
+            } else {
+                None
+            };
+            if open_tools.is_some() {
+                tracker.tool_seen(now);
+            }
+            // Asked before the checks below, so a silence ended by a timeout or a cancel is recorded too.
+            let verdict = tracker.verdict(now);
+            let tool_signal = open_tools.map(|names| ToolSignal {
+                source: ToolSource::Events,
+                names,
+            });
 
             if cancel.load(Ordering::Relaxed) {
                 return Ok(Some(Outcome::Cancelled));
             }
 
             if now.saturating_sub(start_ms) >= timeout_ms {
-                *stop = Some(stop_snapshot(
+                let mut snapshot = stop_snapshot(
                     &mut tree_ctx,
                     Some(&marker),
                     Some(&_active_guard),
                     clock,
                     &watch,
-                ));
+                );
+                snapshot.tool_signal = tool_signal;
+                *stop = Some(snapshot);
                 return Ok(Some(Outcome::TimedOut));
             }
 
-            if now.saturating_sub(last_activity_ms) >= stall_ms {
-                *stop = Some(stop_snapshot(
+            if let Some(limit) = verdict {
+                let mut snapshot = stop_snapshot(
                     &mut tree_ctx,
                     Some(&marker),
                     Some(&_active_guard),
                     clock,
                     &watch,
-                ));
+                );
+                snapshot.limit = Some(limit);
+                snapshot.tool_signal = tool_signal;
+                *stop = Some(snapshot);
                 return Ok(Some(Outcome::Stalled));
             }
         }
     };
     let watched = watch();
+    if let Some(tool) = tool {
+        tool.silence = tracker
+            .longest_tolerated_ms()
+            .map(|longest_ms| ToolSilence {
+                longest_ms,
+                source: ToolSource::Events,
+            });
+    }
     terminate_process_tree(
         &mut child,
         &mut child_exited,
@@ -1496,6 +1545,251 @@ mod tests {
             wait_pid_gone(gpid),
             "setsid grandchild {gpid} survived stall"
         );
+    }
+
+    fn setsid_script(tmp: &TempDir, name: &str) -> (PathBuf, SandboxedCommand) {
+        let pid_file = tmp.path().join(format!("{name}.pid"));
+        let script = tmp.path().join(format!("{name}.sh"));
+        crate::test_support::write_executable(
+            &script,
+            format!(
+                "#!/usr/bin/env sh\nsetsid sh -c 'echo $$ > \"{}\" ; exec sleep 60' </dev/null >/dev/null 2>&1 &\nsleep 60\n",
+                pid_file.display()
+            ),
+        );
+        (pid_file, script_cmd(&script, &[], tmp.path()))
+    }
+
+    #[test]
+    fn open_tool_ends_at_the_ceiling_with_its_tree() {
+        let tmp = TempDir::new().unwrap();
+        let (pid_file, cmd) = setsid_script(&tmp, "tool_ceiling");
+        let clock = StepClock::new(50);
+        let cancel = AtomicBool::new(false);
+        let mut guard = PidGuard(None);
+        let pid_file_probe = pid_file.clone();
+        let mut open = || ToolView::Open(vec!["bash".to_string()]);
+        let mut watch = ToolWatch {
+            limit: Duration::from_millis(400),
+            view: &mut open,
+            silence: None,
+        };
+        let mut stop = None;
+
+        let outcome = run_process_diagnosed(
+            cmd,
+            b"",
+            &tmp.path().join("tool.log"),
+            Limits {
+                timeout: Duration::from_secs(60),
+                stall: Duration::from_millis(150),
+            },
+            &clock,
+            &cancel,
+            &mut |_| {},
+            &mut || {
+                if guard.0.is_none() {
+                    if let Ok(raw) = fs::read_to_string(&pid_file_probe) {
+                        if let Ok(p) = raw.trim().parse::<i32>() {
+                            guard.0 = Some(p);
+                            return true;
+                        }
+                    }
+                }
+                false
+            },
+            Some(&mut watch),
+            &mut stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Stalled);
+        let stop = stop.expect("a stalled stage records a snapshot");
+        assert_eq!(stop.limit, Some(StopLimit::ToolStall));
+        assert_eq!(
+            stop.tool_signal,
+            Some(ToolSignal {
+                source: ToolSource::Events,
+                names: vec!["bash".to_string()],
+            })
+        );
+        let silence = watch.silence.expect("the monitor reports its silence");
+        assert!(silence.longest_ms >= 400, "{silence:?}");
+        let gpid = guard.0.unwrap_or_else(|| read_pid_file(&pid_file));
+        guard.0 = Some(gpid);
+        assert!(wait_pid_gone(gpid), "setsid grandchild {gpid} survived");
+    }
+
+    #[test]
+    fn silence_with_an_open_tool_still_obeys_cancel() {
+        let tmp = TempDir::new().unwrap();
+        let (pid_file, cmd) = setsid_script(&tmp, "tool_cancel");
+        let clock = StepClock::new(50);
+        let cancel = AtomicBool::new(false);
+        let mut guard = PidGuard(None);
+        let pid_file_probe = pid_file.clone();
+        let silent = std::cell::Cell::new(0u32);
+        let mut open = || ToolView::Open(vec!["bash".to_string()]);
+        let mut watch = ToolWatch {
+            limit: Duration::from_secs(10),
+            view: &mut open,
+            silence: None,
+        };
+        let mut stop = None;
+
+        let outcome = run_process_diagnosed(
+            cmd,
+            b"",
+            &tmp.path().join("cancel.log"),
+            Limits {
+                timeout: Duration::from_secs(60),
+                stall: Duration::from_millis(150),
+            },
+            &clock,
+            &cancel,
+            &mut |_| {},
+            &mut || {
+                if guard.0.is_none() {
+                    if let Ok(raw) = fs::read_to_string(&pid_file_probe) {
+                        if let Ok(p) = raw.trim().parse::<i32>() {
+                            guard.0 = Some(p);
+                            return true;
+                        }
+                    }
+                }
+                let seen = silent.get() + 1;
+                silent.set(seen);
+                if seen == 6 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                false
+            },
+            Some(&mut watch),
+            &mut stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(stop.is_none(), "a cancel records no snapshot");
+        let silence = watch.silence.expect("the monitor reports its silence");
+        assert!(silence.longest_ms >= 150, "{silence:?}");
+        let gpid = guard.0.unwrap_or_else(|| read_pid_file(&pid_file));
+        guard.0 = Some(gpid);
+        assert!(wait_pid_gone(gpid), "setsid grandchild {gpid} survived");
+    }
+
+    #[test]
+    fn silence_with_an_open_tool_still_obeys_the_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("tool_timeout.sh");
+        crate::test_support::write_executable(&script, "#!/usr/bin/env sh\nsleep 30\n");
+        let clock = StepClock::new(50);
+        let cancel = AtomicBool::new(false);
+        let mut open = || ToolView::Open(vec!["bash".to_string()]);
+        let mut watch = ToolWatch {
+            limit: Duration::from_secs(10),
+            view: &mut open,
+            silence: None,
+        };
+        let mut stop = None;
+
+        let outcome = run_process_diagnosed(
+            script_cmd(&script, &[], tmp.path()),
+            b"",
+            &tmp.path().join("timeout.log"),
+            Limits {
+                timeout: Duration::from_secs(1),
+                stall: Duration::from_millis(150),
+            },
+            &clock,
+            &cancel,
+            &mut |_| {},
+            &mut || false,
+            Some(&mut watch),
+            &mut stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::TimedOut);
+        let stop = stop.expect("a timeout records a snapshot");
+        assert_eq!(stop.limit, None);
+        assert!(stop.tool_signal.is_some(), "{stop:?}");
+        let silence = watch.silence.expect("the monitor reports its silence");
+        assert!(silence.longest_ms >= 150, "{silence:?}");
+    }
+
+    #[test]
+    fn no_open_tool_stalls_as_before() {
+        enum Case {
+            View(ToolView, Duration),
+            NoWatch,
+        }
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("silent_tool.sh");
+        crate::test_support::write_executable(&script, "#!/usr/bin/env sh\nsleep 30\n");
+        let cases = [
+            (
+                "none_open",
+                Case::View(ToolView::NoneOpen, Duration::from_secs(10)),
+            ),
+            (
+                "unseen",
+                Case::View(ToolView::Unseen { step: 3 }, Duration::from_secs(10)),
+            ),
+            (
+                "limit_off",
+                Case::View(
+                    ToolView::Open(vec!["bash".to_string()]),
+                    Duration::from_millis(150),
+                ),
+            ),
+            ("no_watch", Case::NoWatch),
+        ];
+
+        for (name, case) in cases {
+            let clock = StepClock::new(50);
+            let cancel = AtomicBool::new(false);
+            let mut stop = None;
+            let mut getter: Box<dyn FnMut() -> ToolView> = match &case {
+                Case::View(view, _) => {
+                    let view = view.clone();
+                    Box::new(move || view.clone())
+                }
+                Case::NoWatch => Box::new(|| ToolView::NoneOpen),
+            };
+            let mut watch = match &case {
+                Case::View(_, limit) => Some(ToolWatch {
+                    limit: *limit,
+                    view: &mut getter,
+                    silence: None,
+                }),
+                Case::NoWatch => None,
+            };
+            let outcome = run_process_diagnosed(
+                script_cmd(&script, &[], tmp.path()),
+                b"",
+                &tmp.path().join(format!("{name}.log")),
+                Limits {
+                    timeout: Duration::from_secs(60),
+                    stall: Duration::from_millis(150),
+                },
+                &clock,
+                &cancel,
+                &mut |_| {},
+                &mut || false,
+                watch.as_mut(),
+                &mut stop,
+            )
+            .unwrap();
+
+            assert_eq!(outcome, Outcome::Stalled, "{name}");
+            let stop = stop.expect("a stalled stage records a snapshot");
+            assert_eq!(stop.limit, Some(StopLimit::Stall), "{name}");
+            assert_eq!(stop.tool_signal, None, "{name}");
+            if let Some(watch) = watch {
+                assert_eq!(watch.silence, None, "{name}");
+            }
+        }
     }
 
     #[test]
@@ -1970,6 +2264,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &mut || false,
+            None,
             &mut stop,
         )
         .unwrap();
@@ -2030,6 +2325,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &mut || false,
+            None,
             &mut stop,
         )
         .unwrap();
@@ -2152,6 +2448,7 @@ mod tests {
             &AtomicBool::new(false),
             &mut |_| {},
             &mut || false,
+            None,
             &mut stop,
         )
         .unwrap();
@@ -2171,6 +2468,7 @@ mod tests {
             &AtomicBool::new(true),
             &mut |_| {},
             &mut || false,
+            None,
             &mut stop,
         )
         .unwrap();
