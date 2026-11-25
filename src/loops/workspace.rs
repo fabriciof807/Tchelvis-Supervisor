@@ -15,6 +15,14 @@ pub trait Workspace {
     fn path(&self) -> &Path;
 }
 
+/// What the checkout needs to materialise LFS files from the local store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LfsCheckout {
+    /// Validated `clean`/`smudge`/`process` commands of the repository, without `--skip`.
+    pub commands: BTreeMap<String, String>,
+    pub storage: PathBuf,
+}
+
 #[derive(Debug, Clone)]
 pub struct RepoPreflightInfo {
     pub repo_root: PathBuf,
@@ -23,6 +31,13 @@ pub struct RepoPreflightInfo {
     pub base_commit: String,
     pub base_tree: String,
     pub disabled_filters: Vec<String>,
+    pub lfs: Option<LfsCheckout>,
+}
+
+impl RepoPreflightInfo {
+    pub fn lfs_enabled(&self) -> bool {
+        self.lfs.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +50,8 @@ pub struct FrozenWorkspaceMeta {
     pub base_tree: String,
     pub base_gitlinks: BTreeMap<String, String>,
     pub disabled_filters: Vec<String>,
+    #[serde(default)]
+    pub lfs_enabled: bool,
 }
 
 pub struct GitWorkspace {
@@ -46,6 +63,7 @@ pub struct GitWorkspace {
     base_tree: String,
     base_gitlinks: BTreeMap<String, String>,
     disabled_filters: Vec<String>,
+    lfs_enabled: bool,
 }
 
 pub const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
@@ -103,6 +121,30 @@ fn run_git_checked(mut cmd: Command, context_msg: &str) -> Result<Output> {
     Ok(out)
 }
 
+/// Runs git with `input` on its stdin; the error names the step, prefixed by `context_msg`.
+fn run_git_with_input(mut cmd: Command, input: Vec<u8>, context_msg: &str) -> Result<Vec<u8>> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("falha ao executar git ({context_msg})"))?;
+    let mut stdin = child.stdin.take().context("stdin do git ausente")?;
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let out = child
+        .wait_with_output()
+        .with_context(|| format!("falha ao executar git ({context_msg})"))?;
+    let _ = writer.join();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            bail!("{context_msg}");
+        }
+        bail!("{context_msg}: {stderr}");
+    }
+    Ok(out.stdout)
+}
+
 fn repo_git_cmd(repo: &Path) -> Command {
     let mut cmd = git();
     cmd.arg("-C").arg(repo);
@@ -115,8 +157,9 @@ fn main_git_dir_cmd(git_dir: &Path) -> Command {
     cmd
 }
 
-/// Names of every clean/smudge filter configured for the repository (any scope).
-fn configured_filters(git_dir: &Path) -> Result<BTreeMap<String, Vec<String>>> {
+/// Names of every clean/smudge filter configured for the repository (any scope), with its
+/// `(setting, value)` pairs in config order.
+fn configured_filters(git_dir: &Path) -> Result<BTreeMap<String, Vec<(String, String)>>> {
     let mut cmd = main_git_dir_cmd(git_dir);
     cmd.args([
         "config",
@@ -134,19 +177,18 @@ fn configured_filters(git_dir: &Path) -> Result<BTreeMap<String, Vec<String>>> {
             String::from_utf8_lossy(&out.stderr).trim()
         ),
     }
-    let mut filters: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut filters: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
     for entry in out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
         let entry = String::from_utf8(entry.to_vec()).context("filtro git com nome inválido")?;
         let (key, value) = entry.split_once('\n').unwrap_or((&entry, ""));
-        let name = key
+        let (name, setting) = key
             .strip_prefix("filter.")
             .and_then(|k| k.rsplit_once('.'))
-            .map(|(name, _)| name)
             .with_context(|| format!("filtro git inesperado: {key:?}"))?;
         filters
             .entry(name.to_string())
             .or_default()
-            .push(value.to_string());
+            .push((setting.to_string(), value.to_string()));
     }
     Ok(filters)
 }
@@ -157,22 +199,9 @@ fn filters_in_use(repo_root: &Path) -> Result<BTreeSet<String>> {
     ls.args(["ls-files", "-z"]);
     let files = run_git_checked(ls, "falha ao listar arquivos do repositório")?.stdout;
     let mut check = repo_git_cmd(repo_root);
-    check
-        .args(["check-attr", "-z", "--stdin", "filter"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = check.spawn().context("falha ao ler atributos do git")?;
-    let mut stdin = child.stdin.take().context("stdin de check-attr ausente")?;
-    let writer = std::thread::spawn(move || stdin.write_all(&files));
-    let out = child
-        .wait_with_output()
-        .context("falha ao ler atributos do git")?;
-    let _ = writer.join();
-    if !out.status.success() {
-        bail!("falha ao ler atributos do git");
-    }
-    let fields: Vec<&[u8]> = out.stdout.split(|&b| b == 0).collect();
+    check.args(["check-attr", "-z", "--stdin", "filter"]);
+    let out = run_git_with_input(check, files, "falha ao ler atributos do git")?;
+    let fields: Vec<&[u8]> = out.split(|&b| b == 0).collect();
     Ok(fields
         .as_chunks::<3>()
         .0
@@ -194,27 +223,363 @@ const GIT_LFS_COMMANDS: &[&str] = &[
     "git-lfs filter-process --skip",
 ];
 
+/// The filters the checkout disables, and the LFS commands it may run when the repository uses a
+/// trusted LFS filter.
+struct FilterPolicy {
+    disabled: Vec<String>,
+    lfs: Option<BTreeMap<String, String>>,
+}
+
+/// The commands the checkout may run for `lfs`: the last value per key, without `--skip` (the goal
+/// is real content), and only when smudge or process exists, or no pointer would ever be read.
+fn lfs_checkout_commands(settings: &[(String, String)]) -> Option<BTreeMap<String, String>> {
+    let mut commands: BTreeMap<String, String> = BTreeMap::new();
+    for (setting, value) in settings {
+        commands.insert(setting.clone(), value.replace(" --skip", ""));
+    }
+    if commands.contains_key("smudge") || commands.contains_key("process") {
+        Some(commands)
+    } else {
+        None
+    }
+}
+
 /// A filter command runs outside the sandbox with the workspace as its directory, over files the
 /// agents wrote. Only Git LFS is trusted, and only where the repository already uses it. Every
 /// other filter is switched off; a repository that depends on one is refused, because storing its
 /// files unfiltered would change (or, for git-crypt, disclose) their content.
-fn filters_to_disable(git_dir: &Path, repo_root: &Path) -> Result<Vec<String>> {
+fn filters_to_disable(git_dir: &Path, repo_root: &Path) -> Result<FilterPolicy> {
     let in_use = filters_in_use(repo_root)?;
-    let mut disable = Vec::new();
-    for (name, commands) in configured_filters(git_dir)? {
+    let mut policy = FilterPolicy {
+        disabled: Vec::new(),
+        lfs: None,
+    };
+    for (name, settings) in configured_filters(git_dir)? {
         let is_lfs = name == "lfs"
-            && commands
+            && settings
                 .iter()
-                .all(|c| GIT_LFS_COMMANDS.contains(&c.as_str()));
+                .all(|(_, c)| GIT_LFS_COMMANDS.contains(&c.as_str()));
         match (in_use.contains(&name), is_lfs) {
-            (true, true) => {}
+            (true, true) => {
+                if name == "lfs" {
+                    policy.lfs = lfs_checkout_commands(&settings);
+                }
+            }
             (true, false) => bail!(
                 "o repositório usa o filtro git '{name}', que executaria fora do sandbox; não suportado pelo loop"
             ),
-            (false, _) => disable.push(name),
+            (false, _) => policy.disabled.push(name),
         }
     }
-    Ok(disable)
+    Ok(policy)
+}
+
+/// How the content of a blob of `base_commit` relates to Git LFS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LfsBlob {
+    Pointer { oid: String, size: u64 },
+    NonCanonical,
+    Content,
+}
+
+const LFS_POINTER_VERSION: &str = "version https://git-lfs.github.com/spec/v1";
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The `(oid, size)` of a canonical pointer, rebuilt and compared: anything else (CRLF, extra
+/// lines, a leading zero, size 0, another version) is not canonical.
+fn canonical_pointer_fields(blob: &[u8]) -> Option<(String, u64)> {
+    let text = std::str::from_utf8(blob).ok()?;
+    let mut lines = text.strip_suffix('\n')?.split('\n');
+    if lines.next()? != LFS_POINTER_VERSION {
+        return None;
+    }
+    let oid = lines.next()?.strip_prefix("oid sha256:")?;
+    if oid.len() != 64 || !oid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let size = lines.next()?.strip_prefix("size ")?;
+    if lines.next().is_some() || size.is_empty() || !size.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // Smudge reads content from the object, never from this field, but 0 has no canonical form.
+    if size == "0" || size.len() > 1 && size.starts_with('0') {
+        return None;
+    }
+    let size: u64 = size.parse().ok()?;
+    Some((oid.to_string(), size))
+}
+
+/// Whether `blob` is an LFS pointer, and whether it is the canonical form a checkout can
+/// reproduce without changing the snapshot tree.
+fn classify_lfs_blob(blob: &[u8]) -> LfsBlob {
+    if let Some((oid, size)) = canonical_pointer_fields(blob) {
+        return LfsBlob::Pointer { oid, size };
+    }
+    let looks_like_pointer = contains(blob, b"oid sha256:")
+        && [b"git-lfs".as_slice(), b"git-media", b"hawser"]
+            .iter()
+            .any(|marker| contains(blob, marker));
+    if looks_like_pointer {
+        LfsBlob::NonCanonical
+    } else {
+        LfsBlob::Content
+    }
+}
+
+/// The first paths of an error, bounded and with control characters escaped.
+fn lfs_paths_summary(paths: &[Vec<u8>]) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(3)
+        .map(|path| String::from_utf8_lossy(path).escape_debug().to_string())
+        .collect();
+    let mut summary = shown.join(", ");
+    if paths.len() > 3 {
+        summary.push_str(&format!(" e mais {}", paths.len() - 3));
+    }
+    summary
+}
+
+/// Whether `oid` is in the local store with exactly `size` bytes. Smudge deletes a wrong-size
+/// object, so a truncated one counts as missing and is never passed to it.
+fn lfs_object_present(storage: &Path, oid: &str, size: u64) -> Result<bool> {
+    let path = storage
+        .join("objects")
+        .join(&oid[..2])
+        .join(&oid[2..4])
+        .join(oid);
+    match fs::metadata(&path) {
+        Ok(meta) => Ok(meta.is_file() && meta.len() == size),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(e) => Err(e)
+            .with_context(|| format!("falha ao consultar objeto do Git LFS {}", path.display())),
+    }
+}
+
+/// Reads `cat-file --batch` output: `<oid> blob <size>\n<bytes>\n` for each requested object.
+fn parse_batch_blobs(raw: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
+    let mut blobs = BTreeMap::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
+            bail!("falha ao ler blobs do commit base: saída de cat-file truncada");
+        };
+        let header = std::str::from_utf8(&rest[..end])
+            .context("falha ao ler blobs do commit base: cabeçalho inválido")?;
+        rest = &rest[end + 1..];
+        let mut fields = header.split(' ');
+        let (Some(oid), Some(kind), Some(size)) = (fields.next(), fields.next(), fields.next())
+        else {
+            bail!("falha ao ler blobs do commit base: resposta inesperada de cat-file");
+        };
+        let size: usize = size
+            .parse()
+            .context("falha ao ler blobs do commit base: tamanho inválido")?;
+        if kind != "blob" {
+            bail!("falha ao ler blobs do commit base: objeto {oid} não é um blob");
+        }
+        if rest.len() < size + 1 || rest[size] != b'\n' {
+            bail!("falha ao ler blobs do commit base: conteúdo truncado");
+        }
+        blobs.insert(oid.to_string(), rest[..size].to_vec());
+        rest = &rest[size + 1..];
+    }
+    Ok(blobs)
+}
+
+/// Refuses a run whose `base_commit` needs LFS content that the local store cannot provide, and
+/// pointers that a smudge would rewrite. Runs no `git-lfs` and writes nothing.
+fn check_lfs_objects(repo_root: &Path, base_commit: &str, storage: &Path) -> Result<()> {
+    let mut ls = repo_git_cmd(repo_root);
+    ls.args(["ls-tree", "-r", "-l", "-z", base_commit]);
+    let listing = run_git_checked(ls, "falha ao listar a árvore do commit base")?;
+
+    // A pointer is far smaller than 1024 bytes; anything bigger is content.
+    let mut candidates: Vec<(Vec<u8>, String)> = Vec::new();
+    for entry in listing.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let fields: Vec<&[u8]> = entry[..tab]
+            .split(|b| b.is_ascii_whitespace())
+            .filter(|f| !f.is_empty())
+            .collect();
+        let [mode, kind, oid, size] = fields.as_slice() else {
+            continue;
+        };
+        if *mode != b"100644" && *mode != b"100755" || *kind != b"blob" {
+            continue;
+        }
+        let Ok(size) = std::str::from_utf8(size).unwrap_or("").parse::<u64>() else {
+            continue;
+        };
+        if size >= 1024 {
+            continue;
+        }
+        candidates.push((
+            entry[tab + 1..].to_vec(),
+            String::from_utf8_lossy(oid).into_owned(),
+        ));
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+
+    let mut input = Vec::new();
+    for (path, _) in &candidates {
+        input.extend_from_slice(path);
+        input.push(0);
+    }
+    let mut check = repo_git_cmd(repo_root);
+    check.args([
+        "check-attr",
+        "-z",
+        "--stdin",
+        &format!("--source={base_commit}"),
+        "filter",
+    ]);
+    let attrs = run_git_with_input(
+        check,
+        input,
+        "falha ao ler atributos do commit base (requer git 2.40 ou mais novo)",
+    )?;
+    let fields: Vec<&[u8]> = attrs.split(|&b| b == 0).collect();
+    let lfs_paths: BTreeSet<&[u8]> = fields
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .filter(|chunk| chunk[2] == b"lfs")
+        .map(|chunk| chunk[0])
+        .collect();
+
+    // Unique blobs, in ls-tree order, so a pointer shared by two paths is read once.
+    let mut blob_oids: Vec<&str> = Vec::new();
+    let mut lfs_files: Vec<(&[u8], &str)> = Vec::new();
+    for (path, oid) in &candidates {
+        if !lfs_paths.contains(path.as_slice()) {
+            continue;
+        }
+        if !blob_oids.contains(&oid.as_str()) {
+            blob_oids.push(oid);
+        }
+        lfs_files.push((path, oid));
+    }
+    if lfs_files.is_empty() {
+        return Ok(());
+    }
+
+    let mut input = Vec::new();
+    for oid in &blob_oids {
+        input.extend_from_slice(oid.as_bytes());
+        input.push(b'\n');
+    }
+    let mut cat = repo_git_cmd(repo_root);
+    cat.args(["cat-file", "--batch"]);
+    let blobs = parse_batch_blobs(&run_git_with_input(
+        cat,
+        input,
+        "falha ao ler blobs do commit base",
+    )?)?;
+
+    let mut non_canonical: Vec<Vec<u8>> = Vec::new();
+    let mut seen_non_canonical: BTreeSet<&str> = BTreeSet::new();
+    let mut missing: Vec<Vec<u8>> = Vec::new();
+    let mut seen_missing: BTreeSet<String> = BTreeSet::new();
+    let mut presence: BTreeMap<String, bool> = BTreeMap::new();
+    for (path, blob_oid) in &lfs_files {
+        let blob = blobs
+            .get(*blob_oid)
+            .with_context(|| format!("falha ao ler blobs do commit base: {blob_oid} ausente"))?;
+        match classify_lfs_blob(blob) {
+            LfsBlob::Pointer { oid, size } => {
+                if seen_missing.contains(&oid) {
+                    continue;
+                }
+                let present = match presence.get(&oid) {
+                    Some(present) => *present,
+                    None => {
+                        let present = lfs_object_present(storage, &oid, size)?;
+                        presence.insert(oid.clone(), present);
+                        present
+                    }
+                };
+                if !present {
+                    seen_missing.insert(oid);
+                    missing.push(path.to_vec());
+                }
+            }
+            LfsBlob::NonCanonical => {
+                if seen_non_canonical.insert(blob_oid) {
+                    non_canonical.push(path.to_vec());
+                }
+            }
+            LfsBlob::Content => {}
+        }
+    }
+
+    if !non_canonical.is_empty() {
+        bail!(
+            "{} ponteiro(s) do Git LFS fora do formato canônico: {}; não suportado pelo loop",
+            non_canonical.len(),
+            lfs_paths_summary(&non_canonical)
+        );
+    }
+    if !missing.is_empty() {
+        bail!(
+            "faltam {} objeto(s) do Git LFS no repositório: {}; rode 'git lfs fetch' e tente de novo",
+            missing.len(),
+            lfs_paths_summary(&missing)
+        );
+    }
+    Ok(())
+}
+
+/// The local LFS store of the repository: `lfs.storage` when absolute, joined to the common git
+/// dir (a linked worktree follows `commondir`) when relative, `.git/lfs` by default. `.lfsconfig`
+/// cannot set it; git-lfs only reads it from git config.
+fn lfs_storage(git_dir: &Path) -> Result<PathBuf> {
+    let mut cmd = main_git_dir_cmd(git_dir);
+    cmd.args(["config", "-z", "--get", "lfs.storage"]);
+    let out = cmd.output().context("falha ao ler lfs.storage do git")?;
+    let value = match out.status.code() {
+        Some(0) => String::from_utf8_lossy(&out.stdout)
+            .trim_end_matches('\0')
+            .to_string(),
+        // Not configured.
+        Some(1) => String::new(),
+        _ => bail!(
+            "falha ao ler lfs.storage do git: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    };
+    let value = value.trim();
+    // Default (`lfs`), or a relative value, is relative to the common git dir: a linked worktree
+    // uses the main repository's store.
+    let storage = if value.is_empty() {
+        PathBuf::from("lfs")
+    } else {
+        PathBuf::from(value)
+    };
+    if storage.is_absolute() {
+        return Ok(storage);
+    }
+    let mut common_cmd = main_git_dir_cmd(git_dir);
+    common_cmd.args(["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+    let common_out = run_git_checked(common_cmd, "falha ao localizar .git comum")?;
+    let common = PathBuf::from(String::from_utf8_lossy(&common_out.stdout).trim());
+    Ok(common.join(storage))
 }
 
 /// The text of a gitlink line of `ls-tree`/`ls-files --stage`; `None` for any other entry. A path
@@ -255,9 +620,9 @@ fn parse_gitlinks_from_ls_files_stage(raw: &[u8]) -> Result<Vec<(String, String)
     Ok(out)
 }
 
-/// Through `GIT_CONFIG_*` and not `-c`: a filter name may contain `=`.
-fn set_disabled_filters(cmd: &mut Command, filters: &[String]) {
-    let mut count = 0;
+/// The settings that turn every untrusted filter of the repository off, in this order.
+fn disabled_filter_config(filters: &[String]) -> Vec<(String, String)> {
+    let mut config = Vec::new();
     for name in filters {
         for (key, value) in [
             ("clean", ""),
@@ -265,15 +630,40 @@ fn set_disabled_filters(cmd: &mut Command, filters: &[String]) {
             ("process", ""),
             ("required", "false"),
         ] {
-            cmd.env(
-                format!("GIT_CONFIG_KEY_{count}"),
-                format!("filter.{name}.{key}"),
-            )
-            .env(format!("GIT_CONFIG_VALUE_{count}"), value);
-            count += 1;
+            config.push((format!("filter.{name}.{key}"), value.to_string()));
         }
     }
-    cmd.env("GIT_CONFIG_COUNT", count.to_string());
+    config
+}
+
+/// The settings of the checkout of a repository with the trusted `lfs` filter.
+fn lfs_checkout_config(lfs: &LfsCheckout) -> Vec<(String, String)> {
+    let mut config: Vec<(String, String)> = lfs
+        .commands
+        .iter()
+        .map(|(key, value)| (format!("filter.lfs.{key}"), value.clone()))
+        .collect();
+    config.push(("filter.lfs.required".to_string(), "true".to_string()));
+    config.push(("lfs.storage".to_string(), lfs.storage.display().to_string()));
+    // The three below outrank the repository's `.lfsconfig`, which could otherwise choose an
+    // address (`lfs.url`) or leave pointers in place (`fetchinclude`/`fetchexclude`).
+    config.push(("lfs.url".to_string(), "file:///dev/null".to_string()));
+    config.push(("lfs.fetchinclude".to_string(), String::new()));
+    config.push(("lfs.fetchexclude".to_string(), String::new()));
+    config
+}
+
+/// Through `GIT_CONFIG_*` and not `-c`: a filter name may contain `=`.
+fn set_git_config(cmd: &mut Command, config: &[(String, String)]) {
+    for (slot, (key, value)) in config.iter().enumerate() {
+        cmd.env(format!("GIT_CONFIG_KEY_{slot}"), key)
+            .env(format!("GIT_CONFIG_VALUE_{slot}"), value);
+    }
+    cmd.env("GIT_CONFIG_COUNT", config.len().to_string());
+}
+
+fn set_disabled_filters(cmd: &mut Command, filters: &[String]) {
+    set_git_config(cmd, &disabled_filter_config(filters));
 }
 
 impl GitWorkspace {
@@ -343,7 +733,15 @@ impl GitWorkspace {
         }
 
         // Before `status`, which runs the filters.
-        let disabled_filters = filters_to_disable(&main_git_dir, &repo_root)?;
+        let policy = filters_to_disable(&main_git_dir, &repo_root)?;
+        let disabled_filters = policy.disabled;
+        let lfs = match policy.lfs {
+            Some(commands) => Some(LfsCheckout {
+                commands,
+                storage: lfs_storage(&main_git_dir)?,
+            }),
+            None => None,
+        };
 
         if !from_head {
             let mut status_cmd = repo_git_cmd(&repo_root);
@@ -369,6 +767,10 @@ impl GitWorkspace {
             }
         }
 
+        if let Some(lfs) = &lfs {
+            check_lfs_objects(&repo_root, &base_commit, &lfs.storage)?;
+        }
+
         Ok(RepoPreflightInfo {
             repo_root,
             main_git_dir,
@@ -376,6 +778,7 @@ impl GitWorkspace {
             base_commit,
             base_tree,
             disabled_filters,
+            lfs,
         })
     }
 
@@ -401,6 +804,7 @@ impl GitWorkspace {
             );
         }
         let index_file = run_dir.join("engine.index");
+        let lfs_enabled = info.lfs.is_some();
 
         let mut clone_cmd = git();
         set_disabled_filters(&mut clone_cmd, &info.disabled_filters);
@@ -424,8 +828,19 @@ impl GitWorkspace {
                 .env("GIT_WORK_TREE", workspace_path);
             cmd
         };
-        let mut co_cmd = own_git();
-        co_cmd.args(["checkout", "-q", "--detach", &info.base_commit]);
+        // Only the checkout materialises files: it carries the disabled filters and, when the
+        // repository uses LFS, the trusted commands and the local store — in one block, because a
+        // second `set_git_config` call would restart at slot 0.
+        let mut co_config = disabled_filter_config(&info.disabled_filters);
+        if let Some(lfs) = &info.lfs {
+            co_config.extend(lfs_checkout_config(lfs));
+        }
+        let mut co_cmd = git();
+        set_git_config(&mut co_cmd, &co_config);
+        co_cmd
+            .env("GIT_DIR", workspace_path.join(".git"))
+            .env("GIT_WORK_TREE", workspace_path)
+            .args(["checkout", "-q", "--detach", &info.base_commit]);
         run_git_checked(
             co_cmd,
             "falha ao fazer checkout de base_commit no workspace",
@@ -448,6 +863,7 @@ impl GitWorkspace {
             base_tree: info.base_tree,
             base_gitlinks,
             disabled_filters: info.disabled_filters,
+            lfs_enabled,
         };
 
         let mut init_idx = ws.engine_git();
@@ -472,6 +888,7 @@ impl GitWorkspace {
             base_tree: self.base_tree.clone(),
             base_gitlinks: self.base_gitlinks.clone(),
             disabled_filters: self.disabled_filters.clone(),
+            lfs_enabled: self.lfs_enabled,
         }
     }
 
@@ -485,6 +902,7 @@ impl GitWorkspace {
             base_tree: meta.base_tree,
             base_gitlinks: meta.base_gitlinks,
             disabled_filters: meta.disabled_filters,
+            lfs_enabled: meta.lfs_enabled,
         }
     }
 
@@ -1318,5 +1736,617 @@ mod tests {
             GitWorkspace::preflight_check_repo(&repo, "loop/l", true).unwrap();
         }
         let _ = run;
+    }
+
+    fn configure_lfs(repo: &Path) {
+        git_ok(repo, &["config", "filter.lfs.clean", "git-lfs clean -- %f"]);
+        git_ok(
+            repo,
+            &["config", "filter.lfs.smudge", "git-lfs smudge -- %f"],
+        );
+        git_ok(
+            repo,
+            &["config", "filter.lfs.process", "git-lfs filter-process"],
+        );
+        git_ok(repo, &["config", "filter.lfs.required", "true"]);
+    }
+
+    /// Commits a root `.gitattributes` (`*.bin filter=lfs`) and `files`, creating parent directories.
+    fn commit_lfs_files(repo: &Path, files: &[(&str, &str)]) {
+        fs::write(repo.join(".gitattributes"), "*.bin filter=lfs\n").unwrap();
+        for (path, content) in files {
+            let file = repo.join(path);
+            if let Some(parent) = file.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(file, content).unwrap();
+        }
+        git_ok(repo, &["add", "."]);
+        git_ok(repo, &["commit", "-m", "lfs files"]);
+    }
+
+    /// `new_repo` + `commit_lfs_files` + `configure_lfs` (so the filter is in `.git/config` only).
+    fn lfs_repo(tmp: &TempDir, files: &[(&str, &str)]) -> (PathBuf, PathBuf) {
+        let (repo, run) = new_repo(tmp);
+        commit_lfs_files(&repo, files);
+        configure_lfs(&repo);
+        (repo, run)
+    }
+
+    #[test]
+    fn lfs_commands_keep_the_last_value_and_never_skip() {
+        let settings = vec![
+            ("smudge".to_string(), "git-lfs smudge %f".to_string()),
+            (
+                "smudge".to_string(),
+                "git-lfs smudge --skip -- %f".to_string(),
+            ),
+            (
+                "process".to_string(),
+                "git-lfs filter-process --skip".to_string(),
+            ),
+            ("clean".to_string(), "git-lfs clean -- %f".to_string()),
+        ];
+        let expected: BTreeMap<String, String> = [
+            ("clean", "git-lfs clean -- %f"),
+            ("process", "git-lfs filter-process"),
+            ("smudge", "git-lfs smudge -- %f"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(lfs_checkout_commands(&settings), Some(expected));
+    }
+
+    #[test]
+    fn lfs_commands_need_smudge_or_process() {
+        assert_eq!(
+            lfs_checkout_commands(&[("clean".to_string(), "git-lfs clean -- %f".to_string())]),
+            None
+        );
+        let commands = lfs_checkout_commands(&[
+            ("clean".to_string(), "git-lfs clean -- %f".to_string()),
+            ("smudge".to_string(), "git-lfs smudge %f".to_string()),
+        ])
+        .expect("smudge is enough");
+        assert!(!commands.contains_key("process"));
+        assert_eq!(commands["smudge"], "git-lfs smudge %f");
+    }
+
+    #[test]
+    fn preflight_records_the_lfs_filter_and_its_local_store() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = lfs_repo(&tmp, &[("a.bin", "raw\n")]);
+        let info = GitWorkspace::preflight_check_repo(&repo, "loop/lfs", true).unwrap();
+        assert!(info.lfs_enabled());
+        let lfs = info.lfs.as_ref().unwrap();
+        assert_eq!(lfs.commands["smudge"], "git-lfs smudge -- %f");
+        assert_eq!(lfs.storage, repo.join(".git/lfs"));
+        assert!(!info.disabled_filters.iter().any(|f| f == "lfs"));
+    }
+
+    #[test]
+    fn lfs_configured_but_not_used_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = new_repo(&tmp);
+        configure_lfs(&repo);
+        let info = GitWorkspace::preflight_check_repo(&repo, "loop/lfs", true).unwrap();
+        assert!(info.lfs.is_none());
+        assert!(info.disabled_filters.contains(&"lfs".to_string()));
+    }
+
+    #[test]
+    fn lfs_store_of_a_linked_worktree_is_the_common_one() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = new_repo(&tmp);
+        commit_lfs_files(&repo, &[("a.bin", "raw\n")]);
+        let wt = tmp.path().join("wt");
+        git_ok(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt"],
+        );
+        // Only now: with the filter configured, `worktree add` would run git-lfs.
+        configure_lfs(&repo);
+        let info = GitWorkspace::preflight_check_repo(&wt, "loop/wt", true).unwrap();
+        fs::create_dir_all(repo.join(".git/lfs")).unwrap();
+        let storage = fs::canonicalize(info.lfs.unwrap().storage).unwrap();
+        assert_eq!(storage, fs::canonicalize(repo.join(".git/lfs")).unwrap());
+    }
+
+    #[test]
+    fn configured_lfs_storage_is_respected() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = lfs_repo(&tmp, &[("a.bin", "raw\n")]);
+        let storage = |repo: &Path| {
+            GitWorkspace::preflight_check_repo(repo, "loop/s", true)
+                .unwrap()
+                .lfs
+                .unwrap()
+                .storage
+        };
+        git_ok(&repo, &["config", "lfs.storage", "store"]);
+        assert_eq!(storage(&repo), repo.join(".git/store"));
+        let abs = tmp.path().join("abs");
+        git_ok(&repo, &["config", "lfs.storage", abs.to_str().unwrap()]);
+        assert_eq!(storage(&repo), abs);
+    }
+
+    #[test]
+    fn untrusted_lfs_smudge_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = lfs_repo(&tmp, &[("a.bin", "raw\n")]);
+        git_ok(&repo, &["config", "filter.lfs.smudge", "./evil"]);
+        let Err(err) = GitWorkspace::preflight_check_repo(&repo, "loop/lfs", true) else {
+            panic!("expected the untrusted smudge to be refused");
+        };
+        let err = err.to_string();
+        assert!(err.contains("'lfs'"), "{err}");
+    }
+
+    #[test]
+    fn old_frozen_metadata_loads_without_lfs_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = new_repo(&tmp);
+        let ws = GitWorkspace::create(&repo, &run, "loop/frozen", false).unwrap();
+        let frozen = ws.to_frozen();
+        let mut value = serde_json::to_value(&frozen).unwrap();
+        value.as_object_mut().unwrap().remove("lfs_enabled");
+        let loaded: FrozenWorkspaceMeta = serde_json::from_value(value).unwrap();
+        assert!(!loaded.lfs_enabled);
+        assert_eq!(loaded, frozen);
+    }
+
+    fn pointer(oid: &str, size: u64) -> String {
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{oid}\nsize {size}\n")
+    }
+
+    fn put_lfs_object(storage: &Path, oid: &str, size: usize) {
+        let dir = storage.join("objects").join(&oid[..2]).join(&oid[2..4]);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(oid), vec![b'x'; size]).unwrap();
+    }
+
+    #[test]
+    fn lfs_blobs_are_classified() {
+        let oid = "ab".repeat(32);
+        assert_eq!(
+            classify_lfs_blob(pointer(&oid, 12).as_bytes()),
+            LfsBlob::Pointer {
+                oid: oid.clone(),
+                size: 12
+            }
+        );
+        let canonical = pointer(&oid, 12);
+        let non_canonical = [
+            canonical.replace(
+                "https://git-lfs.github.com/spec/v1",
+                "https://hawser.github.com/spec/v1",
+            ),
+            canonical.replace('\n', "\r\n"),
+            format!("version https://git-lfs.github.com/spec/v1\next-0-x sha256:{oid}\noid sha256:{oid}\nsize 12\n"),
+            pointer(&oid, 0),
+            pointer(&oid, 12).replace("size 12", "size 012"),
+            canonical.trim_end().to_string(),
+            pointer(&oid.to_uppercase(), 12),
+        ];
+        for blob in non_canonical {
+            assert_eq!(
+                classify_lfs_blob(blob.as_bytes()),
+                LfsBlob::NonCanonical,
+                "{blob:?}"
+            );
+        }
+        for blob in [b"raw\n".as_slice(), b"", b"\xff\xfe"] {
+            assert_eq!(classify_lfs_blob(blob), LfsBlob::Content, "{blob:?}");
+        }
+    }
+
+    #[test]
+    fn lfs_summary_lists_three_paths() {
+        let paths = |names: &[&str]| -> Vec<Vec<u8>> {
+            names.iter().map(|n| n.as_bytes().to_vec()).collect()
+        };
+        assert_eq!(lfs_paths_summary(&paths(&["a", "b"])), "a, b");
+        assert_eq!(
+            lfs_paths_summary(&paths(&["a", "b", "c", "d", "e"])),
+            "a, b, c e mais 2"
+        );
+        assert_eq!(lfs_paths_summary(&paths(&["a\x1b"])), "a\\u{1b}");
+    }
+
+    #[test]
+    fn missing_lfs_object_is_refused_before_anything_is_created() {
+        let tmp = TempDir::new().unwrap();
+        let oids: Vec<String> = ["11", "22", "33", "44"]
+            .iter()
+            .map(|prefix| prefix.repeat(32))
+            .collect();
+        let files: Vec<(String, String)> = oids
+            .iter()
+            .enumerate()
+            .map(|(i, oid)| (format!("f{i}.bin"), pointer(oid, 5)))
+            .collect();
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_str()))
+            .collect();
+        let (repo, run) = lfs_repo(&tmp, &refs);
+        put_lfs_object(&repo.join(".git/lfs"), &oids[0], 5);
+
+        let Err(err) = GitWorkspace::create(&repo, &run, "loop/lfs", true) else {
+            panic!("expected missing LFS objects to be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "faltam 3 objeto(s) do Git LFS no repositório: f1.bin, f2.bin, f3.bin; rode 'git lfs fetch' e tente de novo"
+        );
+        assert!(!run.exists());
+    }
+
+    #[test]
+    fn present_lfs_objects_pass_preflight() {
+        let tmp = TempDir::new().unwrap();
+        let oid_a = "aa".repeat(32);
+        let oid_b = "bb".repeat(32);
+        let files = [
+            ("a.bin", pointer(&oid_a, 3)),
+            ("dup.bin", pointer(&oid_a, 3)),
+            ("sub/.gitattributes", "*.dat filter=lfs\n".to_string()),
+            ("sub/x.dat", pointer(&oid_b, 7)),
+        ];
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect();
+        let (repo, _run) = lfs_repo(&tmp, &refs);
+        let storage = repo.join(".git/lfs");
+        put_lfs_object(&storage, &oid_a, 3);
+        put_lfs_object(&storage, &oid_b, 7);
+        GitWorkspace::preflight_check_repo(&repo, "loop/lfs", true).unwrap();
+    }
+
+    #[test]
+    fn truncated_lfs_object_is_refused_and_kept() {
+        let tmp = TempDir::new().unwrap();
+        let oid = "cc".repeat(32);
+        let content = pointer(&oid, 5);
+        let (repo, run) = lfs_repo(&tmp, &[("a.bin", content.as_str())]);
+        let storage = repo.join(".git/lfs");
+        put_lfs_object(&storage, &oid, 4);
+        let Err(err) = GitWorkspace::create(&repo, &run, "loop/lfs", true) else {
+            panic!("expected the truncated object to be refused");
+        };
+        assert!(err.to_string().contains("faltam 1"), "{err}");
+        let object = storage
+            .join("objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        assert!(object.exists(), "the local object must be kept");
+    }
+
+    #[test]
+    fn pointer_text_outside_the_lfs_attribute_is_not_required() {
+        let tmp = TempDir::new().unwrap();
+        let oid = "dd".repeat(32);
+        let fixture = pointer(&oid, 9);
+        let (repo, _run) = lfs_repo(&tmp, &[("fixture.txt", fixture.as_str())]);
+        GitWorkspace::preflight_check_repo(&repo, "loop/lfs", true).unwrap();
+    }
+
+    #[test]
+    fn lfs_attributes_come_from_the_base_commit() {
+        let tmp = TempDir::new().unwrap();
+        let missing = "ee".repeat(32);
+        let present = "ff".repeat(32);
+        let files = [
+            ("missing.bin", pointer(&missing, 4)),
+            ("x.bin", pointer(&present, 3)),
+        ];
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, content)| (*path, content.as_str()))
+            .collect();
+        let (repo, run) = lfs_repo(&tmp, &refs);
+        put_lfs_object(&repo.join(".git/lfs"), &present, 3);
+        // The worktree disagrees with the commit; the commit decides.
+        fs::write(repo.join(".gitattributes"), "x.bin filter=lfs\n").unwrap();
+        let Err(err) = GitWorkspace::create(&repo, &run, "loop/lfs", true) else {
+            panic!("expected attributes from the base commit");
+        };
+        assert!(err.to_string().contains("missing.bin"), "{err}");
+    }
+
+    #[test]
+    fn non_canonical_lfs_pointer_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let oid = "12".repeat(32);
+        let hawser = pointer(&oid, 5).replace(
+            "https://git-lfs.github.com/spec/v1",
+            "https://hawser.github.com/spec/v1",
+        );
+        let (repo, run) = lfs_repo(&tmp, &[("a.bin", hawser.as_str())]);
+        put_lfs_object(&repo.join(".git/lfs"), &oid, 5);
+        let Err(err) = GitWorkspace::create(&repo, &run, "loop/lfs", true) else {
+            panic!("expected the non-canonical pointer to be refused");
+        };
+        assert!(
+            err.to_string()
+                .contains("1 ponteiro(s) do Git LFS fora do formato canônico"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lfs_store_objects_are_found_from_a_linked_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let oid = "34".repeat(32);
+        let (repo, _run) = new_repo(&tmp);
+        commit_lfs_files(&repo, &[("a.bin", &pointer(&oid, 5))]);
+        let wt = tmp.path().join("wt");
+        git_ok(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt"],
+        );
+        configure_lfs(&repo);
+        put_lfs_object(&repo.join(".git/lfs"), &oid, 5);
+        GitWorkspace::preflight_check_repo(&wt, "loop/wt", true).unwrap();
+    }
+
+    fn git_lfs_available() -> bool {
+        Command::new("git-lfs")
+            .arg("version")
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    /// A repository whose `a.bin` is a real LFS file, with the filter only in `.git/config`.
+    fn real_lfs_repo(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let (repo, run) = new_repo(tmp);
+        configure_lfs(&repo);
+        fs::write(
+            repo.join(".gitattributes"),
+            "*.bin filter=lfs diff=lfs merge=lfs -text\n",
+        )
+        .unwrap();
+        fs::write(repo.join("a.bin"), b"REAL\0CONTENT").unwrap();
+        git_ok(&repo, &["add", "."]);
+        git_ok(&repo, &["commit", "-m", "real lfs"]);
+        let blob = git_ok(&repo, &["cat-file", "-p", "HEAD:a.bin"]);
+        assert!(blob.starts_with("version https://git-lfs"), "{blob}");
+        (repo, run)
+    }
+
+    fn lfs_checkout(commands: &[(&str, &str)], storage: &Path) -> LfsCheckout {
+        LfsCheckout {
+            commands: commands
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            storage: storage.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn lfs_checkout_config_is_exact() {
+        let lfs = lfs_checkout(
+            &[
+                ("clean", "git-lfs clean -- %f"),
+                ("process", "git-lfs filter-process"),
+                ("smudge", "git-lfs smudge -- %f"),
+            ],
+            Path::new("/store"),
+        );
+        let expected: Vec<(String, String)> = [
+            ("filter.lfs.clean", "git-lfs clean -- %f"),
+            ("filter.lfs.process", "git-lfs filter-process"),
+            ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+            ("filter.lfs.required", "true"),
+            ("lfs.storage", "/store"),
+            ("lfs.url", "file:///dev/null"),
+            ("lfs.fetchinclude", ""),
+            ("lfs.fetchexclude", ""),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(lfs_checkout_config(&lfs), expected);
+    }
+
+    #[test]
+    fn disabled_filters_and_lfs_settings_do_not_overwrite_each_other() {
+        let tmp = TempDir::new().unwrap();
+        let lfs = lfs_checkout(
+            &[("smudge", "git-lfs smudge -- %f")],
+            &tmp.path().join("store"),
+        );
+        let mut config = disabled_filter_config(&["a=b".to_string()]);
+        config.extend(lfs_checkout_config(&lfs));
+
+        let get = |key: &str| -> String {
+            let mut cmd = Command::new("git");
+            cmd.args(["config", "--get", key])
+                .current_dir(tmp.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            set_git_config(&mut cmd, &config);
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git config --get {key}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        assert_eq!(get("filter.a=b.required"), "false");
+        assert_eq!(get("lfs.storage"), lfs.storage.to_str().unwrap());
+        assert_eq!(get("lfs.url"), "file:///dev/null");
+    }
+
+    #[test]
+    fn lfs_files_are_real_content_and_the_snapshot_keeps_the_tree() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = real_lfs_repo(&tmp);
+        let mut ws = GitWorkspace::create(&repo, &run, "loop/lfs", false).unwrap();
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), b"REAL\0CONTENT");
+        assert_eq!(ws.snapshot().unwrap(), ws.base_tree());
+        assert!(ws.to_frozen().lfs_enabled);
+
+        let base_tree = ws.base_tree().to_string();
+        fs::write(ws.path().join("a.bin"), b"NEW").unwrap();
+        let tree = ws.snapshot().unwrap();
+        assert_ne!(tree, base_tree);
+        let blob = git_cmd(&repo, &["cat-file", "-p", &format!("{tree}:a.bin")]).stdout;
+        match classify_lfs_blob(&blob) {
+            LfsBlob::Pointer { size, .. } => assert_eq!(size, 3),
+            other => panic!("esperava um ponteiro, veio {other:?}"),
+        }
+        ws.restore(&base_tree).unwrap();
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), b"REAL\0CONTENT");
+    }
+
+    #[test]
+    fn lfs_content_appears_for_every_trusted_command_form() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        for form in ["process-unset", "skip"] {
+            let tmp = TempDir::new().unwrap();
+            let (repo, run) = real_lfs_repo(&tmp);
+            match form {
+                "process-unset" => {
+                    git_ok(&repo, &["config", "--unset", "filter.lfs.process"]);
+                }
+                _ => {
+                    git_ok(
+                        &repo,
+                        &["config", "filter.lfs.smudge", "git-lfs smudge --skip -- %f"],
+                    );
+                    git_ok(
+                        &repo,
+                        &[
+                            "config",
+                            "filter.lfs.process",
+                            "git-lfs filter-process --skip",
+                        ],
+                    );
+                }
+            }
+            let mut ws = GitWorkspace::create(&repo, &run, "loop/lfs", false).unwrap();
+            assert_eq!(
+                fs::read(ws.path().join("a.bin")).unwrap(),
+                b"REAL\0CONTENT",
+                "{form}"
+            );
+            assert_eq!(ws.snapshot().unwrap(), ws.base_tree(), "{form}");
+        }
+    }
+
+    #[test]
+    fn repository_lfsconfig_chooses_nothing() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (repo, run) = real_lfs_repo(&tmp);
+        fs::write(
+            repo.join(".lfsconfig"),
+            format!("[lfs]\n\turl = http://127.0.0.1:{port}/x\n\tfetchexclude = *.bin\n"),
+        )
+        .unwrap();
+        git_ok(&repo, &["add", ".lfsconfig"]);
+        git_ok(&repo, &["commit", "-m", "lfsconfig"]);
+
+        let ws = GitWorkspace::create(&repo, &run, "loop/lfs", false).unwrap();
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), b"REAL\0CONTENT");
+
+        let info = GitWorkspace::preflight_check_repo(&repo, "loop/lfs2", false).unwrap();
+        let pointer = git_cmd(&repo, &["cat-file", "-p", "HEAD:a.bin"]).stdout;
+        let LfsBlob::Pointer { oid, .. } = classify_lfs_blob(&pointer) else {
+            panic!("esperava um ponteiro");
+        };
+        let object = repo
+            .join(".git/lfs/objects")
+            .join(&oid[..2])
+            .join(&oid[2..4])
+            .join(&oid);
+        fs::remove_file(&object).unwrap();
+        let run2 = tmp.path().join("run2");
+        // Preflight passed before the object was gone; the checkout must still fail without asking
+        // the repository's `.lfsconfig` URL, which `lfs.url` overrides.
+        assert!(
+            GitWorkspace::create_in(info, &run2, &run2.join("workspace")).is_err(),
+            "esperava a falha do checkout sem objeto"
+        );
+        match listener.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            other => panic!("o checkout não deveria contatar a URL: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lfs_checkout_works_from_a_linked_worktree() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (repo, _run) = real_lfs_repo(&tmp);
+        let wt = tmp.path().join("wt");
+        git_ok(
+            &repo,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "wt"],
+        );
+        let run = tmp.path().join("run-wt");
+        let mut ws = GitWorkspace::create(&wt, &run, "loop/wt", false).unwrap();
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), b"REAL\0CONTENT");
+        assert_eq!(ws.snapshot().unwrap(), ws.base_tree());
+    }
+
+    #[test]
+    fn lfs_attribute_without_a_filter_is_unchanged() {
+        if !git_lfs_available() {
+            println!("SKIPPED: git-lfs unavailable");
+            return;
+        }
+        let probe = TempDir::new().unwrap();
+        let found = Command::new("git")
+            .args(["config", "--get-regexp", "^filter\\.lfs\\."])
+            .current_dir(probe.path())
+            .output()
+            .unwrap();
+        if found.status.success() && !found.stdout.is_empty() {
+            println!("SKIPPED: lfs filter configured globally");
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (repo, run) = real_lfs_repo(&tmp);
+        let pointer_text = git_cmd(&repo, &["cat-file", "-p", "HEAD:a.bin"]).stdout;
+        let LfsBlob::Pointer { oid, .. } = classify_lfs_blob(&pointer_text) else {
+            panic!("esperava um ponteiro");
+        };
+        git_ok(&repo, &["config", "--remove-section", "filter.lfs"]);
+        fs::remove_file(
+            repo.join(".git/lfs/objects")
+                .join(&oid[..2])
+                .join(&oid[2..4])
+                .join(&oid),
+        )
+        .unwrap();
+
+        let mut ws = GitWorkspace::create(&repo, &run, "loop/lfs", true).unwrap();
+        assert!(!ws.to_frozen().lfs_enabled);
+        assert_eq!(fs::read(ws.path().join("a.bin")).unwrap(), pointer_text);
+        assert_eq!(ws.snapshot().unwrap(), ws.base_tree());
     }
 }
