@@ -13,6 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const BASE_ALLOWED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TERM"];
 pub const AGY_TOKEN_REL: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
+pub const PI_UNRECOGNIZED: &str =
+    "instalação do pi não reconhecida (só a instalação gerenciada em ~/.pi/agent é suportada)";
+/// What a stage may see of the pi home: never `settings.json`, `AGENTS.md`, extensions or sessions.
+const PI_INSTALL_MOUNTS: &[&str] = &[
+    ".pi/agent/install",
+    ".local/share/pi-node",
+    ".pi/agent/auth.json",
+    ".pi/agent/models-store.json",
+    ".pi/agent/models.json",
+];
 pub const AGY_LOGIN_DIR_REL: &str = "loops/agy-login";
 pub const AGY_TOKEN_FILE: &str = "antigravity-oauth-token";
 
@@ -33,6 +43,7 @@ const ADAPTER_CREDENTIALS: &[(&str, Option<&str>)] = &[
     ("claude", Some(".claude/.credentials.json")),
     ("agy", Some(AGY_TOKEN_REL)),
     ("opencode", None),
+    ("pi", None),
 ];
 const TCHELVIS_HOME_DIRS: &[&str] = &[
     ".config/tchelvis",
@@ -225,6 +236,47 @@ fn find_in_path(bin: &str, path_var: Option<&std::ffi::OsStr>) -> Option<PathBuf
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiInstall {
+    pub agent_dir: PathBuf,
+    pub version: String,
+}
+
+/// The only install layout `pi` stages accept: the managed one, whose `pi` on PATH resolves into
+/// `<home>/.pi/agent/bin`, with a sane `install/current-version`.
+pub fn pi_managed_install(
+    home: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> std::result::Result<PiInstall, String> {
+    let unrecognized = || PI_UNRECOGNIZED.to_string();
+    let bin = find_in_path("pi", path_var).ok_or_else(unrecognized)?;
+    let real = fs::canonicalize(&bin).map_err(|_| unrecognized())?;
+    let agent_dir = home.join(".pi/agent");
+    let managed = fs::canonicalize(agent_dir.join("bin/pi")).map_err(|_| unrecognized())?;
+    if real != managed {
+        return Err(unrecognized());
+    }
+    let version_path = agent_dir.join("install/current-version");
+    let meta = fs::symlink_metadata(&version_path).map_err(|_| unrecognized())?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(unrecognized());
+    }
+    let raw = fs::read_to_string(&version_path).map_err(|_| unrecognized())?;
+    let version = raw.trim();
+    let safe = !version.is_empty()
+        && version.len() <= 64
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-'));
+    if !safe {
+        return Err(unrecognized());
+    }
+    Ok(PiInstall {
+        agent_dir,
+        version: version.to_string(),
+    })
 }
 
 fn is_path_writable_by_current_user(path: &Path) -> bool {
@@ -448,6 +500,66 @@ impl Sandbox for InheritedSandbox {
     }
 }
 
+/// Wraps a stage command with the one place that knows per-provider environment rules: the
+/// opencode key reaches only `opencode`, and `pi` under `inherited` gets a private agent dir whose
+/// credential files are symlinks into the real `~/.pi/agent`, never the files themselves.
+pub fn wrap_for_provider(
+    sandbox: &dyn Sandbox,
+    provider: crate::loops::workflow::Provider,
+    argv: &[OsString],
+    workspace: &Path,
+    scratch: &Path,
+    opencode_api_key: Option<&str>,
+) -> Result<SandboxedCommand> {
+    let mut cmd = match (provider, opencode_api_key) {
+        (crate::loops::workflow::Provider::Opencode, Some(key)) => {
+            sandbox.wrap_with_extra_env(argv, workspace, &[("OPENCODE_API_KEY", key)])?
+        }
+        _ => sandbox.wrap(argv, workspace)?,
+    };
+    if provider != crate::loops::workflow::Provider::Opencode {
+        cmd.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
+    }
+    if provider == crate::loops::workflow::Provider::Pi && sandbox.kind() == "inherited" {
+        let agent_dir = scratch.join("pi-agent");
+        // A leftover from an earlier call may hold a `settings.json` the stage must not see.
+        let _ = fs::remove_dir_all(&agent_dir);
+        fs::create_dir_all(&agent_dir).with_context(|| {
+            format!(
+                "falha ao criar o diretório de agente do pi: {}",
+                agent_dir.display()
+            )
+        })?;
+        fs::set_permissions(&agent_dir, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "falha ao restringir o diretório de agente do pi: {}",
+                agent_dir.display()
+            )
+        })?;
+        let home = cmd
+            .env
+            .iter()
+            .find(|(k, _)| k == "HOME")
+            .map(|(_, v)| PathBuf::from(v));
+        if let Some(home) = home {
+            for name in ["auth.json", "models-store.json", "models.json"] {
+                let target = home.join(".pi/agent").join(name);
+                if !target.is_file() {
+                    continue;
+                }
+                let link = agent_dir.join(name);
+                let _ = fs::remove_file(&link);
+                std::os::unix::fs::symlink(&target, &link).with_context(|| {
+                    format!("falha ao vincular '{}' no agente do pi", target.display())
+                })?;
+            }
+        }
+        let dir = agent_dir.to_string_lossy().into_owned();
+        apply_extra_env(&mut cmd.env, &[("PI_CODING_AGENT_DIR", dir.as_str())]);
+    }
+    Ok(cmd)
+}
+
 pub struct BwrapSandbox {
     pub home_ro: Vec<String>,
     pub env_pass: Vec<String>,
@@ -502,12 +614,12 @@ impl BwrapSandbox {
         program: &std::ffi::OsStr,
         home: &Path,
         path_var: Option<&std::ffi::OsStr>,
-    ) -> Vec<(PathBuf, PathBuf)> {
+    ) -> Result<Vec<(PathBuf, PathBuf)>> {
         let Some((name, credential)) = ADAPTER_CREDENTIALS
             .iter()
             .find(|(name, _)| program == std::ffi::OsStr::new(name))
         else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut binds = Vec::new();
         if let Some(bin) = find_in_path(name, path_var) {
@@ -528,7 +640,9 @@ impl BwrapSandbox {
                     _ => binds.push((real.clone(), real.clone())),
                 }
             }
-            if bin.starts_with(home) {
+            // The managed launcher finds its install by following its own symlink, so a regular
+            // file at `bin` would make it look in `~/.local`; see `adapter_symlinks`.
+            if bin.starts_with(home) && *name != "pi" {
                 binds.push((real, bin));
             }
         }
@@ -536,13 +650,46 @@ impl BwrapSandbox {
             if let Some(cred) = resolve_agy_credential(home, Some(&self.state_dir)) {
                 binds.push((cred.path, home.join(AGY_TOKEN_REL)));
             }
+        } else if *name == "pi" {
+            pi_managed_install(home, path_var).map_err(anyhow::Error::msg)?;
+            for rel in PI_INSTALL_MOUNTS {
+                let path = home.join(rel);
+                let Ok(meta) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if meta.file_type().is_symlink()
+                    || !(meta.is_file() || meta.is_dir())
+                    || self.reaches_tchelvis(home, &path)
+                {
+                    continue;
+                }
+                binds.push((path.clone(), path));
+            }
         } else if let Some(rel) = credential {
             let file = home.join(rel);
             if file.is_file() {
                 binds.push((file.clone(), file));
             }
         }
-        binds
+        Ok(binds)
+    }
+
+    /// Symlinks `(target, link)` the CLI needs inside the replaced home: only the `pi` launcher,
+    /// which resolves its own symlink to find `~/.pi/agent/install`.
+    fn adapter_symlinks(
+        &self,
+        program: &std::ffi::OsStr,
+        home: &Path,
+        path_var: Option<&std::ffi::OsStr>,
+    ) -> Vec<(PathBuf, PathBuf)> {
+        if program != std::ffi::OsStr::new("pi") {
+            return Vec::new();
+        }
+        let Some(bin) = find_in_path("pi", path_var).filter(|b| b.starts_with(home)) else {
+            return Vec::new();
+        };
+        let real = fs::canonicalize(&bin).unwrap_or_else(|_| bin.clone());
+        vec![(real, bin)]
     }
 
     fn wrap_clean(
@@ -576,7 +723,7 @@ impl BwrapSandbox {
                 binds.push((full.clone(), full));
             }
         }
-        binds.extend(self.adapter_binds(&argv[0], &home, path_var));
+        binds.extend(self.adapter_binds(&argv[0], &home, path_var)?);
 
         let mut wrapped = vec![
             OsString::from("bwrap"),
@@ -612,6 +759,12 @@ impl BwrapSandbox {
             wrapped.push(OsString::from("--ro-bind"));
             wrapped.push(src.as_os_str().to_os_string());
             wrapped.push(dst.as_os_str().to_os_string());
+        }
+
+        for (target, link) in self.adapter_symlinks(&argv[0], &home, path_var) {
+            wrapped.push(OsString::from("--symlink"));
+            wrapped.push(target.into_os_string());
+            wrapped.push(link.into_os_string());
         }
 
         wrapped.push(OsString::from("--bind"));
@@ -834,6 +987,7 @@ impl Sandbox for BwrapSandbox {
 mod tests {
     use super::*;
     use crate::loops::process::{run_process, Limits, Outcome, SystemClock};
+    use crate::loops::workflow::Provider;
     use std::collections::BTreeSet;
     use std::fs;
     use std::process::Command;
@@ -1179,6 +1333,360 @@ mod tests {
         assert!(!home.join(".bashrc").exists());
     }
 
+    fn write_pi_home(home: &Path) {
+        let bin = home.join(".local/bin");
+        let agent = home.join(".pi/agent");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(agent.join("install/releases/1.5.2")).unwrap();
+        fs::create_dir_all(agent.join("bin")).unwrap();
+        fs::create_dir_all(home.join(".local/share/pi-node/current/bin")).unwrap();
+        crate::test_support::write_executable(agent.join("bin/pi"), "#!/bin/sh\n");
+        let _ = fs::remove_file(bin.join("pi"));
+        std::os::unix::fs::symlink("../../.pi/agent/bin/pi", bin.join("pi")).unwrap();
+        fs::write(agent.join("install/current-version"), "1.5.2\n").unwrap();
+    }
+
+    fn pi_path(home: &Path) -> std::ffi::OsString {
+        std::ffi::OsString::from(format!("{}/.local/bin:/usr/bin:/bin", home.display()))
+    }
+
+    fn ro_bind_dests(argv: &[OsString]) -> Vec<PathBuf> {
+        argv.windows(3)
+            .filter(|w| w[0] == "--ro-bind")
+            .map(|w| PathBuf::from(&w[2]))
+            .collect()
+    }
+
+    #[test]
+    fn pi_managed_install_recognises_layout_and_refuses_others() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        let path = pi_path(&home);
+        let install = pi_managed_install(&home, Some(&path)).unwrap();
+        assert_eq!(install.version, "1.5.2");
+        assert_eq!(install.agent_dir, home.join(".pi/agent"));
+        assert_eq!(
+            pi_managed_install(&home, None).unwrap_err(),
+            PI_UNRECOGNIZED
+        );
+
+        let no_version = TempDir::new().unwrap();
+        let home = no_version.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        fs::remove_file(home.join(".pi/agent/install/current-version")).unwrap();
+        let path = pi_path(&home);
+        assert_eq!(
+            pi_managed_install(&home, Some(&path)).unwrap_err(),
+            PI_UNRECOGNIZED
+        );
+
+        let plain = TempDir::new().unwrap();
+        let home = plain.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        let bin = home.join(".local/bin/pi");
+        fs::remove_file(&bin).unwrap();
+        crate::test_support::write_executable(&bin, "#!/bin/sh\n");
+        let path = pi_path(&home);
+        assert_eq!(
+            pi_managed_install(&home, Some(&path)).unwrap_err(),
+            PI_UNRECOGNIZED
+        );
+
+        let bad_version = TempDir::new().unwrap();
+        let home = bad_version.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        fs::write(home.join(".pi/agent/install/current-version"), "../x").unwrap();
+        let path = pi_path(&home);
+        assert_eq!(
+            pi_managed_install(&home, Some(&path)).unwrap_err(),
+            PI_UNRECOGNIZED
+        );
+    }
+
+    #[test]
+    fn bwrap_mounts_for_pi_are_exactly_the_managed_files() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        for rel in [
+            ".pi/agent/auth.json",
+            ".pi/agent/models-store.json",
+            ".pi/agent/settings.json",
+            ".pi/agent/AGENTS.md",
+        ] {
+            fs::write(home.join(rel), "x").unwrap();
+        }
+        for dir in [".pi/agent/sessions", ".pi/agent/extensions"] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        let ws = home.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let path = pi_path(&home);
+        let sb = BwrapSandbox::new(vec![], vec![], home.join("state"));
+
+        let wrap = |argv: &[&str]| {
+            sb.wrap_with_env(
+                &argv.iter().map(OsString::from).collect::<Vec<_>>(),
+                &ws,
+                &[
+                    ("HOME", home.to_str().unwrap()),
+                    ("PATH", path.to_str().unwrap()),
+                ],
+            )
+            .unwrap()
+        };
+
+        let dsts = ro_bind_dests(&wrap(&["pi", "-p"]).argv);
+        for rel in [
+            ".pi/agent/install",
+            ".local/share/pi-node",
+            ".pi/agent/auth.json",
+            ".pi/agent/models-store.json",
+        ] {
+            assert!(dsts.contains(&home.join(rel)), "missing {rel}: {dsts:?}");
+        }
+        for dst in &dsts {
+            let text = dst.to_string_lossy();
+            assert!(!text.ends_with("settings.json"), "{text}");
+            assert!(!text.ends_with("AGENTS.md"), "{text}");
+            assert!(!text.ends_with("sessions"), "{text}");
+            assert!(!text.ends_with("extensions"), "{text}");
+            assert_ne!(*dst, home.join(".pi/agent"), "{text}");
+        }
+        assert!(!dsts.contains(&home.join(".pi/agent/models.json")));
+
+        fs::write(home.join(".pi/agent/models.json"), "{}").unwrap();
+        let dsts = ro_bind_dests(&wrap(&["pi", "-p"]).argv);
+        assert!(
+            dsts.contains(&home.join(".pi/agent/models.json")),
+            "{dsts:?}"
+        );
+
+        let auth = home.join(".pi/agent/auth.json");
+        fs::remove_file(&auth).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &auth).unwrap();
+        let dsts = ro_bind_dests(&wrap(&["pi", "-p"]).argv);
+        assert!(!dsts.contains(&auth), "{dsts:?}");
+    }
+
+    #[test]
+    fn bwrap_gives_pi_a_symlink_launcher_not_a_regular_file() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        let ws = home.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let path = pi_path(&home);
+        let argv = BwrapSandbox::new(vec![], vec![], home.join("state"))
+            .wrap_with_env(
+                &[OsString::from("pi"), OsString::from("-p")],
+                &ws,
+                &[
+                    ("HOME", home.to_str().unwrap()),
+                    ("PATH", path.to_str().unwrap()),
+                ],
+            )
+            .unwrap()
+            .argv;
+        let launcher = home.join(".local/bin/pi");
+        let real = home.join(".pi/agent/bin/pi");
+        // The launcher derives the agent directory from its own symlink, so a regular file here
+        // would make it look in `~/.local`.
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--symlink"
+                && w[1] == real.as_os_str()
+                && w[2] == launcher.as_os_str()),
+            "{argv:?}"
+        );
+        assert!(!ro_bind_dests(&argv).contains(&launcher), "{argv:?}");
+        assert!(ro_bind_dests(&argv).contains(&real.parent().unwrap().to_path_buf()));
+    }
+
+    #[test]
+    fn inherited_pi_agent_dir_is_rebuilt_on_every_call() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        write_pi_home(&home);
+        fs::write(home.join(".pi/agent/auth.json"), "x").unwrap();
+        let ws = home.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let scratch = tmp.path().join("stage.scratch");
+        let sb = StubSandbox {
+            kind: "inherited",
+            env: vec![("HOME".into(), home.clone().into_os_string())],
+        };
+        let argv = [OsString::from("pi")];
+        wrap_for_provider(
+            &sb,
+            crate::loops::workflow::Provider::Pi,
+            &argv,
+            &ws,
+            &scratch,
+            None,
+        )
+        .unwrap();
+        let leftover = scratch.join("pi-agent/settings.json");
+        fs::write(&leftover, "{}").unwrap();
+        wrap_for_provider(
+            &sb,
+            crate::loops::workflow::Provider::Pi,
+            &argv,
+            &ws,
+            &scratch,
+            None,
+        )
+        .unwrap();
+        assert!(!leftover.exists());
+        assert!(scratch.join("pi-agent/auth.json").is_symlink());
+    }
+
+    #[test]
+    fn bwrap_wrap_of_unrecognized_pi_fails() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        crate::test_support::write_executable(bin.join("pi"), "#!/bin/sh\n");
+        let ws = home.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let path = pi_path(&home);
+        let err = BwrapSandbox::new(vec![], vec![], home.join("state"))
+            .wrap_with_env(
+                &[OsString::from("pi"), OsString::from("-p")],
+                &ws,
+                &[
+                    ("HOME", home.to_str().unwrap()),
+                    ("PATH", path.to_str().unwrap()),
+                ],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("instalação do pi não reconhecida"), "{err}");
+    }
+
+    struct StubSandbox {
+        kind: &'static str,
+        env: Vec<(OsString, OsString)>,
+    }
+
+    impl Sandbox for StubSandbox {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn check(&self, _workspace: &Path) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand> {
+            Ok(SandboxedCommand {
+                argv: argv.to_vec(),
+                env: self.env.clone(),
+                cwd: workspace.to_path_buf(),
+            })
+        }
+    }
+
+    fn env_value<'a>(cmd: &'a SandboxedCommand, key: &str) -> Option<&'a std::ffi::OsStr> {
+        cmd.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_os_str())
+    }
+
+    #[test]
+    fn wrap_for_provider_env_rules() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().canonicalize().unwrap().join("home");
+        let scratch = tmp.path().join("scratch");
+        fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+        fs::write(home.join(".pi/agent/auth.json"), "{}").unwrap();
+        fs::write(home.join(".pi/agent/models-store.json"), "{}").unwrap();
+        fs::write(home.join(".pi/agent/settings.json"), "{}").unwrap();
+
+        let env = |extra: &[(&str, &str)]| {
+            let mut env: Vec<(OsString, OsString)> = vec![
+                ("HOME".into(), home.clone().into_os_string()),
+                ("PATH".into(), OsString::from("/usr/bin:/bin")),
+            ];
+            for (k, v) in extra {
+                env.push((OsString::from(k), OsString::from(v)));
+            }
+            env
+        };
+        let argv = vec![OsString::from("pi"), OsString::from("-p")];
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let sb = StubSandbox {
+            kind: "inherited",
+            env: env(&[("OPENCODE_API_KEY", "sk-should-not-cross")]),
+        };
+        let cmd = wrap_for_provider(
+            &sb,
+            Provider::Pi,
+            &argv,
+            &ws,
+            &scratch,
+            Some("sk-should-not-cross"),
+        )
+        .unwrap();
+        assert_eq!(cmd.argv, argv);
+        assert!(env_value(&cmd, "OPENCODE_API_KEY").is_none());
+        let agent_dir = scratch.join("pi-agent");
+        assert_eq!(
+            env_value(&cmd, "PI_CODING_AGENT_DIR"),
+            Some(agent_dir.as_os_str())
+        );
+        let mut links: Vec<_> = fs::read_dir(&agent_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        links.sort();
+        assert_eq!(
+            links,
+            [
+                OsString::from("auth.json"),
+                OsString::from("models-store.json")
+            ]
+        );
+        assert_eq!(
+            fs::read_link(agent_dir.join("auth.json")).unwrap(),
+            home.join(".pi/agent/auth.json")
+        );
+        let mode = fs::metadata(&agent_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert!(!cmd.argv.iter().any(|a| a == "--setenv"));
+
+        let sb = StubSandbox {
+            kind: "test",
+            env: env(&[]),
+        };
+        let cmd = wrap_for_provider(&sb, Provider::Opencode, &argv, &ws, &scratch, Some("sk-oc"))
+            .unwrap();
+        assert_eq!(
+            env_value(&cmd, "OPENCODE_API_KEY"),
+            Some(std::ffi::OsStr::new("sk-oc"))
+        );
+
+        let sb = StubSandbox {
+            kind: "test",
+            env: env(&[("OPENCODE_API_KEY", "sk-stale")]),
+        };
+        let cmd =
+            wrap_for_provider(&sb, Provider::Claude, &argv, &ws, &scratch, Some("sk-oc")).unwrap();
+        assert!(env_value(&cmd, "OPENCODE_API_KEY").is_none());
+
+        let sb = StubSandbox {
+            kind: "bwrap",
+            env: env(&[]),
+        };
+        let cmd = wrap_for_provider(&sb, Provider::Pi, &argv, &ws, &scratch, None).unwrap();
+        assert!(env_value(&cmd, "PI_CODING_AGENT_DIR").is_none());
+    }
+
     #[test]
     fn wrap_with_extra_env_passes_key_only_through_process_env_not_bwrap_argv() {
         let sb = BwrapSandbox::new(vec![], vec![], PathBuf::from("/tmp/state"));
@@ -1247,11 +1755,9 @@ mod tests {
             let link = bin.join("claude");
             let _ = fs::remove_file(&link);
             std::os::unix::fs::symlink(&real, &link).unwrap();
-            let binds = BwrapSandbox::new(vec![], vec![], state_dir.clone()).adapter_binds(
-                std::ffi::OsStr::new("claude"),
-                &home,
-                Some(bin.as_os_str()),
-            );
+            let binds = BwrapSandbox::new(vec![], vec![], state_dir.clone())
+                .adapter_binds(std::ffi::OsStr::new("claude"), &home, Some(bin.as_os_str()))
+                .unwrap();
             assert_eq!(
                 binds,
                 vec![(real.clone(), real.clone()), (real.clone(), link.clone())],

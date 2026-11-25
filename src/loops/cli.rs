@@ -11,7 +11,7 @@ use crate::loops::evidence::{
 };
 use crate::loops::free_check::{
     is_model_listed, plan_preflight, run_free_checks_with_options, ClaudeStatus, FreeCheck, Listed,
-    PlanAction, PlannedCheck, ProviderFreeOutcome, AGY_ABSENT_REASON,
+    PiAccount, PlanAction, PlannedCheck, ProviderFreeOutcome, AGY_ABSENT_REASON,
 };
 use crate::loops::models::{
     check_project_models_references, is_confirmed, load_project_models_from_repo, parse_use_flag,
@@ -24,8 +24,8 @@ use crate::loops::preflight::{
 use crate::loops::process::SystemClock;
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{
-    resolve_agy_credential, AgyCredentialSource, BwrapSandbox, InheritedSandbox, Sandbox,
-    AGY_TOKEN_FILE,
+    pi_managed_install, resolve_agy_credential, AgyCredentialSource, BwrapSandbox,
+    InheritedSandbox, PiInstall, Sandbox, AGY_TOKEN_FILE,
 };
 use crate::loops::state::{
     format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState, Usage,
@@ -214,10 +214,13 @@ pub enum ModelsSubcommand {
 
 #[derive(Debug, Subcommand)]
 pub enum AuthSubcommand {
-    /// Abre uma sessão de login oficial em um terminal Herdr para <cli> (claude|agy|opencode)
+    /// Abre uma sessão de login oficial em um terminal Herdr para <cli> (claude|agy|opencode|pi)
     Login {
-        /// CLI alvo (claude|agy|opencode)
+        /// CLI alvo (claude|agy|opencode|pi)
         cli: String,
+        /// Provedor do 'pi' (ex.: opencode-go); exigido só com cli = pi
+        #[arg(value_name = "provedor")]
+        provider: Option<String>,
     },
 }
 
@@ -915,6 +918,116 @@ fn distinct_providers(targets: &[ProbeTarget]) -> Vec<Provider> {
     out
 }
 
+/// One status line for `tchelvis loop auth`, from the free check outcome and the install probe.
+pub fn pi_auth_line(
+    outcome: Option<&ProviderFreeOutcome>,
+    install: &Result<PiInstall, String>,
+) -> String {
+    if let Err(reason) = install {
+        return format!("pi:       {reason}");
+    }
+    let Some(out) = outcome else {
+        return "pi:       indeterminado ('pi --offline --list-models' indisponível)".to_string();
+    };
+    if out.list_known && !out.models.is_empty() {
+        let mut prefixes: Vec<&str> = out
+            .models
+            .iter()
+            .filter_map(|m| m.split_once('/').map(|(p, _)| p))
+            .collect();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        return match prefixes.as_slice() {
+            [p] => format!(
+                "pi:       {} modelo(s) de {p} (pi --list-models)",
+                out.models.len()
+            ),
+            _ => format!(
+                "pi:       {} modelo(s) de {} provedor(es) (pi --list-models)",
+                out.models.len(),
+                prefixes.len()
+            ),
+        };
+    }
+    "pi:       nenhum provedor com credencial (rode 'tchelvis loop auth login pi <provedor>')"
+        .to_string()
+}
+
+/// Notes for `loop check`/`loop run`: refuses an unrecognised install and warns that a `pi` stage
+/// sees every credential of the real `~/.pi/agent/auth.json`.
+pub fn pi_check_notes(
+    workflow: &Workflow,
+    install: &Result<PiInstall, String>,
+) -> Result<Vec<String>, String> {
+    if !workflow.stages.iter().any(|s| s.provider == Provider::Pi) {
+        return Ok(Vec::new());
+    }
+    if let Err(reason) = install {
+        return Err(reason.clone());
+    }
+    Ok(vec![
+        "aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string(),
+    ])
+}
+
+/// Absolute argv of `loop auth login` for the CLIs that need no extra wiring. `agy` is built by
+/// `cmd_auth` instead, because it needs the `bwrap` path and the loop login directory.
+fn login_argv(cli: &str, provider: Option<&str>) -> Result<Vec<String>, LoopError> {
+    match cli {
+        "claude" | "opencode" => {
+            let argv = vec![cli.to_string(), "auth".into(), "login".into()];
+            if provider.is_some() {
+                return Err(LoopError::usage(format!(
+                    "'{cli}' não aceita provedor; use 'tchelvis loop auth login {cli}'"
+                )));
+            }
+            Ok(argv)
+        }
+        "pi" => {
+            let Some(provider) = provider else {
+                return Err(LoopError::usage(
+                    "informe o provedor: tchelvis loop auth login pi <provedor>".to_string(),
+                ));
+            };
+            if provider.is_empty()
+                || provider.chars().any(char::is_whitespace)
+                || provider.starts_with('-')
+            {
+                return Err(LoopError::usage(format!(
+                    "provedor inválido '{provider}'; use 'tchelvis loop auth login pi <provedor>'"
+                )));
+            }
+            Ok(vec![
+                "pi".to_string(),
+                "auth".into(),
+                "login".into(),
+                provider.to_string(),
+            ])
+        }
+        other => Err(LoopError::usage(format!(
+            "CLI desconhecido '{other}' (use claude, agy, opencode ou pi)"
+        ))),
+    }
+}
+
+fn pi_providers_of(targets: &[ProbeTarget]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in targets.iter().filter(|t| t.choice.provider == Provider::Pi) {
+        let prefix = t
+            .choice
+            .model
+            .as_deref()
+            .and_then(|m| m.split_once('/'))
+            .map(|(p, _)| p.to_string());
+        if let Some(p) = prefix {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_cli_identity_for_provider(
     provider: Provider,
@@ -961,6 +1074,21 @@ fn build_cli_identity_for_provider(
         },
         Provider::Opencode => {
             compute_account_identity(salt, AccountIdentityInput::OpencodeKey(opencode_api_key))
+        }
+        Provider::Pi => {
+            let install = pi_managed_install(home_dir, path_var).ok()?;
+            let meta = fs::metadata(home_dir.join(".pi/agent/auth.json"))
+                .ok()
+                .filter(|meta| meta.is_file())?;
+            return Some(CliIdentity {
+                executable: format!(
+                    "{}:{}",
+                    compute_executable_identity(Provider::Pi.as_str(), path_var),
+                    install.version
+                ),
+                account: compute_account_identity(salt, AccountIdentityInput::PiAuthFile(&meta)),
+                sandbox: sandbox_kind.to_string(),
+            });
         }
         Provider::Agy => {
             let cred = resolve_agy_credential(home_dir, agy_state_dir);
@@ -1091,6 +1219,33 @@ fn build_free_checks_for_targets(
                 let listed = match outcome {
                     Some(out) if out.list_known => is_model_listed(
                         Provider::Opencode,
+                        target.choice.model.as_deref(),
+                        &out.models,
+                    ),
+                    _ => Listed::Unknown,
+                };
+                FreeCheck { account_ok, listed }
+            }
+            Provider::Pi => {
+                let outcome = free_outcomes.get(&Provider::Pi);
+                let prefix = target
+                    .choice
+                    .model
+                    .as_deref()
+                    .and_then(|m| m.split_once('/'))
+                    .map(|(p, _)| p.to_string());
+                let account_ok = match (prefix.as_deref(), outcome) {
+                    (Some(p), Some(out)) => match out.pi_accounts.get(p) {
+                        Some(PiAccount::NotReady(reason)) => Err(format!(
+                            "provedor '{p}' do pi sem credencial ({reason}); rode 'tchelvis loop auth login pi {p}'"
+                        )),
+                        _ => Ok(()),
+                    },
+                    _ => Ok(()),
+                };
+                let listed = match outcome {
+                    Some(out) if out.list_known => is_model_listed(
+                        Provider::Pi,
                         target.choice.model.as_deref(),
                         &out.models,
                     ),
@@ -1926,7 +2081,12 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
             .map_err(|e| LoopError::err(format!("{e:#}")))?;
             let cancel = install_cancel_signal_flag();
             let clock = SystemClock::new();
-            let providers = [Provider::Claude, Provider::Agy, Provider::Opencode];
+            let providers = [
+                Provider::Claude,
+                Provider::Agy,
+                Provider::Opencode,
+                Provider::Pi,
+            ];
             let outcomes = run_free_checks_with_options(
                 &providers,
                 sandbox.as_ref(),
@@ -1935,6 +2095,7 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 &cancel,
                 &clock,
                 opencode_key.as_deref(),
+                &[],
             )
             .map_err(LoopError::cancelled)?;
             drop(auth_dir);
@@ -2004,17 +2165,17 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 ),
             };
 
+            let pi_install =
+                pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
+            let pi_line = pi_auth_line(outcomes.get(&Provider::Pi), &pi_install);
+
             println!("{claude_line}");
             println!("{agy_line}");
             println!("{opencode_line}");
+            println!("{pi_line}");
             Ok(())
         }
-        Some(AuthSubcommand::Login { cli }) => {
-            if !matches!(cli.as_str(), "claude" | "agy" | "opencode") {
-                return Err(LoopError::usage(format!(
-                    "CLI desconhecido '{cli}' (use claude, agy ou opencode)"
-                )));
-            }
+        Some(AuthSubcommand::Login { cli, provider }) => {
             let herdr = HerdrClient::default();
             let caller_id = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
             if caller_id.trim().is_empty() {
@@ -2023,7 +2184,6 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 ));
             }
             let argv: Vec<String> = match cli.as_str() {
-                "claude" => vec!["claude".into(), "auth".into(), "login".into()],
                 // Redirect ~/.gemini/antigravity-cli to <state>/loops/agy-login with file-only
                 // token storage while keeping D-Bus/XDG_RUNTIME_DIR intact so the browser opens.
                 "agy" => {
@@ -2052,8 +2212,7 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                         "agy".into(),
                     ]
                 }
-                "opencode" => vec!["opencode".into(), "auth".into(), "login".into()],
-                _ => unreachable!(),
+                _ => login_argv(&cli, provider.as_deref())?,
             };
             let cwd = std::env::current_dir().unwrap_or_else(|_| paths.home_dir.clone());
             let term = herdr
@@ -2266,6 +2425,10 @@ fn cmd_check(
     .map_err(|errs| LoopError::usage(errs.join("\n")))?;
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra = collect_extra_secrets(opencode_key.as_deref());
+    let pi_install = pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
+    for note in pi_check_notes(&resolution.workflow, &pi_install).map_err(LoopError::err)? {
+        eprint_redacted(&note, &extra);
+    }
 
     let ev_path = evidence_store_path(paths);
     if let Some(r) = &repo {
@@ -2311,6 +2474,7 @@ fn cmd_check(
 
     let targets = probe_targets(&resolution.workflow);
     let providers = distinct_providers(&targets);
+    let pi_providers = pi_providers_of(&targets);
     let cancel = install_cancel_signal_flag();
     let clock = SystemClock::new();
     let free_outcomes = run_free_checks_with_options(
@@ -2321,6 +2485,7 @@ fn cmd_check(
         &cancel,
         &clock,
         opencode_key.as_deref(),
+        &pi_providers,
     )
     .map_err(LoopError::cancelled)?;
 
@@ -2689,6 +2854,10 @@ async fn cmd_run(
     // 3. Resolve OPENCODE_API_KEY + secrets for redaction
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
+    let pi_install = pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
+    for note in pi_check_notes(&resolution.workflow, &pi_install).map_err(LoopError::err)? {
+        eprint_redacted(&note, &extra_secrets);
+    }
 
     // 4. Read-only git check BEFORE preflight so dirty repo runs zero CLIs
     let branch = format!("loop/{}-{run_id}", resolution.workflow.name);
@@ -2708,6 +2877,7 @@ async fn cmd_run(
     .map_err(|e| LoopError::err(format!("{e:#}")))?;
     let clock = SystemClock::new();
 
+    let pi_providers = pi_providers_of(&targets);
     let free_outcomes = run_free_checks_with_options(
         &providers,
         sandbox.as_ref(),
@@ -2716,6 +2886,7 @@ async fn cmd_run(
         &cancel,
         &clock,
         opencode_key.as_deref(),
+        &pi_providers,
     )
     .map_err(|_| LoopError::cancelled("execução cancelada durante o pré-teste"))?;
 
@@ -3769,6 +3940,7 @@ mod tests {
                     models: Vec::new(),
                     list_known: status.is_some(),
                     claude_status: status,
+                    pi_accounts: BTreeMap::new(),
                 },
             )]);
             build_cli_identity_for_provider(
@@ -3880,6 +4052,229 @@ mod tests {
         fs::remove_file(&def_tok).unwrap();
         assert_eq!(id_for(Some(&state)).account, id_loop.account);
         assert_eq!(id_for(None).account, id_none.account);
+    }
+
+    #[test]
+    fn pi_free_check_maps_account_and_listing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let target = |model: &str| ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Pi,
+                model: Some(model.to_string()),
+            },
+            stage_ids: vec!["implement".to_string()],
+        };
+
+        let not_ready = target("anthropic/claude-x");
+        let mut accounts = BTreeMap::new();
+        accounts.insert(
+            "anthropic".to_string(),
+            PiAccount::NotReady("credentials_not_configured".to_string()),
+        );
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            Provider::Pi,
+            ProviderFreeOutcome {
+                provider: Provider::Pi,
+                account_ok: Ok(()),
+                models: Vec::new(),
+                list_known: false,
+                claude_status: None,
+                pi_accounts: accounts,
+            },
+        );
+        let checks = build_free_checks_for_targets(&[not_ready], &outcomes, &home, None, None);
+        let reason = checks[0].account_ok.clone().unwrap_err();
+        assert!(
+            reason.contains("rode 'tchelvis loop auth login pi anthropic'"),
+            "got: {reason}"
+        );
+
+        let ready_target = target("opencode-go/glm-5.3");
+        let mut accounts = BTreeMap::new();
+        accounts.insert("opencode-go".to_string(), PiAccount::Ready);
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            Provider::Pi,
+            ProviderFreeOutcome {
+                provider: Provider::Pi,
+                account_ok: Ok(()),
+                models: vec!["opencode-go/glm-5.3".to_string()],
+                list_known: true,
+                claude_status: None,
+                pi_accounts: accounts,
+            },
+        );
+        let checks = build_free_checks_for_targets(&[ready_target], &outcomes, &home, None, None);
+        assert!(checks[0].account_ok.is_ok());
+        assert_eq!(checks[0].listed, Listed::Yes);
+
+        let unknown_target = target("opencode-go/glm-5.3");
+        let checks =
+            build_free_checks_for_targets(&[unknown_target], &BTreeMap::new(), &home, None, None);
+        assert!(checks[0].account_ok.is_ok());
+        assert_eq!(checks[0].listed, Listed::Unknown);
+    }
+
+    fn pi_install_fixture(tmp: &TempDir) -> (PathBuf, PathBuf) {
+        let home = tmp.path().join("home");
+        let agent_bin = home.join(".pi/agent/bin");
+        fs::create_dir_all(&agent_bin).unwrap();
+        crate::test_support::write_executable(agent_bin.join("pi"), "#!/usr/bin/env sh\nexit 0\n");
+        fs::create_dir_all(home.join(".pi/agent/install")).unwrap();
+        fs::write(home.join(".pi/agent/install/current-version"), "1.2.3\n").unwrap();
+        let path_dir = tmp.path().join("path-bin");
+        fs::create_dir_all(&path_dir).unwrap();
+        std::os::unix::fs::symlink(agent_bin.join("pi"), path_dir.join("pi")).unwrap();
+        (home, path_dir)
+    }
+
+    #[test]
+    fn pi_identity_changes_with_auth_file_and_version() {
+        let tmp = TempDir::new().unwrap();
+        let (home, path_dir) = pi_install_fixture(&tmp);
+        let salt = [11u8; 32];
+        let identity = || {
+            build_cli_identity_for_provider(
+                Provider::Pi,
+                &BTreeMap::new(),
+                &home,
+                None,
+                None,
+                "bwrap",
+                &salt,
+                Some(path_dir.as_os_str()),
+            )
+        };
+        assert!(identity().is_none(), "no auth.json means no account");
+
+        let auth = home.join(".pi/agent/auth.json");
+        fs::write(&auth, "{\"token\":\"one\"}").unwrap();
+        let first = identity().expect("identity with auth file");
+        assert!(first.account.starts_with("pi:"));
+        assert!(first.executable.contains("1.2.3"), "{}", first.executable);
+
+        fs::write(&auth, "{\"token\":\"one\",\"refreshed\":true}").unwrap();
+        let second = identity().unwrap();
+        assert_ne!(second.account, first.account);
+        assert_eq!(second.executable, first.executable);
+
+        fs::write(home.join(".pi/agent/install/current-version"), "2.0.0\n").unwrap();
+        let third = identity().unwrap();
+        assert_ne!(third.executable, second.executable);
+        assert!(third.executable.contains("2.0.0"));
+        assert_eq!(third.account, second.account);
+    }
+
+    #[test]
+    fn pi_auth_line_texts() {
+        let list = crate::loops::free_check::parse_model_list(
+            Provider::Pi,
+            include_str!("../../tests/fixtures/loop/free_pi_models.txt"),
+        );
+        let outcome = ProviderFreeOutcome {
+            provider: Provider::Pi,
+            account_ok: Ok(()),
+            models: list,
+            list_known: true,
+            claude_status: None,
+            pi_accounts: BTreeMap::new(),
+        };
+        let install = Ok(PiInstall {
+            agent_dir: PathBuf::from("/home/u/.pi/agent"),
+            version: "1.2.3".to_string(),
+        });
+        assert_eq!(
+            pi_auth_line(Some(&outcome), &install),
+            "pi:       34 modelo(s) de opencode-go (pi --list-models)"
+        );
+
+        let empty = ProviderFreeOutcome {
+            models: Vec::new(),
+            list_known: true,
+            ..outcome.clone()
+        };
+        assert_eq!(
+            pi_auth_line(Some(&empty), &install),
+            "pi:       nenhum provedor com credencial (rode 'tchelvis loop auth login pi <provedor>')"
+        );
+
+        let bad = Err(crate::loops::sandbox::PI_UNRECOGNIZED.to_string());
+        assert_eq!(
+            pi_auth_line(Some(&outcome), &bad),
+            format!("pi:       {}", crate::loops::sandbox::PI_UNRECOGNIZED)
+        );
+    }
+
+    #[test]
+    fn auth_login_pi_requires_provider() {
+        let err = |res: Result<Vec<String>, LoopError>| res.unwrap_err().message.clone();
+
+        assert_eq!(
+            err(login_argv("pi", None)),
+            "informe o provedor: tchelvis loop auth login pi <provedor>"
+        );
+        assert!(err(login_argv("pi", Some("Bad Name"))).contains("provedor inválido"));
+        let ok = |res: Result<Vec<String>, LoopError>| res.map_err(|e| e.message).unwrap();
+        assert_eq!(
+            ok(login_argv("pi", Some("opencode-go"))),
+            vec!["pi", "auth", "login", "opencode-go"]
+        );
+        assert_eq!(
+            ok(login_argv("claude", None)),
+            vec!["claude", "auth", "login"]
+        );
+        assert_eq!(
+            ok(login_argv("opencode", None)),
+            vec!["opencode", "auth", "login"]
+        );
+        assert!(err(login_argv("nope", None)).contains("CLI desconhecido 'nope'"));
+        assert!(err(login_argv("nope", None)).contains("claude, agy, opencode ou pi"));
+    }
+
+    #[test]
+    fn check_warns_pi_credentials_and_fails_unrecognized_install() {
+        let stage = |provider: Provider| crate::loops::workflow::Stage {
+            id: "s1".to_string(),
+            role: "worker".to_string(),
+            provider,
+            model: Some("opencode-go/glm-5.3".to_string()),
+            reads: Vec::new(),
+            writes: Some("out.md".to_string()),
+            edits: false,
+            next: None,
+            verdict_gate: false,
+            on_pass: None,
+            on_retry: None,
+        };
+        let wf = |provider: Provider| crate::loops::workflow::Workflow {
+            name: "wf".to_string(),
+            description: String::new(),
+            max_cycles: 1,
+            stage_timeout_secs: 60,
+            stall_secs: 60,
+            max_duration_secs: 600,
+            stages: vec![stage(provider)],
+        };
+        let install = Ok(PiInstall {
+            agent_dir: PathBuf::from("/home/u/.pi/agent"),
+            version: "1.2.3".to_string(),
+        });
+
+        assert_eq!(
+            pi_check_notes(&wf(Provider::Pi), &install).unwrap(),
+            vec!["aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string()]
+        );
+        assert!(pi_check_notes(&wf(Provider::Claude), &install)
+            .unwrap()
+            .is_empty());
+
+        let bad = Err(crate::loops::sandbox::PI_UNRECOGNIZED.to_string());
+        assert_eq!(
+            pi_check_notes(&wf(Provider::Pi), &bad).unwrap_err(),
+            crate::loops::sandbox::PI_UNRECOGNIZED
+        );
     }
 
     #[test]

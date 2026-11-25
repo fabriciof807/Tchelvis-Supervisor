@@ -80,6 +80,7 @@ pub enum Provider {
     Claude,
     Agy,
     Opencode,
+    Pi,
 }
 
 impl Provider {
@@ -88,6 +89,7 @@ impl Provider {
             Self::Claude => "claude",
             Self::Agy => "agy",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }
@@ -106,6 +108,7 @@ impl FromStr for Provider {
             "claude" => Ok(Self::Claude),
             "agy" => Ok(Self::Agy),
             "opencode" => Ok(Self::Opencode),
+            "pi" => Ok(Self::Pi),
             other => Err(format!("provider desconhecido '{other}'")),
         }
     }
@@ -205,6 +208,36 @@ pub(crate) fn validate_model_name(model: &str) -> Result<(), String> {
         return Err(format!("'model' inválido: {model:?}"));
     }
     Ok(())
+}
+
+pub(crate) const PI_THINKING_LEVELS: [&str; 7] =
+    ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Strips a trailing thinking level only when it is one of `PI_THINKING_LEVELS`, so a tag such as
+/// `ollama/llama3:8b` keeps its tag as part of the id.
+pub(crate) fn pi_model_base(model: &str) -> &str {
+    match model.rsplit_once(':') {
+        Some((base, level)) if PI_THINKING_LEVELS.contains(&level) => base,
+        _ => model,
+    }
+}
+
+/// `pi` wants `provedor/id[:nível]`: a bare model cannot be routed, and the thinking level is the
+/// only place a colon is not part of the id.
+pub(crate) fn validate_pi_model(model: Option<&str>) -> Result<(), String> {
+    const RULE: &str = "'pi' exige modelo no formato provedor/id";
+    let Some(model) = model else {
+        return Err(RULE.to_string());
+    };
+    validate_model_name(model).map_err(|_| RULE.to_string())?;
+    if model.chars().any(char::is_whitespace) {
+        return Err(RULE.to_string());
+    }
+    let base = pi_model_base(model);
+    match base.split_once('/') {
+        Some((provider, id)) if !provider.is_empty() && !id.is_empty() => Ok(()),
+        _ => Err(RULE.to_string()),
+    }
 }
 
 pub(crate) fn is_valid_stage_id(id: &str) -> bool {
@@ -886,6 +919,54 @@ fn parse_workflow_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_pi_model_rules() {
+        for ok in [
+            "opencode-go/glm-5.3",
+            "opencode-go/glm-5.3:high",
+            "ollama/llama3:8b",
+            "openrouter/anthropic/claude-x",
+        ] {
+            assert_eq!(validate_pi_model(Some(ok)), Ok(()), "should accept {ok:?}");
+        }
+        for bad in [
+            None,
+            Some("glm-5.3"),
+            Some("/x"),
+            Some("x/"),
+            Some("opencode-go/a b"),
+            Some("opencode-go/:high"),
+        ] {
+            assert!(validate_pi_model(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn pi_model_base_strips_only_known_levels() {
+        assert_eq!(pi_model_base("a/b:high"), "a/b");
+        assert_eq!(pi_model_base("a/b:8b"), "a/b:8b");
+        assert_eq!(pi_model_base("a/b"), "a/b");
+    }
+
+    #[test]
+    fn provider_names_round_trip_including_pi() {
+        for (name, provider) in [
+            ("claude", Provider::Claude),
+            ("agy", Provider::Agy),
+            ("opencode", Provider::Opencode),
+            ("pi", Provider::Pi),
+        ] {
+            assert_eq!(name.parse::<Provider>(), Ok(provider));
+            assert_eq!(provider.as_str(), name);
+            assert_eq!(provider.to_string(), name);
+            assert_eq!(
+                serde_json::to_string(&provider).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+        assert!("codex".parse::<Provider>().is_err());
+    }
 
     fn full_defaults() -> RoleDefaults {
         let mut map = RoleDefaults::new();

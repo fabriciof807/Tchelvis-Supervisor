@@ -4,7 +4,7 @@ use crate::loops::models::ModelSource;
 use crate::loops::preflight::ProbeRecord;
 use crate::loops::process::{run_process, Clock, Limits, Outcome};
 use crate::loops::report::render_report_with_secrets;
-use crate::loops::sandbox::Sandbox;
+use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{
     redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
     Usage, LOOP_STATE_SCHEMA_VERSION,
@@ -118,28 +118,21 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
             }
         };
 
-        let sandboxed = match (req.stage.provider, self.opencode_api_key.as_deref()) {
-            (Provider::Opencode, Some(key)) => self.sandbox.wrap_with_extra_env(
-                &cmd.argv,
-                req.workspace,
-                &[("OPENCODE_API_KEY", key)],
-            ),
-            _ => self.sandbox.wrap(&cmd.argv, req.workspace),
-        }
-        .map_err(|e| sanitize_reason(&format!("{e:#}"), &extra_refs));
-
-        let sandboxed = match sandboxed {
-            Ok(mut s) => {
-                if req.stage.provider != Provider::Opencode {
-                    s.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
-                }
-                s
-            }
-            Err(reason) => {
+        let sandboxed = match wrap_for_provider(
+            self.sandbox,
+            req.stage.provider,
+            &cmd.argv,
+            req.workspace,
+            // One scratch directory per stage execution, so a stage never inherits another's files.
+            &req.log_path.with_extension("scratch"),
+            self.opencode_api_key.as_deref(),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
                 return StageResult {
                     outcome: StageOutcome::Error,
                     usage: Usage::default(),
-                    error: Some(reason),
+                    error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                 };
             }
         };
@@ -2433,6 +2426,36 @@ on_retry = "implement"
         assert!(report.contains("Pré-teste de modelos"));
         assert!(report.contains("--use"));
         assert!(report.contains("projeto (.loops/models.toml etapa)"));
+    }
+
+    #[test]
+    fn pi_bad_model_with_exit_zero_fails_stage() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let bad = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop/pi_bad_model.jsonl"
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("pi"),
+            format!("#!/usr/bin/env sh\ncat \"{bad}\"\nexit 0\n"),
+        );
+
+        let mut wf = wrc_workflow(1);
+        wf.stages[0].provider = Provider::Pi;
+        wf.stages[0].model = Some("opencode-go/glm-5.3".into());
+
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let sb = PassthroughSandbox { bin_dir };
+        let clock = SystemClock::new();
+        let runner = ProcessStageRunner::new(&sb, &clock);
+        let cfg = make_config(&tmp, wf);
+        let state = Engine::new(cfg, ws, runner, SystemClock::new()).run();
+
+        assert_eq!(state.status, RunStatus::Error);
+        let reason = state.reason.unwrap_or_default();
+        assert!(reason.contains("isn't included"), "got: {reason}");
     }
 
     #[test]

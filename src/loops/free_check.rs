@@ -2,7 +2,7 @@ use crate::loops::config::{PreflightConfig, PreflightMode};
 use crate::loops::evidence::{CliIdentity, EvidenceStore};
 use crate::loops::preflight::{ProbeTarget, ProbeTempDir};
 use crate::loops::process::{run_process, Clock, Limits, Outcome};
-use crate::loops::sandbox::{resolve_agy_credential, Sandbox};
+use crate::loops::sandbox::{resolve_agy_credential, wrap_for_provider, Sandbox};
 use crate::loops::workflow::Provider;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -56,6 +56,14 @@ pub enum ClaudeStatus {
     Unknown(String),
 }
 
+/// Account state of one `pi` provider prefix (`opencode-go`, `anthropic`, ...).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PiAccount {
+    Ready,
+    NotReady(String),
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFreeOutcome {
     pub provider: Provider,
@@ -63,6 +71,7 @@ pub struct ProviderFreeOutcome {
     pub models: Vec<String>,
     pub list_known: bool,
     pub claude_status: Option<ClaudeStatus>,
+    pub pi_accounts: BTreeMap<String, PiAccount>,
 }
 
 fn non_empty_string_field(val: &Value, key: &str) -> Option<String> {
@@ -92,6 +101,19 @@ pub fn inspect_claude_status(raw: &str) -> ClaudeStatus {
         None => {
             ClaudeStatus::Unknown("campo 'loggedIn' ausente em 'claude auth status'".to_string())
         }
+    }
+}
+
+pub fn parse_pi_auth_check(raw: &str) -> PiAccount {
+    let Ok(val) = serde_json::from_str::<Value>(raw.trim()) else {
+        return PiAccount::Unknown;
+    };
+    match val.get("status").and_then(|v| v.as_str()) {
+        Some("ready") => PiAccount::Ready,
+        Some(status @ ("not_ready" | "invalid")) => PiAccount::NotReady(
+            non_empty_string_field(&val, "reason").unwrap_or_else(|| status.to_string()),
+        ),
+        _ => PiAccount::Unknown,
     }
 }
 
@@ -152,6 +174,28 @@ pub fn parse_model_list(provider: Provider, raw: &str) -> Vec<String> {
             }
             out
         }
+        Provider::Pi => {
+            let mut lines = raw.lines().map(str::trim).filter(|l| !l.is_empty());
+            let Some(header) = lines.next() else {
+                return Vec::new();
+            };
+            let mut header_tokens = header.split_whitespace();
+            if header_tokens.next() != Some("provider") || header_tokens.next() != Some("model") {
+                return Vec::new();
+            }
+            for line in lines {
+                let tokens: Vec<&str> = line.split_whitespace().collect();
+                if tokens.len() < 2 {
+                    return Vec::new();
+                }
+                let (p, m) = (tokens[0], tokens[1]);
+                if looks_like_error_or_markup(p) || looks_like_error_or_markup(m) {
+                    return Vec::new();
+                }
+                out.push(format!("{p}/{m}"));
+            }
+            out
+        }
     }
 }
 
@@ -162,6 +206,16 @@ pub fn is_model_listed(provider: Provider, model: Option<&str>, listed_items: &[
     let Some(m) = model else {
         return Listed::Yes;
     };
+    if provider == Provider::Pi {
+        return if listed_items
+            .iter()
+            .any(|item| item == crate::loops::workflow::pi_model_base(m))
+        {
+            Listed::Yes
+        } else {
+            Listed::No
+        };
+    }
     if listed_items.iter().any(|item| item == m) {
         return Listed::Yes;
     }
@@ -239,6 +293,7 @@ pub fn plan_preflight(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_one_free_check(
     provider: Provider,
     sandbox: &(dyn Sandbox + Sync),
@@ -247,6 +302,7 @@ fn run_one_free_check(
     cancel: &AtomicBool,
     clock: &(dyn Clock + Sync),
     opencode_api_key: Option<&str>,
+    pi_providers: &[String],
 ) -> ProviderFreeOutcome {
     let fallback =
         |account_ok: Result<(), String>, claude_status: Option<ClaudeStatus>| ProviderFreeOutcome {
@@ -255,6 +311,7 @@ fn run_one_free_check(
             models: Vec::new(),
             list_known: false,
             claude_status,
+            pi_accounts: BTreeMap::new(),
         };
 
     let Ok(ws) = ProbeTempDir::new_in(dir, "tchelvis-free-ws-") else {
@@ -277,24 +334,23 @@ fn run_one_free_check(
         Provider::Claude => vec!["claude".into(), "auth".into(), "status".into()],
         Provider::Agy => vec!["agy".into(), "models".into()],
         Provider::Opencode => vec!["opencode".into(), "models".into(), "--standalone".into()],
+        Provider::Pi => vec!["pi".into(), "--offline".into(), "--list-models".into()],
     };
 
-    let wrapped = match (provider, opencode_api_key) {
-        (Provider::Opencode, Some(key)) => {
-            sandbox.wrap_with_extra_env(&argv, ws.path(), &[("OPENCODE_API_KEY", key)])
-        }
-        _ => sandbox.wrap(&argv, ws.path()),
-    };
-    let Ok(mut sandboxed) = wrapped else {
+    let Ok(sandboxed) = wrap_for_provider(
+        sandbox,
+        provider,
+        &argv,
+        ws.path(),
+        log_dir.path(),
+        opencode_api_key,
+    ) else {
         return fallback(
             Ok(()),
             (provider == Provider::Claude)
                 .then(|| ClaudeStatus::Unknown("falha ao preparar sandbox".into())),
         );
     };
-    if provider != Provider::Opencode {
-        sandboxed.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
-    }
 
     let limits = Limits {
         timeout: Duration::from_secs(FREE_CHECK_TIMEOUT_SECS),
@@ -347,6 +403,7 @@ fn run_one_free_check(
                     models: Vec::new(),
                     list_known: true,
                     claude_status: Some(status),
+                    pi_accounts: BTreeMap::new(),
                 },
                 ClaudeStatus::LoggedOut => ProviderFreeOutcome {
                     provider,
@@ -357,6 +414,7 @@ fn run_one_free_check(
                     models: Vec::new(),
                     list_known: false,
                     claude_status: Some(status),
+                    pi_accounts: BTreeMap::new(),
                 },
                 ClaudeStatus::Unknown(_) => fallback(Ok(()), Some(status)),
             }
@@ -371,6 +429,7 @@ fn run_one_free_check(
                         models,
                         list_known: true,
                         claude_status: None,
+                        pi_accounts: BTreeMap::new(),
                     };
                 }
                 if captured.trim().is_empty()
@@ -391,13 +450,106 @@ fn run_one_free_check(
                     models,
                     list_known,
                     claude_status: None,
+                    pi_accounts: BTreeMap::new(),
                 };
             }
             fallback(Ok(()), None)
         }
+        Provider::Pi => {
+            let models = if matches!(proc_res, Ok(Outcome::Exited(0))) {
+                parse_model_list(Provider::Pi, &captured)
+            } else {
+                Vec::new()
+            };
+            let limits = Limits {
+                timeout: Duration::from_secs(FREE_CHECK_TIMEOUT_SECS),
+                stall: Duration::from_secs(FREE_CHECK_TIMEOUT_SECS),
+            };
+            let mut pi_accounts = BTreeMap::new();
+            for (idx, p) in pi_providers.iter().enumerate() {
+                let argv: Vec<OsString> = vec![
+                    "pi".into(),
+                    "auth".into(),
+                    "check".into(),
+                    "--provider".into(),
+                    OsString::from(p),
+                    "--json".into(),
+                    "--no-refresh".into(),
+                ];
+                let auth_log = log_dir.path().join(format!("free_check_auth_{idx}.log"));
+                if let Some(raw) = capture_free_check(
+                    sandbox,
+                    Provider::Pi,
+                    &argv,
+                    ws.path(),
+                    &auth_log,
+                    limits,
+                    clock,
+                    cancel,
+                    opencode_api_key,
+                ) {
+                    pi_accounts.insert(p.clone(), parse_pi_auth_check(&raw));
+                }
+            }
+            ProviderFreeOutcome {
+                provider,
+                account_ok: Ok(()),
+                list_known: !models.is_empty(),
+                models,
+                claude_status: None,
+                pi_accounts,
+            }
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn capture_free_check(
+    sandbox: &(dyn Sandbox + Sync),
+    provider: Provider,
+    argv: &[OsString],
+    workspace: &Path,
+    log_path: &Path,
+    limits: Limits,
+    clock: &(dyn Clock + Sync),
+    cancel: &AtomicBool,
+    opencode_api_key: Option<&str>,
+) -> Option<String> {
+    let scratch = log_path.parent()?;
+    let sandboxed = wrap_for_provider(
+        sandbox,
+        provider,
+        argv,
+        workspace,
+        scratch,
+        opencode_api_key,
+    )
+    .ok()?;
+    let mut captured = String::new();
+    run_process(
+        sandboxed,
+        b"",
+        log_path,
+        limits,
+        clock,
+        cancel,
+        &mut |line| {
+            if captured.len() < MAX_FREE_OUTPUT_BYTES {
+                if !captured.is_empty() {
+                    captured.push('\n');
+                }
+                let remaining = MAX_FREE_OUTPUT_BYTES.saturating_sub(captured.len());
+                let take = line.len().min(remaining);
+                captured.push_str(&line[..line.floor_char_boundary(take)]);
+            }
+        },
+        &mut || false,
+    )
+    .ok()?;
+    Some(captured)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_free_checks_with_options(
     providers: &[Provider],
     sandbox: &(dyn Sandbox + Sync),
@@ -406,6 +558,7 @@ pub fn run_free_checks_with_options(
     cancel: &AtomicBool,
     clock: &(dyn Clock + Sync),
     opencode_api_key: Option<&str>,
+    pi_providers: &[String],
 ) -> Result<BTreeMap<Provider, ProviderFreeOutcome>, String> {
     let mut unique: Vec<Provider> = Vec::new();
     for &p in providers {
@@ -417,6 +570,13 @@ pub fn run_free_checks_with_options(
         return Ok(BTreeMap::new());
     }
 
+    let mut pi_prefixes: Vec<String> = Vec::new();
+    for p in pi_providers {
+        if !pi_prefixes.contains(p) {
+            pi_prefixes.push(p.clone());
+        }
+    }
+    let pi_prefixes = pi_prefixes.as_slice();
     let results: Vec<ProviderFreeOutcome> = std::thread::scope(|scope| {
         let handles: Vec<_> = unique
             .iter()
@@ -430,6 +590,7 @@ pub fn run_free_checks_with_options(
                         cancel,
                         clock,
                         opencode_api_key,
+                        pi_prefixes,
                     )
                 })
             })
@@ -473,6 +634,12 @@ mod tests {
     const FIX_AGY_OUT: &str = include_str!("../../tests/fixtures/loop/free_agy_logged_out.txt");
     const FIX_OC_MODELS: &str = include_str!("../../tests/fixtures/loop/free_opencode_models.txt");
     const FIX_OC_NOKEY: &str = include_str!("../../tests/fixtures/loop/free_opencode_no_key.txt");
+    const FIX_PI_MODELS: &str = include_str!("../../tests/fixtures/loop/free_pi_models.txt");
+    const FIX_PI_NO_MATCH: &str = include_str!("../../tests/fixtures/loop/free_pi_no_match.txt");
+    const FIX_PI_AUTH_READY: &str =
+        include_str!("../../tests/fixtures/loop/free_pi_auth_ready.json");
+    const FIX_PI_AUTH_NOT_READY: &str =
+        include_str!("../../tests/fixtures/loop/free_pi_auth_not_ready.json");
 
     type RecordedCall = (Vec<OsString>, Vec<(OsString, OsString)>);
 
@@ -823,6 +990,122 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_list_for_pi_reads_the_provider_model_table() {
+        let list = parse_model_list(Provider::Pi, FIX_PI_MODELS);
+        assert_eq!(list.len(), 34, "got: {list:?}");
+        assert_eq!(list[0], "opencode-go/beam-free");
+        assert!(list.contains(&"opencode-go/hy4-flash-free".to_string()));
+
+        assert!(parse_model_list(Provider::Pi, FIX_PI_NO_MATCH).is_empty());
+        assert!(parse_model_list(Provider::Pi, "").is_empty());
+        assert!(parse_model_list(Provider::Pi, "Error: x\n{\"bad\":true}").is_empty());
+        assert!(parse_model_list(Provider::Pi, "model provider\nopencode-go/x").is_empty());
+    }
+
+    #[test]
+    fn is_model_listed_for_pi_ignores_only_the_thinking_level() {
+        let list = parse_model_list(Provider::Pi, FIX_PI_MODELS);
+        assert_eq!(
+            is_model_listed(Provider::Pi, Some("opencode-go/hy4-flash-free:high"), &list),
+            Listed::Yes
+        );
+        assert_eq!(
+            is_model_listed(Provider::Pi, Some("opencode-go/nope"), &list),
+            Listed::No
+        );
+        assert_eq!(
+            is_model_listed(Provider::Pi, Some("opencode-go/beam-free"), &[]),
+            Listed::Unknown
+        );
+    }
+
+    #[test]
+    fn parse_pi_auth_check_reads_status_and_reason() {
+        assert_eq!(parse_pi_auth_check(FIX_PI_AUTH_READY), PiAccount::Ready);
+        assert_eq!(
+            parse_pi_auth_check(FIX_PI_AUTH_NOT_READY),
+            PiAccount::NotReady("credentials_not_configured".to_string())
+        );
+        assert_eq!(parse_pi_auth_check("not json at all"), PiAccount::Unknown);
+    }
+
+    #[test]
+    fn pi_free_check_runs_list_and_one_auth_check_per_provider() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let work_dir = tmp.path().join("work");
+        let home_dir = tmp.path().join("home");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        let log = tmp.path().join("pi_calls.log");
+        let models = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop/free_pi_models.txt"
+        );
+        let ready = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop/free_pi_auth_ready.json"
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("pi"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf 'pi %s\\n' \"$*\" >> \"{}\"\n\
+                 case \"$*\" in\n\
+                   *--provider*) cat \"{}\" ;;\n\
+                   *) cat \"{}\" ;;\n\
+                 esac\n\
+                 exit 0\n",
+                log.display(),
+                ready,
+                models
+            ),
+        );
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        let sb = FakeSandbox::new().with_env("PATH", &test_path);
+        let cancel = AtomicBool::new(false);
+        let outcomes = run_free_checks_with_options(
+            &[Provider::Pi],
+            &sb,
+            &work_dir,
+            &home_dir,
+            &cancel,
+            &crate::loops::process::SystemClock::new(),
+            None,
+            &["opencode-go".to_string()],
+        )
+        .unwrap();
+
+        let mut calls: Vec<String> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(ToString::to_string)
+            .collect();
+        calls.sort();
+        assert_eq!(
+            calls,
+            [
+                "pi --offline --list-models",
+                "pi auth check --provider opencode-go --json --no-refresh"
+            ]
+        );
+        let recorded = sb.recorded_calls.lock().unwrap();
+        for (argv, _) in recorded.iter() {
+            assert!(
+                !argv.iter().any(|a| a == "--credentials"),
+                "pi must never be given --credentials: {argv:?}"
+            );
+        }
+        let out = &outcomes[&Provider::Pi];
+        assert!(out.list_known);
+        assert_eq!(out.models.len(), 34);
+        assert_eq!(out.pi_accounts.get("opencode-go"), Some(&PiAccount::Ready));
+    }
+
+    #[test]
     fn hanging_free_check_ends_at_15s_and_leads_to_probe_in_auto_and_fail_in_free() {
         let tmp = TempDir::new().unwrap();
         let bin_dir = tmp.path().join("bin");
@@ -863,6 +1146,7 @@ mod tests {
             &cancel,
             &clock,
             Some(secret),
+            &[],
         )
         .unwrap();
 

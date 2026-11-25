@@ -42,6 +42,8 @@ pub enum AccountIdentityInput<'a> {
     AgyDefaultFile(bool),
     /// Metadata of the credential file, whose content is never read.
     ClaudeCredentialFile(&'a fs::Metadata),
+    /// Metadata of `~/.pi/agent/auth.json`, whose content is never read: every login rewrites it.
+    PiAuthFile(&'a fs::Metadata),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -604,6 +606,9 @@ pub fn compute_account_identity(salt: &[u8; 32], input: AccountIdentityInput<'_>
         AccountIdentityInput::ClaudeCredentialFile(meta) => {
             format!("claude:{}", file_identity(salt, b"claude-file\0", meta))
         }
+        AccountIdentityInput::PiAuthFile(meta) => {
+            format!("pi:{}", file_identity(salt, b"pi-auth\0", meta))
+        }
         AccountIdentityInput::OpencodeKey(Some(key)) => {
             let mut msg = Vec::with_capacity(4 + key.len());
             msg.extend_from_slice(b"key\0");
@@ -674,6 +679,26 @@ mod tests {
         crate::test_support::write_executable(&bin, "#!/bin/sh\necho changed-size-content\n");
         let id2 = compute_executable_identity("claude", Some(bin_dir.as_os_str()));
         assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn pi_account_identity_follows_the_auth_file() {
+        let tmp = TempDir::new().unwrap();
+        let salt = [3u8; 32];
+        let path = tmp.path().join("auth.json");
+        fs::write(&path, "{\"a\":1}").unwrap();
+        let meta1 = fs::metadata(&path).unwrap();
+        let id1 = compute_account_identity(&salt, AccountIdentityInput::PiAuthFile(&meta1));
+        assert!(id1.starts_with("pi:"), "got: {id1}");
+
+        fs::write(&path, "{\"a\":1,\"refreshed\":true}").unwrap();
+        let meta2 = fs::metadata(&path).unwrap();
+        let id2 = compute_account_identity(&salt, AccountIdentityInput::PiAuthFile(&meta2));
+        assert_ne!(id1, id2);
+        assert_eq!(
+            id2,
+            compute_account_identity(&salt, AccountIdentityInput::PiAuthFile(&meta2))
+        );
     }
 
     #[test]

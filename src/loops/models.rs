@@ -1,7 +1,7 @@
 use crate::loops::config::parse_loops_config;
 use crate::loops::workflow::{
-    line_at, toml_error_reason, validate_model_name, Provider, RoleDefault, RoleDefaults, Stage,
-    UnresolvedWorkflow, Workflow,
+    line_at, toml_error_reason, validate_model_name, validate_pi_model, Provider, RoleDefault,
+    RoleDefaults, Stage, UnresolvedWorkflow, Workflow,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -378,6 +378,14 @@ pub fn resolve_workflow(
             ));
             continue;
         };
+
+        if choice.provider == Provider::Pi && validate_pi_model(choice.model.as_deref()).is_err() {
+            errors.push(format!(
+                "etapa '{}': 'pi' exige modelo no formato provedor/id",
+                st.id
+            ));
+            continue;
+        }
 
         let from_repo = source.is_from_repo(workflow_origin);
         resolutions.push(StageResolution {
@@ -954,6 +962,55 @@ model = "stage-model"
         let joined = errs.join("\n");
         assert!(joined.contains("ghost"), "got: {joined}");
         assert!(joined.contains("implement"), "got: {joined}");
+    }
+
+    #[test]
+    fn resolve_rejects_pi_without_provider_model() {
+        let unres =
+            parse_workflow_unresolved(&wf_two_stage(Some("pi"), None, Some("claude"))).unwrap();
+        let errs = resolve_workflow(
+            unres,
+            WorkflowOrigin::Preset,
+            &[],
+            None,
+            &RoleDefaults::new(),
+        )
+        .unwrap_err();
+        let joined = errs.join("\n");
+        assert!(
+            joined.contains("etapa 'implement': 'pi' exige modelo no formato provedor/id"),
+            "got: {joined}"
+        );
+
+        let unres = parse_workflow_unresolved(&wf_two_stage(None, None, Some("claude"))).unwrap();
+        let errs = resolve_workflow(
+            unres,
+            WorkflowOrigin::Preset,
+            &[parse_use_flag("implement=pi:glm-5.3").unwrap()],
+            None,
+            &RoleDefaults::new(),
+        )
+        .unwrap_err();
+        let joined = errs.join("\n");
+        assert!(
+            joined.contains("etapa 'implement': 'pi' exige modelo no formato provedor/id"),
+            "got: {joined}"
+        );
+
+        let unres = parse_workflow_unresolved(&wf_two_stage(None, None, Some("claude"))).unwrap();
+        let res = resolve_workflow(
+            unres,
+            WorkflowOrigin::Preset,
+            &[parse_use_flag("implement=pi:opencode-go/glm-5.3:high").unwrap()],
+            None,
+            &RoleDefaults::new(),
+        )
+        .unwrap();
+        assert_eq!(res.workflow.stages[0].provider, Provider::Pi);
+        assert_eq!(
+            res.workflow.stages[0].model.as_deref(),
+            Some("opencode-go/glm-5.3:high")
+        );
     }
 
     #[test]

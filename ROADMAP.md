@@ -41,7 +41,7 @@ with the UI track.
 | M8 | Supervisor chat + Pi Durable ([design](docs/superpowers/specs/2026-11-17-supervisor-chat-design.md)) | M1b | **Phase A implemented** (`dd16bd3`, `238191a`, `6c472d3`); **Phase B: adopt Pi Durable** |
 | M9 | `files-yazi` mod: Files button opens yazi in a split beside the focused terminal | — | Design agreed (not planned) |
 | M10 | User-configurable supervisor `[guardrails]` ([design](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md)) | M0 | **Implemented**; host validation pending |
-| M11 | Declarative multi-agent loops (`tchelvis loop`, [design](docs/superpowers/specs/2026-11-23-loop-engine-design.md)) | M10 | **Phase A validated on the host** (2026-11-24; Incus and Phases B–C pending) |
+| M11 | Declarative multi-agent loops (`tchelvis loop`, [design](docs/superpowers/specs/2026-11-23-loop-engine-design.md)) | M10 | **Phase A validated on the host** (2026-11-24); **Phase B: pi adapter** implemented (host validation pending); Incus and Phase C pending |
 
 ### M0 — Container validation & config hardening
 Make the `llama.cpp` container path (commit `6a38eee`) reliable on the real host before building on it.
@@ -171,7 +171,7 @@ a closed `allow_tools` list, and `tchelvis supervisor rules [test]` for dry runs
 stays immutable and an invalid table turns automatic replies off.
 Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md).
 
-### M11 — Declarative multi-agent loops (Phase A validated; Phases B–C planned)
+### M11 — Declarative multi-agent loops (Phase A validated; Phase B pi adapter; Phase C planned)
 `tchelvis loop`: a fixed engine runs headless worker/reviewer/critic stages from TOML workflows inside a mandatory sandbox (`bwrap` default, `inherited` inside containers, `incus` planned), exchanging files through symlink-safe `.tchelvis-loop/{in,out}` directories. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls, errors, or is cancelled. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
 - **Operational guarantees & security notes:**
   - The loop never merges or pushes (commits only to a local `loop/<workflow>-<run-id>` branch, leaving checkout and `.gitignore` untouched).
@@ -179,6 +179,7 @@ Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-gu
   - `bwrap` shares the network and localhost (plus abstract sockets), while keeping `/` read-only and binding only the cloned run workspace writable.
   - Every model is really called once before a loop starts and that spends tokens (`Reply with exactly: OK` preflight probe per distinct `provider:model` pair).
   - An exported `OPENCODE_API_KEY` is visible to every program started from that shell (`tchelvis` only passes it into `opencode` stages/probes via environment and redacts it, never writing it to disk).
+- **Phase B — `pi` as a stage provider (implemented; host validation pending):** only the managed install (`~/.pi/agent`) is accepted; stages run `pi -p --mode json` with the prompt on `stdin` and report turns, tokens, cache, and cost from the event stream. Credentials are narrowed to `auth.json`, `models-store.json`, and `models.json` (bwrap mounts or symlinks in a scratch `PI_CODING_AGENT_DIR`), each provider is a separate account identity, and `check` warns that a pi stage sees every credential in the agent's `auth.json`.
 
 ### M6 — Delegator mode & multi-agent orchestration (implemented)
 Event-driven parent-child agent orchestration (`tchelvis orch`) over Herdr (`hc`) terminals. Design: [M6 spec](docs/designs/m6-orchestration.md).

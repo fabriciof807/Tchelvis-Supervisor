@@ -99,6 +99,34 @@ pub fn command(p: Provider, model: Option<&str>, prompt: &str) -> Result<Adapter
                 stdin: prompt.as_bytes().to_vec(),
             })
         }
+        Provider::Pi => {
+            let Some(m) = model else {
+                bail!("'pi' exige modelo no formato provedor/id");
+            };
+            let argv: Vec<OsString> = [
+                "pi",
+                "-p",
+                "--mode",
+                "json",
+                "--no-session",
+                "--offline",
+                "--no-approve",
+                "--no-extensions",
+                "--no-skills",
+                "--no-mcp",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--model",
+                m,
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+            Ok(AdapterCommand {
+                argv,
+                stdin: prompt.as_bytes().to_vec(),
+            })
+        }
     }
 }
 
@@ -127,6 +155,21 @@ pub struct EventParser {
     opencode_cache_seen: u64,
     opencode_cost_sum: f64,
     opencode_cost_seen: u64,
+    pi_turns: u64,
+    pi_assistant_msgs: u64,
+    pi_in_sum: u64,
+    pi_in_seen: u64,
+    pi_out_sum: u64,
+    pi_out_seen: u64,
+    pi_cache_sum: u64,
+    pi_cache_seen: u64,
+    pi_cost_sum: f64,
+    pi_cost_seen: u64,
+    pi_last_stop: Option<String>,
+    pi_last_error: Option<String>,
+    pi_retry_failed: Option<String>,
+    pi_settled: bool,
+    pi_aborted: bool,
 }
 
 impl EventParser {
@@ -146,6 +189,21 @@ impl EventParser {
             opencode_cache_seen: 0,
             opencode_cost_sum: 0.0,
             opencode_cost_seen: 0,
+            pi_turns: 0,
+            pi_assistant_msgs: 0,
+            pi_in_sum: 0,
+            pi_in_seen: 0,
+            pi_out_sum: 0,
+            pi_out_seen: 0,
+            pi_cache_sum: 0,
+            pi_cache_seen: 0,
+            pi_cost_sum: 0.0,
+            pi_cost_seen: 0,
+            pi_last_stop: None,
+            pi_last_error: None,
+            pi_retry_failed: None,
+            pi_settled: false,
+            pi_aborted: false,
         }
     }
 
@@ -162,6 +220,7 @@ impl EventParser {
             Provider::Claude => self.handle_claude(&val),
             Provider::Agy => self.handle_agy(&val),
             Provider::Opencode => self.handle_opencode(&val),
+            Provider::Pi => self.handle_pi(&val),
         }
     }
 
@@ -300,6 +359,71 @@ impl EventParser {
         }
     }
 
+    fn handle_pi(&mut self, val: &serde_json::Value) {
+        let message = val.get("message");
+        let assistant =
+            message.and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("assistant");
+        match val.get("type").and_then(|v| v.as_str()) {
+            Some("message_end") if assistant => {
+                self.pi_assistant_msgs = self.pi_assistant_msgs.saturating_add(1);
+                if let Some(usage) = message.and_then(|m| m.get("usage")) {
+                    if let Some(v) = usage.get("input").and_then(|v| v.as_u64()) {
+                        self.pi_in_sum = self.pi_in_sum.saturating_add(v);
+                        self.pi_in_seen += 1;
+                    }
+                    if let Some(v) = usage.get("output").and_then(|v| v.as_u64()) {
+                        self.pi_out_sum = self.pi_out_sum.saturating_add(v);
+                        self.pi_out_seen += 1;
+                    }
+                    if let Some(v) = usage.get("cacheRead").and_then(|v| v.as_u64()) {
+                        self.pi_cache_sum = self.pi_cache_sum.saturating_add(v);
+                        self.pi_cache_seen += 1;
+                    }
+                    if let Some(c) = usage
+                        .get("cost")
+                        .and_then(|c| c.get("total"))
+                        .and_then(|v| v.as_f64())
+                        .filter(|c| c.is_finite())
+                    {
+                        self.pi_cost_sum += c;
+                        self.pi_cost_seen += 1;
+                    }
+                }
+                self.pi_last_stop = message
+                    .and_then(|m| m.get("stopReason"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                self.pi_last_error = message
+                    .and_then(|m| m.get("errorMessage"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+            }
+            Some("turn_end") if assistant => {
+                let stop = message
+                    .and_then(|m| m.get("stopReason"))
+                    .and_then(|v| v.as_str());
+                if matches!(stop, Some(s) if s != "error" && s != "aborted") {
+                    self.pi_turns = self.pi_turns.saturating_add(1);
+                }
+            }
+            Some("auto_retry_end") => {
+                if val.get("success").and_then(|v| v.as_bool()) == Some(false) {
+                    self.pi_retry_failed = Some(
+                        val.get("finalError")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("pi esgotou as tentativas automáticas")
+                            .to_string(),
+                    );
+                }
+            }
+            Some("agent_settled") => {
+                self.pi_settled = true;
+                self.pi_aborted = val.get("aborted").and_then(|v| v.as_bool()) == Some(true);
+            }
+            _ => {}
+        }
+    }
+
     pub fn finish(mut self) -> AdapterResult {
         match self.provider {
             Provider::Claude => {
@@ -326,6 +450,41 @@ impl EventParser {
                     self.usage.cost_usd = (self.opencode_cost_seen == self.opencode_steps)
                         .then_some(self.opencode_cost_sum);
                 }
+            }
+            Provider::Pi => {
+                if self.pi_turns > 0 {
+                    self.usage.turns = Some(self.pi_turns);
+                }
+                if self.pi_assistant_msgs > 0 {
+                    let responses = self.pi_assistant_msgs;
+                    self.usage.input_tokens =
+                        (self.pi_in_seen == responses).then_some(self.pi_in_sum);
+                    self.usage.output_tokens =
+                        (self.pi_out_seen == responses).then_some(self.pi_out_sum);
+                    self.usage.cache_read_tokens =
+                        (self.pi_cache_seen == responses).then_some(self.pi_cache_sum);
+                    self.usage.cost_usd =
+                        (self.pi_cost_seen == responses).then_some(self.pi_cost_sum);
+                }
+                // `pi --mode json` exits 0 even when the model failed: the stream decides.
+                let stop = self.pi_last_stop.clone();
+                let failed_stop = matches!(stop.as_deref(), Some("error") | Some("aborted"));
+                self.error = if let Some(final_error) = self.pi_retry_failed.take() {
+                    Some(sanitize_error_text(&final_error))
+                } else if failed_stop {
+                    let reason = self.pi_last_error.clone().unwrap_or_else(|| {
+                        format!("pi retornou stopReason {}", stop.unwrap_or_default())
+                    });
+                    Some(sanitize_error_text(&reason))
+                } else if self.pi_settled && self.pi_aborted {
+                    Some("pi abortou a execução".to_string())
+                } else if stop.as_deref() == Some("length") {
+                    Some("resposta truncada no limite de saída".to_string())
+                } else if !self.pi_settled {
+                    Some("pi terminou sem evento 'agent_settled'".to_string())
+                } else {
+                    None
+                };
             }
         }
         AdapterResult {
@@ -514,6 +673,37 @@ mod tests {
                 "zai/glm-5.3-flash",
             ])
         );
+
+        let pi = command(
+            Provider::Pi,
+            Some("opencode-go/glm-5.3:high"),
+            "hello prompt",
+        )
+        .unwrap();
+        assert_eq!(
+            pi.argv,
+            os_vec(&[
+                "pi",
+                "-p",
+                "--mode",
+                "json",
+                "--no-session",
+                "--offline",
+                "--no-approve",
+                "--no-extensions",
+                "--no-skills",
+                "--no-mcp",
+                "--no-prompt-templates",
+                "--no-themes",
+                "--model",
+                "opencode-go/glm-5.3:high",
+            ])
+        );
+        assert_eq!(pi.stdin, b"hello prompt");
+        assert!(
+            command(Provider::Pi, None, "x").is_err(),
+            "pi must refuse a stage without a model"
+        );
     }
 
     #[test]
@@ -541,6 +731,14 @@ mod tests {
         assert_eq!(opencode.usage.output_tokens, Some(99));
         assert_eq!(opencode.usage.cache_read_tokens, Some(15616));
         assert_eq!(opencode.usage.cost_usd, Some(0.0));
+
+        let pi = parse_fixture(Provider::Pi, "pi_ok.jsonl");
+        assert_eq!(pi.error, None);
+        assert_eq!(pi.usage.turns, Some(1));
+        assert_eq!(pi.usage.input_tokens, Some(1493));
+        assert_eq!(pi.usage.output_tokens, Some(39));
+        assert_eq!(pi.usage.cache_read_tokens, Some(0));
+        assert_eq!(pi.usage.cost_usd, Some(0.0));
     }
 
     #[test]
@@ -559,6 +757,15 @@ mod tests {
             opencode.error.is_some(),
             "expected error for opencode_bad_model"
         );
+
+        let pi = parse_fixture(Provider::Pi, "pi_bad_model.jsonl");
+        let pi_err = pi.error.unwrap_or_default();
+        assert!(
+            pi_err.contains("isn't included in OpenCode Go"),
+            "unexpected pi error: {pi_err}"
+        );
+        assert!(!pi_err.contains('\n') && !pi_err.contains('\r'));
+        assert_eq!(pi.usage.turns, None);
 
         let mut claude_no_result = EventParser::new(Provider::Claude);
         claude_no_result.line(r#"{"type":"system","subtype":"init"}"#);
@@ -600,6 +807,138 @@ mod tests {
         assert_eq!(res.usage.output_tokens, None);
         assert_eq!(res.usage.cache_read_tokens, None);
         assert_eq!(res.usage.cost_usd, None);
+
+        // Pi with garbage lines and renamed usage fields, settled without errors
+        let mut pi = EventParser::new(Provider::Pi);
+        pi.line("non-json banner");
+        pi.line(
+            r#"{"type":"message_end","message":{"role":"assistant","usage_renamed":{"input":10}}}"#,
+        );
+        pi.line(
+            r#"{"type":"turn_end","message":{"role":"assistant","stop_reason_renamed":"stop"}}"#,
+        );
+        pi.line(r#"{"type":"agent_settled","aborted":false}"#);
+        let res = pi.finish();
+        assert_eq!(res.error, None);
+        assert_eq!(res.usage.turns, None);
+        assert_eq!(res.usage.input_tokens, None);
+        assert_eq!(res.usage.output_tokens, None);
+        assert_eq!(res.usage.cache_read_tokens, None);
+        assert_eq!(res.usage.cost_usd, None);
+    }
+
+    #[test]
+    fn pi_error_rules() {
+        fn parse(lines: &[serde_json::Value]) -> AdapterResult {
+            let mut parser = EventParser::new(Provider::Pi);
+            for val in lines {
+                parser.line(&val.to_string());
+            }
+            parser.finish()
+        }
+
+        let aborted = parse(&[serde_json::json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "stopReason": "aborted", "errorMessage": "pedido cancelado"}
+        })]);
+        assert!(aborted
+            .error
+            .unwrap_or_default()
+            .contains("pedido cancelado"));
+
+        let truncated = parse(&[serde_json::json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "stopReason": "length"}
+        })]);
+        assert!(truncated.error.unwrap_or_default().contains("truncada"));
+
+        let settled_aborted =
+            parse(&[serde_json::json!({"type": "agent_settled", "aborted": true})]);
+        assert!(settled_aborted
+            .error
+            .unwrap_or_default()
+            .contains("abortou"));
+
+        let never_settled = parse(&[serde_json::json!({
+            "type": "message_end",
+            "message": {"role": "assistant", "stopReason": "stop"}
+        })]);
+        assert_eq!(
+            never_settled.error,
+            Some("pi terminou sem evento 'agent_settled'".to_string())
+        );
+
+        // A retried turn that then succeeds is not an error.
+        let retried_then_ok = parse(&[
+            serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "error", "errorMessage": "tentativa 1"}
+            }),
+            serde_json::json!({"type": "turn_end", "message": {"role": "assistant", "stopReason": "error"}}),
+            serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"}
+            }),
+            serde_json::json!({"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop"}}),
+            serde_json::json!({"type": "agent_settled", "aborted": false}),
+        ]);
+        assert_eq!(retried_then_ok.error, None);
+        assert_eq!(retried_then_ok.usage.turns, Some(1));
+    }
+
+    #[test]
+    fn pi_usage_null_rules() {
+        let mut parser = EventParser::new(Provider::Pi);
+        parser.line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop", "usage": {"input": 10, "output": 2, "cacheRead": 3, "cost": {"total": 0.5, "totalFromProvider": false}}}
+            })
+            .to_string(),
+        );
+        parser.line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop"}
+            })
+            .to_string(),
+        );
+        parser.line(
+            &serde_json::json!({"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop"}})
+                .to_string(),
+        );
+        parser.line(
+            &serde_json::json!({"type": "turn_end", "message": {"role": "assistant", "stopReason": "stop"}})
+                .to_string(),
+        );
+        parser.line(&serde_json::json!({"type": "agent_settled", "aborted": false}).to_string());
+        let res = parser.finish();
+        assert_eq!(res.error, None);
+        assert_eq!(res.usage.turns, Some(2));
+        assert_eq!(res.usage.input_tokens, None);
+        assert_eq!(res.usage.output_tokens, None);
+        assert_eq!(res.usage.cache_read_tokens, None);
+        assert_eq!(res.usage.cost_usd, None);
+
+        let mut costed = EventParser::new(Provider::Pi);
+        costed.line(
+            &serde_json::json!({
+                "type": "message_end",
+                "message": {"role": "assistant", "stopReason": "stop", "usage": {"input": 7, "output": 1, "cacheRead": 0, "cost": {"total": 0.25, "totalFromProvider": false}}}
+            })
+            .to_string(),
+        );
+        costed.line(
+            &serde_json::json!({ "type": "turn_end", "message": {"role": "assistant", "stopReason": "stop"} })
+                .to_string(),
+        );
+        costed.line(&serde_json::json!({"type": "agent_settled", "aborted": false}).to_string());
+        let res = costed.finish();
+        assert_eq!(res.usage.turns, Some(1));
+        assert_eq!(res.usage.input_tokens, Some(7));
+        assert_eq!(res.usage.output_tokens, Some(1));
+        assert_eq!(res.usage.cache_read_tokens, Some(0));
+        assert_eq!(res.usage.cost_usd, Some(0.25));
     }
 
     #[test]
@@ -632,6 +971,21 @@ mod tests {
         assert!(!err.contains('\n') && !err.contains('\r'));
         assert!(!err.contains('\x1b'));
         assert!(!err.contains("glpat-abcdefghijklmn"));
+        assert!(err.contains("[REDACTED]"));
+
+        let mut pi = EventParser::new(Provider::Pi);
+        pi.line(
+            &serde_json::json!({
+                "type": "auto_retry_end",
+                "success": false,
+                "attempt": 3,
+                "finalError": "Authorization: Bearer sk-abcdef0123456789\nsegunda linha"
+            })
+            .to_string(),
+        );
+        let err = pi.finish().error.unwrap();
+        assert!(!err.contains('\n') && !err.contains('\r'));
+        assert!(!err.contains("sk-abcdef0123456789"));
         assert!(err.contains("[REDACTED]"));
     }
 

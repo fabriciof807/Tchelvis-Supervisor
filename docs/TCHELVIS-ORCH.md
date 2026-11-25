@@ -210,7 +210,7 @@ Known limits:
 
 - `PASS` reflects the reviewer's verdict; running the verification command
   deterministically requires Phase B `checks`.
-- `tchelvis loop` supports `claude`, `agy`, and `opencode` stages only.
+- `tchelvis loop` supports `claude`, `agy`, `opencode`, and `pi` stages only (`pi` must be the managed install at `~/.pi/agent`).
 - `.loops/runs` inside the integration worktree is removed if you delete that
   worktree.
 

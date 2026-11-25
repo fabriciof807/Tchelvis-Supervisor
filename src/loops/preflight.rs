@@ -1,7 +1,7 @@
 use crate::loops::adapters::{command as adapter_command, EventParser};
 use crate::loops::models::ModelChoice;
 use crate::loops::process::{run_process, Clock, Limits, Outcome, SystemClock};
-use crate::loops::sandbox::Sandbox;
+use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{sanitize_single_line, Usage};
 use crate::loops::workflow::{Provider, Stage, Workflow};
 use serde::{Deserialize, Serialize};
@@ -199,24 +199,30 @@ fn probe_one(
     )
     .map_err(|e| fail(format!("{e:#}")))?;
 
-    if target.choice.provider == Provider::Claude {
-        cmd.argv.push(OsString::from("--tools"));
-        cmd.argv.push(OsString::from(""));
-        cmd.argv.push(OsString::from("--system-prompt"));
-        cmd.argv.push(OsString::from("Reply briefly."));
+    match target.choice.provider {
+        Provider::Claude => {
+            cmd.argv.push(OsString::from("--tools"));
+            cmd.argv.push(OsString::from(""));
+            cmd.argv.push(OsString::from("--system-prompt"));
+            cmd.argv.push(OsString::from("Reply briefly."));
+        }
+        Provider::Pi => {
+            cmd.argv.push(OsString::from("--no-tools"));
+            cmd.argv.push(OsString::from("--system-prompt"));
+            cmd.argv.push(OsString::from("Reply briefly."));
+        }
+        _ => {}
     }
 
-    let mut sandboxed = match (target.choice.provider, opencode_api_key) {
-        (Provider::Opencode, Some(key)) => sandbox
-            .wrap_with_extra_env(&cmd.argv, probe_ws.path(), &[("OPENCODE_API_KEY", key)])
-            .map_err(|e| fail(format!("{e:#}")))?,
-        _ => sandbox
-            .wrap(&cmd.argv, probe_ws.path())
-            .map_err(|e| fail(format!("{e:#}")))?,
-    };
-    if target.choice.provider != Provider::Opencode {
-        sandboxed.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
-    }
+    let sandboxed = wrap_for_provider(
+        sandbox,
+        target.choice.provider,
+        &cmd.argv,
+        probe_ws.path(),
+        probe_log_dir.path(),
+        opencode_api_key,
+    )
+    .map_err(|e| fail(format!("{e:#}")))?;
 
     let mut parser = EventParser::new(target.choice.provider);
     let start_mono = clock.monotonic_ms();
@@ -841,6 +847,103 @@ echo $$ > "{}"
         assert_eq!(failures[0].choice, target.choice);
         assert_eq!(failures[0].stage_ids, target.stage_ids);
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn pi_probe_adds_no_tools_and_short_system_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let probe_root = tmp.path().join("probes");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&probe_root).unwrap();
+        let saw_argv = tmp.path().join("saw_argv");
+        let ok = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop/pi_ok.jsonl"
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("pi"),
+            format!(
+                "#!/usr/bin/env sh\n\
+                 printf '%s' \"$*\" > \"{}\"\n\
+                 cat \"{}\"\n\
+                 exit 0\n",
+                saw_argv.display(),
+                ok
+            ),
+        );
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        let sb = FakeSandbox::new().with_env("PATH", &test_path);
+        let targets = vec![ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Pi,
+                model: Some("opencode-go/glm-5.3".into()),
+            },
+            stage_ids: vec!["implement".into()],
+        }];
+
+        let records = run_preflight_with_options(
+            &targets,
+            &sb,
+            &probe_root,
+            &AtomicBool::new(false),
+            &SystemClock::new(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(records.len(), 1);
+        let argv = fs::read_to_string(&saw_argv).unwrap();
+        assert!(
+            argv.ends_with("--model opencode-go/glm-5.3 --no-tools --system-prompt Reply briefly."),
+            "got: {argv}"
+        );
+        assert_eq!(records[0].usage.output_tokens, Some(39));
+    }
+
+    #[test]
+    fn pi_bad_model_with_exit_zero_fails_probe() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let probe_root = tmp.path().join("probes");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&probe_root).unwrap();
+        let bad = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/loop/pi_bad_model.jsonl"
+        );
+        crate::test_support::write_executable(
+            bin_dir.join("pi"),
+            format!("#!/usr/bin/env sh\ncat \"{bad}\"\nexit 0\n"),
+        );
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        let sb = FakeSandbox::new().with_env("PATH", &test_path);
+        let targets = vec![ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Pi,
+                model: Some("opencode-go/glm-5.3".into()),
+            },
+            stage_ids: vec!["implement".into()],
+        }];
+
+        let failures = run_preflight_with_options(
+            &targets,
+            &sb,
+            &probe_root,
+            &AtomicBool::new(false),
+            &SystemClock::new(),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].reason.contains("isn't included"),
+            "got: {}",
+            failures[0].reason
+        );
     }
 
     #[test]
