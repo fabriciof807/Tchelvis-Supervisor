@@ -1,5 +1,5 @@
 use crate::loops::sandbox::SandboxedCommand;
-use crate::loops::state::StopProcess;
+use crate::loops::state::{StopLimit, StopProcess};
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -238,6 +238,71 @@ pub enum Outcome {
     TimedOut,
     Stalled,
     Cancelled,
+}
+
+/// Decides when a silent stage may keep running because a tool is open.
+///
+/// `A` is the last activity, `F` the last tool sighting; only a tool sighting past `stall` buys
+/// extra time, and only up to `tool_stall` measured from the last activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallTracker {
+    stall_ms: u64,
+    tool_stall_ms: u64,
+    last_activity_ms: u64,
+    last_tool_ms: Option<u64>,
+    longest_tolerated_ms: Option<u64>,
+}
+
+impl StallTracker {
+    pub fn new(stall: Duration, tool_stall: Duration, now_ms: u64) -> Self {
+        Self {
+            stall_ms: stall.as_millis() as u64,
+            tool_stall_ms: tool_stall.as_millis() as u64,
+            last_activity_ms: now_ms,
+            last_tool_ms: None,
+            longest_tolerated_ms: None,
+        }
+    }
+
+    /// False when `tool_stall <= stall`: then `tool_seen` does nothing.
+    pub fn tool_enabled(&self) -> bool {
+        self.tool_stall_ms > self.stall_ms
+    }
+
+    pub fn activity(&mut self, now_ms: u64) {
+        self.last_activity_ms = now_ms;
+        self.last_tool_ms = None;
+    }
+
+    pub fn tool_seen(&mut self, now_ms: u64) {
+        if self.tool_enabled() {
+            self.last_tool_ms = Some(now_ms);
+        }
+    }
+
+    pub fn verdict(&mut self, now_ms: u64) -> Option<StopLimit> {
+        let quiet = now_ms.saturating_sub(self.last_activity_ms);
+        let since_tool =
+            now_ms.saturating_sub(self.last_tool_ms.map_or(self.last_activity_ms, |tool| {
+                tool.max(self.last_activity_ms)
+            }));
+        let verdict = if since_tool >= self.stall_ms {
+            Some(StopLimit::Stall)
+        } else if self.last_tool_ms.is_some() && quiet >= self.tool_stall_ms {
+            Some(StopLimit::ToolStall)
+        } else {
+            None
+        };
+        if verdict != Some(StopLimit::Stall) && quiet >= self.stall_ms {
+            self.longest_tolerated_ms =
+                Some(self.longest_tolerated_ms.map_or(quiet, |l| l.max(quiet)));
+        }
+        verdict
+    }
+
+    pub fn longest_tolerated_ms(&self) -> Option<u64> {
+        self.longest_tolerated_ms
+    }
 }
 
 /// What the stage was doing at the moment the engine ended it.
@@ -1977,6 +2042,95 @@ mod tests {
             "without any output no process can be after it"
         );
         assert!(stop.silent_ms >= 300);
+    }
+
+    #[test]
+    fn tracker_without_tool_stalls_at_stall() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        assert_eq!(tracker.verdict(599), None);
+        assert_eq!(tracker.verdict(600), Some(StopLimit::Stall));
+        assert_eq!(tracker.longest_tolerated_ms(), None);
+    }
+
+    #[test]
+    fn tracker_open_tool_lives_to_the_ceiling() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        for now in [0, 600, 1199] {
+            tracker.tool_seen(now);
+            assert_eq!(tracker.verdict(now), None, "at {now}");
+        }
+        assert_eq!(tracker.verdict(1200), Some(StopLimit::ToolStall));
+        assert_eq!(tracker.longest_tolerated_ms(), Some(1200));
+    }
+
+    #[test]
+    fn tracker_tool_gone_late_dies_at_the_ceiling() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        tracker.tool_seen(700);
+        assert_eq!(tracker.verdict(1199), None);
+        assert_eq!(tracker.verdict(1200), Some(StopLimit::ToolStall));
+    }
+
+    #[test]
+    fn tracker_tool_gone_early_dies_at_stall() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        tracker.tool_seen(300);
+        assert_eq!(tracker.verdict(899), None);
+        assert_eq!(tracker.verdict(900), Some(StopLimit::Stall));
+        assert_eq!(tracker.longest_tolerated_ms(), Some(899));
+    }
+
+    #[test]
+    fn tracker_tie_is_a_plain_stall() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        tracker.tool_seen(600);
+        assert_eq!(tracker.verdict(1200), Some(StopLimit::Stall));
+    }
+
+    #[test]
+    fn tracker_activity_restarts_both_limits() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        tracker.tool_seen(700);
+        assert_eq!(tracker.verdict(700), None);
+        tracker.activity(700);
+        assert_eq!(tracker.verdict(1299), None);
+        assert_eq!(tracker.verdict(1300), Some(StopLimit::Stall));
+        assert_eq!(tracker.longest_tolerated_ms(), Some(700));
+    }
+
+    #[test]
+    fn tracker_gives_each_tool_the_whole_ceiling() {
+        let mut tracker =
+            StallTracker::new(Duration::from_millis(600), Duration::from_millis(1200), 0);
+        tracker.tool_seen(1100);
+        assert_eq!(tracker.verdict(1100), None);
+        tracker.activity(1100);
+        tracker.tool_seen(2299);
+        assert_eq!(tracker.verdict(2299), None);
+        tracker.tool_seen(2300);
+        assert_eq!(tracker.verdict(2300), Some(StopLimit::ToolStall));
+    }
+
+    #[test]
+    fn tracker_equal_or_smaller_tool_limit_is_off() {
+        for tool_ms in [600, 500] {
+            let mut tracker = StallTracker::new(
+                Duration::from_millis(600),
+                Duration::from_millis(tool_ms),
+                0,
+            );
+            assert!(!tracker.tool_enabled(), "limit {tool_ms}");
+            tracker.tool_seen(599);
+            assert_eq!(tracker.verdict(599), None, "limit {tool_ms}");
+            assert_eq!(tracker.verdict(600), Some(StopLimit::Stall));
+            assert_eq!(tracker.longest_tolerated_ms(), None);
+        }
     }
 
     #[test]
