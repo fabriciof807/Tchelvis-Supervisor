@@ -4,16 +4,20 @@ use crate::loops::adapters::{
 use crate::loops::artifacts::{collect_output, prepare_exchange};
 use crate::loops::models::ModelSource;
 use crate::loops::preflight::ProbeRecord;
-use crate::loops::process::{run_process_diagnosed, Clock, Limits, Outcome, StopSnapshot};
+use crate::loops::process::{
+    run_process_diagnosed, Clock, Limits, Outcome, StopSnapshot, ToolWatch,
+};
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{
     redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
-    StopDiagnostic, StopProcess, ToolSignal, ToolSilence, Usage, LOOP_STATE_SCHEMA_VERSION,
+    StopDiagnostic, StopLimit, StopProcess, ToolSignal, ToolSilence, Usage,
+    LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::loops::verdict::{parse_verdict, summary_line, MAX_SUMMARY_CHARS};
 use crate::loops::workflow::{Provider, Stage, Workflow};
 use crate::loops::workspace::Workspace;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -74,6 +78,7 @@ pub struct StageRequest<'a> {
     pub prompt: &'a str,
     pub log_path: &'a Path,
     pub limits: Limits,
+    pub tool_stall: Duration,
     pub cancel: &'a AtomicBool,
     pub pulse: &'a dyn Fn(bool),
 }
@@ -153,9 +158,16 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
             }
         };
 
-        let mut parser = EventParser::new(req.stage.provider);
+        // The monitor asks the parser what is open while `on_line` feeds it, so the parser is
+        // shared through a `RefCell` rather than moved into one closure.
+        let parser = RefCell::new(EventParser::new(req.stage.provider));
         let mut sampler = WorkspaceSampler::new(req.workspace, self.clock);
         let pulse = req.pulse;
+        let mut tool_watch = ToolWatch {
+            limit: req.tool_stall,
+            view: &mut || parser.borrow().tool_view(),
+            silence: None,
+        };
 
         let mut stop_snapshot: Option<StopSnapshot> = None;
         let proc_res = run_process_diagnosed(
@@ -166,7 +178,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
             self.clock,
             req.cancel,
             &mut |line| {
-                parser.line(line);
+                parser.borrow_mut().line(line);
                 pulse(true);
             },
             &mut || {
@@ -178,9 +190,11 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     false
                 }
             },
-            None,
+            Some(&mut tool_watch),
             &mut stop_snapshot,
         );
+        let tool_silence = tool_watch.silence;
+        let parser = parser.into_inner();
 
         // A stage the engine ended never reaches its own settled event, so the parser must not
         // report the resulting silence as a provider failure.
@@ -198,9 +212,10 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 running_tools: stream.running_tools.clone(),
                 processes: snapshot.processes,
                 processes_total: snapshot.processes_total,
-                limit: None,
-                limit_secs: None,
-                tool_signal: None,
+                limit: snapshot.limit,
+                limit_secs: (snapshot.limit == Some(StopLimit::ToolStall))
+                    .then_some(req.tool_stall.as_secs()),
+                tool_signal: snapshot.tool_signal,
             });
             (
                 AdapterResult {
@@ -220,7 +235,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 usage: parsed.usage,
                 error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
                 stop: None,
-                tool_silence: None,
+                tool_silence,
             },
             Ok(Outcome::Exited(0)) => {
                 if parsed_error.is_some() {
@@ -229,7 +244,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                         usage: parsed.usage,
                         error: parsed_error,
                         stop: None,
-                        tool_silence: None,
+                        tool_silence,
                     }
                 } else {
                     StageResult {
@@ -237,7 +252,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                         usage: parsed.usage,
                         error: None,
                         stop: None,
-                        tool_silence: None,
+                        tool_silence,
                     }
                 }
             }
@@ -247,7 +262,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 error: parsed_error
                     .or_else(|| Some(format!("processo retornou código de saída {code}"))),
                 stop: None,
-                tool_silence: None,
+                tool_silence,
             },
             Ok(Outcome::Signaled(sig)) => StageResult {
                 outcome: StageOutcome::Signaled(sig),
@@ -255,28 +270,28 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 error: parsed_error
                     .or_else(|| Some(format!("processo encerrado pelo sinal {sig}"))),
                 stop: None,
-                tool_silence: None,
+                tool_silence,
             },
             Ok(Outcome::TimedOut) => StageResult {
                 outcome: StageOutcome::TimedOut,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop,
-                tool_silence: None,
+                tool_silence,
             },
             Ok(Outcome::Stalled) => StageResult {
                 outcome: StageOutcome::Stalled,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop,
-                tool_silence: None,
+                tool_silence,
             },
             Ok(Outcome::Cancelled) => StageResult {
                 outcome: StageOutcome::Cancelled,
                 usage: parsed.usage,
                 error: parsed_error,
                 stop: None,
-                tool_silence: None,
+                tool_silence,
             },
         }
     }
@@ -905,6 +920,9 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         timeout: Duration::from_millis(effective_timeout_ms),
                         stall: Duration::from_millis(stall_ms),
                     },
+                    tool_stall: Duration::from_millis(
+                        self.config.workflow.tool_stall_secs.saturating_mul(1000),
+                    ),
                     cancel: &self.config.cancel,
                     pulse: &pulse,
                 });
@@ -1015,11 +1033,14 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                     }
                     StageOutcome::Stalled => {
                         push_exec("STALLED", None, result.error);
-                        end_run(
-                            RunStatus::Escalate,
-                            Some(with_hint("etapa travada sem atividade (STALLED)")),
-                            None,
-                        );
+                        let base = if result.stop.as_ref().and_then(|s| s.limit)
+                            == Some(StopLimit::ToolStall)
+                        {
+                            "etapa travada sem atividade com ferramenta aberta (STALLED, tool_stall_secs)"
+                        } else {
+                            "etapa travada sem atividade (STALLED)"
+                        };
+                        end_run(RunStatus::Escalate, Some(with_hint(base)), None);
                         break;
                     }
                     StageOutcome::TimedOut => {
@@ -2819,6 +2840,291 @@ on_retry = "implement"
             .all(|(kind, _, _)| kind == "record"));
     }
 
+    /// Runs one stage with a fake CLI. Once `lines` lines were read, each probe advances the clock by
+    /// 100 s, `steps` times; on the last one the file `@GO@` appears. `stall` 600 s, `tool_stall` 1200 s.
+    fn run_silent_stage(provider: Provider, lines: u32, steps: u32, body: &str) -> StageResult {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let go = tmp.path().join("go");
+        let wait = "i=0; while [ ! -f \"@GO@\" ]; do i=$((i+1)); [ $i -gt 500 ] && exit 9; sleep 0.02; done";
+        let script = format!("#!/usr/bin/env sh\n{}\n", body.replace("@WAIT@", wait))
+            .replace("@GO@", &go.display().to_string());
+        crate::test_support::write_executable(bin_dir.join(provider.as_str()), script);
+
+        let mut stage = wrc_workflow(1).stages[0].clone();
+        stage.provider = provider;
+        stage.model = (provider == Provider::Pi).then(|| "opencode-go/glm-5.3".to_string());
+
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let sb = PassthroughSandbox { bin_dir };
+        let clock = FakeClock::new();
+        let (seen, stepped) = (std::cell::Cell::new(0u32), std::cell::Cell::new(0u32));
+        let pulse = |active: bool| {
+            if active {
+                seen.set(seen.get() + 1);
+            } else if seen.get() >= lines && stepped.get() < steps {
+                clock.advance(100_000);
+                stepped.set(stepped.get() + 1);
+                if stepped.get() == steps {
+                    fs::write(&go, "").unwrap();
+                }
+            }
+        };
+        let cancel = AtomicBool::new(false);
+        let log_path = tmp.path().join("stage.log");
+        ProcessStageRunner::new(&sb, &clock).run(StageRequest {
+            run_id: "20261125-000000-tst0",
+            cycle: 1,
+            exec_seq: 1,
+            stage: &stage,
+            workspace: ws.path(),
+            prompt: "faça algo",
+            log_path: &log_path,
+            limits: Limits {
+                timeout: Duration::from_secs(100_000),
+                stall: Duration::from_secs(600),
+            },
+            tool_stall: Duration::from_secs(1200),
+            cancel: &cancel,
+            pulse: &pulse,
+        })
+    }
+
+    const PI_START: &str = r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash"}"#;
+    const PI_END: &str = r#"{"type":"tool_execution_end","toolCallId":"c1","toolName":"bash"}"#;
+    const PI_RESULT: &str = r#"{"type":"agent_settled"}"#;
+    const CLAUDE_START: &str = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash"}]}}"#;
+    const CLAUDE_END: &str =
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1"}]}}"#;
+    const CLAUDE_RESULT: &str = r#"{"type":"result","is_error":false,"num_turns":1}"#;
+    const AGY_START: &str = r#"{"event":"step_update","step_update":{"step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"shell"}}"#;
+    const AGY_END: &str = r#"{"event":"step_update","step_update":{"step_index":1,"state":"DONE","step_type":"tool","tool_name":"shell"}}"#;
+    const AGY_RESULT: &str = r#"{"event":"result","result":{"status":"SUCCESS"}}"#;
+
+    fn printed(lines: &[&str]) -> String {
+        let mut out = String::from("printf '%s\\n'");
+        for line in lines {
+            out.push(' ');
+            out.push_str(&format!("'{}'", line.replace('\'', "'\\''")));
+        }
+        out
+    }
+
+    #[test]
+    fn silent_open_tool_survives_stall_and_is_recorded() {
+        for (provider, start, end, result) in [
+            (Provider::Pi, PI_START, PI_END, PI_RESULT),
+            (Provider::Claude, CLAUDE_START, CLAUDE_END, CLAUDE_RESULT),
+            (Provider::Agy, AGY_START, AGY_END, AGY_RESULT),
+        ] {
+            let body = format!(
+                "{}\n@WAIT@\n{}\n{}",
+                printed(&[start]),
+                printed(&[end, result]),
+                ""
+            );
+            let out = run_silent_stage(provider, 1, 8, &body);
+            assert_eq!(out.outcome, StageOutcome::Ok, "{provider:?}");
+            assert_eq!(out.error, None, "{provider:?}");
+            assert_eq!(
+                out.tool_silence,
+                Some(ToolSilence {
+                    longest_ms: 700_000,
+                    source: ToolSource::Events,
+                }),
+                "{provider:?}"
+            );
+            assert_eq!(out.stop, None, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn closed_tool_with_a_background_shell_stalls_at_stall() {
+        for (provider, start, end) in [
+            (Provider::Pi, PI_START, PI_END),
+            (Provider::Claude, CLAUDE_START, CLAUDE_END),
+            (Provider::Agy, AGY_START, AGY_END),
+        ] {
+            let body = format!(
+                "sleep 60 >/dev/null 2>&1 &\n{}\n@WAIT@",
+                printed(&[start, end])
+            );
+            let out = run_silent_stage(provider, 2, 30, &body);
+            assert_eq!(out.outcome, StageOutcome::Stalled, "{provider:?}");
+            let stop = out.stop.expect("a stalled stage records a stop");
+            assert_eq!(stop.limit, Some(StopLimit::Stall));
+            assert_eq!(stop.limit_secs, None);
+            assert_eq!(stop.tool_signal, None);
+            assert_eq!(out.tool_silence, None);
+            assert_eq!(stop.silent_ms, 700_000, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn silent_opencode_stage_stalls_as_before() {
+        let body = "printf '%s\\n' '{\"type\":\"step_start\"}'\nsleep 60 >/dev/null 2>&1 &\n@WAIT@"
+            .to_string();
+        let out = run_silent_stage(Provider::Opencode, 1, 30, &body);
+        assert_eq!(out.outcome, StageOutcome::Stalled);
+        let stop = out.stop.expect("a stalled stage records a stop");
+        assert_eq!(stop.limit, Some(StopLimit::Stall));
+        assert_eq!(stop.limit_secs, None);
+        assert_eq!(stop.tool_signal, None);
+        assert_eq!(out.tool_silence, None);
+        assert_eq!(stop.silent_ms, 700_000);
+    }
+
+    #[test]
+    fn open_tool_that_never_ends_stops_at_the_ceiling() {
+        let body = format!("{}\n@WAIT@", printed(&[PI_START]));
+        let out = run_silent_stage(Provider::Pi, 1, 30, &body);
+        assert_eq!(out.outcome, StageOutcome::Stalled);
+        let stop = out.stop.expect("a stalled stage records a stop");
+        assert_eq!(stop.limit, Some(StopLimit::ToolStall));
+        assert_eq!(stop.limit_secs, Some(1200));
+        assert_eq!(
+            stop.tool_signal,
+            Some(ToolSignal {
+                source: ToolSource::Events,
+                names: vec!["bash".to_string()],
+            })
+        );
+        assert_eq!(
+            out.tool_silence,
+            Some(ToolSilence {
+                longest_ms: 1_200_000,
+                source: ToolSource::Events,
+            })
+        );
+    }
+
+    #[test]
+    fn failed_stage_keeps_its_tool_silence() {
+        let body = format!("{}\n@WAIT@\nexit 3", printed(&[PI_START]));
+        let out = run_silent_stage(Provider::Pi, 1, 8, &body);
+        assert_eq!(out.outcome, StageOutcome::NonZeroExit(3));
+        assert_eq!(
+            out.tool_silence,
+            Some(ToolSilence {
+                longest_ms: 700_000,
+                source: ToolSource::Events,
+            })
+        );
+    }
+
+    #[test]
+    fn stage_request_carries_tool_stall_and_max_duration_still_wins() {
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let clock = Arc::new(FakeClock::new());
+        let clock_for_stage = Arc::clone(&clock);
+        let mut runner = ScriptedRunner::new();
+        runner.push(move |_| {
+            clock_for_stage.advance(250_000);
+            StageResult::default()
+        });
+        let clock_for_stage = Arc::clone(&clock);
+        runner.push(move |req| {
+            assert_eq!(req.tool_stall, Duration::from_secs(1200));
+            assert_eq!(req.limits.stall, Duration::from_secs(30));
+            assert_eq!(req.limits.timeout, Duration::from_secs(50));
+            clock_for_stage.advance(50_000);
+            StageResult {
+                outcome: StageOutcome::TimedOut,
+                ..Default::default()
+            }
+        });
+        let state = Engine::new(make_config(&tmp, wrc_workflow(3)), ws, runner, clock).run();
+        assert_eq!(state.status, RunStatus::Escalate);
+        assert!(state
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("MAX_DURATION"));
+    }
+
+    #[test]
+    fn tool_stall_reason_and_silence_reach_the_state_without_a_secret() {
+        let secret = "sk-tool-secret-123456";
+        let run = |limit: Option<StopLimit>| {
+            let tmp = TempDir::new().unwrap();
+            let ws = FakeWorkspace::new(tmp.path().join("ws"));
+            let mut runner = ScriptedRunner::new();
+            runner.push(move |_| StageResult {
+                outcome: StageOutcome::Stalled,
+                stop: Some(StopDiagnostic {
+                    last_event: Some("tool_execution_start (bash)".into()),
+                    last_output_at_ms: Some(0),
+                    silent_ms: 1_200_000,
+                    cli_alive: true,
+                    running_tools: Some(vec!["bash".to_string()]),
+                    processes: Vec::new(),
+                    processes_total: 0,
+                    limit,
+                    limit_secs: limit.map(|_| 1200),
+                    tool_signal: Some(ToolSignal {
+                        source: ToolSource::Events,
+                        names: vec![format!("bash {secret}")],
+                    }),
+                }),
+                tool_silence: Some(ToolSilence {
+                    longest_ms: 1_200_000,
+                    source: ToolSource::Events,
+                }),
+                ..Default::default()
+            });
+            let state = Engine::new(
+                make_config(&tmp, wrc_workflow(3)),
+                ws,
+                runner,
+                FakeClock::new(),
+            )
+            .with_extra_secrets(vec![secret.to_string()])
+            .run();
+            (tmp, state)
+        };
+
+        let (tmp, state) = run(Some(StopLimit::ToolStall));
+        assert_eq!(state.status, RunStatus::Escalate);
+        let reason = state.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains(
+                "etapa travada sem atividade com ferramenta aberta (STALLED, tool_stall_secs): ferramenta em execução: bash"
+            ),
+            "got: {reason}"
+        );
+        let stop = state.executions[0]
+            .stop
+            .clone()
+            .expect("a cut stage records a stop");
+        assert_eq!(stop.limit, Some(StopLimit::ToolStall));
+        assert_eq!(stop.limit_secs, Some(1200));
+        let loaded = load_state(&tmp.path().join("run")).unwrap();
+        assert_eq!(
+            loaded.executions[0].stop.as_ref().unwrap().limit,
+            Some(StopLimit::ToolStall)
+        );
+        assert_eq!(
+            loaded.executions[0].tool_silence,
+            Some(ToolSilence {
+                longest_ms: 1_200_000,
+                source: ToolSource::Events,
+            })
+        );
+        let raw_state = fs::read_to_string(tmp.path().join("run/state.json")).unwrap();
+        assert!(!raw_state.contains(secret), "secret leaked into state.json");
+        let raw_report = fs::read_to_string(tmp.path().join("run/report.md")).unwrap();
+        assert!(!raw_report.contains(secret), "secret leaked into report.md");
+
+        let (_tmp, state) = run(Some(StopLimit::Stall));
+        let reason = state.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("etapa travada sem atividade (STALLED): ferramenta em execução: bash"),
+            "got: {reason}"
+        );
+    }
+
     #[test]
     fn stalled_stage_records_stop_and_hint_without_leaking_a_secret() {
         let tmp = TempDir::new().unwrap();
@@ -2970,6 +3276,7 @@ on_retry = "implement"
                 timeout: Duration::from_secs(30),
                 stall: Duration::from_millis(800),
             },
+            tool_stall: Duration::from_millis(800),
             cancel: &cancel,
             pulse: &pulse,
         });
