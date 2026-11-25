@@ -1,5 +1,7 @@
 use crate::loops::artifacts::MAX_ARTIFACT_BYTES;
-use crate::loops::state::{redact_loop_text, sanitize_single_line, sum_usage, Execution, RunState};
+use crate::loops::state::{
+    redact_loop_text, sanitize_single_line, sum_usage, Execution, RunState, StopLimit,
+};
 use crate::loops::verdict::MAX_SUMMARY_CHARS;
 use regex::Regex;
 use std::ffi::CString;
@@ -451,6 +453,18 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
                 "- **Indício:** {}",
                 sanitize_line(&stop.hint(), None, extra_secrets)
             );
+            if stop.limit == Some(StopLimit::ToolStall) {
+                let secs = stop
+                    .limit_secs
+                    .map(|secs| format!(" ({secs} s)"))
+                    .unwrap_or_default();
+                let source = stop
+                    .tool_signal
+                    .as_ref()
+                    .map(|signal| format!("; ferramenta vista por {}", signal.source.label_pt()))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "- **Limite aplicado:** tool_stall_secs{secs}{source}");
+            }
             let _ = writeln!(
                 out,
                 "- **Processos ({} de {}):**",
@@ -475,6 +489,28 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
                 );
             }
             let _ = writeln!(out);
+        }
+    }
+
+    let silent: Vec<&Execution> = state
+        .executions
+        .iter()
+        .filter(|exec| exec.tool_silence.is_some())
+        .collect();
+    if !silent.is_empty() {
+        let _ = writeln!(out, "\n## Silêncio longo de ferramenta\n");
+        for exec in silent {
+            let Some(silence) = exec.tool_silence else {
+                continue;
+            };
+            let stage = sanitize_line(&exec.stage_id, None, extra_secrets);
+            let _ = writeln!(
+                out,
+                "- {stage} (ciclo {}): {}; fonte: {}",
+                exec.cycle,
+                format_duration_ms(silence.longest_ms),
+                silence.source.label_pt()
+            );
         }
     }
 
@@ -505,9 +541,116 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
 mod tests {
     use super::*;
     use crate::loops::state::{
-        CallerInfo, Execution, RunStatus, StopDiagnostic, StopProcess, Usage,
-        LOOP_STATE_SCHEMA_VERSION,
+        CallerInfo, Execution, RunStatus, StopDiagnostic, StopLimit, StopProcess, ToolSignal,
+        ToolSilence, ToolSource, Usage, LOOP_STATE_SCHEMA_VERSION,
     };
+
+    fn stopped_state(
+        limit: Option<StopLimit>,
+        limit_secs: Option<u64>,
+        signal: Option<ToolSignal>,
+    ) -> RunState {
+        let mut state = rich_state();
+        state.executions[0].outcome = "STALLED".to_string();
+        state.executions[0].stop = Some(StopDiagnostic {
+            last_event: Some("tool_execution_start (bash)".to_string()),
+            last_output_at_ms: Some(0),
+            silent_ms: 1_200_000,
+            cli_alive: true,
+            running_tools: Some(vec!["bash".to_string()]),
+            processes: Vec::new(),
+            processes_total: 0,
+            limit,
+            limit_secs,
+            tool_signal: signal,
+        });
+        state
+    }
+
+    fn events() -> Option<ToolSignal> {
+        Some(ToolSignal {
+            source: ToolSource::Events,
+            names: vec!["bash".to_string()],
+        })
+    }
+
+    #[test]
+    fn report_shows_the_applied_tool_limit() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        let md = render_report(
+            &stopped_state(Some(StopLimit::ToolStall), Some(1200), events()),
+            dir,
+        );
+        assert!(
+            md.contains("- **Limite aplicado:** tool_stall_secs (1200 s); ferramenta vista por eventos do CLI"),
+            "{md}"
+        );
+        let indice = md.find("- **Indício:**").expect("the hint line");
+        let limite = md.find("- **Limite aplicado:**").expect("the limit line");
+        assert!(limite > indice, "the limit follows the hint: {md}");
+
+        let md = render_report(
+            &stopped_state(
+                Some(StopLimit::ToolStall),
+                Some(1200),
+                Some(ToolSignal {
+                    source: ToolSource::Processes,
+                    names: Vec::new(),
+                }),
+            ),
+            dir,
+        );
+        assert!(
+            md.contains(
+                "- **Limite aplicado:** tool_stall_secs (1200 s); ferramenta vista por processos do passo atual"
+            ),
+            "{md}"
+        );
+
+        let md = render_report(&stopped_state(Some(StopLimit::ToolStall), None, None), dir);
+        assert!(
+            md.contains(
+                "- **Limite aplicado:** tool_stall_secs
+"
+            ),
+            "{md}"
+        );
+    }
+
+    #[test]
+    fn report_lists_long_tool_silence() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut state = rich_state();
+        state.executions[0].tool_silence = Some(ToolSilence {
+            longest_ms: 700_000,
+            source: ToolSource::Events,
+        });
+
+        let md = render_report(&state, dir);
+        assert!(md.contains("## Silêncio longo de ferramenta"), "{md}");
+        assert!(
+            md.contains("- implement (ciclo 1): 11m 40s; fonte: eventos do CLI"),
+            "{md}"
+        );
+        assert!(!md.contains("## Etapas interrompidas"), "{md}");
+        let silencio = md.find("## Silêncio longo de ferramenta").unwrap();
+        let artefatos = md.find("## Artefatos e apontamentos").unwrap_or(md.len());
+        assert!(silencio < artefatos, "silence comes before the artifacts");
+    }
+
+    #[test]
+    fn report_without_long_silence_is_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let no_limit = render_report(&stopped_state(None, None, events()), dir);
+        let plain_stall = render_report(&stopped_state(Some(StopLimit::Stall), None, None), dir);
+        assert_eq!(no_limit, plain_stall);
+        assert!(!no_limit.contains("Limite aplicado"), "{no_limit}");
+        assert!(!no_limit.contains("Silêncio longo"), "{no_limit}");
+    }
     use crate::loops::verdict::Verdict;
     use crate::loops::workflow::Provider;
     use tempfile::TempDir;
