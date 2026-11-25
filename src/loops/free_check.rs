@@ -14,6 +14,16 @@ use std::time::Duration;
 pub const FREE_CHECK_TIMEOUT_SECS: u64 = 15;
 const MAX_FREE_OUTPUT_BYTES: usize = 1024 * 1024;
 pub const AGY_ABSENT_REASON: &str = "conta do 'agy' ausente — o loop usa um login próprio em arquivo (o login no chaveiro do sistema não serve); rode 'tchelvis loop auth login agy'";
+pub const AGY_ABSENT_REASON_UNSANDBOXED: &str = "conta do 'agy' não encontrada; sem sandbox o agy usa o login normal (rode 'agy' e entre na conta)";
+
+/// The loop login is a `bwrap` mechanism: outside it, a listed model is proof of a login.
+pub fn agy_absent_reason(sandbox_kind: &str) -> &'static str {
+    if sandbox_kind == "none" {
+        AGY_ABSENT_REASON_UNSANDBOXED
+    } else {
+        AGY_ABSENT_REASON
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Listed {
@@ -435,7 +445,7 @@ fn run_one_free_check(
                 if captured.trim().is_empty()
                     && resolve_agy_credential(home_dir, sandbox.agy_state_dir()).is_none()
                 {
-                    return fallback(Err(AGY_ABSENT_REASON.to_string()), None);
+                    return fallback(Err(agy_absent_reason(sandbox.kind()).to_string()), None);
                 }
             }
             fallback(Ok(()), None)
@@ -646,6 +656,7 @@ mod tests {
     struct FakeSandbox {
         recorded_calls: Mutex<Vec<RecordedCall>>,
         extra_env: Vec<(OsString, OsString)>,
+        kind_name: &'static str,
     }
 
     impl FakeSandbox {
@@ -653,7 +664,13 @@ mod tests {
             Self {
                 recorded_calls: Mutex::new(Vec::new()),
                 extra_env: Vec::new(),
+                kind_name: "fake",
             }
+        }
+
+        fn with_kind(mut self, kind: &'static str) -> Self {
+            self.kind_name = kind;
+            self
         }
 
         fn with_env(mut self, k: &str, v: &str) -> Self {
@@ -699,7 +716,7 @@ mod tests {
 
     impl Sandbox for FakeSandbox {
         fn kind(&self) -> &'static str {
-            "fake"
+            self.kind_name
         }
 
         fn check(&self, _workspace: &Path) -> anyhow::Result<Vec<String>> {
@@ -1227,5 +1244,46 @@ mod tests {
             1_700_000_000_000,
         );
         assert!(matches!(free_plan[0].action, PlanAction::Fail(_)));
+    }
+
+    #[test]
+    fn free_check_agy_reason_by_kind() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        let work_dir = tmp.path().join("work");
+        let home_dir = tmp.path().join("home");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&work_dir).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        crate::test_support::write_executable(bin_dir.join("agy"), "#!/usr/bin/env sh\nexit 0\n");
+
+        let orig_path = std::env::var("PATH").unwrap_or_default();
+        let test_path = format!("{}:{orig_path}", bin_dir.display());
+        let cancel = AtomicBool::new(false);
+        let run = |kind: &'static str| {
+            let sb = FakeSandbox::new()
+                .with_kind(kind)
+                .with_env("PATH", &test_path);
+            run_free_checks_with_options(
+                &[Provider::Agy],
+                &sb,
+                &work_dir,
+                &home_dir,
+                &cancel,
+                &crate::loops::process::SystemClock::new(),
+                None,
+                &[],
+            )
+            .unwrap()[&Provider::Agy]
+                .account_ok
+                .clone()
+        };
+
+        assert_eq!(
+            run("none").unwrap_err(),
+            AGY_ABSENT_REASON_UNSANDBOXED.to_string()
+        );
+        assert_eq!(run("fake").unwrap_err(), AGY_ABSENT_REASON.to_string());
+        assert_eq!(run("bwrap").unwrap_err(), AGY_ABSENT_REASON.to_string());
     }
 }

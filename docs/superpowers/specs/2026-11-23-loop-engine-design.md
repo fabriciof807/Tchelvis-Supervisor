@@ -81,7 +81,7 @@ auto_approve_in_sandbox = true   # obrigatório: autoriza os CLIs a agir sem per
 env_pass = []
 
 [sandbox]
-kind = "bwrap"                   # padrão; bwrap | inherited | incus
+kind = "bwrap"                   # padrão; bwrap | inherited | none | incus
 
 [sandbox.bwrap]
 home_ro = [".cargo", ".rustup"]
@@ -96,6 +96,7 @@ user = "ubuntu"
 | 1 | `bwrap` (padrão) | `/` somente leitura, `$HOME` e `/run` vazios, só o workspace gravável, PID próprio; funciona dentro de um container | Também o repositório principal, outros projetos, sockets e o Herdr |
 | 2 | `inherited` | O `tchelvis` já roda em um container; exige detecção e escolha explícita | O host, só na medida do container. **Nada dentro dele** |
 | 3 | `incus` | `incus exec` na instância, a partir do host; o workspace precisa estar montado nela | O host |
+| 4 | `none` | Processo comum do usuário; exige `allow_unsandboxed = true` | Nada (ver [modo sem sandbox](2026-11-25-loop-sandbox-none-design.md)) |
 
 - **Limite do `inherited`:** o agente tem os mesmos poderes do usuário do container. Se houver `sudo` sem senha, acesso ao Docker ou ao Incus, pastas do host graváveis ou `hc`, ele alcança tudo isso, e também o repositório principal, o `state.json` e os outros terminais. `loop check` lista o que encontrou, e cada relatório registra o tipo de sandbox usado. O git seguro continua valendo contra execução acidental, mas não é uma fronteira nesse modo.
 - **Sem as opções de aprovação, os CLIs podem agir mesmo assim:** em teste de 2026-11-23, `opencode` e `agy` criaram arquivos sem nenhuma delas, por configuração do usuário. O sandbox é a única barreira.

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 pub const DEFAULT_MAX_CONCURRENT: u32 = 2;
+pub const UNSANDBOXED_GATE_ERROR: &str = "sandbox 'none' exige allow_unsandboxed = true em ~/.config/tchelvis/loops.toml: o agente roda sem isolamento, com seu HOME, sua rede e seus terminais";
 
 /// Where tchelvis keeps its own configuration and state: never visible to a stage.
 const TCHELVIS_HOME_DIRS: &[&str] = &[
@@ -16,6 +17,17 @@ const TCHELVIS_HOME_DIRS: &[&str] = &[
 pub enum SandboxConfig {
     Inherited,
     Bwrap { home_ro: Vec<String> },
+    Unsandboxed,
+}
+
+impl SandboxConfig {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Inherited => "inherited",
+            Self::Bwrap { .. } => "bwrap",
+            Self::Unsandboxed => "none",
+        }
+    }
 }
 
 pub const DEFAULT_PREFLIGHT_VALID_HOURS: u32 = 12;
@@ -55,10 +67,21 @@ impl Default for PreflightConfig {
     }
 }
 
+pub fn allow_unsandboxed_warning(cfg: &LoopsConfig) -> Option<String> {
+    if !cfg.allow_unsandboxed || cfg.sandbox == SandboxConfig::Unsandboxed {
+        return None;
+    }
+    Some(format!(
+        "aviso: allow_unsandboxed = true não tem efeito com sandbox '{}'",
+        cfg.sandbox.kind_str()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopsConfig {
     pub max_concurrent: u32,
     pub auto_approve_in_sandbox: bool,
+    pub allow_unsandboxed: bool,
     pub env_pass: Vec<String>,
     pub sandbox: SandboxConfig,
     pub defaults: RoleDefaults,
@@ -72,6 +95,8 @@ struct RawLoopsConfig {
     max_concurrent: u32,
     #[serde(default)]
     auto_approve_in_sandbox: bool,
+    #[serde(default)]
+    allow_unsandboxed: bool,
     #[serde(default)]
     env_pass: Vec<String>,
     #[serde(default)]
@@ -233,6 +258,12 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
             let b = parsed.sandbox.bwrap.unwrap_or_default();
             SandboxConfig::Bwrap { home_ro: b.home_ro }
         }
+        "none" => {
+            if !parsed.allow_unsandboxed {
+                bail!("{UNSANDBOXED_GATE_ERROR}");
+            }
+            SandboxConfig::Unsandboxed
+        }
         "incus" => {
             let _ = parsed.sandbox.incus;
             bail!("sandbox 'incus' ainda não suportado nesta versão");
@@ -255,6 +286,7 @@ pub fn parse_loops_config(raw: &str) -> Result<LoopsConfig> {
     Ok(LoopsConfig {
         max_concurrent: parsed.max_concurrent,
         auto_approve_in_sandbox: parsed.auto_approve_in_sandbox,
+        allow_unsandboxed: parsed.allow_unsandboxed,
         env_pass: parsed.env_pass,
         sandbox,
         defaults: parsed.defaults,
@@ -525,5 +557,71 @@ model = "claude-sonnet-4"
         assert!(parse_loops_config("[preflight]\nvalid_hours = 169\n").is_err());
         assert!(parse_loops_config("[preflight]\nmode = \"bogus\"\n").is_err());
         assert!(parse_loops_config("[preflight]\nextra = true\n").is_err());
+    }
+
+    #[test]
+    fn sandbox_kind_none_requires_the_gate() {
+        let err = format!(
+            "{:#}",
+            parse_loops_config("[sandbox]\nkind = \"none\"\n").unwrap_err()
+        );
+        assert!(err.contains(UNSANDBOXED_GATE_ERROR), "{err}");
+
+        let cfg =
+            parse_loops_config("allow_unsandboxed = true\n[sandbox]\nkind = \"none\"\n").unwrap();
+        assert_eq!(cfg.sandbox, SandboxConfig::Unsandboxed);
+        assert!(cfg.allow_unsandboxed);
+    }
+
+    #[test]
+    fn allow_unsandboxed_must_be_a_bool() {
+        for bad in ["\"yes\"", "1"] {
+            let raw = format!("allow_unsandboxed = {bad}\n[sandbox]\nkind = \"none\"\n");
+            assert!(parse_loops_config(&raw).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn allow_unsandboxed_has_no_effect_elsewhere() {
+        let cfg =
+            parse_loops_config("allow_unsandboxed = true\n[sandbox]\nkind = \"bwrap\"\n").unwrap();
+        assert!(cfg.allow_unsandboxed);
+        assert_eq!(cfg.sandbox, SandboxConfig::Bwrap { home_ro: vec![] });
+        assert_eq!(
+            allow_unsandboxed_warning(&cfg).as_deref(),
+            Some("aviso: allow_unsandboxed = true não tem efeito com sandbox 'bwrap'")
+        );
+
+        let none =
+            parse_loops_config("allow_unsandboxed = true\n[sandbox]\nkind = \"none\"\n").unwrap();
+        assert_eq!(allow_unsandboxed_warning(&none), None);
+
+        let inherited = parse_loops_config("[sandbox]\nkind = \"inherited\"\n").unwrap();
+        assert_eq!(allow_unsandboxed_warning(&inherited), None);
+    }
+
+    #[test]
+    fn frozen_config_roundtrips_unsandboxed_and_old_variants() {
+        // `FrozenRunConfig` stores `SandboxConfig` through serde; frozen runs from older
+        // versions must keep loading after the new variant exists.
+        assert_eq!(
+            serde_json::to_string(&SandboxConfig::Unsandboxed).unwrap(),
+            "\"Unsandboxed\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxConfig>("\"Unsandboxed\"").unwrap(),
+            SandboxConfig::Unsandboxed
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxConfig>("\"Inherited\"").unwrap(),
+            SandboxConfig::Inherited
+        );
+        assert_eq!(
+            serde_json::from_str::<SandboxConfig>("{\"Bwrap\":{\"home_ro\":[\".cargo\"]}}")
+                .unwrap(),
+            SandboxConfig::Bwrap {
+                home_ro: vec![".cargo".into()]
+            }
+        );
     }
 }

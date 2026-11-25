@@ -313,6 +313,22 @@ pub fn load_state(dir: &Path) -> Result<RunState> {
     parse_state(&raw)
 }
 
+/// Line 1 of `loop result` and of `loop status`. The unsandboxed mode must never be silent.
+pub fn result_line_one(
+    status: &RunStatus,
+    workflow: &str,
+    cycle: u32,
+    max: u32,
+    sandbox: &str,
+) -> String {
+    let line = format!("STATUS: {status} | LOOP: {workflow} | CICLOS: {cycle}/{max}");
+    if sandbox == "none" {
+        format!("{line} | SEM SANDBOX")
+    } else {
+        line
+    }
+}
+
 pub fn format_result(s: &RunState) -> String {
     let workflow = sanitize_single_line(&s.workflow, None);
     let run_id = sanitize_single_line(&s.run_id, None);
@@ -351,8 +367,18 @@ pub fn format_result(s: &RunState) -> String {
     let summary = sanitize_single_line(raw_summary, Some(MAX_SUMMARY_CHARS));
 
     format!(
-        "STATUS: {} | LOOP: {} | CICLOS: {}/{}\nRUN_ID: {}\nBRANCH: {}\nARQUIVOS: {}\nRESUMO: {}",
-        s.status, workflow, s.current_cycle, s.max_cycles, run_id, branch, files_line, summary
+        "{}\nRUN_ID: {}\nBRANCH: {}\nARQUIVOS: {}\nRESUMO: {}",
+        result_line_one(
+            &s.status,
+            &workflow,
+            s.current_cycle,
+            s.max_cycles,
+            &s.sandbox
+        ),
+        run_id,
+        branch,
+        files_line,
+        summary
     )
 }
 
@@ -612,5 +638,28 @@ mod tests {
         save_state(dir.path(), &modern).unwrap();
         let reloaded = load_state(dir.path()).unwrap();
         assert_eq!(reloaded, modern);
+    }
+
+    #[test]
+    fn format_result_flags_unsandboxed_runs() {
+        for status in [
+            RunStatus::Running,
+            RunStatus::Pass,
+            RunStatus::Error,
+            RunStatus::Escalate,
+            RunStatus::Cancelled,
+        ] {
+            let mut s = sample_state(status);
+            s.sandbox = "none".to_string();
+            let out = format_result(&s);
+            assert!(
+                out.lines().next().unwrap().ends_with(" | SEM SANDBOX"),
+                "{out}"
+            );
+            assert_eq!(out.lines().count(), 5, "{out}");
+        }
+
+        let out = format_result(&sample_state(RunStatus::Pass));
+        assert!(!out.contains("SEM SANDBOX"), "{out}");
     }
 }

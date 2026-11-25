@@ -63,6 +63,9 @@ pub trait Sandbox {
     fn agy_state_dir(&self) -> Option<&Path> {
         None
     }
+    fn agy_session_env(&self) -> &[(String, String)] {
+        &[]
+    }
     fn check(&self, workspace: &Path) -> Result<Vec<String>>;
     fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand>;
     fn wrap_with_extra_env(
@@ -321,6 +324,45 @@ fn probe_workspace_writable(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Host facilities reachable from inside the workspace, checked against `root` (the real `/` in
+/// production, a fake rootfs in tests).
+pub(crate) fn host_exposures(root: &Path) -> Vec<String> {
+    let mut exposures = Vec::new();
+
+    for rel in [
+        "var/run/docker.sock",
+        "run/docker.sock",
+        "var/lib/incus/unix.socket",
+        "run/incus/unix.socket",
+    ] {
+        let p = root.join(rel);
+        if fs::symlink_metadata(&p).is_ok() && is_path_writable_by_current_user(&p) {
+            exposures.push(format!("socket gravável acessível: /{rel}"));
+        }
+    }
+
+    if root == Path::new("/") {
+        if let Some(sudo_bin) = find_in_path("sudo", std::env::var_os("PATH").as_deref()) {
+            let ok = Command::new(sudo_bin)
+                .args(["-n", "true"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if ok {
+                exposures.push("sudo sem senha disponível (sudo -n true)".to_string());
+            }
+        }
+        if find_in_path("hc", std::env::var_os("PATH").as_deref()).is_some() {
+            exposures.push("hc disponível no PATH (acesso a outros terminais)".to_string());
+        }
+    }
+
+    exposures
+}
+
 pub struct InheritedSandbox {
     pub env_pass: Vec<String>,
     pub root: PathBuf,
@@ -450,39 +492,7 @@ impl Sandbox for InheritedSandbox {
 
         probe_workspace_writable(workspace)?;
 
-        let mut exposures = Vec::new();
-
-        for rel in [
-            "var/run/docker.sock",
-            "run/docker.sock",
-            "var/lib/incus/unix.socket",
-            "run/incus/unix.socket",
-        ] {
-            let p = self.root.join(rel);
-            if fs::symlink_metadata(&p).is_ok() && is_path_writable_by_current_user(&p) {
-                exposures.push(format!("socket gravável acessível: /{rel}"));
-            }
-        }
-
-        if self.root == Path::new("/") {
-            if let Some(sudo_bin) = find_in_path("sudo", std::env::var_os("PATH").as_deref()) {
-                let ok = Command::new(sudo_bin)
-                    .args(["-n", "true"])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-                if ok {
-                    exposures.push("sudo sem senha disponível (sudo -n true)".to_string());
-                }
-            }
-            if find_in_path("hc", std::env::var_os("PATH").as_deref()).is_some() {
-                exposures.push("hc disponível no PATH (acesso a outros terminais)".to_string());
-            }
-        }
-
+        let mut exposures = host_exposures(&self.root);
         exposures.extend(self.detect_shared_writable_mounts());
         Ok(exposures)
     }
@@ -519,6 +529,15 @@ pub fn wrap_for_provider(
     };
     if provider != crate::loops::workflow::Provider::Opencode {
         cmd.env.retain(|(k, _)| k != "OPENCODE_API_KEY");
+    }
+    // Only the unsandboxed mode needs the session bus: `agy` reads its login from the keyring.
+    if provider == crate::loops::workflow::Provider::Agy && sandbox.kind() == "none" {
+        let pairs: Vec<(&str, &str)> = sandbox
+            .agy_session_env()
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        apply_extra_env(&mut cmd.env, &pairs);
     }
     if provider == crate::loops::workflow::Provider::Pi && sandbox.kind() == "inherited" {
         let agent_dir = scratch.join("pi-agent");
@@ -981,6 +1000,82 @@ impl Sandbox for BwrapSandbox {
         apply_extra_env(&mut clean_env, extra_env);
         self.wrap_clean(argv, workspace, clean_env)
     }
+}
+
+pub const UNSANDBOXED_EXPOSURE: &str = "SEM SANDBOX: o agente roda como o seu usuário, com HOME, rede, repositório principal, estado do tchelvis (~/.config, ~/.local/share e ~/.local/state/tchelvis) e terminais Herdr ao alcance";
+
+/// No isolation at all: the stage runs as the user, in the user's environment. The gate that
+/// allows this lives in the config layer; this type only makes the reach explicit.
+pub struct NoSandbox {
+    pub env_pass: Vec<String>,
+    /// Real `/` in production, a fake rootfs in tests.
+    pub root: PathBuf,
+    /// Passed to `agy` only, so it can reach the desktop keyring/session bus.
+    pub agy_session_env: Vec<(String, String)>,
+}
+
+impl NoSandbox {
+    pub fn new(env_pass: Vec<String>, agy_session_env: Vec<(String, String)>) -> Self {
+        Self {
+            env_pass,
+            root: PathBuf::from("/"),
+            agy_session_env,
+        }
+    }
+}
+
+impl Sandbox for NoSandbox {
+    fn kind(&self) -> &'static str {
+        "none"
+    }
+
+    fn agy_session_env(&self) -> &[(String, String)] {
+        &self.agy_session_env
+    }
+
+    fn check(&self, workspace: &Path) -> Result<Vec<String>> {
+        probe_workspace_writable(workspace)?;
+        let mut exposures = vec![UNSANDBOXED_EXPOSURE.to_string()];
+        exposures.extend(host_exposures(&self.root));
+        Ok(exposures)
+    }
+
+    fn wrap(&self, argv: &[OsString], workspace: &Path) -> Result<SandboxedCommand> {
+        if argv.is_empty() {
+            bail!("comando vazio");
+        }
+        let env_pairs = current_env_pairs();
+        Ok(SandboxedCommand {
+            argv: argv.to_vec(),
+            env: build_clean_env(&self.env_pass, &env_pairs),
+            cwd: workspace.to_path_buf(),
+        })
+    }
+}
+
+/// D-Bus variables `agy` needs outside a sandbox. They come from the `tchelvis` environment;
+/// when missing they are derived from the uid and only if the user bus socket exists.
+pub fn unsandboxed_agy_env(
+    env: &dyn Fn(&str) -> Option<String>,
+    uid: u32,
+    root: &Path,
+) -> Vec<(String, String)> {
+    let runtime_dir = format!("/run/user/{uid}");
+    let bus_path = format!("{runtime_dir}/bus");
+    let socket_exists = fs::symlink_metadata(root.join(bus_path.trim_start_matches('/'))).is_ok();
+
+    let dbus = env("DBUS_SESSION_BUS_ADDRESS")
+        .or_else(|| socket_exists.then(|| format!("unix:path={bus_path}")));
+    let xdg = env("XDG_RUNTIME_DIR").or_else(|| socket_exists.then(|| runtime_dir.clone()));
+
+    let mut pairs = Vec::new();
+    if let Some(v) = dbus {
+        pairs.push(("DBUS_SESSION_BUS_ADDRESS".to_string(), v));
+    }
+    if let Some(v) = xdg {
+        pairs.push(("XDG_RUNTIME_DIR".to_string(), v));
+    }
+    pairs
 }
 
 #[cfg(test)]
@@ -1596,6 +1691,43 @@ mod tests {
     }
 
     #[test]
+    fn no_sandbox_sends_the_opencode_key_and_the_session_bus_only_where_they_belong() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let scratch = tmp.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let sb = NoSandbox::new(
+            vec![],
+            vec![("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/x".into())],
+        );
+        let run = |provider| {
+            wrap_for_provider(
+                &sb,
+                provider,
+                &[OsString::from("cli")],
+                &ws,
+                &scratch,
+                Some("sk-opencode-key"),
+            )
+            .unwrap()
+        };
+        let has = |cmd: &SandboxedCommand, key: &str| env_value(cmd, key).is_some();
+
+        let opencode = run(Provider::Opencode);
+        assert!(has(&opencode, "OPENCODE_API_KEY"));
+        assert!(!has(&opencode, "DBUS_SESSION_BUS_ADDRESS"));
+        for provider in [Provider::Claude, Provider::Pi] {
+            let cmd = run(provider);
+            assert!(!has(&cmd, "OPENCODE_API_KEY"), "{provider:?}");
+            assert!(!has(&cmd, "DBUS_SESSION_BUS_ADDRESS"), "{provider:?}");
+        }
+        let agy = run(Provider::Agy);
+        assert!(has(&agy, "DBUS_SESSION_BUS_ADDRESS"));
+        assert!(!has(&agy, "OPENCODE_API_KEY"));
+    }
+
+    #[test]
     fn wrap_for_provider_env_rules() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path().canonicalize().unwrap().join("home");
@@ -2086,6 +2218,200 @@ mod tests {
                 )
                 .unwrap_err();
             assert!(err.to_string().contains("home_ro"), "{err:#}");
+        }
+    }
+
+    #[test]
+    fn no_sandbox_check_needs_no_container_and_lists_fixed_exposure_first() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("var/run")).unwrap();
+        fs::write(root.join("var/run/docker.sock"), "").unwrap();
+
+        let sb = NoSandbox {
+            root,
+            ..NoSandbox::new(vec![], vec![])
+        };
+        let exposures = sb.check(&ws).unwrap();
+        assert_eq!(exposures[0], UNSANDBOXED_EXPOSURE);
+        assert!(
+            exposures
+                .iter()
+                .any(|e| e.contains("socket gravável acessível: /var/run/docker.sock")),
+            "{exposures:?}"
+        );
+        assert!(
+            !exposures.iter().any(|e| e.starts_with("montagem gravável")),
+            "{exposures:?}"
+        );
+    }
+
+    #[test]
+    fn no_sandbox_check_fails_when_the_workspace_is_not_writable() {
+        let tmp = TempDir::new().unwrap();
+        let sb = NoSandbox {
+            root: tmp.path().join("root"),
+            ..NoSandbox::new(vec![], vec![])
+        };
+        let err = sb.check(&tmp.path().join("does-not-exist")).unwrap_err();
+        assert!(err.to_string().contains("workspace não existe"), "{err:#}");
+    }
+
+    #[test]
+    fn no_sandbox_wrap_keeps_argv_and_cleans_the_environment() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+
+        let sb = NoSandbox::new(vec!["ALLOWED_API_KEY".into()], vec![]);
+        let argv = vec![OsString::from("/bin/true"), OsString::from("--flag")];
+        let cmd = sb.wrap(&argv, &ws).unwrap();
+        assert_eq!(cmd.argv, argv);
+        assert_eq!(cmd.cwd, ws);
+        let allowed: BTreeSet<&str> = ["PATH", "HOME", "LANG", "TERM", "ALLOWED_API_KEY"]
+            .into_iter()
+            .collect();
+        for (key, _) in &cmd.env {
+            let name = key.to_string_lossy();
+            assert!(allowed.contains(name.as_ref()), "vazou {name}");
+        }
+    }
+
+    #[test]
+    fn unsandboxed_agy_env_rules() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let bus = root.join("run/user/1000");
+        fs::create_dir_all(&bus).unwrap();
+        fs::write(bus.join("bus"), "").unwrap();
+
+        let both = |k: &str| match k {
+            "DBUS_SESSION_BUS_ADDRESS" => Some("unix:path=/run/user/1000/bus".to_string()),
+            "XDG_RUNTIME_DIR" => Some("/run/user/1000".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            unsandboxed_agy_env(&both, 1000, root),
+            vec![
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                    "unix:path=/run/user/1000/bus".to_string()
+                ),
+                ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+            ]
+        );
+
+        let none = |_: &str| None;
+        assert_eq!(
+            unsandboxed_agy_env(&none, 1000, root),
+            vec![
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                    "unix:path=/run/user/1000/bus".to_string()
+                ),
+                ("XDG_RUNTIME_DIR".to_string(), "/run/user/1000".to_string()),
+            ]
+        );
+
+        let other = TempDir::new().unwrap();
+        assert!(unsandboxed_agy_env(&none, 1000, other.path()).is_empty());
+    }
+
+    #[test]
+    fn inherited_keeps_host_exposure_order() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        let root = tmp.path().join("root");
+        fs::create_dir_all(root.join("var/run")).unwrap();
+        fs::create_dir_all(root.join("run/incus")).unwrap();
+        fs::write(root.join("var/run/docker.sock"), "").unwrap();
+        fs::write(root.join("run/incus/unix.socket"), "").unwrap();
+
+        let sb = InheritedSandbox {
+            root,
+            test_container_marker: true,
+            ..InheritedSandbox::new(vec![])
+        };
+        let exposures = sb.check(&ws).unwrap();
+        assert_eq!(
+            exposures,
+            vec![
+                "socket gravável acessível: /var/run/docker.sock".to_string(),
+                "socket gravável acessível: /run/incus/unix.socket".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_for_provider_under_no_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let scratch = tmp.path().join("scratch");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+
+        let sb = NoSandbox::new(
+            vec![],
+            vec![(
+                "DBUS_SESSION_BUS_ADDRESS".to_string(),
+                "unix:path=/run/user/1000/bus".to_string(),
+            )],
+        );
+
+        let agy = wrap_for_provider(
+            &sb,
+            Provider::Agy,
+            &[OsString::from("agy")],
+            &ws,
+            &scratch,
+            None,
+        )
+        .unwrap();
+        let has_dbus = |cmd: &SandboxedCommand| {
+            cmd.env.iter().any(|(k, v)| {
+                k == "DBUS_SESSION_BUS_ADDRESS" && v == "unix:path=/run/user/1000/bus"
+            })
+        };
+        assert!(has_dbus(&agy), "{:?}", agy.env);
+
+        let pi = wrap_for_provider(
+            &sb,
+            Provider::Pi,
+            &[OsString::from("pi")],
+            &ws,
+            &scratch,
+            None,
+        )
+        .unwrap();
+        assert!(!has_dbus(&pi), "{:?}", pi.env);
+        assert!(!scratch.join("pi-agent").exists());
+    }
+
+    #[test]
+    fn inherited_agy_gets_no_dbus() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        let scratch = tmp.path().join("scratch");
+        fs::create_dir_all(&ws).unwrap();
+        fs::create_dir_all(&scratch).unwrap();
+
+        let sb = InheritedSandbox::new(vec![]);
+        let agy = wrap_for_provider(
+            &sb,
+            Provider::Agy,
+            &[OsString::from("agy")],
+            &ws,
+            &scratch,
+            None,
+        )
+        .unwrap();
+        for (key, _) in &agy.env {
+            let name = key.to_string_lossy();
+            assert_ne!(name, "DBUS_SESSION_BUS_ADDRESS");
+            assert_ne!(name, "XDG_RUNTIME_DIR");
         }
     }
 }

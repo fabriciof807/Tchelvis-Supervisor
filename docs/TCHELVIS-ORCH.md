@@ -181,6 +181,15 @@ tchelvis loop result <RUN_ID>
 - **`bwrap` shares the network.** `bwrap` is the default sandbox. It makes `/`
   read-only and leaves only the run workspace writable. But network access,
   `localhost` services and abstract sockets stay reachable.
+- **`kind = "none"` runs with no sandbox at all.** Two gates are needed:
+  `kind = "none"` plus `allow_unsandboxed = true` in
+  `~/.config/tchelvis/loops.toml` (and the usual `auto_approve_in_sandbox`).
+  The agent then runs as your user with `HOME`, network, the main repository,
+  the `tchelvis` state (`~/.config`, `~/.local/share`, `~/.local/state`) and
+  Herdr terminals in reach; `sudo`, `hc` and container sockets are anybody's.
+  Line 1 of `loop result`/`loop status` and the report say `SEM SANDBOX`, and
+  the ticket coordinator asks before merging such a run. Logins are the normal
+  ones from `HOME` (`agy` gets the session bus, so no separate loop login).
 - **Models from the repository need confirmation.** Use
   `tchelvis loop models confirm <workflow>` when running with `--detach`.
 

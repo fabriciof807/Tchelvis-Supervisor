@@ -172,13 +172,14 @@ stays immutable and an invalid table turns automatic replies off.
 Design: [guardrails config spec](docs/superpowers/specs/2026-11-22-supervisor-guardrails-config-design.md).
 
 ### M11 — Declarative multi-agent loops (Phase A validated; Phase B pi adapter; Phase C planned)
-`tchelvis loop`: a fixed engine runs headless worker/reviewer/critic stages from TOML workflows inside a mandatory sandbox (`bwrap` default, `inherited` inside containers, `incus` planned), exchanging files through symlink-safe `.tchelvis-loop/{in,out}` directories. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls, errors, or is cancelled. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
+`tchelvis loop`: a fixed engine runs headless worker/reviewer/critic stages from TOML workflows inside a mandatory sandbox (`bwrap` default, `inherited` inside containers, `none` unsandboxed behind `allow_unsandboxed = true`, `incus` planned), exchanging files through symlink-safe `.tchelvis-loop/{in,out}` directories. The caller ends its turn and the daemon wakes it once, when the loop finishes, stalls, errors, or is cancelled. Design: [loop engine spec](docs/superpowers/specs/2026-11-23-loop-engine-design.md).
 - **Operational guarantees & security notes:**
   - The loop never merges or pushes (commits only to a local `loop/<workflow>-<run-id>` branch, leaving checkout and `.gitignore` untouched).
   - `auto_approve_in_sandbox` must be turned on by the user in `~/.config/tchelvis/loops.toml`.
   - `bwrap` shares the network and localhost (plus abstract sockets), while keeping `/` read-only and binding only the cloned run workspace writable.
   - Every model is really called once before a loop starts and that spends tokens (`Reply with exactly: OK` preflight probe per distinct `provider:model` pair).
   - An exported `OPENCODE_API_KEY` is visible to every program started from that shell (`tchelvis` only passes it into `opencode` stages/probes via environment and redacts it, never writing it to disk).
+- **Unsandboxed kind (`none`) implemented (ai-box validation pending):** `kind = "none"` plus `allow_unsandboxed = true` runs the stages as the user, with `HOME`, network and the `tchelvis` state in reach; `loop result`/`status` line 1 and `report.md` say `SEM SANDBOX`, and the ticket coordinator asks before merging such a run.
 - **Phase B — `pi` as a stage provider (implemented; host validation pending):** only the managed install (`~/.pi/agent`) is accepted; stages run `pi -p --mode json` with the prompt on `stdin` and report turns, tokens, cache, and cost from the event stream. Credentials are narrowed to `auth.json`, `models-store.json`, and `models.json` (bwrap mounts or symlinks in a scratch `PI_CODING_AGENT_DIR`), each provider is a separate account identity, and `check` warns that a pi stage sees every credential in the agent's `auth.json`.
 
 ### M6 — Delegator mode & multi-agent orchestration (implemented)

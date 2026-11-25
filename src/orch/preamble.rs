@@ -154,6 +154,7 @@ Operational limits and guarantees to know before launching or advising a user:
   ```
   Write `run_id` right after. Repeat for every eligible ticket, then end your turn. If the launch fails, set that ticket back to `ready`. Refused by the concurrency limit while one of your loops is active: wait for its wake-up. Refused with none of yours active, or for any other reason: stop and report it.
 - **On wake-up (one per loop):** Run `tchelvis orch check --run loop_<RUN_ID>` and `tchelvis loop result <RUN_ID>`. On `PASS`, list the changed names in the worktree with `git diff --name-only --no-renames HEAD...<branch>` (`<branch>` is the `BRANCH:` line; the `ARQUIVOS:` line is shortened when long).
+  - Line 1 ends with `| SEM SANDBOX`: the loop ran without a sandbox, so its agent could have rewritten this result. Do not merge yet: show the ticket, `RUN_ID` and `BRANCH`, and ask the user. On yes, apply the rules below; on no, set `status: failed`.
   - Every name inside the ticket's `files`: run `git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff <branch>` in the worktree, set `status: merged`, launch the tickets it unblocked, and end your turn.
   - `BRANCH: (nenhuma)`: the ticket needed no change; nothing to merge, set `status: merged`.
   - A name outside `files`, or any `.gitattributes` or `.gitmodules` (they can run programs during a merge): do not merge; stop and ask the user.
@@ -316,6 +317,9 @@ mod tests {
             "planner-worker-tester-critic",
             "designer-worker-reviewer",
             "tchelvis orch launch",
+            "| SEM SANDBOX",
+            "could have rewritten this result",
+            "ask the user. On yes, apply the rules below",
         ] {
             assert!(
                 section.contains(needle),
@@ -325,5 +329,24 @@ mod tests {
         let lower = section.to_ascii_lowercase();
         assert!(!lower.contains("sleep"), "section must not contain 'sleep'");
         assert!(!lower.contains("--yes"), "section must not contain '--yes'");
+    }
+
+    #[test]
+    fn unsandboxed_rule_comes_before_merge_rule() {
+        let skill = orchestration_skill_markdown();
+        let idx = skill
+            .find("## Running Tickets with Loops")
+            .expect("missing '## Running Tickets with Loops' section");
+        let section = &skill[idx..];
+        let rule = section
+            .find("| SEM SANDBOX")
+            .expect("missing the unsandboxed wake-up rule");
+        let merge = section
+            .find("merge --no-ff <branch>")
+            .expect("missing the merge rule");
+        assert!(
+            rule < merge,
+            "the '| SEM SANDBOX' rule must come before the merge rule"
+        );
     }
 }

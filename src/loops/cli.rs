@@ -1,8 +1,8 @@
 use crate::config::CockpitPaths;
 use crate::herdr::HerdrClient;
 use crate::loops::config::{
-    check_home_ro_does_not_reach, parse_loops_config, LoopsConfig, PreflightConfig, PreflightMode,
-    SandboxConfig, DEFAULT_MAX_CONCURRENT,
+    allow_unsandboxed_warning, check_home_ro_does_not_reach, parse_loops_config, LoopsConfig,
+    PreflightConfig, PreflightMode, SandboxConfig, DEFAULT_MAX_CONCURRENT,
 };
 use crate::loops::engine::{Engine, EngineConfig, EvidenceRecorder, ProcessStageRunner};
 use crate::loops::evidence::{
@@ -12,6 +12,7 @@ use crate::loops::evidence::{
 use crate::loops::free_check::{
     is_model_listed, plan_preflight, run_free_checks_with_options, ClaudeStatus, FreeCheck, Listed,
     PiAccount, PlanAction, PlannedCheck, ProviderFreeOutcome, AGY_ABSENT_REASON,
+    AGY_ABSENT_REASON_UNSANDBOXED,
 };
 use crate::loops::models::{
     check_project_models_references, is_confirmed, load_project_models_from_repo, parse_use_flag,
@@ -24,11 +25,12 @@ use crate::loops::preflight::{
 use crate::loops::process::SystemClock;
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{
-    pi_managed_install, resolve_agy_credential, AgyCredentialSource, BwrapSandbox,
-    InheritedSandbox, PiInstall, Sandbox, AGY_TOKEN_FILE,
+    pi_managed_install, resolve_agy_credential, unsandboxed_agy_env, AgyCredentialSource,
+    BwrapSandbox, InheritedSandbox, NoSandbox, PiInstall, Sandbox, AGY_TOKEN_FILE,
 };
 use crate::loops::state::{
-    format_result, load_state, redact_loop_text, sanitize_single_line, CallerInfo, RunState, Usage,
+    format_result, load_state, redact_loop_text, result_line_one, sanitize_single_line, CallerInfo,
+    RunState, Usage,
 };
 use crate::loops::watch::{
     current_process_identity, LinuxProcTable, ProcTable, ENGINE_START_GRACE_MS,
@@ -780,9 +782,25 @@ fn load_roles_for_workflow(
 }
 
 fn build_sandbox(cfg: &LoopsConfig, paths: &CockpitPaths) -> Box<dyn Sandbox + Sync> {
-    match &cfg.sandbox {
-        SandboxConfig::Inherited => Box::new(InheritedSandbox::new(cfg.env_pass.clone())),
-        SandboxConfig::Bwrap { home_ro } => Box::new(bwrap_sandbox(home_ro, &cfg.env_pass, paths)),
+    sandbox_from_config(&cfg.sandbox, &cfg.env_pass, paths)
+}
+
+fn sandbox_from_config(
+    sandbox: &SandboxConfig,
+    env_pass: &[String],
+    paths: &CockpitPaths,
+) -> Box<dyn Sandbox + Sync> {
+    match sandbox {
+        SandboxConfig::Inherited => Box::new(InheritedSandbox::new(env_pass.to_vec())),
+        SandboxConfig::Bwrap { home_ro } => Box::new(bwrap_sandbox(home_ro, env_pass, paths)),
+        SandboxConfig::Unsandboxed => Box::new(NoSandbox::new(
+            env_pass.to_vec(),
+            unsandboxed_agy_env(
+                &|k| std::env::var(k).ok(),
+                unsafe { libc::geteuid() },
+                Path::new("/"),
+            ),
+        )),
     }
 }
 
@@ -958,15 +976,56 @@ pub fn pi_auth_line(
 pub fn pi_check_notes(
     workflow: &Workflow,
     install: &Result<PiInstall, String>,
+    sandbox_kind: &str,
 ) -> Result<Vec<String>, String> {
     if !workflow.stages.iter().any(|s| s.provider == Provider::Pi) {
         return Ok(Vec::new());
     }
-    if let Err(reason) = install {
-        return Err(reason.clone());
+    // Only `bwrap` mounts the managed install; `inherited` and `none` run the user's real pi.
+    if sandbox_kind == "bwrap" {
+        if let Err(reason) = install {
+            return Err(reason.clone());
+        }
     }
     Ok(vec![
         "aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string(),
+    ])
+}
+
+fn auth_header(kind: &str) -> Option<&'static str> {
+    if kind == "none" {
+        Some("modo sem sandbox: os CLIs usam os logins normais do HOME")
+    } else {
+        None
+    }
+}
+
+const AGY_BWRAP_MISSING: &str = "bubblewrap ('bwrap') não encontrado no PATH; instale o pacote 'bubblewrap' (ex.: 'sudo apt install bubblewrap' ou 'sudo pacman -S bubblewrap') para separar o login do 'agy'";
+
+/// `agy` login argv. Without a sandbox there is no separate login: the CLI uses the HOME login.
+fn agy_login_argv(
+    cfg_sandbox: &SandboxConfig,
+    bwrap: Option<&Path>,
+    login_dir: &Path,
+    target_dir: &Path,
+) -> Result<Vec<String>, LoopError> {
+    if matches!(cfg_sandbox, SandboxConfig::Unsandboxed) {
+        return Ok(vec!["agy".to_string()]);
+    }
+    let bwrap = bwrap.ok_or_else(|| LoopError::err(AGY_BWRAP_MISSING))?;
+    Ok(vec![
+        bwrap.to_string_lossy().into_owned(),
+        "--dev-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--bind".into(),
+        login_dir.to_string_lossy().into_owned(),
+        target_dir.to_string_lossy().into_owned(),
+        "--die-with-parent".into(),
+        "--".into(),
+        "/usr/bin/env".into(),
+        "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1".into(),
+        "agy".into(),
     ])
 }
 
@@ -1146,6 +1205,7 @@ fn build_free_checks_for_targets(
     home_dir: &Path,
     agy_state_dir: Option<&Path>,
     opencode_api_key: Option<&str>,
+    sandbox_kind: &str,
 ) -> Vec<FreeCheck> {
     targets
         .iter()
@@ -1185,7 +1245,17 @@ fn build_free_checks_for_targets(
             Provider::Agy => {
                 let outcome = free_outcomes.get(&Provider::Agy);
                 let token_present = resolve_agy_credential(home_dir, agy_state_dir).is_some();
-                let account_ok = if !token_present {
+                let listed_by_cli = outcome.is_some_and(|out| out.list_known);
+                let account_ok = if sandbox_kind == "none" {
+                    // No loop login here: any login the user has is the one `agy` finds itself.
+                    if !token_present && !listed_by_cli {
+                        Err(AGY_ABSENT_REASON_UNSANDBOXED.to_string())
+                    } else if let Some(out) = outcome {
+                        out.account_ok.clone()
+                    } else {
+                        Ok(())
+                    }
+                } else if !token_present {
                     Err(AGY_ABSENT_REASON.to_string())
                 } else if let Some(out) = outcome {
                     out.account_ok.clone()
@@ -1642,6 +1712,7 @@ fn default_loops_toml_template() -> &'static str {
      \n\
      [sandbox]\n\
      kind = \"bwrap\"\n\
+     # kind = \"none\" roda sem sandbox; exige também allow_unsandboxed = true\n\
      \n\
      [sandbox.bwrap]\n\
      home_ro = [\".cargo\", \".rustup\"]\n\
@@ -2052,25 +2123,30 @@ fn cmd_models(
     }
 }
 
+fn auth_loops_config(paths: &CockpitPaths) -> Result<LoopsConfig, LoopError> {
+    match load_loops_config_optional(paths) {
+        Ok(Some(c)) => Ok(c),
+        Ok(None) => Ok(LoopsConfig {
+            max_concurrent: DEFAULT_MAX_CONCURRENT,
+            auto_approve_in_sandbox: false,
+            allow_unsandboxed: false,
+            env_pass: Vec::new(),
+            sandbox: SandboxConfig::Bwrap {
+                home_ro: Vec::new(),
+            },
+            defaults: RoleDefaults::default(),
+            preflight: PreflightConfig::default(),
+        }),
+        Err(e) => Err(LoopError::usage(format!("{e:#}"))),
+    }
+}
+
 async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Result<(), LoopError> {
     match action {
         None => {
             let opencode_key = resolve_opencode_api_key();
             let extra = collect_extra_secrets(opencode_key.as_deref());
-            let cfg = match load_loops_config_optional(paths) {
-                Ok(Some(c)) => c,
-                Ok(None) => LoopsConfig {
-                    max_concurrent: DEFAULT_MAX_CONCURRENT,
-                    auto_approve_in_sandbox: false,
-                    env_pass: Vec::new(),
-                    sandbox: SandboxConfig::Bwrap {
-                        home_ro: Vec::new(),
-                    },
-                    defaults: RoleDefaults::default(),
-                    preflight: PreflightConfig::default(),
-                },
-                Err(e) => return Err(LoopError::usage(format!("{e:#}"))),
-            };
+            let cfg = auth_loops_config(paths)?;
             ensure_sandbox_prereqs(&cfg)?;
             let sandbox = build_sandbox(&cfg, paths);
             let auth_dir = TempDirGuard::create(paths.state_dir.join("loops").join(format!(
@@ -2132,20 +2208,35 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 }
             };
 
-            let agy_line = match outcomes.get(&Provider::Agy) {
-                Some(out) if !agy_cred || out.account_ok.is_err() => {
-                    format!("agy:      ausente ({AGY_ABSENT_REASON})")
+            let agy_line = if sandbox.kind() == "none" {
+                if let Some(out) = outcomes.get(&Provider::Agy).filter(|o| o.list_known) {
+                    format!(
+                        "agy:      autenticado ({} modelo(s) listado(s) por 'agy models')",
+                        out.models.len() / 2
+                    )
+                } else if agy_cred {
+                    "agy:      autenticado (login normal do HOME)".to_string()
+                } else {
+                    format!("agy:      ausente ({AGY_ABSENT_REASON_UNSANDBOXED})")
                 }
-                Some(out) if out.list_known => {
-                    let count = out.models.len() / 2;
-                    format!("agy:      autenticado ({count} modelo(s) listado(s) por 'agy models')")
-                }
-                _ => {
-                    if agy_cred {
-                        "agy:      autenticado (token presente; lista indisponível em 'agy models')"
-                            .to_string()
-                    } else {
+            } else {
+                match outcomes.get(&Provider::Agy) {
+                    Some(out) if !agy_cred || out.account_ok.is_err() => {
                         format!("agy:      ausente ({AGY_ABSENT_REASON})")
+                    }
+                    Some(out) if out.list_known => {
+                        let count = out.models.len() / 2;
+                        format!(
+                            "agy:      autenticado ({count} modelo(s) listado(s) por 'agy models')"
+                        )
+                    }
+                    _ => {
+                        if agy_cred {
+                            "agy:      autenticado (token presente; lista indisponível em 'agy models')"
+                            .to_string()
+                        } else {
+                            format!("agy:      ausente ({AGY_ABSENT_REASON})")
+                        }
                     }
                 }
             };
@@ -2169,13 +2260,29 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
             let pi_line = pi_auth_line(outcomes.get(&Provider::Pi), &pi_install);
 
+            if let Some(header) = auth_header(sandbox.kind()) {
+                println!("{header}");
+            }
             println!("{claude_line}");
             println!("{agy_line}");
             println!("{opencode_line}");
             println!("{pi_line}");
+            if sandbox.kind() == "none" {
+                let login_dir = paths
+                    .state_dir
+                    .join(crate::loops::sandbox::AGY_LOGIN_DIR_REL);
+                if fs::symlink_metadata(&login_dir).is_ok() {
+                    println!(
+                        "agy:      login próprio do loop em {} não é usado sem sandbox",
+                        login_dir.display()
+                    );
+                }
+            }
             Ok(())
         }
         Some(AuthSubcommand::Login { cli, provider }) => {
+            // Only `agy` depends on the sandbox kind; a broken `loops.toml` must not block the others.
+            let mut agy_loop_login = false;
             let herdr = HerdrClient::default();
             let caller_id = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
             if caller_id.trim().is_empty() {
@@ -2187,30 +2294,24 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                 // Redirect ~/.gemini/antigravity-cli to <state>/loops/agy-login with file-only
                 // token storage while keeping D-Bus/XDG_RUNTIME_DIR intact so the browser opens.
                 "agy" => {
+                    let cfg = auth_loops_config(paths)?;
+                    agy_loop_login = !matches!(cfg.sandbox, SandboxConfig::Unsandboxed);
                     // The absolute path: a Herdr terminal has its own `PATH`.
-                    let bwrap = find_in_path("bwrap").ok_or_else(|| {
-                        LoopError::err(
-                            "bubblewrap ('bwrap') não encontrado no PATH; instale o pacote 'bubblewrap' (ex.: 'sudo apt install bubblewrap' ou 'sudo pacman -S bubblewrap') para separar o login do 'agy'",
-                        )
-                    })?;
-                    let login_dir = ensure_private_agy_login_dir(&paths.state_dir)
-                        .map_err(|e| LoopError::err(format!("{e:#}")))?;
-                    let target_dir = ensure_agy_target_dir(&paths.home_dir)
-                        .map_err(|e| LoopError::err(format!("{e:#}")))?;
-                    vec![
-                        bwrap.to_string_lossy().into_owned(),
-                        "--dev-bind".into(),
-                        "/".into(),
-                        "/".into(),
-                        "--bind".into(),
-                        login_dir.to_string_lossy().into_owned(),
-                        target_dir.to_string_lossy().into_owned(),
-                        "--die-with-parent".into(),
-                        "--".into(),
-                        "/usr/bin/env".into(),
-                        "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1".into(),
-                        "agy".into(),
-                    ]
+                    let bwrap = find_in_path("bwrap");
+                    if matches!(cfg.sandbox, SandboxConfig::Unsandboxed) {
+                        agy_login_argv(
+                            &cfg.sandbox,
+                            bwrap.as_deref(),
+                            Path::new(""),
+                            Path::new(""),
+                        )?
+                    } else {
+                        let login_dir = ensure_private_agy_login_dir(&paths.state_dir)
+                            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                        let target_dir = ensure_agy_target_dir(&paths.home_dir)
+                            .map_err(|e| LoopError::err(format!("{e:#}")))?;
+                        agy_login_argv(&cfg.sandbox, bwrap.as_deref(), &login_dir, &target_dir)?
+                    }
                 }
                 _ => login_argv(&cli, provider.as_deref())?,
             };
@@ -2222,7 +2323,7 @@ async fn cmd_auth(paths: &CockpitPaths, action: Option<AuthSubcommand>) -> Resul
                     LoopError::err(format!("falha ao abrir terminal de login via Herdr: {e:#}"))
                 })?;
             println!("Terminal de login aberto para '{cli}': {}", term.address);
-            if cli == "agy" {
+            if agy_loop_login {
                 println!(
                     "Esse login é só do loop (salvo em arquivo, sem chaveiro); se o navegador não abrir, copie a URL exibida no terminal."
                 );
@@ -2394,6 +2495,13 @@ fn install_cancel_signal_flag() -> Arc<AtomicBool> {
     cancel
 }
 
+fn check_header(workflow: &str, kind: &str) -> String {
+    if kind == "none" {
+        return format!("Workflow '{workflow}' válido (sandbox: none — SEM SANDBOX).");
+    }
+    format!("Workflow '{workflow}' válido (sandbox: {kind}).")
+}
+
 fn cmd_check(
     paths: &CockpitPaths,
     workflow_name: &str,
@@ -2403,6 +2511,9 @@ fn cmd_check(
     let repo = try_find_git_repo_root();
 
     let cfg = load_loops_config_required(paths).map_err(|e| LoopError::usage(format!("{e:#}")))?;
+    if let Some(warn) = allow_unsandboxed_warning(&cfg) {
+        eprintln!("{warn}");
+    }
     let use_overrides = parse_use_overrides(use_overrides_raw)?;
 
     let (unresolved, origin) =
@@ -2426,7 +2537,9 @@ fn cmd_check(
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra = collect_extra_secrets(opencode_key.as_deref());
     let pi_install = pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
-    for note in pi_check_notes(&resolution.workflow, &pi_install).map_err(LoopError::err)? {
+    for note in pi_check_notes(&resolution.workflow, &pi_install, cfg.sandbox.kind_str())
+        .map_err(LoopError::err)?
+    {
         eprint_redacted(&note, &extra);
     }
 
@@ -2511,6 +2624,7 @@ fn cmd_check(
         &paths.home_dir,
         sandbox.agy_state_dir(),
         opencode_key.as_deref(),
+        sandbox.kind(),
     );
     let mut account_errs = Vec::new();
     for chk in &checks {
@@ -2535,10 +2649,7 @@ fn cmd_check(
         unix_now_ms(),
     );
 
-    println!(
-        "Workflow '{workflow_name}' válido (sandbox: {}).",
-        sandbox.kind()
-    );
+    println!("{}", check_header(workflow_name, sandbox.kind()));
     if exposures.is_empty() {
         println!("Exposições do sandbox: nenhuma adicional detectada.");
     } else {
@@ -2855,7 +2966,9 @@ async fn cmd_run(
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
     let pi_install = pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
-    for note in pi_check_notes(&resolution.workflow, &pi_install).map_err(LoopError::err)? {
+    for note in
+        pi_check_notes(&resolution.workflow, &pi_install, sandbox.kind()).map_err(LoopError::err)?
+    {
         eprint_redacted(&note, &extra_secrets);
     }
 
@@ -2912,6 +3025,7 @@ async fn cmd_run(
         &paths.home_dir,
         sandbox.agy_state_dir(),
         opencode_key.as_deref(),
+        sandbox.kind(),
     );
     let planned = plan_preflight(
         &targets,
@@ -3233,12 +3347,8 @@ async fn run_frozen_engine_with_cancel(
     let ev_path = evidence_store_path(paths);
     let sandbox_paths = paths.clone();
     let final_state = tokio::task::spawn_blocking(move || -> RunState {
-        let sandbox: Box<dyn Sandbox + Sync> = match &frozen.sandbox {
-            SandboxConfig::Inherited => Box::new(InheritedSandbox::new(frozen.env_pass.clone())),
-            SandboxConfig::Bwrap { home_ro } => {
-                Box::new(bwrap_sandbox(home_ro, &frozen.env_pass, &sandbox_paths))
-            }
-        };
+        let sandbox: Box<dyn Sandbox + Sync> =
+            sandbox_from_config(&frozen.sandbox, &frozen.env_pass, &sandbox_paths);
         let clock = SystemClock::new();
         let runner = ProcessStageRunner::new(sandbox.as_ref(), &clock)
             .with_opencode_api_key(opencode_key)
@@ -3337,8 +3447,14 @@ fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<
                 println!("{out}");
             } else {
                 println!(
-                    "STATUS: {} | LOOP: {} | CICLOS: {}/{}",
-                    state.status, state.workflow, state.current_cycle, state.max_cycles
+                    "{}",
+                    result_line_one(
+                        &state.status,
+                        &state.workflow,
+                        state.current_cycle,
+                        state.max_cycles,
+                        &state.sandbox
+                    )
                 );
                 println!("RUN_ID: {}", state.run_id);
                 if let Some(branch) = &state.branch {
@@ -4084,7 +4200,8 @@ mod tests {
                 pi_accounts: accounts,
             },
         );
-        let checks = build_free_checks_for_targets(&[not_ready], &outcomes, &home, None, None);
+        let checks =
+            build_free_checks_for_targets(&[not_ready], &outcomes, &home, None, None, "bwrap");
         let reason = checks[0].account_ok.clone().unwrap_err();
         assert!(
             reason.contains("rode 'tchelvis loop auth login pi anthropic'"),
@@ -4106,13 +4223,20 @@ mod tests {
                 pi_accounts: accounts,
             },
         );
-        let checks = build_free_checks_for_targets(&[ready_target], &outcomes, &home, None, None);
+        let checks =
+            build_free_checks_for_targets(&[ready_target], &outcomes, &home, None, None, "bwrap");
         assert!(checks[0].account_ok.is_ok());
         assert_eq!(checks[0].listed, Listed::Yes);
 
         let unknown_target = target("opencode-go/glm-5.3");
-        let checks =
-            build_free_checks_for_targets(&[unknown_target], &BTreeMap::new(), &home, None, None);
+        let checks = build_free_checks_for_targets(
+            &[unknown_target],
+            &BTreeMap::new(),
+            &home,
+            None,
+            None,
+            "bwrap",
+        );
         assert!(checks[0].account_ok.is_ok());
         assert_eq!(checks[0].listed, Listed::Unknown);
     }
@@ -4263,16 +4387,16 @@ mod tests {
         });
 
         assert_eq!(
-            pi_check_notes(&wf(Provider::Pi), &install).unwrap(),
+            pi_check_notes(&wf(Provider::Pi), &install, "bwrap").unwrap(),
             vec!["aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string()]
         );
-        assert!(pi_check_notes(&wf(Provider::Claude), &install)
+        assert!(pi_check_notes(&wf(Provider::Claude), &install, "bwrap")
             .unwrap()
             .is_empty());
 
         let bad = Err(crate::loops::sandbox::PI_UNRECOGNIZED.to_string());
         assert_eq!(
-            pi_check_notes(&wf(Provider::Pi), &bad).unwrap_err(),
+            pi_check_notes(&wf(Provider::Pi), &bad, "bwrap").unwrap_err(),
             crate::loops::sandbox::PI_UNRECOGNIZED
         );
     }
@@ -4295,12 +4419,18 @@ mod tests {
             },
             stage_ids: vec!["s1".to_string()],
         }];
-        let with_state =
-            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, Some(&state), None);
+        let with_state = build_free_checks_for_targets(
+            &targets,
+            &BTreeMap::new(),
+            &home,
+            Some(&state),
+            None,
+            "bwrap",
+        );
         assert!(with_state[0].account_ok.is_ok());
 
         let without_state =
-            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None);
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None, "bwrap");
         assert_eq!(
             without_state[0]
                 .account_ok
@@ -4309,5 +4439,199 @@ mod tests {
                 .map(String::as_str),
             Some(AGY_ABSENT_REASON)
         );
+    }
+
+    #[test]
+    fn sandbox_from_config_kinds() {
+        let tmp = TempDir::new().unwrap();
+        let paths = CockpitPaths {
+            home_dir: tmp.path().to_path_buf(),
+            config_dir: tmp.path().join("config"),
+            data_dir: tmp.path().join("data"),
+            state_dir: tmp.path().join("state"),
+            runtime_dir: tmp.path().join("state/run"),
+        };
+        let none = sandbox_from_config(&SandboxConfig::Unsandboxed, &[], &paths);
+        assert_eq!(none.kind(), "none");
+        assert!(none.agy_state_dir().is_none());
+
+        let inherited = sandbox_from_config(&SandboxConfig::Inherited, &[], &paths);
+        assert_eq!(inherited.kind(), "inherited");
+
+        let bwrap = sandbox_from_config(
+            &SandboxConfig::Bwrap {
+                home_ro: Vec::new(),
+            },
+            &[],
+            &paths,
+        );
+        assert_eq!(bwrap.kind(), "bwrap");
+    }
+
+    #[test]
+    fn pi_check_notes_requires_the_managed_install_only_under_bwrap() {
+        let stage = crate::loops::workflow::Stage {
+            id: "s1".to_string(),
+            role: "worker".to_string(),
+            provider: Provider::Pi,
+            model: Some("opencode-go/glm-5.3".to_string()),
+            reads: Vec::new(),
+            writes: Some("out.md".to_string()),
+            edits: false,
+            next: None,
+            verdict_gate: false,
+            on_pass: None,
+            on_retry: None,
+        };
+        let wf = crate::loops::workflow::Workflow {
+            name: "wf".to_string(),
+            description: String::new(),
+            max_cycles: 1,
+            stage_timeout_secs: 60,
+            stall_secs: 60,
+            max_duration_secs: 600,
+            stages: vec![stage],
+        };
+        let install = Ok(PiInstall {
+            agent_dir: PathBuf::from("/home/u/.pi/agent"),
+            version: "1.2.3".to_string(),
+        });
+        let unrecognized = Err(crate::loops::sandbox::PI_UNRECOGNIZED.to_string());
+        let warning =
+            "aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string();
+
+        assert_eq!(
+            pi_check_notes(&wf, &unrecognized, "bwrap").unwrap_err(),
+            crate::loops::sandbox::PI_UNRECOGNIZED
+        );
+        for kind in ["none", "inherited"] {
+            assert_eq!(
+                pi_check_notes(&wf, &unrecognized, kind).unwrap(),
+                vec![warning.clone()],
+                "{kind}"
+            );
+        }
+        assert_eq!(
+            pi_check_notes(&wf, &install, "bwrap").unwrap(),
+            vec![warning]
+        );
+    }
+
+    #[test]
+    fn check_header_texts() {
+        assert_eq!(
+            check_header("wf", "bwrap"),
+            "Workflow 'wf' válido (sandbox: bwrap)."
+        );
+        assert_eq!(
+            check_header("wf", "inherited"),
+            "Workflow 'wf' válido (sandbox: inherited)."
+        );
+        assert_eq!(
+            check_header("wf", "none"),
+            "Workflow 'wf' válido (sandbox: none — SEM SANDBOX)."
+        );
+    }
+
+    #[test]
+    fn agy_account_unsandboxed_uses_list_or_file() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let targets = vec![ProbeTarget {
+            choice: ModelChoice {
+                provider: Provider::Agy,
+                model: None,
+            },
+            stage_ids: vec!["s1".to_string()],
+        }];
+        let listed = ProviderFreeOutcome {
+            provider: Provider::Agy,
+            account_ok: Ok(()),
+            models: vec!["m1".to_string()],
+            list_known: true,
+            claude_status: None,
+            pi_accounts: BTreeMap::new(),
+        };
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(Provider::Agy, listed);
+
+        let checks = build_free_checks_for_targets(&targets, &outcomes, &home, None, None, "none");
+        assert!(checks[0].account_ok.is_ok(), "{:?}", checks[0].account_ok);
+
+        let checks =
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None, "none");
+        assert_eq!(
+            checks[0].account_ok.as_ref().err(),
+            Some(&AGY_ABSENT_REASON_UNSANDBOXED.to_string())
+        );
+
+        let checks =
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None, "bwrap");
+        assert_eq!(
+            checks[0].account_ok.as_ref().err(),
+            Some(&AGY_ABSENT_REASON.to_string())
+        );
+
+        let token = home.join(crate::loops::sandbox::AGY_TOKEN_REL);
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(&token, "tok").unwrap();
+        let checks =
+            build_free_checks_for_targets(&targets, &BTreeMap::new(), &home, None, None, "none");
+        assert!(checks[0].account_ok.is_ok());
+    }
+
+    #[test]
+    fn auth_header_only_for_none() {
+        assert_eq!(
+            auth_header("none"),
+            Some("modo sem sandbox: os CLIs usam os logins normais do HOME")
+        );
+        assert_eq!(auth_header("bwrap"), None);
+        assert_eq!(auth_header("inherited"), None);
+    }
+
+    #[test]
+    fn agy_login_argv_by_kind() {
+        let login = Path::new("/state/loops/agy-login");
+        let target = Path::new("/home/u/.gemini/antigravity-cli");
+        let bwrap = Path::new("/usr/bin/bwrap");
+        let expected = vec![
+            "/usr/bin/bwrap",
+            "--dev-bind",
+            "/",
+            "/",
+            "--bind",
+            "/state/loops/agy-login",
+            "/home/u/.gemini/antigravity-cli",
+            "--die-with-parent",
+            "--",
+            "/usr/bin/env",
+            "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1",
+            "agy",
+        ];
+
+        assert_eq!(
+            agy_login_argv(&SandboxConfig::Unsandboxed, None, login, target)
+                .map_err(|e| e.message)
+                .unwrap(),
+            vec!["agy"]
+        );
+        for sandbox in [
+            SandboxConfig::Bwrap { home_ro: vec![] },
+            SandboxConfig::Inherited,
+        ] {
+            assert_eq!(
+                agy_login_argv(&sandbox, Some(bwrap), login, target)
+                    .map_err(|e| e.message)
+                    .unwrap(),
+                expected
+            );
+            let err = match agy_login_argv(&sandbox, None, login, target) {
+                Ok(argv) => panic!("bwrap ausente deveria falhar, veio {argv:?}"),
+                Err(e) => e,
+            };
+            assert!(err.message.contains("bubblewrap"), "{}", err.message);
+        }
     }
 }

@@ -90,6 +90,7 @@ Nova seção "Executar tickets com loops". Regras:
   time planejado não tinha modelo para o `critic`); a escolha aparece no pedido de autorização.
   Modelos vêm da configuração; o revisor não deve ser mais fraco que o worker.
 - **Ao acordar** (um aviso por loop): `orch check` e `loop result`.
+  - Linha 1 terminando em `| SEM SANDBOX`: o loop rodou sem sandbox e o agente pode ter reescrito o resultado; não junta sozinho: mostra ticket, `RUN_ID` e `BRANCH` e pergunta. Com o sim, seguem as regras abaixo; sem ele, `status: failed`.
   - `PASS` e todos os nomes de `git diff --name-only --no-renames HEAD...<branch>` dentro de `files` (a linha
     `ARQUIVOS` é cortada quando longa): merge com hooks desligados
     (`git -c core.hooksPath=/dev/null -c core.fsmonitor=false merge --no-ff <branch>`), `status: merged`, dispara os

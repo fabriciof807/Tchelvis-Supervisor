@@ -593,6 +593,51 @@ exit 0
 }
 
 #[test]
+fn unsandboxed_run_marks_line_one_keeps_five_lines_and_needs_both_gates() {
+    let h = LoopHarness::new();
+    h.write_default_inherited_config(2, true);
+    h.write_accounts();
+    let path = h.config_dir.join("loops.toml");
+    let inherited = fs::read_to_string(&path).unwrap();
+    let none = format!(
+        "allow_unsandboxed = true\n{}",
+        inherited.replace("kind = \"inherited\"", "kind = \"none\"")
+    );
+    fs::write(&path, &none).unwrap();
+
+    let out = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "add feature"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert!(lines[0].starts_with("STATUS: PASS"), "{lines:?}");
+    assert!(lines[0].ends_with(" | SEM SANDBOX"), "{lines:?}");
+
+    // Without the second gate the configuration is refused before anything runs.
+    fs::write(&path, none.replace("allow_unsandboxed = true\n", "")).unwrap();
+    let refused = h
+        .cmd()
+        .args(["loop", "run", "fast-worker-reviewer", "add feature"])
+        .output()
+        .unwrap();
+    assert_ne!(refused.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("allow_unsandboxed"),
+        "stderr={}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+}
+
+#[test]
 fn init_twice_keeps_edited_files_and_does_not_touch_repo_gitignore() {
     let h = LoopHarness::new();
     let repo_gitignore_before = fs::read_to_string(h.repo.join(".gitignore")).unwrap();

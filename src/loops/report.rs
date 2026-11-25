@@ -195,7 +195,14 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
         "- **Duração total:** {}",
         format_duration_ms(total_duration_ms)
     );
-    let _ = writeln!(out, "- **Sandbox:** `{sandbox}`");
+    if sandbox == "none" {
+        let _ = writeln!(
+            out,
+            "- **Sandbox:** **SEM SANDBOX** (`none`): o agente rodou com o HOME, a rede e os poderes do seu usuário"
+        );
+    } else {
+        let _ = writeln!(out, "- **Sandbox:** `{sandbox}`");
+    }
     if state.sandbox_exposures.is_empty() {
         let _ = writeln!(out, "- **Exposições do sandbox:** nenhuma detectada");
     } else {
@@ -429,103 +436,7 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("critic.md"), "Tudo corrigido.\nVERDICT: PASS\n").unwrap();
 
-        let state = RunState {
-            schema_version: LOOP_STATE_SCHEMA_VERSION,
-            run_id: "20261123-182500-a1b2".to_string(),
-            workflow: "worker-reviewer-critic".to_string(),
-            status: RunStatus::Pass,
-            reason: None,
-            sandbox: "bwrap".to_string(),
-            sandbox_exposures: vec![
-                "rede compartilhada com o host/container".to_string(),
-                "serviços em localhost e sockets abstratos compartilhados".to_string(),
-            ],
-            preflight: vec![],
-            current_cycle: 2,
-            max_cycles: 3,
-            branch: Some("loop/worker-reviewer-critic-20261123-182500-a1b2".to_string()),
-            base_commit: Some("deadbeef".to_string()),
-            engine_pid: Some(1234),
-            engine_start_ticks: Some(5678),
-            caller: Some(CallerInfo {
-                terminal: "t1".to_string(),
-                created_ms: 1000,
-            }),
-            heartbeat_at_ms: 5000,
-            last_activity_at_ms: 5000,
-            started_at_ms: 1000,
-            finished_at_ms: Some(15000),
-            executions: vec![
-                Execution {
-                    cycle: 1,
-                    stage_id: "implement".to_string(),
-                    role: "worker".to_string(),
-                    provider: Provider::Opencode,
-                    model: Some("zai/glm-5.3-flash".to_string()),
-                    model_source: Some(crate::loops::models::ModelSource::ProjectStage),
-                    started_at_ms: 1000,
-                    finished_at_ms: Some(5000),
-                    duration_ms: 4000,
-                    usage: Usage {
-                        turns: Some(3),
-                        input_tokens: Some(18_420),
-                        output_tokens: Some(500),
-                        cache_read_tokens: None,
-                        cost_usd: Some(0.12),
-                    },
-                    verdict: None,
-                    outcome: "OK".to_string(),
-                    error: None,
-                    log_file: Some("logs/c1-01-implement.log".to_string()),
-                },
-                Execution {
-                    cycle: 1,
-                    stage_id: "audit".to_string(),
-                    role: "critic".to_string(),
-                    provider: Provider::Claude,
-                    model: None,
-                    model_source: None,
-                    started_at_ms: 5000,
-                    finished_at_ms: Some(10000),
-                    duration_ms: 5000,
-                    usage: Usage {
-                        turns: Some(2),
-                        input_tokens: None,
-                        output_tokens: Some(200),
-                        cache_read_tokens: Some(1000),
-                        cost_usd: None,
-                    },
-                    verdict: Some(Verdict::Retry),
-                    outcome: "RETRY".to_string(),
-                    error: None,
-                    log_file: Some("logs/c1-02-audit.log".to_string()),
-                },
-                Execution {
-                    cycle: 2,
-                    stage_id: "audit".to_string(),
-                    role: "critic".to_string(),
-                    provider: Provider::Claude,
-                    model: None,
-                    model_source: None,
-                    started_at_ms: 10000,
-                    finished_at_ms: Some(15000),
-                    duration_ms: 5000,
-                    usage: Usage {
-                        turns: Some(1),
-                        input_tokens: Some(500),
-                        output_tokens: Some(100),
-                        cache_read_tokens: Some(200),
-                        cost_usd: Some(0.05),
-                    },
-                    verdict: Some(Verdict::Pass),
-                    outcome: "PASS".to_string(),
-                    error: None,
-                    log_file: Some("logs/c2-03-audit.log".to_string()),
-                },
-            ],
-            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
-            summary: "Tudo corrigido com token glpat-abcdefghijklmn".to_string(),
-        };
+        let state = rich_state();
 
         let md = render_report(&state, dir);
 
@@ -692,5 +603,119 @@ mod tests {
         let md = render_report_with_secrets(&state, tmp.path(), &[secret]);
         assert!(!md.contains(secret), "secret leaked in report:\n{md}");
         assert!(md.contains("[REDACTED]"));
+    }
+
+    fn rich_state() -> RunState {
+        RunState {
+            schema_version: LOOP_STATE_SCHEMA_VERSION,
+            run_id: "20261123-182500-a1b2".to_string(),
+            workflow: "worker-reviewer-critic".to_string(),
+            status: RunStatus::Pass,
+            reason: None,
+            sandbox: "bwrap".to_string(),
+            sandbox_exposures: vec![
+                "rede compartilhada com o host/container".to_string(),
+                "serviços em localhost e sockets abstratos compartilhados".to_string(),
+            ],
+            preflight: vec![],
+            current_cycle: 2,
+            max_cycles: 3,
+            branch: Some("loop/worker-reviewer-critic-20261123-182500-a1b2".to_string()),
+            base_commit: Some("deadbeef".to_string()),
+            engine_pid: Some(1234),
+            engine_start_ticks: Some(5678),
+            caller: Some(CallerInfo {
+                terminal: "t1".to_string(),
+                created_ms: 1000,
+            }),
+            heartbeat_at_ms: 5000,
+            last_activity_at_ms: 5000,
+            started_at_ms: 1000,
+            finished_at_ms: Some(15000),
+            executions: vec![
+                Execution {
+                    cycle: 1,
+                    stage_id: "implement".to_string(),
+                    role: "worker".to_string(),
+                    provider: Provider::Opencode,
+                    model: Some("zai/glm-5.3-flash".to_string()),
+                    model_source: Some(crate::loops::models::ModelSource::ProjectStage),
+                    started_at_ms: 1000,
+                    finished_at_ms: Some(5000),
+                    duration_ms: 4000,
+                    usage: Usage {
+                        turns: Some(3),
+                        input_tokens: Some(18_420),
+                        output_tokens: Some(500),
+                        cache_read_tokens: None,
+                        cost_usd: Some(0.12),
+                    },
+                    verdict: None,
+                    outcome: "OK".to_string(),
+                    error: None,
+                    log_file: Some("logs/c1-01-implement.log".to_string()),
+                },
+                Execution {
+                    cycle: 1,
+                    stage_id: "audit".to_string(),
+                    role: "critic".to_string(),
+                    provider: Provider::Claude,
+                    model: None,
+                    model_source: None,
+                    started_at_ms: 5000,
+                    finished_at_ms: Some(10000),
+                    duration_ms: 5000,
+                    usage: Usage {
+                        turns: Some(2),
+                        input_tokens: None,
+                        output_tokens: Some(200),
+                        cache_read_tokens: Some(1000),
+                        cost_usd: None,
+                    },
+                    verdict: Some(Verdict::Retry),
+                    outcome: "RETRY".to_string(),
+                    error: None,
+                    log_file: Some("logs/c1-02-audit.log".to_string()),
+                },
+                Execution {
+                    cycle: 2,
+                    stage_id: "audit".to_string(),
+                    role: "critic".to_string(),
+                    provider: Provider::Claude,
+                    model: None,
+                    model_source: None,
+                    started_at_ms: 10000,
+                    finished_at_ms: Some(15000),
+                    duration_ms: 5000,
+                    usage: Usage {
+                        turns: Some(1),
+                        input_tokens: Some(500),
+                        output_tokens: Some(100),
+                        cache_read_tokens: Some(200),
+                        cost_usd: Some(0.05),
+                    },
+                    verdict: Some(Verdict::Pass),
+                    outcome: "PASS".to_string(),
+                    error: None,
+                    log_file: Some("logs/c2-03-audit.log".to_string()),
+                },
+            ],
+            files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            summary: "Tudo corrigido com token glpat-abcdefghijklmn".to_string(),
+        }
+    }
+
+    #[test]
+    fn report_flags_unsandboxed_runs() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = rich_state();
+        state.sandbox = "none".to_string();
+        let md = render_report(&state, tmp.path());
+        assert!(
+            md.contains(
+                "- **Sandbox:** **SEM SANDBOX** (`none`): o agente rodou com o HOME, a rede e os poderes do seu usuário"
+            ),
+            "{md}"
+        );
     }
 }
