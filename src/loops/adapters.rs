@@ -19,6 +19,14 @@ pub struct AdapterResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct StreamState {
+    pub last_event: Option<String>,
+    pub running_tools: Option<Vec<String>>,
+    pub usage: Usage,
+    pub error: Option<String>,
+}
+
 pub fn command(p: Provider, model: Option<&str>, prompt: &str) -> Result<AdapterCommand> {
     let model = model.map(str::trim).filter(|m| !m.is_empty());
     match p {
@@ -140,6 +148,26 @@ fn sanitize_error_text(raw: &str) -> String {
     }
 }
 
+fn claude_tool_name(val: &serde_json::Value) -> Option<String> {
+    if val.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+        return None;
+    }
+    val.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|blocks| {
+            blocks.iter().find_map(|block| {
+                if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                    return None;
+                }
+                block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+        })
+}
+
 pub struct EventParser {
     provider: Provider,
     saw_result: bool,
@@ -170,6 +198,8 @@ pub struct EventParser {
     pi_retry_failed: Option<String>,
     pi_settled: bool,
     pi_aborted: bool,
+    last_event: Option<String>,
+    open_tools: Vec<(String, String)>,
 }
 
 impl EventParser {
@@ -204,6 +234,8 @@ impl EventParser {
             pi_retry_failed: None,
             pi_settled: false,
             pi_aborted: false,
+            last_event: None,
+            open_tools: Vec::new(),
         }
     }
 
@@ -216,6 +248,7 @@ impl EventParser {
             return;
         };
 
+        self.record_event(&val);
         match self.provider {
             Provider::Claude => self.handle_claude(&val),
             Provider::Agy => self.handle_agy(&val),
@@ -424,18 +457,150 @@ impl EventParser {
         }
     }
 
-    pub fn finish(mut self) -> AdapterResult {
-        match self.provider {
+    fn record_event(&mut self, val: &serde_json::Value) {
+        let mut tool: Option<String> = None;
+        let base: Option<String> = match self.provider {
             Provider::Claude => {
-                if !self.saw_result && self.error.is_none() {
-                    self.error = Some("claude terminou sem evento 'result'".to_string());
-                }
+                self.track_claude_tools(val);
+                tool = claude_tool_name(val);
+                val.get("type").and_then(|v| v.as_str()).map(str::to_string)
             }
             Provider::Agy => {
-                self.usage.turns = (self.agy_turns > 0).then_some(self.agy_turns);
-                if !self.saw_result && self.error.is_none() {
-                    self.error = Some("agy terminou sem evento 'result'".to_string());
+                let event = val.get("event").and_then(|v| v.as_str());
+                let mut base = event.map(str::to_string);
+                if event == Some("step_update") {
+                    if let Some(step) = val.get("step_update") {
+                        self.track_agy_tool(step);
+                        if let Some(step_type) = step.get("step_type").and_then(|v| v.as_str()) {
+                            base = Some(format!("step_update {step_type}"));
+                        }
+                        tool = step
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
                 }
+                base
+            }
+            Provider::Opencode => {
+                let kind = val.get("type").and_then(|v| v.as_str());
+                if kind == Some("tool_use") {
+                    tool = val
+                        .get("part")
+                        .and_then(|p| p.get("tool"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                kind.map(str::to_string)
+            }
+            Provider::Pi => {
+                let kind = val.get("type").and_then(|v| v.as_str());
+                self.track_pi_tool(kind, val);
+                if matches!(kind, Some(k) if k.starts_with("tool_execution_")) {
+                    tool = val
+                        .get("toolName")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                }
+                kind.map(str::to_string)
+            }
+        };
+        if let Some(base) = base {
+            self.last_event = Some(match tool.as_deref() {
+                Some(name) if !name.is_empty() => format!("{base} ({name})"),
+                _ => base,
+            });
+        }
+    }
+
+    fn track_claude_tools(&mut self, val: &serde_json::Value) {
+        let kind = val.get("type").and_then(|v| v.as_str());
+        let Some(blocks) = val
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            return;
+        };
+        match kind {
+            Some("assistant") => {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                        continue;
+                    }
+                    if let (Some(id), Some(name)) = (
+                        block.get("id").and_then(|v| v.as_str()),
+                        block.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        self.open_tools.push((id.to_string(), name.to_string()));
+                    }
+                }
+            }
+            Some("user") => {
+                for block in blocks {
+                    if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+                        continue;
+                    }
+                    if let Some(id) = block.get("tool_use_id").and_then(|v| v.as_str()) {
+                        self.open_tools.retain(|(open, _)| open != id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn track_agy_tool(&mut self, step: &serde_json::Value) {
+        if step.get("step_type").and_then(|v| v.as_str()) != Some("tool") {
+            return;
+        }
+        let Some(index) = step.get("step_index") else {
+            return;
+        };
+        let Some(key) = index
+            .as_u64()
+            .map(|n| n.to_string())
+            .or_else(|| index.as_str().map(str::to_string))
+        else {
+            return;
+        };
+        if step.get("state").and_then(|v| v.as_str()) == Some("ACTIVE") {
+            let name = step
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !name.is_empty() && !self.open_tools.iter().any(|(open, _)| open == &key) {
+                self.open_tools.push((key, name.to_string()));
+            }
+        } else {
+            self.open_tools.retain(|(open, _)| open != &key);
+        }
+    }
+
+    fn track_pi_tool(&mut self, kind: Option<&str>, val: &serde_json::Value) {
+        let Some(id) = val.get("toolCallId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        match kind {
+            Some("tool_execution_start") => {
+                let name = val
+                    .get("toolName")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    self.open_tools.push((id.to_string(), name.to_string()));
+                }
+            }
+            Some("tool_execution_end") => self.open_tools.retain(|(open, _)| open != id),
+            _ => {}
+        }
+    }
+
+    fn apply_usage(&mut self) {
+        match self.provider {
+            Provider::Claude => {}
+            Provider::Agy => {
+                self.usage.turns = (self.agy_turns > 0).then_some(self.agy_turns);
             }
             Provider::Opencode => {
                 if self.opencode_steps > 0 {
@@ -466,30 +631,82 @@ impl EventParser {
                     self.usage.cost_usd =
                         (self.pi_cost_seen == responses).then_some(self.pi_cost_sum);
                 }
-                // `pi --mode json` exits 0 even when the model failed: the stream decides.
-                let stop = self.pi_last_stop.clone();
-                let failed_stop = matches!(stop.as_deref(), Some("error") | Some("aborted"));
-                self.error = if let Some(final_error) = self.pi_retry_failed.take() {
-                    Some(sanitize_error_text(&final_error))
-                } else if failed_stop {
-                    let reason = self.pi_last_error.clone().unwrap_or_else(|| {
-                        format!("pi retornou stopReason {}", stop.unwrap_or_default())
-                    });
-                    Some(sanitize_error_text(&reason))
-                } else if self.pi_settled && self.pi_aborted {
-                    Some("pi abortou a execução".to_string())
-                } else if stop.as_deref() == Some("length") {
-                    Some("resposta truncada no limite de saída".to_string())
-                } else if !self.pi_settled {
-                    Some("pi terminou sem evento 'agent_settled'".to_string())
-                } else {
-                    None
-                };
+            }
+        }
+    }
+
+    /// Errors the stream itself reported, never the "ended without event" ones.
+    fn explicit_error(&mut self) -> Option<String> {
+        if self.provider != Provider::Pi {
+            return self.error.take();
+        }
+        let stop = self.pi_last_stop.clone();
+        if let Some(final_error) = self.pi_retry_failed.take() {
+            return Some(sanitize_error_text(&final_error));
+        }
+        if matches!(stop.as_deref(), Some("error") | Some("aborted")) {
+            let reason = self
+                .pi_last_error
+                .clone()
+                .unwrap_or_else(|| format!("pi retornou stopReason {}", stop.unwrap_or_default()));
+            return Some(sanitize_error_text(&reason));
+        }
+        None
+    }
+
+    pub fn finish(mut self) -> AdapterResult {
+        self.apply_usage();
+        let mut error = self.explicit_error();
+        if error.is_none() {
+            match self.provider {
+                Provider::Claude => {
+                    if !self.saw_result {
+                        error = Some("claude terminou sem evento 'result'".to_string());
+                    }
+                }
+                Provider::Agy => {
+                    if !self.saw_result {
+                        error = Some("agy terminou sem evento 'result'".to_string());
+                    }
+                }
+                Provider::Opencode => {}
+                Provider::Pi => {
+                    let stop = self.pi_last_stop.clone();
+                    error = if self.pi_settled && self.pi_aborted {
+                        Some("pi abortou a execução".to_string())
+                    } else if stop.as_deref() == Some("length") {
+                        Some("resposta truncada no limite de saída".to_string())
+                    } else if !self.pi_settled {
+                        Some("pi terminou sem evento 'agent_settled'".to_string())
+                    } else {
+                        None
+                    };
+                }
             }
         }
         AdapterResult {
             usage: self.usage,
-            error: self.error,
+            error,
+        }
+    }
+
+    pub fn finish_interrupted(mut self) -> StreamState {
+        self.apply_usage();
+        let error = self.explicit_error();
+        let running_tools = match self.provider {
+            Provider::Opencode => None,
+            _ => Some(
+                self.open_tools
+                    .iter()
+                    .map(|(_, name)| name.clone())
+                    .collect(),
+            ),
+        };
+        StreamState {
+            last_event: self.last_event.take(),
+            running_tools,
+            usage: self.usage,
+            error,
         }
     }
 }
@@ -1016,5 +1233,151 @@ mod tests {
         assert!(prompt.contains(".tchelvis-loop/out/critic.md"));
         assert!(prompt.contains("VERDICT: PASS"));
         assert!(prompt.contains("VERDICT: RETRY"));
+    }
+
+    fn interrupted_after(provider: Provider, name: &str, lines: usize) -> StreamState {
+        let raw = fixture(name);
+        let mut parser = EventParser::new(provider);
+        for line in raw.lines().take(lines) {
+            parser.line(line);
+        }
+        parser.finish_interrupted()
+    }
+
+    #[test]
+    fn interrupted_pi_reports_the_open_tool() {
+        let mut parser = EventParser::new(Provider::Pi);
+        for val in [
+            serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": "c1",
+                "toolName": "bash"
+            }),
+            serde_json::json!({
+                "type": "tool_execution_update",
+                "toolCallId": "c1",
+                "toolName": "bash"
+            }),
+        ] {
+            parser.line(&val.to_string());
+        }
+        let state = parser.finish_interrupted();
+        assert_eq!(
+            state.last_event.as_deref(),
+            Some("tool_execution_update (bash)")
+        );
+        assert_eq!(state.running_tools, Some(vec!["bash".to_string()]));
+        assert_eq!(state.error, None);
+
+        let mut parser = EventParser::new(Provider::Pi);
+        for (kind, id) in [
+            ("tool_execution_start", "c1"),
+            ("tool_execution_update", "c1"),
+            ("tool_execution_end", "c1"),
+        ] {
+            parser.line(
+                &serde_json::json!({"type": kind, "toolCallId": id, "toolName": "bash"})
+                    .to_string(),
+            );
+        }
+        let state = parser.finish_interrupted();
+        assert_eq!(state.running_tools, Some(Vec::new()));
+        assert_eq!(
+            state.last_event.as_deref(),
+            Some("tool_execution_end (bash)")
+        );
+    }
+
+    #[test]
+    fn interrupted_claude_and_agy_track_open_tools() {
+        let claude_open = interrupted_after(Provider::Claude, "claude_ok.jsonl", 2);
+        assert_eq!(claude_open.running_tools, Some(vec!["Read".to_string()]));
+        assert_eq!(claude_open.last_event.as_deref(), Some("assistant (Read)"));
+        let claude_closed = interrupted_after(Provider::Claude, "claude_ok.jsonl", 3);
+        assert_eq!(claude_closed.running_tools, Some(Vec::new()));
+
+        let agy_open = interrupted_after(Provider::Agy, "agy_ok.jsonl", 4);
+        assert_eq!(agy_open.running_tools, Some(vec!["read_file".to_string()]));
+        assert_eq!(
+            agy_open.last_event.as_deref(),
+            Some("step_update tool (read_file)")
+        );
+        let agy_closed = interrupted_after(Provider::Agy, "agy_ok.jsonl", 5);
+        assert_eq!(agy_closed.running_tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn interrupted_opencode_does_not_know_tools() {
+        let started = interrupted_after(Provider::Opencode, "opencode_ok.jsonl", 1);
+        assert_eq!(started.last_event.as_deref(), Some("step_start"));
+        assert_eq!(started.running_tools, None);
+
+        let tool = interrupted_after(Provider::Opencode, "opencode_ok.jsonl", 2);
+        assert_eq!(tool.last_event.as_deref(), Some("tool_use (read)"));
+        assert_eq!(tool.running_tools, None);
+    }
+
+    #[test]
+    fn parallel_tools_with_one_name_close_by_id() {
+        let mut parser = EventParser::new(Provider::Pi);
+        for (kind, id) in [("tool_execution_start", "a"), ("tool_execution_start", "b")] {
+            parser.line(
+                &serde_json::json!({"type": kind, "toolCallId": id, "toolName": "bash"})
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            parser.finish_interrupted().running_tools,
+            Some(vec!["bash".to_string(), "bash".to_string()])
+        );
+
+        let mut parser = EventParser::new(Provider::Pi);
+        for (kind, id) in [
+            ("tool_execution_start", "a"),
+            ("tool_execution_start", "b"),
+            ("tool_execution_end", "a"),
+        ] {
+            parser.line(
+                &serde_json::json!({"type": kind, "toolCallId": id, "toolName": "bash"})
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            parser.finish_interrupted().running_tools,
+            Some(vec!["bash".to_string()])
+        );
+
+        let mut parser = EventParser::new(Provider::Pi);
+        for (kind, id) in [("tool_execution_start", "a"), ("tool_execution_end", "z")] {
+            parser.line(
+                &serde_json::json!({"type": kind, "toolCallId": id, "toolName": "bash"})
+                    .to_string(),
+            );
+        }
+        assert_eq!(
+            parser.finish_interrupted().running_tools,
+            Some(vec!["bash".to_string()])
+        );
+
+        let mut parser = EventParser::new(Provider::Pi);
+        parser.line(
+            &serde_json::json!({"type": "tool_execution_start", "toolName": "bash"}).to_string(),
+        );
+        assert_eq!(parser.finish_interrupted().running_tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn interrupted_keeps_explicit_errors() {
+        let mut parser = EventParser::new(Provider::Pi);
+        parser.line(
+            &serde_json::json!({
+                "type": "auto_retry_end",
+                "success": false,
+                "finalError": "x"
+            })
+            .to_string(),
+        );
+        let state = parser.finish_interrupted();
+        assert_eq!(state.error, Some("x".to_string()));
     }
 }

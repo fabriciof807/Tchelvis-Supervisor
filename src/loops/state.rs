@@ -129,6 +129,73 @@ pub struct CallerInfo {
     pub created_ms: i64,
 }
 
+/// One process found in a stopped stage, named only by its kernel `comm`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopProcess {
+    pub name: String,
+    pub age_ms: u64,
+    pub cpu_ms: u64,
+    pub after_last_output: bool,
+}
+
+/// What the loop saw when it cut a stage short, so a wedged run can be diagnosed later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopDiagnostic {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_output_at_ms: Option<i64>,
+    pub silent_ms: u64,
+    pub cli_alive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub processes: Vec<StopProcess>,
+    pub processes_total: usize,
+}
+
+/// Most names shown in one hint line.
+const MAX_HINT_NAMES: usize = 3;
+
+impl StopDiagnostic {
+    /// One line explaining what most likely kept the stage from finishing.
+    pub fn hint(&self) -> String {
+        let tools = unique_names(self.running_tools.iter().flatten().map(|s| s.as_str()));
+        if !tools.is_empty() {
+            return format!("ferramenta em execução: {}", tools.join(", "));
+        }
+        let started = unique_names(
+            self.processes
+                .iter()
+                .filter(|p| p.after_last_output)
+                .map(|p| p.name.as_str()),
+        );
+        if !started.is_empty() {
+            return format!(
+                "possível ferramenta em execução: {} (processos iniciados depois da última saída)",
+                started.join(", ")
+            );
+        }
+        if self.last_event.is_none() {
+            return "o CLI não emitiu nenhum evento".to_string();
+        }
+        "nenhuma ferramenta detectada em execução (provável espera pelo modelo)".to_string()
+    }
+}
+
+fn unique_names<'a>(names: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for name in names {
+        if name.trim().is_empty() || seen.len() >= MAX_HINT_NAMES {
+            continue;
+        }
+        if !seen.iter().any(|s| s == name) {
+            seen.push(name.to_string());
+        }
+    }
+    seen
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Execution {
     pub cycle: u32,
@@ -148,6 +215,8 @@ pub struct Execution {
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -488,6 +557,7 @@ mod tests {
                 outcome: "OK".into(),
                 error: None,
                 log_file: None,
+                stop: None,
             },
             Execution {
                 cycle: 1,
@@ -510,6 +580,7 @@ mod tests {
                 outcome: "OK".into(),
                 error: None,
                 log_file: None,
+                stop: None,
             },
         ];
 
@@ -603,6 +674,7 @@ mod tests {
             parse_state(legacy_json).expect("legacy JSON without model_source/preflight must load");
         assert!(legacy.preflight.is_empty());
         assert_eq!(legacy.executions[0].model_source, None);
+        assert_eq!(legacy.executions[0].stop, None);
 
         let mut modern = sample_state(RunStatus::Pass);
         modern.preflight.push(ProbeRecord {
@@ -633,6 +705,7 @@ mod tests {
             outcome: "OK".into(),
             error: None,
             log_file: None,
+            stop: None,
         });
         let dir = tempfile::tempdir().unwrap();
         save_state(dir.path(), &modern).unwrap();
@@ -661,5 +734,106 @@ mod tests {
 
         let out = format_result(&sample_state(RunStatus::Pass));
         assert!(!out.contains("SEM SANDBOX"), "{out}");
+    }
+
+    fn wedged_stop() -> StopDiagnostic {
+        StopDiagnostic {
+            last_event: Some("tool_execution_update (bash)".to_string()),
+            last_output_at_ms: Some(1_000),
+            silent_ms: 1_500,
+            cli_alive: true,
+            running_tools: Some(vec![
+                "bash".to_string(),
+                "bash".to_string(),
+                "read".to_string(),
+            ]),
+            processes: vec![
+                StopProcess {
+                    name: "early_tool.sh".into(),
+                    age_ms: 900,
+                    cpu_ms: 0,
+                    after_last_output: false,
+                },
+                StopProcess {
+                    name: "late_tool.sh".into(),
+                    age_ms: 100,
+                    cpu_ms: 5,
+                    after_last_output: true,
+                },
+            ],
+            processes_total: 3,
+        }
+    }
+
+    #[test]
+    fn hint_follows_the_spec_order() {
+        let mut stop = wedged_stop();
+        assert_eq!(stop.hint(), "ferramenta em execução: bash, read");
+
+        stop.running_tools = None;
+        assert_eq!(
+            stop.hint(),
+            "possível ferramenta em execução: late_tool.sh (processos iniciados depois da última saída)"
+        );
+
+        stop.processes.clear();
+        stop.last_event = None;
+        assert_eq!(stop.hint(), "o CLI não emitiu nenhum evento");
+
+        stop.last_event = Some("message_end".into());
+        assert_eq!(
+            stop.hint(),
+            "nenhuma ferramenta detectada em execução (provável espera pelo modelo)"
+        );
+
+        // An open tool wins over a process started after the last output.
+        stop.last_event = None;
+        stop.running_tools = Some(vec!["bash".into()]);
+        assert_eq!(stop.hint(), "ferramenta em execução: bash");
+
+        // A provider that reports tools but has none open falls back to the process hint.
+        stop.processes.push(StopProcess {
+            name: "late_tool.sh".into(),
+            age_ms: 100,
+            cpu_ms: 5,
+            after_last_output: true,
+        });
+        stop.running_tools = Some(vec![]);
+        assert_eq!(
+            stop.hint(),
+            "possível ferramenta em execução: late_tool.sh (processos iniciados depois da última saída)"
+        );
+    }
+
+    #[test]
+    fn execution_stop_round_trips_and_is_absent_when_unset() {
+        let mut state = sample_state(RunStatus::Escalate);
+        state.executions.push(Execution {
+            cycle: 1,
+            stage_id: "implement".into(),
+            role: "worker".into(),
+            provider: Provider::Pi,
+            model: Some("openrouter/x".into()),
+            model_source: None,
+            started_at_ms: 1_000,
+            finished_at_ms: Some(2_500),
+            duration_ms: 1_500,
+            usage: Usage::default(),
+            verdict: None,
+            outcome: "STALLED".into(),
+            error: None,
+            log_file: Some("implement.log".into()),
+            stop: Some(wedged_stop()),
+        });
+
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(json.contains("\"stop\""), "{json}");
+        assert_eq!(parse_state(&json).unwrap(), state);
+
+        let mut clean = state.clone();
+        clean.executions[0].stop = None;
+        let json = serde_json::to_string(&clean).unwrap();
+        assert!(!json.contains("\"stop\""), "{json}");
+        assert_eq!(parse_state(&json).unwrap().executions[0].stop, None);
     }
 }

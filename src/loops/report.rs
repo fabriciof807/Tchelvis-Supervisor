@@ -1,5 +1,5 @@
 use crate::loops::artifacts::MAX_ARTIFACT_BYTES;
-use crate::loops::state::{redact_loop_text, sanitize_single_line, sum_usage, RunState};
+use crate::loops::state::{redact_loop_text, sanitize_single_line, sum_usage, Execution, RunState};
 use crate::loops::verdict::MAX_SUMMARY_CHARS;
 use regex::Regex;
 use std::ffi::CString;
@@ -393,6 +393,91 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
         }
     }
 
+    let interrupted: Vec<&Execution> = state
+        .executions
+        .iter()
+        .filter(|exec| exec.stop.is_some())
+        .collect();
+    if !interrupted.is_empty() {
+        let _ = writeln!(out, "\n## Etapas interrompidas\n");
+        for exec in interrupted {
+            let Some(stop) = exec.stop.as_ref() else {
+                continue;
+            };
+            let stage = sanitize_line(&exec.stage_id, None, extra_secrets);
+            let outcome = sanitize_line(&exec.outcome, None, extra_secrets);
+            let _ = writeln!(out, "### Etapa: {stage} ({outcome})\n");
+            let last_event = stop
+                .last_event
+                .as_deref()
+                .map(|event| sanitize_line(event, Some(64), extra_secrets))
+                .filter(|event| !event.is_empty());
+            match last_event {
+                Some(event) => {
+                    let _ = writeln!(
+                        out,
+                        "- **Último evento:** {event} (sem saída há {})",
+                        format_duration_ms(stop.silent_ms)
+                    );
+                }
+                None => {
+                    let _ = writeln!(out, "- **Último evento:** nenhum");
+                }
+            }
+            let _ = writeln!(
+                out,
+                "- **CLI ainda vivo:** {}",
+                if stop.cli_alive { "sim" } else { "não" }
+            );
+            let tools = match stop.running_tools.as_deref() {
+                None => "o CLI não informa".to_string(),
+                Some(names) => {
+                    let names: Vec<String> = names
+                        .iter()
+                        .take(10)
+                        .map(|name| sanitize_line(name, Some(64), extra_secrets))
+                        .filter(|name| !name.is_empty())
+                        .collect();
+                    if names.is_empty() {
+                        "nenhuma".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                }
+            };
+            let _ = writeln!(out, "- **Ferramentas em execução:** {tools}");
+            let _ = writeln!(
+                out,
+                "- **Indício:** {}",
+                sanitize_line(&stop.hint(), None, extra_secrets)
+            );
+            let _ = writeln!(
+                out,
+                "- **Processos ({} de {}):**",
+                stop.processes.len(),
+                stop.processes_total
+            );
+            if stop.processes.is_empty() {
+                let _ = writeln!(out, "  - nenhum");
+            }
+            for proc_entry in &stop.processes {
+                let name = sanitize_line(&proc_entry.name, Some(64), extra_secrets);
+                let after = if proc_entry.after_last_output {
+                    ", depois da última saída"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "  - {name} (idade {}, CPU {}{after})",
+                    format_duration_ms(proc_entry.age_ms),
+                    format_duration_ms(proc_entry.cpu_ms)
+                );
+            }
+            let _ = writeln!(out);
+        }
+    }
+
     let mut rendered_any = false;
     for filename in artifact_names(dir) {
         let heading = format!("`{filename}`");
@@ -419,7 +504,10 @@ pub fn render_report_with_secrets(state: &RunState, dir: &Path, extra_secrets: &
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::loops::state::{CallerInfo, Execution, RunStatus, Usage, LOOP_STATE_SCHEMA_VERSION};
+    use crate::loops::state::{
+        CallerInfo, Execution, RunStatus, StopDiagnostic, StopProcess, Usage,
+        LOOP_STATE_SCHEMA_VERSION,
+    };
     use crate::loops::verdict::Verdict;
     use crate::loops::workflow::Provider;
     use tempfile::TempDir;
@@ -528,6 +616,7 @@ mod tests {
                 outcome: "PASS".to_string(),
                 error: None,
                 log_file: None,
+                stop: None,
             }],
             files: vec![],
             summary: "ok".to_string(),
@@ -654,6 +743,7 @@ mod tests {
                     outcome: "OK".to_string(),
                     error: None,
                     log_file: Some("logs/c1-01-implement.log".to_string()),
+                    stop: None,
                 },
                 Execution {
                     cycle: 1,
@@ -676,6 +766,7 @@ mod tests {
                     outcome: "RETRY".to_string(),
                     error: None,
                     log_file: Some("logs/c1-02-audit.log".to_string()),
+                    stop: None,
                 },
                 Execution {
                     cycle: 2,
@@ -698,6 +789,7 @@ mod tests {
                     outcome: "PASS".to_string(),
                     error: None,
                     log_file: Some("logs/c2-03-audit.log".to_string()),
+                    stop: None,
                 },
             ],
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
@@ -717,5 +809,67 @@ mod tests {
             ),
             "{md}"
         );
+    }
+
+    #[test]
+    fn report_lists_interrupted_stages() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        let mut state = rich_state();
+
+        let md = render_report(&state, dir);
+        assert!(!md.contains("Etapas interrompidas"), "{md}");
+
+        state.executions[0].outcome = "STALLED".to_string();
+        state.executions[0].stop = Some(StopDiagnostic {
+            last_event: Some("tool_execution_update (bash)".to_string()),
+            last_output_at_ms: Some(4_000),
+            silent_ms: 1_500,
+            cli_alive: true,
+            running_tools: Some(vec!["bash".to_string(), "read".to_string()]),
+            processes: vec![
+                StopProcess {
+                    name: "early_tool.sh".to_string(),
+                    age_ms: 900,
+                    cpu_ms: 0,
+                    after_last_output: false,
+                },
+                StopProcess {
+                    name: "late | `x`\ny".to_string(),
+                    age_ms: 200,
+                    cpu_ms: 10,
+                    after_last_output: true,
+                },
+            ],
+            processes_total: 5,
+        });
+
+        let md = render_report(&state, dir);
+        assert!(md.contains("## Etapas interrompidas"), "{md}");
+        assert!(md.contains("### Etapa: implement (STALLED)"), "{md}");
+        assert!(
+            md.contains("- **Último evento:** tool_execution_update (bash) (sem saída há 1.5s)"),
+            "{md}"
+        );
+        assert!(md.contains("- **CLI ainda vivo:** sim"), "{md}");
+        assert!(
+            md.contains("- **Ferramentas em execução:** bash, read"),
+            "{md}"
+        );
+        assert!(
+            md.contains("- **Indício:** ferramenta em execução: bash, read"),
+            "{md}"
+        );
+        assert!(md.contains("- **Processos (2 de 5):**"), "{md}");
+        assert!(
+            md.contains("early_tool.sh (idade 900ms, CPU 0ms)"),
+            "an old process must not be flagged as new: {md}"
+        );
+        assert!(
+            md.contains("late | `x` y (idade 200ms, CPU 10ms, depois da última saída)"),
+            "a hostile name must stay on one line and keep its text: {md}"
+        );
+        // The name is reported without code spans, so a stray backtick cannot break the section.
+        assert!(!md.contains("**Processos (2 de 5):**\n  - `late"), "{md}");
     }
 }

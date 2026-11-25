@@ -1,4 +1,5 @@
 use crate::loops::sandbox::SandboxedCommand;
+use crate::loops::state::StopProcess;
 use anyhow::{bail, Context, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -20,6 +21,8 @@ const POLL_SLICE_MS: i32 = 25;
 const TREE_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 /// How long to read what is left in the pipes after the stage ended.
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// How many processes a stop snapshot keeps; the real count is preserved separately.
+const MAX_STOP_PROCESSES: usize = 20;
 
 static NEXT_STAGE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -237,19 +240,37 @@ pub enum Outcome {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// What the stage was doing at the moment the engine ended it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StopSnapshot {
+    /// Time since the last byte on `stdout`; the whole stage when nothing came.
+    pub silent_ms: u64,
+    pub last_output_at_ms: Option<i64>,
+    pub cli_alive: bool,
+    pub processes: Vec<StopProcess>,
+    pub processes_total: usize,
+}
+
+#[derive(Debug, Clone)]
 struct ProcStat {
     pid: i32,
     state: char,
     ppid: i32,
     pgrp: i32,
     session: i32,
+    utime: u64,
+    stime: u64,
     start_ticks: u64,
+    /// Only for display: never the command line, which may hold secrets.
+    comm: String,
 }
 
-fn read_proc_stat(pid: i32) -> Option<ProcStat> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+/// Parses one `/proc/<pid>/stat` line. The command name sits between the first `(` and the last
+/// `)`, because it may itself contain spaces and parentheses.
+fn parse_proc_stat(pid: i32, raw: &str) -> Option<ProcStat> {
+    let lparen = raw.find('(')?;
     let rparen = raw.rfind(')')?;
+    let comm = raw.get(lparen + 1..rparen)?.to_string();
     let rest = raw.get(rparen + 1..)?.trim_start();
     let fields: Vec<&str> = rest.split_whitespace().collect();
     if fields.len() < 20 {
@@ -259,6 +280,8 @@ fn read_proc_stat(pid: i32) -> Option<ProcStat> {
     let ppid = fields[1].parse::<i32>().ok()?;
     let pgrp = fields[2].parse::<i32>().ok()?;
     let session = fields[3].parse::<i32>().ok()?;
+    let utime = fields[11].parse::<u64>().ok()?;
+    let stime = fields[12].parse::<u64>().ok()?;
     let start_ticks = fields[19].parse::<u64>().ok()?;
     Some(ProcStat {
         pid,
@@ -266,8 +289,41 @@ fn read_proc_stat(pid: i32) -> Option<ProcStat> {
         ppid,
         pgrp,
         session,
+        utime,
+        stime,
         start_ticks,
+        comm,
     })
+}
+
+fn read_proc_stat(pid: i32) -> Option<ProcStat> {
+    let raw = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_proc_stat(pid, &raw)
+}
+
+fn clock_ticks_per_second() -> u64 {
+    // SAFETY: sysconf only reads a system constant.
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value > 0 {
+        value as u64
+    } else {
+        100
+    }
+}
+
+/// Boot time in `/proc`'s start ticks. `CLOCK_BOOTTIME`, not `/proc/uptime`: lxcfs fakes the latter.
+fn boot_time_ticks() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes into the provided timespec.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+        return None;
+    }
+    let ns = (ts.tv_sec as u128) * 1_000_000_000 + ts.tv_nsec as u128;
+    let ticks = ns * clock_ticks_per_second() as u128 / 1_000_000_000;
+    Some(ticks as u64)
 }
 
 fn scan_proc_stats() -> Vec<ProcStat> {
@@ -333,7 +389,7 @@ fn collect_tree_pids_marked(
     let mut stat_by_pid: HashMap<i32, ProcStat> = HashMap::new();
     for st in &stats {
         by_ppid.entry(st.ppid).or_default().push(st.pid);
-        stat_by_pid.insert(st.pid, *st);
+        stat_by_pid.insert(st.pid, st.clone());
     }
 
     let mut queue: VecDeque<i32> = VecDeque::new();
@@ -432,6 +488,74 @@ fn collect_tree_pids_marked(
         g.update_owned(ctx.observed);
     }
     live
+}
+
+/// What the watch loop knows about the last `stdout` byte; empty when nothing came.
+struct StopWatch {
+    start_mono_ms: u64,
+    last_output_mono_ms: Option<u64>,
+    last_output_at_ms: Option<i64>,
+    last_output_ticks: Option<u64>,
+}
+
+fn stop_snapshot(
+    ctx: &mut TreeContext<'_>,
+    marker: Option<&StageMarker>,
+    guard: Option<&ActiveStageGuard>,
+    clock: &dyn Clock,
+    watch: &StopWatch,
+) -> StopSnapshot {
+    let live = collect_tree_pids_marked(ctx, marker, guard);
+    let stats: HashMap<i32, ProcStat> = scan_proc_stats()
+        .into_iter()
+        .map(|st| (st.pid, st))
+        .collect();
+    let ticks_per_second = clock_ticks_per_second().max(1);
+    let now_ticks = boot_time_ticks();
+    let ticks_to_ms = |ticks: u64| ticks.saturating_mul(1000) / ticks_per_second;
+
+    let silent_ms = clock
+        .monotonic_ms()
+        .saturating_sub(watch.last_output_mono_ms.unwrap_or(watch.start_mono_ms));
+
+    let mut processes: Vec<(StopProcess, i32)> = live
+        .iter()
+        .filter_map(|pid| {
+            let st = stats.get(pid)?;
+            let after_last_output = match watch.last_output_ticks {
+                Some(out_ticks) => st.start_ticks > out_ticks,
+                None => false,
+            };
+            let process = StopProcess {
+                name: st.comm.clone(),
+                age_ms: now_ticks.map_or(0, |now| ticks_to_ms(now.saturating_sub(st.start_ticks))),
+                cpu_ms: ticks_to_ms(st.utime.saturating_add(st.stime)),
+                after_last_output,
+            };
+            Some((process, *pid))
+        })
+        .collect();
+    processes.sort_by_key(|(process, pid)| {
+        (
+            !process.after_last_output,
+            std::cmp::Reverse(process.cpu_ms),
+            *pid,
+        )
+    });
+    let processes_total = processes.len();
+    processes.truncate(MAX_STOP_PROCESSES);
+
+    let cli_alive = stats.get(&ctx.root_pid).is_some_and(|st| {
+        st.state != 'Z' && ctx.root_start_ticks.is_none_or(|t| st.start_ticks == t)
+    });
+
+    StopSnapshot {
+        silent_ms,
+        last_output_at_ms: watch.last_output_at_ms,
+        cli_alive,
+        processes: processes.into_iter().map(|(process, _)| process).collect(),
+        processes_total,
+    }
 }
 
 fn reap_reparented(observed: &HashMap<i32, u64>, root_pid: i32) {
@@ -657,6 +781,34 @@ pub fn run_process(
     on_line: &mut dyn FnMut(&str),
     probe_activity: &mut dyn FnMut() -> bool,
 ) -> Result<Outcome> {
+    let mut stop = None;
+    run_process_diagnosed(
+        cmd,
+        stdin_data,
+        log,
+        limits,
+        clock,
+        cancel,
+        on_line,
+        probe_activity,
+        &mut stop,
+    )
+}
+
+/// Same as [`run_process`], and additionally fills `stop` when the engine ends the stage for
+/// `Stalled` or `TimedOut`. Collecting it never changes the outcome.
+#[allow(clippy::too_many_arguments)]
+pub fn run_process_diagnosed(
+    cmd: SandboxedCommand,
+    stdin_data: &[u8],
+    log: &Path,
+    limits: Limits,
+    clock: &dyn Clock,
+    cancel: &AtomicBool,
+    on_line: &mut dyn FnMut(&str),
+    probe_activity: &mut dyn FnMut() -> bool,
+    stop: &mut Option<StopSnapshot>,
+) -> Result<Outcome> {
     let Some((prog, args)) = cmd.argv.split_first() else {
         bail!("comando vazio em run_process");
     };
@@ -777,6 +929,12 @@ pub fn run_process(
         let mut drain_deadline: Option<Instant> = None;
         let start_ms = clock.monotonic_ms();
         let mut last_activity_ms = start_ms;
+        let mut watch = StopWatch {
+            start_mono_ms: start_ms,
+            last_output_mono_ms: None,
+            last_output_at_ms: None,
+            last_output_ticks: None,
+        };
         let timeout_ms = limits.timeout.as_millis() as u64;
         let stall_ms = limits.stall.as_millis() as u64;
 
@@ -881,6 +1039,11 @@ pub fn run_process(
                             match read_nonblocking_fd(fd, &mut read_buf)? {
                                 ReadStreamResult::Data(n) => {
                                     saw_io_bytes = true;
+                                    // Here and not after the probe below, which may be slow: a
+                                    // process started meanwhile is newer than this output.
+                                    watch.last_output_mono_ms = Some(clock.monotonic_ms());
+                                    watch.last_output_at_ms = Some(clock.now_ms());
+                                    watch.last_output_ticks = boot_time_ticks();
                                     let chunk = &read_buf[..n];
                                     write_to_log(
                                         &mut log_file,
@@ -977,10 +1140,24 @@ pub fn run_process(
             }
 
             if now.saturating_sub(start_ms) >= timeout_ms {
+                *stop = Some(stop_snapshot(
+                    &mut tree_ctx,
+                    Some(&marker),
+                    Some(&_active_guard),
+                    clock,
+                    &watch,
+                ));
                 return Ok(Some(Outcome::TimedOut));
             }
 
             if now.saturating_sub(last_activity_ms) >= stall_ms {
+                *stop = Some(stop_snapshot(
+                    &mut tree_ctx,
+                    Some(&marker),
+                    Some(&_active_guard),
+                    clock,
+                    &watch,
+                ));
                 return Ok(Some(Outcome::Stalled));
             }
         }
@@ -1696,5 +1873,168 @@ mod tests {
                 "B2's setsid grandchild {gpid_b2} survived B2's exit"
             );
         });
+    }
+
+    #[test]
+    fn stall_snapshot_separates_processes_by_last_output() {
+        let tmp = TempDir::new().unwrap();
+        crate::test_support::write_executable(
+            tmp.path().join("early_tool.sh"),
+            "#!/bin/sh\ntouch ready\nsleep 30\n",
+        );
+        crate::test_support::write_executable(
+            tmp.path().join("late_tool.sh"),
+            "#!/bin/sh\nsleep 30\n",
+        );
+        let script = tmp.path().join("main.sh");
+        crate::test_support::write_executable(
+            &script,
+            "#!/bin/sh\n./early_tool.sh &\nwhile [ ! -f ready ]; do sleep 0.02; done\nprintf 'one line\\n'\nsleep 0.2\n./late_tool.sh &\nwait\n",
+        );
+
+        let mut stop = None;
+        let outcome = run_process_diagnosed(
+            script_cmd(&script, &[], tmp.path()),
+            b"",
+            &tmp.path().join("stall.log"),
+            Limits {
+                timeout: Duration::from_secs(20),
+                stall: Duration::from_millis(1500),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut || false,
+            &mut stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Stalled);
+        assert!(stop.is_some(), "a stalled stage must record a snapshot");
+        let stop = stop.unwrap();
+        assert!(stop.cli_alive, "the CLI was still running");
+        assert!(
+            stop.silent_ms >= 1500,
+            "silent_ms must cover the whole silent window, got {}",
+            stop.silent_ms
+        );
+        assert!(stop.last_output_at_ms.is_some());
+        let early = stop
+            .processes
+            .iter()
+            .find(|p| p.name == "early_tool.sh")
+            .expect("early_tool.sh must be listed");
+        let late = stop
+            .processes
+            .iter()
+            .find(|p| p.name == "late_tool.sh")
+            .expect("late_tool.sh must be listed");
+        assert!(
+            !early.after_last_output,
+            "a tool started before the last output is not the open one"
+        );
+        assert!(
+            late.after_last_output,
+            "a tool started after the last output is the open one"
+        );
+        assert!(stop.processes_total >= stop.processes.len());
+        let after: Vec<bool> = stop.processes.iter().map(|p| p.after_last_output).collect();
+        let first_old = after.iter().position(|a| !a).unwrap_or(after.len());
+        assert!(
+            after[first_old..].iter().all(|a| !a),
+            "processes started after the last output come first: {after:?}"
+        );
+    }
+
+    #[test]
+    fn stall_snapshot_without_output_marks_no_process() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("silent.sh");
+        crate::test_support::write_executable(&script, "#!/bin/sh\nsleep 30\n");
+
+        let mut stop = None;
+        let outcome = run_process_diagnosed(
+            script_cmd(&script, &[], tmp.path()),
+            b"",
+            &tmp.path().join("silent.log"),
+            Limits {
+                timeout: Duration::from_secs(20),
+                stall: Duration::from_millis(300),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut || false,
+            &mut stop,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Stalled);
+        let stop = stop.expect("a stalled stage must record a snapshot");
+        assert_eq!(stop.last_output_at_ms, None);
+        assert!(
+            stop.processes.iter().all(|p| !p.after_last_output),
+            "without any output no process can be after it"
+        );
+        assert!(stop.silent_ms >= 300);
+    }
+
+    #[test]
+    fn normal_exit_and_cancel_leave_no_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let script = tmp.path().join("ok.sh");
+        crate::test_support::write_executable(&script, "#!/usr/bin/env sh\nexit 0\n");
+
+        let mut stop = None;
+        let outcome = run_process_diagnosed(
+            script_cmd(&script, &[], tmp.path()),
+            b"",
+            &tmp.path().join("ok.log"),
+            Limits {
+                timeout: Duration::from_secs(20),
+                stall: Duration::from_secs(20),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(false),
+            &mut |_| {},
+            &mut || false,
+            &mut stop,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Exited(0));
+        assert!(stop.is_none(), "a normal exit has no stop diagnostic");
+
+        let mut stop = None;
+        let outcome = run_process_diagnosed(
+            script_cmd(&script, &[], tmp.path()),
+            b"",
+            &tmp.path().join("cancel.log"),
+            Limits {
+                timeout: Duration::from_secs(20),
+                stall: Duration::from_secs(20),
+            },
+            &SystemClock::new(),
+            &AtomicBool::new(true),
+            &mut |_| {},
+            &mut || false,
+            &mut stop,
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(stop.is_none(), "a cancelled stage has no stop diagnostic");
+    }
+
+    #[test]
+    fn stat_with_odd_names_is_parsed() {
+        let raw = "7 (a) b (x)) S 1 7 7 0 -1 4194560 100 0 0 0 3 4 0 0 20 0 1 0 12345 0 0";
+        let stat = parse_proc_stat(7, raw).expect("a comm with spaces and parentheses parses");
+        assert_eq!(stat.comm, "a) b (x)");
+        assert_eq!(stat.state, 'S');
+        assert_eq!(stat.ppid, 1);
+        assert_eq!(stat.pgrp, 7);
+        assert_eq!(stat.session, 7);
+        assert_eq!(stat.utime, 3);
+        assert_eq!(stat.stime, 4);
+        assert_eq!(stat.start_ticks, 12345);
     }
 }

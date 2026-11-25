@@ -21,7 +21,7 @@ O log não separa "modelo sem resposta" de "ferramenta longa". Medido no ai-box:
 2. **Nunca** gravar linha de comando, argumentos, ambiente ou caminho de processo: podem ter segredos. O `log` da etapa já tem o comando.
 3. Uma dica de uma linha entra no fim do motivo (linha `RESUMO` e `report.md`):
    - ferramenta aberta: `ferramenta em execução: <nomes>`;
-   - senão, processo iniciado depois da última saída: `processos iniciados depois da última saída: <nomes> (possível ferramenta em execução)`;
+   - senão, processo iniciado depois da última saída: `possível ferramenta em execução: <nomes> (processos iniciados depois da última saída)`;
    - senão, nenhum evento recebido: `o CLI não emitiu nenhum evento`;
    - senão: `nenhuma ferramenta detectada em execução (provável espera pelo modelo)`.
    O texto é um indício, não uma certeza, e as palavras "possível" e "provável" são obrigatórias.

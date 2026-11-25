@@ -1,13 +1,15 @@
-use crate::loops::adapters::{build_prompt, command as adapter_command, EventParser};
+use crate::loops::adapters::{
+    build_prompt, command as adapter_command, AdapterResult, EventParser,
+};
 use crate::loops::artifacts::{collect_output, prepare_exchange};
 use crate::loops::models::ModelSource;
 use crate::loops::preflight::ProbeRecord;
-use crate::loops::process::{run_process, Clock, Limits, Outcome};
+use crate::loops::process::{run_process_diagnosed, Clock, Limits, Outcome, StopSnapshot};
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{
     redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
-    Usage, LOOP_STATE_SCHEMA_VERSION,
+    StopDiagnostic, StopProcess, Usage, LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::loops::verdict::{parse_verdict, summary_line, MAX_SUMMARY_CHARS};
 use crate::loops::workflow::{Provider, Stage, Workflow};
@@ -24,6 +26,10 @@ pub const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const PROBE_SAMPLE_INTERVAL_MS: u64 = 10_000;
 const MAX_PROBE_ENTRIES: usize = 100_000;
 const MAX_REASON_CHARS: usize = 500;
+/// Upper bounds on what a single stop diagnostic keeps, so a wedged stage cannot bloat the state.
+const MAX_STOP_TOOLS: usize = 10;
+const MAX_STOP_PROCESSES: usize = 20;
+const MAX_STOP_NAME_CHARS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageOutcome {
@@ -41,6 +47,8 @@ pub struct StageResult {
     pub outcome: StageOutcome,
     pub usage: Usage,
     pub error: Option<String>,
+    /// Filled only when the engine cut the stage short; see [`StopDiagnostic`].
+    pub stop: Option<StopDiagnostic>,
 }
 
 impl Default for StageResult {
@@ -49,6 +57,7 @@ impl Default for StageResult {
             outcome: StageOutcome::Ok,
             usage: Usage::default(),
             error: None,
+            stop: None,
         }
     }
 }
@@ -114,6 +123,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     outcome: StageOutcome::Error,
                     usage: Usage::default(),
                     error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
+                    stop: None,
                 };
             }
         };
@@ -133,6 +143,7 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     outcome: StageOutcome::Error,
                     usage: Usage::default(),
                     error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
+                    stop: None,
                 };
             }
         };
@@ -141,7 +152,8 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
         let mut sampler = WorkspaceSampler::new(req.workspace, self.clock);
         let pulse = req.pulse;
 
-        let proc_res = run_process(
+        let mut stop_snapshot: Option<StopSnapshot> = None;
+        let proc_res = run_process_diagnosed(
             sandboxed,
             &cmd.stdin,
             req.log_path,
@@ -161,15 +173,44 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                     false
                 }
             },
+            &mut stop_snapshot,
         );
 
-        let parsed = parser.finish();
+        // A stage the engine ended never reaches its own settled event, so the parser must not
+        // report the resulting silence as a provider failure.
+        let interrupted = matches!(
+            &proc_res,
+            Ok(Outcome::Stalled) | Ok(Outcome::TimedOut) | Ok(Outcome::Cancelled)
+        );
+        let (parsed, stop) = if interrupted {
+            let stream = parser.finish_interrupted();
+            let stop = stop_snapshot.map(|snapshot| StopDiagnostic {
+                last_event: stream.last_event.clone(),
+                last_output_at_ms: snapshot.last_output_at_ms,
+                silent_ms: snapshot.silent_ms,
+                cli_alive: snapshot.cli_alive,
+                running_tools: stream.running_tools.clone(),
+                processes: snapshot.processes,
+                processes_total: snapshot.processes_total,
+            });
+            (
+                AdapterResult {
+                    usage: stream.usage,
+                    error: stream.error,
+                },
+                stop,
+            )
+        } else {
+            (parser.finish(), None)
+        };
+
         let parsed_error = parsed.error.map(|e| sanitize_reason(&e, &extra_refs));
         match proc_res {
             Err(e) => StageResult {
                 outcome: StageOutcome::Error,
                 usage: parsed.usage,
                 error: Some(sanitize_reason(&format!("{e:#}"), &extra_refs)),
+                stop: None,
             },
             Ok(Outcome::Exited(0)) => {
                 if parsed_error.is_some() {
@@ -177,12 +218,14 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                         outcome: StageOutcome::Error,
                         usage: parsed.usage,
                         error: parsed_error,
+                        stop: None,
                     }
                 } else {
                     StageResult {
                         outcome: StageOutcome::Ok,
                         usage: parsed.usage,
                         error: None,
+                        stop: None,
                     }
                 }
             }
@@ -191,27 +234,32 @@ impl<'a> StageRunner for ProcessStageRunner<'a> {
                 usage: parsed.usage,
                 error: parsed_error
                     .or_else(|| Some(format!("processo retornou código de saída {code}"))),
+                stop: None,
             },
             Ok(Outcome::Signaled(sig)) => StageResult {
                 outcome: StageOutcome::Signaled(sig),
                 usage: parsed.usage,
                 error: parsed_error
                     .or_else(|| Some(format!("processo encerrado pelo sinal {sig}"))),
+                stop: None,
             },
             Ok(Outcome::TimedOut) => StageResult {
                 outcome: StageOutcome::TimedOut,
                 usage: parsed.usage,
                 error: parsed_error,
+                stop,
             },
             Ok(Outcome::Stalled) => StageResult {
                 outcome: StageOutcome::Stalled,
                 usage: parsed.usage,
                 error: parsed_error,
+                stop,
             },
             Ok(Outcome::Cancelled) => StageResult {
                 outcome: StageOutcome::Cancelled,
                 usage: parsed.usage,
                 error: parsed_error,
+                stop: None,
             },
         }
     }
@@ -388,6 +436,44 @@ fn sanitize_reason(raw: &str, extra_secrets: &[&str]) -> String {
         "erro desconhecido".to_string()
     } else {
         s
+    }
+}
+
+/// Redacts and caps a diagnostic before it is persisted; process names come from the kernel.
+fn sanitize_stop(stop: StopDiagnostic, extra_secrets: &[&str]) -> StopDiagnostic {
+    // Redact the whole text before cutting it: a cut secret would no longer be recognised.
+    let text = |raw: &str| {
+        let full = sanitize_text(raw, None, extra_secrets);
+        sanitize_text(&full, Some(MAX_STOP_NAME_CHARS), extra_secrets)
+    };
+    StopDiagnostic {
+        last_event: stop
+            .last_event
+            .map(|event| text(&event))
+            .filter(|event| !event.is_empty()),
+        last_output_at_ms: stop.last_output_at_ms,
+        silent_ms: stop.silent_ms,
+        cli_alive: stop.cli_alive,
+        running_tools: stop.running_tools.map(|tools| {
+            tools
+                .iter()
+                .take(MAX_STOP_TOOLS)
+                .map(|tool| text(tool))
+                .filter(|tool| !tool.is_empty())
+                .collect()
+        }),
+        processes: stop
+            .processes
+            .iter()
+            .take(MAX_STOP_PROCESSES)
+            .map(|p| StopProcess {
+                name: text(&p.name),
+                age_ms: p.age_ms,
+                cpu_ms: p.cpu_ms,
+                after_last_output: p.after_last_output,
+            })
+            .collect(),
+        processes_total: stop.processes_total,
     }
 }
 
@@ -844,6 +930,10 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         outcome: "ERROR".to_string(),
                         error: Some(err.clone()),
                         log_file: Some(log_rel),
+                        stop: result
+                            .stop
+                            .clone()
+                            .map(|stop| sanitize_stop(stop, extra_secrets)),
                     });
                     drop(guard);
                     end_run(RunStatus::Error, Some(err), None);
@@ -867,8 +957,19 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         verdict,
                         outcome: outcome.to_string(),
                         error: clean_err,
+                        stop: result
+                            .stop
+                            .clone()
+                            .map(|stop| sanitize_stop(stop, extra_secrets)),
                         log_file: Some(log_rel.clone()),
                     });
+                };
+
+                // The hint names what was likely still holding the stage, so the reason explains
+                // a wedge without opening state.json.
+                let with_hint = |base: &str| match result.stop.as_ref() {
+                    Some(stop) => format!("{base}: {}", stop.hint()),
+                    None => base.to_string(),
                 };
 
                 match result.outcome {
@@ -885,7 +986,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                         push_exec("STALLED", None, result.error);
                         end_run(
                             RunStatus::Escalate,
-                            Some("etapa travada sem atividade (STALLED)".to_string()),
+                            Some(with_hint("etapa travada sem atividade (STALLED)")),
                             None,
                         );
                         break;
@@ -896,14 +997,14 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                             push_exec("MAX_DURATION", None, result.error);
                             end_run(
                                 RunStatus::Escalate,
-                                Some("tempo máximo do loop atingido (MAX_DURATION)".to_string()),
+                                Some(with_hint("tempo máximo do loop atingido (MAX_DURATION)")),
                                 None,
                             );
                         } else {
                             push_exec("TIMEOUT", None, result.error);
                             end_run(
                                 RunStatus::Escalate,
-                                Some("tempo limite da etapa atingido (STAGE_TIMEOUT)".to_string()),
+                                Some(with_hint("tempo limite da etapa atingido (STAGE_TIMEOUT)")),
                                 None,
                             );
                         }
@@ -1495,6 +1596,7 @@ on_retry = "implement"
                     cost_usd: Some(0.01),
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1509,6 +1611,7 @@ on_retry = "implement"
                     cost_usd: Some(0.005),
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1527,6 +1630,7 @@ on_retry = "implement"
                     cost_usd: Some(0.005),
                 },
                 error: None,
+                stop: None,
             }
         });
 
@@ -1568,6 +1672,7 @@ on_retry = "implement"
                     cost_usd: Some(0.10),
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1582,6 +1687,7 @@ on_retry = "implement"
                     cost_usd: None,
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1600,6 +1706,7 @@ on_retry = "implement"
                     cost_usd: Some(0.05),
                 },
                 error: None,
+                stop: None,
             }
         });
 
@@ -1616,6 +1723,7 @@ on_retry = "implement"
                     cost_usd: Some(0.08),
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1630,6 +1738,7 @@ on_retry = "implement"
                     cost_usd: None,
                 },
                 error: None,
+                stop: None,
             }
         });
         runner.push(|req| {
@@ -1644,6 +1753,7 @@ on_retry = "implement"
                     cost_usd: Some(0.02),
                 },
                 error: None,
+                stop: None,
             }
         });
 
@@ -2576,6 +2686,7 @@ on_retry = "implement"
             outcome: StageOutcome::NonZeroExit(1),
             usage: Usage::default(),
             error: Some("quota exhausted".into()),
+            stop: None,
         });
         let events = RecordingEvidence::default();
         let state = Engine::new(make_config(&tmp, wf.clone()), ws, runner, FakeClock::new())
@@ -2598,6 +2709,7 @@ on_retry = "implement"
             outcome: StageOutcome::Cancelled,
             usage: Usage::default(),
             error: None,
+            stop: None,
         });
         let events2 = RecordingEvidence::default();
         let state2 = Engine::new(
@@ -2663,5 +2775,139 @@ on_retry = "implement"
             .unwrap()
             .iter()
             .all(|(kind, _, _)| kind == "record"));
+    }
+
+    #[test]
+    fn stalled_stage_records_stop_and_hint_without_leaking_a_secret() {
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let secret = "sk-stop-secret-123456";
+        let mut runner = ScriptedRunner::new();
+        runner.push(move |_| StageResult {
+            outcome: StageOutcome::Stalled,
+            usage: Usage::default(),
+            error: None,
+            stop: Some(StopDiagnostic {
+                last_event: Some("tool_execution_update (bash)".into()),
+                last_output_at_ms: Some(1_000),
+                silent_ms: 1_500,
+                cli_alive: true,
+                running_tools: Some(vec![
+                    format!("bash {secret}"),
+                    format!("{}{secret}", "x".repeat(55)),
+                ]),
+                processes: vec![StopProcess {
+                    name: format!("tool-{secret}"),
+                    age_ms: 100,
+                    cpu_ms: 5,
+                    after_last_output: true,
+                }],
+                processes_total: 3,
+            }),
+        });
+
+        let state = Engine::new(
+            make_config(&tmp, wrc_workflow(3)),
+            ws,
+            runner,
+            FakeClock::new(),
+        )
+        .with_extra_secrets(vec![secret.to_string()])
+        .run();
+
+        assert_eq!(state.status, RunStatus::Escalate);
+        let reason = state.reason.clone().unwrap_or_default();
+        assert!(
+            reason.contains("etapa travada sem atividade (STALLED): ferramenta em execução: bash"),
+            "got: {reason}"
+        );
+        assert!(
+            !reason.contains(secret),
+            "secret leaked into reason: {reason}"
+        );
+
+        let stop = state.executions[0]
+            .stop
+            .clone()
+            .expect("a cut stage must record a stop");
+        assert_eq!(stop.silent_ms, 1_500);
+        assert_eq!(stop.processes_total, 3);
+        assert!(stop.cli_alive);
+        assert!(
+            !format!("{stop:?}").contains("sk-stop"),
+            "secret kept in state"
+        );
+
+        let raw_state = fs::read_to_string(tmp.path().join("run/state.json")).unwrap();
+        assert!(!raw_state.contains(secret), "secret leaked into state.json");
+        assert!(raw_state.contains("[REDACTED]"));
+        let raw_report = fs::read_to_string(tmp.path().join("run/report.md")).unwrap();
+        assert!(!raw_report.contains(secret), "secret leaked into report.md");
+        assert!(
+            raw_report.contains("## Etapas interrompidas"),
+            "{raw_report}"
+        );
+        assert!(raw_report.contains("[REDACTED]"), "{raw_report}");
+    }
+
+    #[test]
+    fn interrupted_pi_stage_hides_the_missing_settled_error() {
+        let tmp = TempDir::new().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        crate::test_support::write_executable(
+            bin_dir.join("pi"),
+            "#!/usr/bin/env sh\n\
+             printf '%s\\n' '{\"type\":\"tool_execution_start\",\"toolCallId\":\"c1\",\"toolName\":\"bash\"}'\n\
+             printf '%s\\n' '{\"type\":\"tool_execution_update\",\"toolCallId\":\"c1\",\"toolName\":\"bash\"}'\n\
+             sleep 30\n",
+        );
+
+        let mut wf = wrc_workflow(1);
+        wf.stages[0].provider = Provider::Pi;
+        wf.stages[0].model = Some("opencode-go/glm-5.3".into());
+        let stage = wf.stages[0].clone();
+
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let sb = PassthroughSandbox { bin_dir };
+        let clock = SystemClock::new();
+        let mut runner = ProcessStageRunner::new(&sb, &clock);
+        let log_path = tmp.path().join("implement.log");
+        let cancel = AtomicBool::new(false);
+        let pulse = |_active: bool| {};
+        let result = runner.run(StageRequest {
+            run_id: "20261125-000000-tst0",
+            cycle: 1,
+            exec_seq: 1,
+            stage: &stage,
+            workspace: ws.path(),
+            prompt: "faça algo",
+            log_path: &log_path,
+            limits: Limits {
+                timeout: Duration::from_secs(30),
+                stall: Duration::from_millis(800),
+            },
+            cancel: &cancel,
+            pulse: &pulse,
+        });
+
+        assert_eq!(result.outcome, StageOutcome::Stalled);
+        assert_eq!(
+            result.error, None,
+            "an interrupted stage must not report the missing settled event"
+        );
+        let stop = result.stop.expect("a cut stage must record a stop");
+        assert_eq!(stop.running_tools, Some(vec!["bash".to_string()]));
+        assert_eq!(
+            stop.last_event.as_deref(),
+            Some("tool_execution_update (bash)")
+        );
+        assert!(stop.cli_alive, "the fake pi is still sleeping");
+        assert!(
+            stop.silent_ms >= 800,
+            "silent_ms {} must cover the stall threshold",
+            stop.silent_ms
+        );
+        assert_eq!(stop.hint(), "ferramenta em execução: bash");
     }
 }
