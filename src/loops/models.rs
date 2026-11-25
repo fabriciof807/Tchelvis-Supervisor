@@ -421,6 +421,7 @@ pub fn resolve_workflow(
             max_cycles: unresolved.max_cycles,
             stage_timeout_secs: unresolved.stage_timeout_secs,
             stall_secs: unresolved.stall_secs,
+            tool_stall_secs: unresolved.tool_stall_secs,
             max_duration_secs: unresolved.max_duration_secs,
             stages: resolved_stages,
         },

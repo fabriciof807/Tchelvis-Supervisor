@@ -3,6 +3,7 @@ description = "Projeta a solução, implementa e revisa antes de aprovar"
 max_cycles = 3
 stage_timeout_secs = 1800
 stall_secs = 600
+tool_stall_secs = 1200
 max_duration_secs = 7200
 
 [[stages]]

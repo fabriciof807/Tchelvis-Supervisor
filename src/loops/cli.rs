@@ -38,7 +38,8 @@ use crate::loops::watch::{
 use crate::loops::workflow::{
     is_valid_role_name, is_valid_slug, is_valid_stage_id, parse_workflow_unresolved, Provider,
     RoleDefaults, UnresolvedWorkflow, Workflow, DEFAULT_MAX_CYCLES, DEFAULT_MAX_DURATION_SECS,
-    DEFAULT_ROLES, DEFAULT_STAGE_TIMEOUT_SECS, DEFAULT_STALL_SECS, PRESET_WORKFLOWS,
+    DEFAULT_ROLES, DEFAULT_STAGE_TIMEOUT_SECS, DEFAULT_STALL_SECS, DEFAULT_TOOL_STALL_SECS,
+    PRESET_WORKFLOWS,
 };
 use crate::loops::workspace::{FrozenWorkspaceMeta, GitWorkspace};
 use crate::model::{IpcOp, IpcRequest};
@@ -1653,6 +1654,7 @@ pub fn build_generated_workflow_and_roles(
     let _ = writeln!(toml, "max_cycles = {DEFAULT_MAX_CYCLES}");
     let _ = writeln!(toml, "stage_timeout_secs = {DEFAULT_STAGE_TIMEOUT_SECS}");
     let _ = writeln!(toml, "stall_secs = {DEFAULT_STALL_SECS}");
+    let _ = writeln!(toml, "tool_stall_secs = {DEFAULT_TOOL_STALL_SECS}");
     let _ = writeln!(toml, "max_duration_secs = {DEFAULT_MAX_DURATION_SECS}");
 
     let mut new_roles = BTreeMap::new();
@@ -3949,6 +3951,8 @@ mod tests {
             let res = resolve_workflow(unresolved, WorkflowOrigin::Repo, &[], None, &defaults)
                 .expect("resolves cleanly");
             assert_eq!(res.workflow.stages.len(), stages.len());
+            assert!(toml.contains("tool_stall_secs = 1200"));
+            assert_eq!(res.workflow.tool_stall_secs, 1200);
 
             if name == "custom-shape" {
                 assert!(roles.contains_key("auditor"));
@@ -4378,6 +4382,7 @@ mod tests {
             max_cycles: 1,
             stage_timeout_secs: 60,
             stall_secs: 60,
+            tool_stall_secs: 1200,
             max_duration_secs: 600,
             stages: vec![stage(provider)],
         };
@@ -4489,6 +4494,7 @@ mod tests {
             max_cycles: 1,
             stage_timeout_secs: 60,
             stall_secs: 60,
+            tool_stall_secs: 1200,
             max_duration_secs: 600,
             stages: vec![stage],
         };

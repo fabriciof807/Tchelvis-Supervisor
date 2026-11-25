@@ -6,6 +6,7 @@ use std::str::FromStr;
 pub const DEFAULT_MAX_CYCLES: u32 = 3;
 pub const DEFAULT_STAGE_TIMEOUT_SECS: u64 = 1800;
 pub const DEFAULT_STALL_SECS: u64 = 600;
+pub const DEFAULT_TOOL_STALL_SECS: u64 = 1200;
 pub const DEFAULT_MAX_DURATION_SECS: u64 = 7200;
 const LIMIT_MAX_CYCLES: u64 = 20;
 const LIMIT_SECS: u64 = 7 * 24 * 3600;
@@ -53,6 +54,7 @@ const WORKFLOW_KEYS: &[&str] = &[
     "max_cycles",
     "stage_timeout_secs",
     "stall_secs",
+    "tool_stall_secs",
     "max_duration_secs",
     "stages",
 ];
@@ -146,6 +148,7 @@ pub struct Workflow {
     pub max_cycles: u32,
     pub stage_timeout_secs: u64,
     pub stall_secs: u64,
+    pub tool_stall_secs: u64,
     pub max_duration_secs: u64,
     pub stages: Vec<Stage>,
 }
@@ -172,6 +175,7 @@ pub struct UnresolvedWorkflow {
     pub max_cycles: u32,
     pub stage_timeout_secs: u64,
     pub stall_secs: u64,
+    pub tool_stall_secs: u64,
     pub max_duration_secs: u64,
     pub stages: Vec<UnresolvedStage>,
 }
@@ -342,6 +346,7 @@ pub fn parse_workflow(raw: &str, defaults: &RoleDefaults) -> Result<Workflow, Ve
         max_cycles: unresolved.max_cycles,
         stage_timeout_secs: unresolved.stage_timeout_secs,
         stall_secs: unresolved.stall_secs,
+        tool_stall_secs: unresolved.tool_stall_secs,
         max_duration_secs: unresolved.max_duration_secs,
         stages: unresolved
             .stages
@@ -438,6 +443,18 @@ fn parse_workflow_inner(
         LIMIT_SECS,
         &mut errors,
     );
+    let tool_stall_secs = read_positive_u64(
+        table,
+        "tool_stall_secs",
+        DEFAULT_TOOL_STALL_SECS.max(stall_secs),
+        LIMIT_SECS,
+        &mut errors,
+    );
+    if stall_secs > 0 && tool_stall_secs > 0 && tool_stall_secs < stall_secs {
+        errors.push(format!(
+            "limite 'tool_stall_secs' ({tool_stall_secs}) não pode ser menor que 'stall_secs' ({stall_secs})"
+        ));
+    }
     let max_duration_secs = read_positive_u64(
         table,
         "max_duration_secs",
@@ -908,6 +925,7 @@ fn parse_workflow_inner(
             max_cycles,
             stage_timeout_secs,
             stall_secs,
+            tool_stall_secs,
             max_duration_secs,
             stages: parsed_stages.into_iter().map(|m| m.stage).collect(),
         })
@@ -1526,6 +1544,8 @@ next = "done"
             let wf = parse_workflow(raw, &defaults)
                 .unwrap_or_else(|e| panic!("preset '{name}' failed validation: {e:?}"));
             assert_eq!(wf.name, *name);
+            assert_eq!(wf.tool_stall_secs, 1200);
+            assert!(raw.contains("tool_stall_secs = 1200"));
             for st in &wf.stages {
                 assert!(
                     DEFAULT_ROLES.iter().any(|(r, _)| *r == st.role),
@@ -1592,6 +1612,51 @@ verdict_gate = true
         parse_workflow(raw, &RoleDefaults::new())
             .expect_err("must be rejected")
             .join("\n")
+    }
+
+    fn with_limits(limits: &str) -> String {
+        two_stage("w", GATE_OK).replacen("name", &format!("{limits}\nname"), 1)
+    }
+
+    #[test]
+    fn tool_stall_default_follows_stall_secs() {
+        for (limits, expected) in [
+            ("", 1200),
+            ("stall_secs = 300", 1200),
+            ("stall_secs = 1200", 1200),
+            ("stall_secs = 3000", 3000),
+            ("stall_secs = 600\ntool_stall_secs = 900", 900),
+            ("stall_secs = 600\ntool_stall_secs = 600", 600),
+            ("tool_stall_secs = 604800", 604800),
+            ("stage_timeout_secs = 60\ntool_stall_secs = 1200", 1200),
+        ] {
+            let wf = parse_workflow(&with_limits(limits), &RoleDefaults::new())
+                .unwrap_or_else(|e| panic!("{limits}: {e:?}"));
+            assert_eq!(wf.tool_stall_secs, expected, "{limits}");
+        }
+    }
+
+    #[test]
+    fn tool_stall_invalid_values_are_rejected() {
+        for limits in [
+            "tool_stall_secs = 0",
+            "tool_stall_secs = -1",
+            "tool_stall_secs = \"1200\"",
+            "tool_stall_secs = 604801",
+        ] {
+            let text = errors(&with_limits(limits));
+            assert!(text.contains("tool_stall_secs"), "{limits}: {text}");
+            assert!(!text.contains("menor que 'stall_secs'"), "{limits}: {text}");
+        }
+        let text = errors(&with_limits("stall_secs = 600\ntool_stall_secs = 599"));
+        assert!(
+            text.contains(
+                "limite 'tool_stall_secs' (599) não pode ser menor que 'stall_secs' (600)"
+            ),
+            "{text}"
+        );
+        let text = errors(&with_limits("stall_secs = 0\ntool_stall_secs = 900"));
+        assert!(!text.contains("tool_stall_secs"), "{text}");
     }
 
     #[test]

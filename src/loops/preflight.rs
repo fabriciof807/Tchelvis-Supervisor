@@ -452,6 +452,7 @@ mod tests {
             max_cycles: 3,
             stage_timeout_secs: 60,
             stall_secs: 60,
+            tool_stall_secs: 1200,
             max_duration_secs: 300,
             stages: vec![s1, s2, s3, s4],
         };
