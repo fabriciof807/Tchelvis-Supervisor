@@ -467,6 +467,31 @@ pub struct ListResult {
     pub terminals: Vec<HcTerminal>,
 }
 
+/// Name of the doc the daemon publishes the fleet summary under.
+pub const SNAPSHOT_DOC: &str = "cockpit.snapshot";
+
+/// A doc whose content did not change is still rewritten this often, so `published_at` stays fresh.
+pub const DOC_REPUBLISH_SECS: i64 = 30;
+
+/// Whether `new` must be written over `current`: its content differs (ignoring `published_at`), or
+/// the published one is old enough to look stale.
+pub fn doc_needs_publish(current: &Value, new: &Value) -> bool {
+    fn published_at(v: &Value) -> Option<i64> {
+        v.get("published_at").and_then(Value::as_i64)
+    }
+    fn without_stamp(v: &Value) -> Value {
+        let mut v = v.clone();
+        if let Some(map) = v.as_object_mut() {
+            map.remove("published_at");
+        }
+        v
+    }
+    let (Some(old), Some(now)) = (published_at(current), published_at(new)) else {
+        return true;
+    };
+    now - old >= DOC_REPUBLISH_SECS || without_stamp(current) != without_stamp(new)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocGetResult {
     #[serde(default)]
@@ -487,6 +512,8 @@ pub enum HcStreamItem {
         seq: u64,
         terminal: Option<String>,
         event_type: String,
+        /// Name of the doc, for `doc` events.
+        name: Option<String>,
         data: Value,
     },
     Heartbeat,
@@ -515,11 +542,16 @@ pub fn parse_hc_event_line(line: &str) -> Result<HcStreamItem> {
                     .and_then(|t| t.as_str())
                     .unwrap_or("unknown")
                     .to_string();
+                let name = params
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string());
                 let data = params.get("data").cloned().unwrap_or(Value::Null);
                 return Ok(HcStreamItem::Event {
                     seq,
                     terminal,
                     event_type,
+                    name,
                     data,
                 });
             }
@@ -591,11 +623,14 @@ impl FleetTracker {
             HcStreamItem::Event {
                 terminal,
                 event_type,
+                name,
                 data,
                 ..
             } => {
                 let Some(addr) = terminal else {
-                    return event_type == "doc";
+                    // The daemon's own `doc.set` of the snapshot comes back as a `doc` event; treating
+                    // it as a change makes the daemon publish again, in a loop.
+                    return event_type == "doc" && name.as_deref() != Some(SNAPSHOT_DOC);
                 };
                 match event_type.as_str() {
                     "created" | "restarted" => {
@@ -993,15 +1028,18 @@ impl HerdrClient {
         let val = serde_json::to_value(projection)?;
         for attempt in 0..2 {
             let get_res = self
-                .rpc_call(rpc, "doc.get", json!({"name": "cockpit.snapshot"}))
+                .rpc_call(rpc, "doc.get", json!({"name": SNAPSHOT_DOC}))
                 .await?;
             let current: DocGetResult = serde_json::from_value(get_res)?;
+            if !doc_needs_publish(&current.value, &val) {
+                return Ok(current.version);
+            }
             match self
                 .rpc_call(
                     rpc,
                     "doc.set",
                     json!({
-                        "name": "cockpit.snapshot",
+                        "name": SNAPSHOT_DOC,
                         "value": val,
                         "version": current.version
                     }),
@@ -1569,6 +1607,44 @@ mod tests {
             tracker.effective_attention("t2", 2_700),
             AttentionState::Working { .. }
         ));
+    }
+
+    #[test]
+    fn doc_event_of_our_own_snapshot_is_not_a_change() {
+        let mut tracker = FleetTracker::new();
+        let own = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"seq":5,"type":"doc","name":"cockpit.snapshot"}}"#,
+        )
+        .unwrap();
+        // Our own `doc.set` would otherwise trigger a refresh that publishes again, forever.
+        assert!(!tracker.apply_stream_item(own, 1_000));
+
+        let other = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"seq":6,"type":"doc","name":"herdr-app"}}"#,
+        )
+        .unwrap();
+        assert!(tracker.apply_stream_item(other, 1_000));
+
+        let unnamed = parse_hc_event_line(
+            r#"{"jsonrpc":"2.0","method":"event","params":{"seq":7,"type":"doc"}}"#,
+        )
+        .unwrap();
+        assert!(tracker.apply_stream_item(unnamed, 1_000));
+    }
+
+    #[test]
+    fn doc_snapshot_is_republished_only_when_content_changes_or_gets_old() {
+        let current = json!({"published_at": 1_000, "agents": [], "summary": {"live": 1}});
+        let same_later = json!({"published_at": 1_005, "agents": [], "summary": {"live": 1}});
+        let changed = json!({"published_at": 1_005, "agents": [], "summary": {"live": 2}});
+
+        assert!(!doc_needs_publish(&current, &same_later));
+        assert!(doc_needs_publish(&current, &changed));
+        // Old enough that a consumer may read the doc as stale: refresh `published_at`.
+        let same_much_later = json!({"published_at": 1_000 + DOC_REPUBLISH_SECS, "agents": [], "summary": {"live": 1}});
+        assert!(doc_needs_publish(&current, &same_much_later));
+        // A doc that was never published has no `published_at`.
+        assert!(doc_needs_publish(&Value::Null, &same_later));
     }
 
     #[test]
