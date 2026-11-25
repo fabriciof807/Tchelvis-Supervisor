@@ -168,6 +168,17 @@ fn claude_tool_name(val: &serde_json::Value) -> Option<String> {
         })
 }
 
+/// What the CLI said about the tools it has open right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolView {
+    Open(Vec<String>),
+    NoneOpen,
+    /// The CLI never says when a tool starts (`opencode`); `step` counts step boundaries.
+    Unseen {
+        step: u64,
+    },
+}
+
 pub struct EventParser {
     provider: Provider,
     saw_result: bool,
@@ -175,6 +186,8 @@ pub struct EventParser {
     error: Option<String>,
     agy_turns: u64,
     opencode_steps: u64,
+    /// Step boundaries, the only progress signal `opencode` gives while it is silent.
+    opencode_boundaries: u64,
     opencode_in_sum: u64,
     opencode_in_seen: u64,
     opencode_out_sum: u64,
@@ -211,6 +224,7 @@ impl EventParser {
             error: None,
             agy_turns: 0,
             opencode_steps: 0,
+            opencode_boundaries: 0,
             opencode_in_sum: 0,
             opencode_in_seen: 0,
             opencode_out_sum: 0,
@@ -484,6 +498,9 @@ impl EventParser {
             }
             Provider::Opencode => {
                 let kind = val.get("type").and_then(|v| v.as_str());
+                if matches!(kind, Some("step_start") | Some("step_finish")) {
+                    self.opencode_boundaries = self.opencode_boundaries.saturating_add(1);
+                }
                 if kind == Some("tool_use") {
                     tool = val
                         .get("part")
@@ -630,6 +647,26 @@ impl EventParser {
                         (self.pi_cache_seen == responses).then_some(self.pi_cache_sum);
                     self.usage.cost_usd =
                         (self.pi_cost_seen == responses).then_some(self.pi_cost_sum);
+                }
+            }
+        }
+    }
+
+    pub fn tool_view(&self) -> ToolView {
+        match self.provider {
+            Provider::Opencode => ToolView::Unseen {
+                step: self.opencode_boundaries,
+            },
+            _ => {
+                if self.open_tools.is_empty() {
+                    ToolView::NoneOpen
+                } else {
+                    ToolView::Open(
+                        self.open_tools
+                            .iter()
+                            .map(|(_, name)| name.clone())
+                            .collect(),
+                    )
                 }
             }
         }
@@ -1286,6 +1323,110 @@ mod tests {
             state.last_event.as_deref(),
             Some("tool_execution_end (bash)")
         );
+    }
+
+    fn view_after(provider: Provider, name: &str, lines: usize) -> ToolView {
+        let raw = fixture(name);
+        let mut parser = EventParser::new(provider);
+        for line in raw.lines().take(lines) {
+            parser.line(line);
+        }
+        parser.tool_view()
+    }
+
+    #[test]
+    fn tool_view_follows_open_tools() {
+        assert_eq!(
+            view_after(Provider::Claude, "claude_ok.jsonl", 1),
+            ToolView::NoneOpen
+        );
+        assert_eq!(
+            view_after(Provider::Claude, "claude_ok.jsonl", 2),
+            ToolView::Open(vec!["Read".to_string()])
+        );
+        assert_eq!(
+            view_after(Provider::Claude, "claude_ok.jsonl", 3),
+            ToolView::NoneOpen
+        );
+        assert_eq!(
+            view_after(Provider::Agy, "agy_ok.jsonl", 4),
+            ToolView::Open(vec!["read_file".to_string()])
+        );
+        assert_eq!(
+            view_after(Provider::Agy, "agy_ok.jsonl", 5),
+            ToolView::NoneOpen
+        );
+
+        let raw = fixture("claude_ok.jsonl");
+        let mut parser = EventParser::new(Provider::Claude);
+        for line in raw.lines().take(2) {
+            parser.line(line);
+        }
+        let first = parser.tool_view();
+        assert_eq!(first, parser.tool_view(), "the view is stable");
+        assert_eq!(
+            parser.finish_interrupted().running_tools,
+            Some(vec!["Read".to_string()])
+        );
+    }
+
+    #[test]
+    fn tool_view_keeps_parallel_tools_with_one_name() {
+        let mut parser = EventParser::new(Provider::Pi);
+        for line in [
+            r#"{"type":"tool_execution_start","toolCallId":"a","toolName":"bash"}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"b","toolName":"bash"}"#,
+        ] {
+            parser.line(line);
+        }
+        assert_eq!(
+            parser.tool_view(),
+            ToolView::Open(vec!["bash".to_string(), "bash".to_string()])
+        );
+        parser.line(r#"{"type":"tool_execution_end","toolCallId":"a"}"#);
+        assert_eq!(parser.tool_view(), ToolView::Open(vec!["bash".to_string()]));
+        parser.line(r#"{"type":"tool_execution_end","toolCallId":"b"}"#);
+        assert_eq!(parser.tool_view(), ToolView::NoneOpen);
+    }
+
+    #[test]
+    fn tool_view_ignores_bad_lines() {
+        let mut pi = EventParser::new(Provider::Pi);
+        for line in [
+            "not json",
+            r#"{"type":"tool_execution_start","toolName":"bash"}"#,
+            r#"{"type":"tool_execution_start","toolCallId":"x","name":"bash"}"#,
+        ] {
+            pi.line(line);
+            assert_eq!(pi.tool_view(), ToolView::NoneOpen, "{line}");
+        }
+        pi.line(r#"{"type":"tool_execution_start","toolCallId":"c1","toolName":"bash"}"#);
+        pi.line(r#"{"type":"tool_execution_end","toolCallId":"c1""#);
+        assert_eq!(pi.tool_view(), ToolView::Open(vec!["bash".to_string()]));
+
+        let mut claude = EventParser::new(Provider::Claude);
+        claude.line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#,
+        );
+        assert_eq!(claude.tool_view(), ToolView::NoneOpen);
+
+        let mut agy = EventParser::new(Provider::Agy);
+        agy.line(
+            r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"tool","tool_name":"shell"}}"#,
+        );
+        assert_eq!(agy.tool_view(), ToolView::NoneOpen);
+    }
+
+    #[test]
+    fn tool_view_counts_opencode_boundaries() {
+        let expected = [0, 1, 1, 2, 3, 3, 4];
+        for (lines, step) in expected.into_iter().enumerate() {
+            assert_eq!(
+                view_after(Provider::Opencode, "opencode_ok.jsonl", lines),
+                ToolView::Unseen { step },
+                "after {lines} lines"
+            );
+        }
     }
 
     #[test]
