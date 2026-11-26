@@ -42,6 +42,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   - **Herdr mod:** active fallback shows `● LLM: <model> (Fallback)` in warning tone; the **Supervisor model** card splits into `PRINCIPAL (local)` (with `falhou` badge while active) and `FALLBACK (API)` with endpoint entry, `/v1/models` picker (`Trocar`), and `Voltar ao principal`.
 
 ### Changed
+- `loop status`, `loop result` and `loop report` run from the caller terminal acknowledge a finished loop's end notice, so no pointer follows a result already read.
+- A loop's end notice waits 30 s before its pointer is sent; a pointer whose oldest message is 5 min or older says how old it is.
+- `loop run` no longer prints the pi credentials note (`loop check` still does).
 - The Fleet card of a loop shows its active stage and cycle (e.g. `worker: pi · 1/3`, then the final status) instead of the run id; the parent's active-children line uses the same text.
 - **Compact Fleet cards.** Two lines at about half the height: state, agent icon, project and status; then branch, summary and the PR or issue. The terminal address moved to the Inspector title and shows on a card only when two would look the same. Permission requests and blocked or active children keep their own line.
 - **Host-matched API keys for `openai-compatible`.** Provider environment variables are now matched against the target host (`openai.com` → `OPENAI_API_KEY`, `openrouter.ai` → `OPENROUTER_API_KEY`, `deepseek.com` → `DEEPSEEK_API_KEY`, `opencode.ai` → `OPENCODE_API_KEY`); an `OPENAI_API_KEY` is no longer sent to non-OpenAI hosts. Explicit `TCHELVIS_LLM_API_KEY` (and `TCHELVIS_FALLBACK_API_KEY` / key file for fallback) still take precedence.

@@ -993,6 +993,15 @@ pub fn pi_check_notes(
     ])
 }
 
+/// `loop run` refuses what `loop check` refuses, without `pi_check_notes`' informational notes.
+fn pi_run_gate(
+    workflow: &Workflow,
+    install: &Result<PiInstall, String>,
+    sandbox_kind: &str,
+) -> Result<(), String> {
+    pi_check_notes(workflow, install, sandbox_kind).map(|_| ())
+}
+
 fn auth_header(kind: &str) -> Option<&'static str> {
     if kind == "none" {
         Some("modo sem sandbox: os CLIs usam os logins normais do HOME")
@@ -2968,11 +2977,7 @@ async fn cmd_run(
     let opencode_key = opencode_key_for(&resolution.workflow);
     let extra_secrets = collect_extra_secrets(opencode_key.as_deref());
     let pi_install = pi_managed_install(&paths.home_dir, std::env::var_os("PATH").as_deref());
-    for note in
-        pi_check_notes(&resolution.workflow, &pi_install, sandbox.kind()).map_err(LoopError::err)?
-    {
-        eprint_redacted(&note, &extra_secrets);
-    }
+    pi_run_gate(&resolution.workflow, &pi_install, sandbox.kind()).map_err(LoopError::err)?;
 
     // 4. Read-only git check BEFORE preflight so dirty repo runs zero CLIs
     let branch = format!("loop/{}-{run_id}", resolution.workflow.name);
@@ -4572,6 +4577,51 @@ mod tests {
         assert_eq!(
             pi_check_notes(&wf, &install, "bwrap").unwrap(),
             vec![warning]
+        );
+    }
+
+    #[test]
+    fn pi_run_gate_refuses_like_check_but_carries_no_note() {
+        let stage = crate::loops::workflow::Stage {
+            id: "s1".to_string(),
+            role: "worker".to_string(),
+            provider: Provider::Pi,
+            model: Some("opencode-go/glm-5.3".to_string()),
+            reads: Vec::new(),
+            writes: Some("out.md".to_string()),
+            edits: false,
+            next: None,
+            verdict_gate: false,
+            on_pass: None,
+            on_retry: None,
+        };
+        let wf = crate::loops::workflow::Workflow {
+            name: "wf".to_string(),
+            description: String::new(),
+            max_cycles: 1,
+            stage_timeout_secs: 60,
+            stall_secs: 60,
+            tool_stall_secs: 1200,
+            max_duration_secs: 600,
+            stages: vec![stage],
+        };
+        let install = Ok(PiInstall {
+            agent_dir: PathBuf::from("/home/u/.pi/agent"),
+            version: "1.2.3".to_string(),
+        });
+        let unrecognized = Err(crate::loops::sandbox::PI_UNRECOGNIZED.to_string());
+
+        assert_eq!(pi_run_gate(&wf, &install, "bwrap"), Ok(()));
+        assert_eq!(
+            pi_run_gate(&wf, &unrecognized, "bwrap"),
+            Err(pi_check_notes(&wf, &unrecognized, "bwrap").unwrap_err())
+        );
+        for kind in ["inherited", "none"] {
+            assert_eq!(pi_run_gate(&wf, &unrecognized, kind), Ok(()), "{kind}");
+        }
+        assert_eq!(
+            pi_check_notes(&wf, &install, "bwrap").unwrap(),
+            vec!["aviso: pi: a etapa vê todas as credenciais de ~/.pi/agent/auth.json".to_string()]
         );
     }
 
