@@ -30,7 +30,7 @@ use crate::loops::sandbox::{
 };
 use crate::loops::state::{
     format_result, load_state, redact_loop_text, result_line_one, sanitize_single_line, CallerInfo,
-    RunState, Usage,
+    RunState, RunStatus, Usage,
 };
 use crate::loops::watch::{
     current_process_identity, LinuxProcTable, ProcTable, ENGINE_START_GRACE_MS,
@@ -3439,6 +3439,50 @@ fn removed_records_message(run_id: &str, status: &str) -> String {
     )
 }
 
+/// Records the final if the watcher has not, then acknowledges the loop's end notice for
+/// `terminal`. Returns true when the notice changed.
+fn ack_read_notice(
+    store: &OrchStore,
+    run_id: &str,
+    status: RunStatus,
+    terminal: &str,
+    now_ms: i64,
+) -> anyhow::Result<bool> {
+    if !status.is_final() {
+        return Ok(false);
+    }
+    let Some(rec) = store.get_loop(run_id)? else {
+        return Ok(false);
+    };
+    if rec.caller_terminal.as_deref() != Some(terminal) {
+        return Ok(false);
+    }
+    store.record_loop_final(run_id, status.as_str(), now_ms)?;
+    store.ack_loop_notice(run_id, terminal, now_ms)
+}
+
+/// Acknowledges the end notice when the run's result is read from the caller terminal.
+/// Never changes the command's output or exit code, and never creates the orch db.
+fn ack_notice_on_read(paths: &CockpitPaths, state: &RunState) {
+    let terminal = std::env::var("HC_TERMINAL_ID").unwrap_or_default();
+    let terminal = terminal.trim();
+    if terminal.is_empty() {
+        return;
+    }
+    let db_path = paths.orch_db_file();
+    if !db_path.exists() {
+        return;
+    }
+    let result = (|| -> anyhow::Result<()> {
+        let store = OrchStore::open(&db_path)?;
+        ack_read_notice(&store, &state.run_id, state.status, terminal, unix_now_ms())?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::debug!(run_id = %state.run_id, error = %e, "loop notice ack on read failed");
+    }
+}
+
 fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<(), LoopError> {
     let (resolved_id, run_dir) = find_run_dir(run_id, paths)?;
     match load_state(&run_dir) {
@@ -3467,6 +3511,7 @@ fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<
                 }
                 println!("ETAPAS EXECUTADAS: {}", state.executions.len());
             }
+            ack_notice_on_read(paths, &state);
             Ok(())
         }
         Err(_) => {
@@ -3515,7 +3560,10 @@ fn cmd_status(paths: &CockpitPaths, run_id: Option<&str>, json: bool) -> Result<
 fn cmd_result(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopError> {
     let (id, run_dir) = find_run_dir(run_id, paths)?;
     match load_state(&run_dir) {
-        Ok(state) => println!("{}", format_result(&state)),
+        Ok(state) => {
+            println!("{}", format_result(&state));
+            ack_notice_on_read(paths, &state);
+        }
         // The engine ended before writing anything (or disk files were cleaned): the record still says how.
         Err(_) => {
             let rec = registered_run(&id, paths)?;
@@ -3606,6 +3654,9 @@ fn cmd_report(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopErro
         let md = read_regular_file_nofollow(&report_path, MAX_LOG_PRINT_BYTES)
             .map_err(|e| LoopError::err(format!("{e:#}")))?;
         println!("{}", for_terminal(&md, &extra));
+        if let Ok(state) = load_state(&run_dir) {
+            ack_notice_on_read(paths, &state);
+        }
         return Ok(());
     }
     let state = load_state(&run_dir).map_err(|e| LoopError::err(format!("{e:#}")))?;
@@ -3613,6 +3664,7 @@ fn cmd_report(paths: &CockpitPaths, run_id: Option<&str>) -> Result<(), LoopErro
         "{}",
         render_report_with_secrets(&state, &run_dir, &extra_refs)
     );
+    ack_notice_on_read(paths, &state);
     Ok(())
 }
 
@@ -4639,5 +4691,96 @@ mod tests {
             };
             assert!(err.message.contains("bubblewrap"), "{}", err.message);
         }
+    }
+
+    fn sample_registered_loop(run_id: &str) -> LoopRunRecord {
+        LoopRunRecord {
+            run_id: run_id.to_string(),
+            dir: format!("/tmp/loops/{run_id}"),
+            workflow: "worker-reviewer-critic".to_string(),
+            status: "RUNNING".to_string(),
+            caller_terminal: Some("t1".to_string()),
+            caller_created_ms: Some(1_000),
+            engine_pid: Some(42),
+            engine_start_ticks: Some(999),
+            orch_run_id: None,
+            notify_state: "pending".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn reading_a_final_run_from_the_caller_records_and_acks_the_notice() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+        store.register_loop(&sample_registered_loop("r1")).unwrap();
+
+        assert!(ack_read_notice(&store, "r1", RunStatus::Pass, "t1", 5_000).unwrap());
+
+        let rec = store.get_loop("r1").unwrap().unwrap();
+        assert_eq!(rec.status, "PASS");
+        assert_eq!(rec.notify_state, "acknowledged");
+        let msgs = store.list_messages_for_run("loop_r1").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].pointer_state,
+            crate::orch::PointerState::Acknowledged
+        );
+        assert!(store
+            .pending_pointer_targets(10_000_000)
+            .unwrap()
+            .is_empty());
+        // A later watcher pass has nothing to record.
+        assert!(store
+            .record_loop_final("r1", "PASS", 6_000)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn reading_from_another_terminal_or_while_running_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+        store.register_loop(&sample_registered_loop("r2")).unwrap();
+        store.register_loop(&sample_registered_loop("r3")).unwrap();
+
+        assert!(!ack_read_notice(&store, "r2", RunStatus::Pass, "t9", 5_000).unwrap());
+        assert!(store.list_messages_for_run("loop_r2").unwrap().is_empty());
+
+        // The watcher records it later, so the real caller still gets the notice.
+        assert!(store
+            .record_loop_final("r2", "PASS", 6_000)
+            .unwrap()
+            .is_some());
+        let msgs = store.list_messages_for_run("loop_r2").unwrap();
+        assert_eq!(msgs[0].pointer_state, crate::orch::PointerState::Pending);
+        let targets = store
+            .pending_pointer_targets(6_000 + crate::orch::store::LOOP_NOTIFY_GRACE_MS + 1)
+            .unwrap();
+        assert!(targets.iter().any(|t| t.run_id == "loop_r2"));
+
+        assert!(!ack_read_notice(&store, "r3", RunStatus::Running, "t1", 5_000).unwrap());
+        assert_eq!(store.get_loop("r3").unwrap().unwrap().status, "RUNNING");
+
+        assert!(!ack_read_notice(&store, "unknown", RunStatus::Pass, "t1", 5_000).unwrap());
+    }
+
+    #[test]
+    fn reading_after_the_watcher_still_acks() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open(&tmp.path().join("orch.db")).unwrap();
+        store.register_loop(&sample_registered_loop("r4")).unwrap();
+        store.record_loop_final("r4", "ESCALATE", 2_000).unwrap();
+        store
+            .mark_pointer_delivered("t1", "loop_r4", 2_500)
+            .unwrap();
+
+        assert!(ack_read_notice(&store, "r4", RunStatus::Escalate, "t1", 3_000).unwrap());
+        let msgs = store.list_messages_for_run("loop_r4").unwrap();
+        assert_eq!(
+            msgs[0].pointer_state,
+            crate::orch::PointerState::Acknowledged
+        );
     }
 }

@@ -3752,3 +3752,93 @@ fn agy_evidence_identity_invalidates_when_switching_between_default_and_loop_log
         "{plan}"
     );
 }
+
+#[test]
+fn reading_the_result_from_the_caller_terminal_acknowledges_the_end_notice() {
+    let h = LoopHarness::new();
+    fs::create_dir_all(&h.data_dir).unwrap();
+    let store = OrchStore::open(&h.data_dir.join("orch.db")).unwrap();
+    let legacy = |id: &str| {
+        format!(
+            r#"{{
+  "schema_version": 1,
+  "run_id": "{id}",
+  "workflow": "worker-reviewer-critic",
+  "status": "PASS",
+  "sandbox": "bwrap",
+  "current_cycle": 1,
+  "max_cycles": 3,
+  "heartbeat_at_ms": 2000,
+  "last_activity_at_ms": 2000,
+  "started_at_ms": 1000,
+  "executions": []
+}}"#
+        )
+    };
+    let setup = |id: &str| {
+        let dir = h.repo.join(".loops/runs").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("state.json"), legacy(id)).unwrap();
+        if id == "p1" {
+            fs::write(dir.join("report.md"), "# relatório\n").unwrap();
+        }
+        store
+            .register_loop(&tchelvis::orch::store::LoopRunRecord {
+                run_id: id.to_string(),
+                dir: dir.display().to_string(),
+                workflow: "worker-reviewer-critic".to_string(),
+                status: "RUNNING".to_string(),
+                caller_terminal: Some("t1".to_string()),
+                caller_created_ms: Some(1_000),
+                engine_pid: Some(42),
+                engine_start_ticks: Some(999),
+                orch_run_id: None,
+                notify_state: "pending".to_string(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+    };
+
+    for (id, verb) in [("s1", "status"), ("r1", "result"), ("p1", "report")] {
+        setup(id);
+        let out = h
+            .cmd()
+            .env("HC_TERMINAL_ID", "t1")
+            .args(["loop", verb, id])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{verb} {id}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let msgs = store.list_messages_for_run(&format!("loop_{id}")).unwrap();
+        assert_eq!(msgs.len(), 1, "{id}");
+        assert_eq!(
+            msgs[0].pointer_state,
+            tchelvis::orch::PointerState::Acknowledged,
+            "{id}"
+        );
+        assert_eq!(
+            store.get_loop(id).unwrap().unwrap().notify_state,
+            "acknowledged",
+            "{id}"
+        );
+    }
+
+    // Another terminal reads the result: same output, and nothing is acknowledged.
+    setup("x1");
+    let with_other = h
+        .cmd()
+        .env("HC_TERMINAL_ID", "t9")
+        .args(["loop", "result", "x1"])
+        .output()
+        .unwrap();
+    let without = h.cmd().args(["loop", "result", "x1"]).output().unwrap();
+    assert_eq!(with_other.status.code(), Some(0));
+    assert_eq!(without.status.code(), Some(0));
+    assert_eq!(with_other.stdout, without.stdout);
+    assert!(store.list_messages_for_run("loop_x1").unwrap().is_empty());
+}
