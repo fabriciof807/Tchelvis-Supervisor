@@ -3,7 +3,7 @@ use crate::correlate::{build_initial_agent_row, resolve_git_head_file, should_in
 use crate::herdr::{parse_hc_event_line, FleetTracker, HcRpcSession, HerdrClient};
 use crate::model::{
     AgentRow, CockpitSnapshot, FleetSummary, FleetSummaryProjection, InspectResponse, IpcOp,
-    IpcRequest, SNAPSHOT_SCHEMA_VERSION,
+    IpcRequest, LoopProgress, SNAPSHOT_SCHEMA_VERSION,
 };
 use crate::orch::delivery::{DeliveryScheduler, ScheduleOutcome};
 use crate::orch::reconciler::OrchReconciler;
@@ -181,6 +181,52 @@ pub async fn collect_once(
     Ok(snap)
 }
 
+/// The loop stage a terminal belongs to, read from the loop's own `state.json`.
+///
+/// A missing record, an unreadable file or a state written by an older engine all read as
+/// "no loop progress" — the row then renders exactly as it did before loops existed.
+fn loop_progress_for(store: Option<&OrchStore>, run_id: &str) -> Option<LoopProgress> {
+    let store = store?;
+    let rec = match store.get_loop(run_id) {
+        Ok(Some(rec)) => rec,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(run_id, error = %e, "loop progress unavailable");
+            return None;
+        }
+    };
+    match crate::loops::state::load_state(Path::new(&rec.dir)) {
+        Ok(state) => Some(crate::loops::state::loop_progress_from_state(&state)),
+        Err(e) => {
+            tracing::debug!(run_id, error = %e, "loop progress unavailable");
+            None
+        }
+    }
+}
+
+/// Replaces the loop-run addresses in `active_children` with the child's loop label, so the
+/// parent shows `worker: pi · 1/3` instead of an opaque terminal address.
+fn label_active_children(rows: &mut [AgentRow]) {
+    let labels: BTreeMap<String, String> = rows
+        .iter()
+        .filter_map(|row| {
+            row.loop_progress
+                .as_ref()
+                .map(|p| (row.address.clone(), p.short_label()))
+        })
+        .collect();
+    if labels.is_empty() {
+        return;
+    }
+    for row in rows.iter_mut() {
+        for child in row.active_children.iter_mut() {
+            if let Some(label) = labels.get(child) {
+                *child = label.clone();
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn materialize_snapshot(
     tracker: &mut FleetTracker,
@@ -197,8 +243,10 @@ pub async fn materialize_snapshot(
     let now_sec = now_ms / 1000;
     let ttl_cutoff_ms = now_ms - (cfg.retention.finished_ttl_hours as i64) * 3600 * 1000;
     let blocked_children_map = tracker.blocked_children_map(now_ms);
-    let active_orch_children = OrchStore::open(&paths.orch_db_file())
-        .and_then(|s| s.active_dispatches_by_parent())
+    let orch = OrchStore::open(&paths.orch_db_file()).ok();
+    let active_orch_children = orch
+        .as_ref()
+        .and_then(|s| s.active_dispatches_by_parent().ok())
         .unwrap_or_default();
     let active_children_map = tracker.active_children_map(&active_orch_children, now_ms);
     let addresses: Vec<String> = tracker.terminals.keys().cloned().collect();
@@ -222,8 +270,13 @@ pub async fn materialize_snapshot(
         let blocked_children = blocked_children_map.get(&addr).cloned().unwrap_or_default();
         let mut row = build_initial_agent_row(&term, att, blocked_children, now_sec);
         row.active_children = active_children_map.get(&addr).cloned().unwrap_or_default();
+        if let Some(run_id) = term.loop_run_id() {
+            row.loop_progress = loop_progress_for(orch.as_ref(), run_id);
+        }
         agents.push(row);
     }
+
+    label_active_children(&mut agents);
 
     coord
         .enrich_agents(&mut agents, cfg, store, &paths.home_dir, force_refresh)
@@ -1061,6 +1114,179 @@ mod tests {
             "active_children should clear on ms boundary, got: {:?}",
             t1.active_children
         );
+    }
+
+    #[test]
+    fn label_active_children_uses_loop_labels_and_keeps_other_addresses() {
+        let mut t1 = AgentRow {
+            address: "t1".into(),
+            active_children: vec!["t2".into(), "t3".into()],
+            ..Default::default()
+        };
+        let t2 = AgentRow {
+            address: "t2".into(),
+            loop_progress: Some(crate::model::LoopProgress {
+                status: "RUNNING".into(),
+                cycle: 1,
+                max_cycles: 3,
+                role: Some("worker".into()),
+                provider: Some("pi".into()),
+            }),
+            ..Default::default()
+        };
+        let t3 = AgentRow {
+            address: "t3".into(),
+            ..Default::default()
+        };
+        let mut rows = vec![t1.clone(), t2.clone(), t3.clone()];
+
+        label_active_children(&mut rows);
+
+        t1.active_children = vec!["worker: pi · 1/3".into(), "t3".into()];
+        assert_eq!(rows, vec![t1, t2, t3]);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_snapshot_fills_loop_progress_from_state_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = make_test_paths(tmp.path());
+        let cfg = CockpitConfig::default();
+        let store = CacheStore::open(&paths.db_file()).unwrap();
+        let coord = ProviderCoordinator::new();
+
+        let agent_fg = Some(crate::herdr::HcForeground {
+            name: Some("claude".into()),
+            argv: vec!["claude".into()],
+            ..Default::default()
+        });
+        let parent = crate::herdr::HcTerminal {
+            address: "t1".into(),
+            state: "live".into(),
+            reported: true,
+            foreground: agent_fg.clone(),
+            status: Some(crate::herdr::HcStatus {
+                state: "idle".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let live_child = crate::herdr::HcTerminal {
+            address: "t2".into(),
+            parent: Some("t1".into()),
+            state: "live".into(),
+            reported: true,
+            foreground: agent_fg.clone(),
+            labels: BTreeMap::from([("cockpit.loop_run".to_string(), "r-live".to_string())]),
+            status: Some(crate::herdr::HcStatus {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            status_ms: Some(9_000),
+            ..Default::default()
+        };
+        let gone_child = crate::herdr::HcTerminal {
+            address: "t3".into(),
+            state: "live".into(),
+            reported: true,
+            foreground: agent_fg,
+            labels: BTreeMap::from([("cockpit.loop_run".to_string(), "r-gone".to_string())]),
+            status: Some(crate::herdr::HcStatus {
+                state: "working".into(),
+                ..Default::default()
+            }),
+            status_ms: Some(9_000),
+            ..Default::default()
+        };
+        let mut tracker = FleetTracker::new();
+        tracker.apply_snapshot(vec![parent, live_child, gone_child], 10_000);
+
+        let live_dir = tmp.path().join("r-live");
+        std::fs::create_dir_all(&live_dir).unwrap();
+        let st = crate::loops::state::RunState {
+            schema_version: crate::loops::state::LOOP_STATE_SCHEMA_VERSION,
+            run_id: "r-live".to_string(),
+            workflow: "worker-reviewer-critic".to_string(),
+            status: crate::loops::state::RunStatus::Running,
+            reason: None,
+            sandbox: "bwrap".to_string(),
+            sandbox_exposures: vec![],
+            preflight: vec![],
+            current_cycle: 1,
+            max_cycles: 3,
+            branch: None,
+            base_commit: None,
+            engine_pid: Some(1234),
+            engine_start_ticks: Some(123),
+            caller: None,
+            heartbeat_at_ms: 9_000,
+            last_activity_at_ms: 9_000,
+            started_at_ms: 1_000,
+            finished_at_ms: None,
+            executions: vec![],
+            files: vec![],
+            summary: String::new(),
+            active_stage: Some(crate::loops::state::ActiveStage {
+                stage_id: "implement".to_string(),
+                role: "worker".to_string(),
+                provider: crate::loops::workflow::Provider::Pi,
+                started_at_ms: 8_000,
+            }),
+        };
+        crate::loops::state::save_state(&live_dir, &st).unwrap();
+
+        let orch = OrchStore::open(&paths.orch_db_file()).unwrap();
+        for (run_id, dir) in [
+            ("r-live", live_dir.clone()),
+            ("r-gone", tmp.path().join("missing")),
+        ] {
+            orch.register_loop(&crate::orch::store::LoopRunRecord {
+                run_id: run_id.to_string(),
+                dir: dir.display().to_string(),
+                workflow: "worker-reviewer-critic".to_string(),
+                status: "RUNNING".to_string(),
+                caller_terminal: Some("t1".to_string()),
+                caller_created_ms: Some(1_000),
+                engine_pid: Some(1234),
+                engine_start_ticks: Some(123),
+                orch_run_id: None,
+                notify_state: "none".to_string(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        }
+        drop(orch);
+
+        let snap = materialize_snapshot(
+            &mut tracker,
+            &cfg,
+            &paths,
+            &store,
+            &coord,
+            true,
+            Some(1),
+            false,
+            false,
+            10_000,
+        )
+        .await;
+
+        let t1 = snap.agents.iter().find(|a| a.address == "t1").unwrap();
+        let t2 = snap.agents.iter().find(|a| a.address == "t2").unwrap();
+        let t3 = snap.agents.iter().find(|a| a.address == "t3").unwrap();
+        assert_eq!(
+            t2.loop_progress,
+            Some(crate::model::LoopProgress {
+                status: "RUNNING".into(),
+                cycle: 1,
+                max_cycles: 3,
+                role: Some("worker".into()),
+                provider: Some("pi".into()),
+            })
+        );
+        assert_eq!(t3.loop_progress, None);
+        assert_eq!(t1.active_children, vec!["worker: pi · 1/3".to_string()]);
+        assert_eq!(snap.agents.len(), 3);
     }
 
     #[tokio::test]
