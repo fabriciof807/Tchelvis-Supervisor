@@ -427,6 +427,7 @@ fn test_contract_fixtures_and_schema_version_match() {
         prompt_destructive: false,
         blocked_children: Vec::new(),
         active_children: vec!["t2".into()],
+        loop_progress: None,
         turn: 4,
         reported: true,
         labels: BTreeMap::from([("cockpit.issue".into(), "ENG-42".into())]),

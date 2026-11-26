@@ -2105,6 +2105,7 @@ mod tests {
             labels,
             blocked_children: vec![],
             active_children: vec![],
+            loop_progress: None,
             parent: None,
             prompt_destructive: false,
             turn: 0,

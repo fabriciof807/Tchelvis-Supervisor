@@ -2,7 +2,7 @@ use crate::loops::models::ModelSource;
 use crate::loops::preflight::ProbeRecord;
 use crate::loops::verdict::{Verdict, MAX_SUMMARY_CHARS};
 use crate::loops::workflow::Provider;
-use crate::model::sanitize_terminal_text;
+use crate::model::{sanitize_terminal_text, LoopProgress};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -327,6 +327,21 @@ pub struct RunState {
     /// The stage currently executing. Absent between stages and once the run is final.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_stage: Option<ActiveStage>,
+}
+
+pub fn loop_progress_from_state(s: &RunState) -> LoopProgress {
+    let stage = if s.status == RunStatus::Running {
+        s.active_stage.as_ref()
+    } else {
+        None
+    };
+    LoopProgress {
+        status: s.status.as_str().to_string(),
+        cycle: s.current_cycle,
+        max_cycles: s.max_cycles,
+        role: stage.map(|st| st.role.clone()),
+        provider: stage.map(|st| st.provider.as_str().to_string()),
+    }
 }
 
 pub fn redact_loop_text(raw: &str, extra_secrets: &[&str]) -> String {
@@ -1026,5 +1041,54 @@ mod tests {
         assert!(!raw.contains("active_stage"), "{raw}");
         // A file written before this field existed loads as "no stage".
         assert_eq!(parse_state(&raw).unwrap().active_stage, None);
+    }
+
+    #[test]
+    fn progress_in_a_stage_names_role_and_provider() {
+        let mut state = sample_state(RunStatus::Running);
+        state.active_stage = Some(ActiveStage {
+            stage_id: "implement".to_string(),
+            role: "worker".to_string(),
+            provider: Provider::Pi,
+            started_at_ms: 1500,
+        });
+        let progress = loop_progress_from_state(&state);
+        assert_eq!(progress.status, "RUNNING");
+        assert_eq!(progress.cycle, 2);
+        assert_eq!(progress.max_cycles, 3);
+        assert_eq!(progress.role.as_deref(), Some("worker"));
+        assert_eq!(progress.provider.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn progress_without_active_stage_is_between_stages() {
+        let mut state = sample_state(RunStatus::Running);
+        state.active_stage = None;
+        let progress = loop_progress_from_state(&state);
+        assert_eq!(progress.status, "RUNNING");
+        assert_eq!(progress.role, None);
+        assert_eq!(progress.provider, None);
+    }
+
+    #[test]
+    fn progress_of_a_final_run_ignores_a_leftover_stage() {
+        for status in [
+            RunStatus::Pass,
+            RunStatus::Escalate,
+            RunStatus::Error,
+            RunStatus::Cancelled,
+        ] {
+            let mut state = sample_state(status);
+            state.active_stage = Some(ActiveStage {
+                stage_id: "implement".to_string(),
+                role: "worker".to_string(),
+                provider: Provider::Pi,
+                started_at_ms: 1500,
+            });
+            let progress = loop_progress_from_state(&state);
+            assert_eq!(progress.status, status.as_str());
+            assert_eq!(progress.role, None);
+            assert_eq!(progress.provider, None);
+        }
     }
 }

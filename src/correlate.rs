@@ -503,6 +503,7 @@ pub fn build_initial_agent_row(
         prompt_destructive,
         blocked_children,
         active_children: Vec::new(),
+        loop_progress: None,
         turn: term.turn,
         reported: term.reported,
         labels: term.labels.clone(),

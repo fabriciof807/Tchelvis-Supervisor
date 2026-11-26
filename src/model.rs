@@ -421,6 +421,32 @@ pub struct CorrelatedContext {
     pub runbooks: Vec<RunbookRef>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopProgress {
+    pub status: String,
+    pub cycle: u32,
+    pub max_cycles: u32,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl LoopProgress {
+    /// The card title of a loop child: `worker: pi · 1/3`, `loop · 2/3` or `PASS · 2/3`.
+    pub fn short_label(&self) -> String {
+        let cycle = format!("{}/{}", self.cycle, self.max_cycles);
+        if self.status != "RUNNING" {
+            format!("{} · {cycle}", self.status)
+        } else {
+            match (self.role.as_deref(), self.provider.as_deref()) {
+                (Some(role), Some(provider)) => format!("{role}: {provider} · {cycle}"),
+                _ => format!("loop · {cycle}"),
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentRow {
     pub address: String,
@@ -436,6 +462,8 @@ pub struct AgentRow {
     pub blocked_children: Vec<String>,
     #[serde(default)]
     pub active_children: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_progress: Option<LoopProgress>,
     #[serde(default)]
     pub turn: u64,
     #[serde(default)]
@@ -717,6 +745,35 @@ pub struct InspectResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loop_progress_short_label() {
+        let p = |status: &str, cycle, role: Option<&str>, provider: Option<&str>| LoopProgress {
+            status: status.to_string(),
+            cycle,
+            max_cycles: 3,
+            role: role.map(str::to_string),
+            provider: provider.map(str::to_string),
+        };
+        assert_eq!(
+            p("RUNNING", 1, Some("worker"), Some("pi")).short_label(),
+            "worker: pi · 1/3"
+        );
+        assert_eq!(p("RUNNING", 2, None, None).short_label(), "loop · 2/3");
+        assert_eq!(p("PASS", 2, None, None).short_label(), "PASS · 2/3");
+        assert_eq!(
+            p("ESCALATE", 3, Some("worker"), Some("pi")).short_label(),
+            "ESCALATE · 3/3"
+        );
+    }
+
+    #[test]
+    fn agent_row_without_loop_progress_serializes_as_before() {
+        let json = serde_json::to_string(&AgentRow::default()).unwrap();
+        assert!(!json.contains("loop_progress"), "{json}");
+        let back: AgentRow = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.loop_progress, None);
+    }
 
     #[test]
     fn test_sanitize_terminal_text_strips_osc_and_csi() {
