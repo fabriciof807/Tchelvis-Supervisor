@@ -431,6 +431,7 @@ pub struct PendingPointerTarget {
     pub run_id: String,
     pub pending_count: usize,
     pub has_active_unexpired_pointer: bool,
+    pub oldest_pending_created_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -15,6 +15,9 @@ const DISPATCH_COLUMNS: &str =
     turn_at_dispatch, agent_kind, worktree_mode, worktree_path, depth, status, \
     idle_since_ms, blocked_since_ms, created_at_ms, updated_at_ms";
 
+/// A loop's end notice is not eligible for a pointer until this long after it was created.
+pub const LOOP_NOTIFY_GRACE_MS: i64 = 30_000;
+
 const MESSAGE_SELECT: &str =
     "SELECT m.id, m.run_id, m.task_id, m.dispatch_id, m.from_handle, m.to_handle, m.target_terminal, \
      m.msg_type, m.outcome, m.body, m.pointer_state, m.pointer_terminal, m.delivery_attempts, \
@@ -1654,8 +1657,13 @@ impl OrchStore {
         let mut stmt = conn.prepare(
             "SELECT target_terminal,
                     run_id,
-                    SUM(CASE WHEN pointer_state = 'pending' THEN 1 ELSE 0 END) AS pending_cnt,
-                    SUM(CASE WHEN pointer_state = 'delivered' AND (next_retry_at_ms IS NULL OR next_retry_at_ms > ?1) THEN 1 ELSE 0 END) AS active_delivered_cnt
+                    SUM(CASE WHEN pointer_state = 'pending'
+                              AND NOT (substr(id, 1, 9) = 'msg_loop_' AND created_at_ms > ?2)
+                             THEN 1 ELSE 0 END) AS pending_cnt,
+                    SUM(CASE WHEN pointer_state = 'delivered' AND (next_retry_at_ms IS NULL OR next_retry_at_ms > ?1) THEN 1 ELSE 0 END) AS active_delivered_cnt,
+                    MIN(CASE WHEN pointer_state = 'pending'
+                              AND NOT (substr(id, 1, 9) = 'msg_loop_' AND created_at_ms > ?2)
+                             THEN created_at_ms END) AS oldest_pending_created_ms
              FROM messages
              WHERE pointer_state IN ('pending', 'delivered')
              GROUP BY target_terminal, run_id
@@ -1664,16 +1672,18 @@ impl OrchStore {
         )?;
 
         let rows = stmt
-            .query_map(params![now_ms], |r| {
+            .query_map(params![now_ms, now_ms - LOOP_NOTIFY_GRACE_MS], |r| {
                 let target_terminal: String = r.get(0)?;
                 let run_id: String = r.get(1)?;
                 let pending_cnt: i64 = r.get(2)?;
                 let active_delivered_cnt: i64 = r.get(3)?;
+                let oldest_pending_created_ms: i64 = r.get(4)?;
                 Ok(PendingPointerTarget {
                     target_terminal,
                     run_id,
                     pending_count: pending_cnt.max(0) as usize,
                     has_active_unexpired_pointer: active_delivered_cnt > 0,
+                    oldest_pending_created_ms,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

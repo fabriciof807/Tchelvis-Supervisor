@@ -171,7 +171,10 @@ mod tests {
         load_state, save_state, CallerInfo, RunState, RunStatus, LOOP_STATE_SCHEMA_VERSION,
     };
     use crate::orch::store::LoopRunRecord;
-    use crate::orch::PointerState;
+    use crate::orch::{
+        DispatchContext, DispatchStatus, OrchRun, OrchTask, PointerState,
+        RunStatus as OrchRunStatus, TaskStatus,
+    };
     use rusqlite::Connection;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -733,5 +736,89 @@ mod tests {
         assert!(!store.ack_loop_notice("no-caller", "t1", 3_000).unwrap());
 
         assert!(!store.ack_loop_notice("unknown-run", "t1", 3_000).unwrap());
+    }
+
+    #[test]
+    fn loop_notice_waits_out_the_grace_but_other_messages_do_not() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open_in_memory().unwrap();
+        store
+            .register_loop(&sample_loop_rec(
+                "g1",
+                tmp.path(),
+                42,
+                999,
+                Some(("t1", 1_000)),
+            ))
+            .unwrap();
+        store.record_loop_final("g1", "PASS", 100_000).unwrap();
+
+        let targets = store.pending_pointer_targets(110_000).unwrap();
+        assert!(!targets.iter().any(|t| t.run_id == "loop_g1"));
+
+        let targets = store.pending_pointer_targets(131_000).unwrap();
+        let target = targets
+            .iter()
+            .find(|t| t.run_id == "loop_g1")
+            .expect("loop notice becomes eligible after the grace");
+        assert_eq!(target.pending_count, 1);
+        assert_eq!(target.oldest_pending_created_ms, 100_000);
+
+        // A non-loop message for the same terminal is eligible immediately.
+        store
+            .create_run(&OrchRun {
+                id: "run_x".to_string(),
+                title: "Run x".to_string(),
+                coordinator_terminal: "t1".to_string(),
+                coordinator_created_ms: 1_000,
+                status: OrchRunStatus::Active,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        store
+            .create_or_update_task(&OrchTask {
+                id: "task_x".to_string(),
+                run_id: "run_x".to_string(),
+                title: "Task x".to_string(),
+                prompt: "Do x".to_string(),
+                deps: vec![],
+                failure_count: 0,
+                status: TaskStatus::Pending,
+                result_summary: None,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            })
+            .unwrap();
+        store
+            .create_dispatch(&DispatchContext {
+                id: "disp_x".to_string(),
+                run_id: "run_x".to_string(),
+                task_id: "task_x".to_string(),
+                parent_terminal: "t1".to_string(),
+                assignee_terminal: "t2".to_string(),
+                terminal_created_ms: 1_000,
+                turn_at_dispatch: 0,
+                agent_kind: "claude".to_string(),
+                worktree_mode: "current".to_string(),
+                worktree_path: None,
+                depth: 1,
+                status: DispatchStatus::Dispatched,
+                idle_since_ms: None,
+                blocked_since_ms: None,
+                created_at_ms: 1_100,
+                updated_at_ms: 1_100,
+            })
+            .unwrap();
+        store
+            .record_question("disp_x", "t2", 1_000, "q?", 130_000)
+            .unwrap();
+
+        let targets = store.pending_pointer_targets(131_000).unwrap();
+        let target = targets
+            .iter()
+            .find(|t| t.run_id == "run_x")
+            .expect("non-loop message waits for no grace");
+        assert_eq!(target.oldest_pending_created_ms, 130_000);
     }
 }

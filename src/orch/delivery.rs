@@ -30,10 +30,18 @@ pub fn is_terminal_safe_for_pointer(
     pointer_deferral_reason(tracker, target_terminal, now_ms).is_none()
 }
 
-pub fn format_pointer_line(run_id: &str, count: usize) -> String {
-    format!(
+const POINTER_AGE_MIN_MS: i64 = 300_000;
+
+pub fn format_pointer_line(run_id: &str, count: usize, age_ms: Option<i64>) -> String {
+    let mut line = format!(
         "[tchelvis] You have {count} orchestration message(s) in run {run_id}. Run: tchelvis orch check --run {run_id}"
-    )
+    );
+    if let Some(age_ms) = age_ms {
+        if age_ms >= POINTER_AGE_MIN_MS {
+            line.push_str(&format!(" (oldest message {} min old)", age_ms / 60_000));
+        }
+    }
+    line
 }
 
 fn compute_backoff_ms(consecutive_failures: u32) -> i64 {
@@ -253,7 +261,11 @@ impl DeliveryScheduler {
                     self.in_flight.insert(target.target_terminal.clone());
                     let herdr = self.herdr.clone();
                     let tx = self.done_tx.clone();
-                    let pointer = format_pointer_line(&target.run_id, target.pending_count);
+                    let pointer = format_pointer_line(
+                        &target.run_id,
+                        target.pending_count,
+                        Some(now_ms - target.oldest_pending_created_ms),
+                    );
                     let timeout = self.send_timeout;
                     let target_terminal = target.target_terminal.clone();
                     let run_id = target.run_id.clone();
@@ -417,8 +429,8 @@ impl OrchDeliveryCoordinator {
         is_terminal_safe_for_pointer(tracker, target_terminal, now_ms)
     }
 
-    pub fn format_pointer_line(run_id: &str, count: usize) -> String {
-        format_pointer_line(run_id, count)
+    pub fn format_pointer_line(run_id: &str, count: usize, age_ms: Option<i64>) -> String {
+        format_pointer_line(run_id, count, age_ms)
     }
 
     pub async fn deliver_pending_pointers(
@@ -473,10 +485,25 @@ mod tests {
 
     #[test]
     fn test_format_pointer_line_canonical() {
-        let line = format_pointer_line("run_abc", 2);
+        let line = format_pointer_line("run_abc", 2, None);
         assert_eq!(
             line,
             "[tchelvis] You have 2 orchestration message(s) in run run_abc. Run: tchelvis orch check --run run_abc"
+        );
+    }
+
+    #[test]
+    fn pointer_line_shows_the_age_only_when_late() {
+        let base = "[tchelvis] You have 2 orchestration message(s) in run run_abc. Run: tchelvis orch check --run run_abc";
+        assert_eq!(format_pointer_line("run_abc", 2, None), base);
+        assert_eq!(format_pointer_line("run_abc", 2, Some(4 * 60_000)), base);
+        assert_eq!(
+            format_pointer_line("run_abc", 2, Some(5 * 60_000)),
+            format!("{base} (oldest message 5 min old)")
+        );
+        assert_eq!(
+            format_pointer_line("run_abc", 2, Some(58 * 60_000 + 59_000)),
+            format!("{base} (oldest message 58 min old)")
         );
     }
 
