@@ -285,3 +285,37 @@ test("merge_rows_shows_live_loop_run_as_working_with_run_id_and_excludes_attach_
 });
 
 
+
+test("merge_rows_carry_loop_progress", () => {
+  const terms = [
+    { address: "t2", state: "live", labels: { "cockpit.loop_run": "r2" } },
+    { address: "t3", state: "live", labels: { "cockpit.loop_run": "r3" } },
+    { address: "t4", state: "live", labels: { "cockpit.loop_run": "r4" } },
+  ];
+  const progress = {
+    status: "RUNNING",
+    cycle: 1,
+    max_cycles: 3,
+    role: "worker",
+    provider: "pi",
+  };
+  const snap = {
+    agents: [
+      { address: "t2", name: "loop-r2", loop_progress: progress },
+      { address: "t3", name: "loop-r3", loop_progress: { ...progress } },
+    ],
+  };
+
+  const rows = mergeFleetRows(
+    [{ address: "t2", status: "working" }],
+    terms,
+    snap,
+    null
+  );
+  const r2 = rows.find((r) => r.address === "t2");
+  const r3 = rows.find((r) => r.address === "t3");
+  const r4 = rows.find((r) => r.address === "t4");
+  assert.deepEqual(r2.loop_progress, progress);
+  assert.deepEqual(r3.loop_progress, progress);
+  assert.ok(!r4.loop_progress, "t4 has no loop progress");
+});

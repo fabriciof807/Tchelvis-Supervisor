@@ -514,7 +514,20 @@ function agentGlyph(kindOrLabel, color) {
 // The supervisor's text for "nothing to say yet".
 const SUMMARY_PLACEHOLDER = "Monitorando sessão ativa do agente.";
 
+// The stage line of a loop card: `worker: pi · 1/3`, `loop · 2/3` or `PASS · 2/3`.
+// Mirrors `LoopProgress::short_label` in src/model.rs, so both sides always agree.
+export function loopProgressTitle(progress) {
+  const status = progress?.status ?? "";
+  const cycle = `${progress?.cycle}/${progress?.max_cycles}`;
+  if (status !== "RUNNING") return `${status} · ${cycle}`;
+  const role = progress?.role;
+  const provider = progress?.provider;
+  if (role && provider) return `${role}: ${provider} · ${cycle}`;
+  return `loop · ${cycle}`;
+}
+
 function fleetCardTitle(row) {
+  if (row?.loop_progress) return loopProgressTitle(row.loop_progress);
   return loopRunIdFromLabels(row?.labels)
     ? row.name
     : row?.project_name || row?.name || "";
@@ -578,7 +591,7 @@ export function fleetCardView(
   const detailMax = 42 - indent - (hasBadge ? 14 : 0) - (address ? 6 : 0);
   return {
     title:
-      isLoop && title.length > titleMax
+      isLoop && !row.loop_progress && title.length > titleMax
         ? `…${title.slice(1 - titleMax)}`
         : ellipsize(title, titleMax),
     agentName,
@@ -1835,6 +1848,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       project_name: projectName,
       program_label: programLabel,
       status,
+      loop_progress: enriched?.loop_progress ?? null,
       kind: isFinished
         ? null
         : enriched?.attention_state?.kind ??
@@ -1932,6 +1946,7 @@ export function mergeFleetRows(liveAgents, allTerminals, snap, supSnap = null) {
       project_name: projectName,
       program_label: programLabel,
       status,
+      loop_progress: sa?.loop_progress ?? null,
       kind: isFinished
         ? null
         : sa?.attention_state?.kind ??

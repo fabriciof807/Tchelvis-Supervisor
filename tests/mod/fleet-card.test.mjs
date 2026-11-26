@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import {
   duplicateFleetAddresses,
   fleetCardView,
+  loopProgressTitle,
 } from "../../assets/herdr-app/mods/tchelvis/main.js";
 
 const row = (over = {}) => ({
@@ -166,4 +167,89 @@ test("the card is drawn from the view, without the old rows", () => {
   assert.ok(body.includes("fleetCardView(a, duplicates, {"));
   assert.ok(!body.includes(".child(a.address)"));
   assert.ok(!body.includes("tierLabel"));
+});
+
+test("loop progress title mirrors the Rust label", () => {
+  const p = (status, cycle, role, provider) => ({
+    status,
+    cycle,
+    max_cycles: 3,
+    role,
+    provider,
+  });
+  assert.equal(
+    loopProgressTitle(p("RUNNING", 1, "worker", "pi")),
+    "worker: pi · 1/3"
+  );
+  assert.equal(loopProgressTitle(p("RUNNING", 2, null, null)), "loop · 2/3");
+  assert.equal(loopProgressTitle(p("PASS", 2, null, null)), "PASS · 2/3");
+  assert.equal(
+    loopProgressTitle(p("CANCELLED", 1, "worker", "pi")),
+    "CANCELLED · 1/3"
+  );
+});
+
+test("a loop with progress is titled by its stage, not its run id", () => {
+  const loop = row({
+    name: "loop-20261124-193000-cafe",
+    program: null,
+    status: "working",
+    labels: { "cockpit.loop_run": "20261124-193000-cafe" },
+    loop_progress: {
+      status: "RUNNING",
+      cycle: 1,
+      max_cycles: 3,
+      role: "worker",
+      provider: "pi",
+    },
+  });
+  assert.equal(
+    fleetCardView(loop, new Set(), { statusLabel: "WORKING", isChild: true })
+      .title,
+    "worker: pi · 1/3"
+  );
+});
+
+test("a long stage title is cut at the end", () => {
+  const loop = row({
+    name: "loop-20261124-193000-cafe",
+    program: null,
+    status: "working",
+    labels: { "cockpit.loop_run": "20261124-193000-cafe" },
+    loop_progress: {
+      status: "RUNNING",
+      cycle: 1,
+      max_cycles: 3,
+      role: "implementador-principal",
+      provider: "opencode",
+    },
+  });
+  const { title } = fleetCardView(loop, new Set(), {
+    statusLabel: "WORKING",
+    isChild: true,
+  });
+  assert.ok(title.startsWith("implementador"), title);
+  assert.ok(title.endsWith("…"), title);
+});
+
+test("two loops at the same stage show their addresses", () => {
+  const progress = {
+    status: "RUNNING",
+    cycle: 1,
+    max_cycles: 3,
+    role: "worker",
+    provider: "pi",
+  };
+  const loop = (address) =>
+    row({
+      address,
+      name: "loop-20261124-193000-cafe",
+      program: null,
+      status: "working",
+      labels: { "cockpit.loop_run": "20261124-193000-cafe" },
+      loop_progress: progress,
+    });
+  const duplicates = duplicateFleetAddresses([loop("t2"), loop("t3")]);
+  assert.ok(duplicates.has("t2"), "t2");
+  assert.ok(duplicates.has("t3"), "t3");
 });
