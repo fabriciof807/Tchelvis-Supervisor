@@ -657,4 +657,81 @@ mod tests {
         let _ = watch_loops(&store, &FleetTracker::new(), &none, 5_000);
         assert_eq!(store.get_loop("b-good").unwrap().unwrap().status, "ERROR");
     }
+
+    #[test]
+    fn ack_loop_notice_acks_pending_delivered_and_stalled_for_the_caller_only() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open_in_memory().unwrap();
+
+        for id in ["a-pending", "a-delivered", "a-stalled"] {
+            store
+                .register_loop(&sample_loop_rec(
+                    id,
+                    tmp.path(),
+                    42,
+                    999,
+                    Some(("t1", 1_000)),
+                ))
+                .unwrap();
+            store.record_loop_final(id, "PASS", 2_000).unwrap();
+        }
+
+        // Another terminal acknowledges nothing.
+        assert!(!store.ack_loop_notice("a-pending", "t9", 3_000).unwrap());
+        let msgs = store.list_messages_for_run("loop_a-pending").unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].pointer_state, PointerState::Pending);
+        assert_eq!(
+            store.get_loop("a-pending").unwrap().unwrap().notify_state,
+            "pending"
+        );
+
+        // The caller acknowledges the pending message, once.
+        assert!(store.ack_loop_notice("a-pending", "t1", 3_000).unwrap());
+        let msgs = store.list_messages_for_run("loop_a-pending").unwrap();
+        assert_eq!(msgs[0].pointer_state, PointerState::Acknowledged);
+        assert_eq!(
+            store.get_loop("a-pending").unwrap().unwrap().notify_state,
+            "acknowledged"
+        );
+        assert!(!store.ack_loop_notice("a-pending", "t1", 3_000).unwrap());
+
+        // A delivered pointer is still acknowledged by reading the result.
+        store
+            .mark_pointer_delivered("t1", "loop_a-delivered", 2_500)
+            .unwrap();
+        assert!(store.ack_loop_notice("a-delivered", "t1", 3_000).unwrap());
+        let msgs = store.list_messages_for_run("loop_a-delivered").unwrap();
+        assert_eq!(msgs[0].pointer_state, PointerState::Acknowledged);
+
+        // A stalled delivery is acknowledged too, and notify_state follows.
+        store.mark_loop_undelivered("a-stalled", 2_500).unwrap();
+        assert!(store.ack_loop_notice("a-stalled", "t1", 3_000).unwrap());
+        let msgs = store.list_messages_for_run("loop_a-stalled").unwrap();
+        assert_eq!(msgs[0].pointer_state, PointerState::Acknowledged);
+        assert_eq!(
+            store.get_loop("a-stalled").unwrap().unwrap().notify_state,
+            "acknowledged"
+        );
+
+        // Nothing is left to point at.
+        let targets = store.pending_pointer_targets(10_000_000).unwrap();
+        for id in ["a-pending", "a-delivered", "a-stalled"] {
+            assert!(!targets.iter().any(|t| t.run_id == format!("loop_{id}")));
+        }
+    }
+
+    #[test]
+    fn ack_loop_notice_without_a_message_is_a_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let store = OrchStore::open_in_memory().unwrap();
+
+        store
+            .register_loop(&sample_loop_rec("no-caller", tmp.path(), 42, 999, None))
+            .unwrap();
+        store.record_loop_final("no-caller", "PASS", 2_000).unwrap();
+        assert!(!store.ack_loop_notice("no-caller", "t1", 3_000).unwrap());
+
+        assert!(!store.ack_loop_notice("unknown-run", "t1", 3_000).unwrap());
+    }
 }

@@ -2405,6 +2405,36 @@ impl OrchStore {
         Ok(changed > 0)
     }
 
+    /// Acknowledges the end notice of a loop for its caller terminal.
+    /// Returns true when the message changed.
+    pub fn ack_loop_notice(
+        &self,
+        run_id: &str,
+        caller_terminal: &str,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let msg_id = format!("msg_loop_{run_id}");
+        let changed = tx.execute(
+            "UPDATE messages
+             SET pointer_state = 'acknowledged', acknowledged_at_ms = ?3
+             WHERE id = ?1 AND target_terminal = ?2
+               AND pointer_state IN ('pending', 'delivered', 'delivery_stalled')",
+            params![msg_id, caller_terminal, now_ms],
+        )?;
+        if changed > 0 {
+            tx.execute(
+                "UPDATE loop_runs
+                 SET notify_state = 'acknowledged', updated_at_ms = ?2
+                 WHERE run_id = ?1 AND notify_state != 'acknowledged'",
+                params![run_id, now_ms],
+            )?;
+        }
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     pub fn sync_loop_notify_state(&self, run_id: &str, now_ms: i64) -> Result<bool> {
         let mut conn = self.conn.lock().expect("orch sqlite mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
