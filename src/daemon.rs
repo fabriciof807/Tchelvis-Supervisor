@@ -1539,6 +1539,7 @@ mod tests {
             executions: vec![],
             files: vec![],
             summary: String::new(),
+            active_stage: None,
         };
         crate::loops::state::save_state(&dead_dir, &st).unwrap();
         orch_store

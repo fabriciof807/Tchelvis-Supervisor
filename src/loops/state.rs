@@ -280,6 +280,14 @@ pub struct Execution {
     pub tool_silence: Option<ToolSilence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveStage {
+    pub stage_id: String,
+    pub role: String,
+    pub provider: Provider,
+    pub started_at_ms: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunState {
     pub schema_version: u32,
@@ -316,6 +324,9 @@ pub struct RunState {
     pub files: Vec<String>,
     #[serde(default)]
     pub summary: String,
+    /// The stage currently executing. Absent between stages and once the run is final.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_stage: Option<ActiveStage>,
 }
 
 pub fn redact_loop_text(raw: &str, extra_secrets: &[&str]) -> String {
@@ -543,6 +554,7 @@ mod tests {
             executions: vec![],
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             summary: "Tudo implementado e verificado.".to_string(),
+            active_stage: None,
         }
     }
 
@@ -991,5 +1003,28 @@ mod tests {
             assert!(!json.contains(needle), "unexpected {needle} in {json}");
         }
         assert_eq!(parse_state(&json).unwrap(), clean);
+    }
+
+    #[test]
+    fn active_stage_round_trips_and_is_absent_when_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sample_state(RunStatus::Running);
+        state.active_stage = Some(ActiveStage {
+            stage_id: "implement".to_string(),
+            role: "worker".to_string(),
+            provider: Provider::Pi,
+            started_at_ms: 1500,
+        });
+        save_state(dir.path(), &state).unwrap();
+        assert_eq!(load_state(dir.path()).unwrap(), state);
+        let raw = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(raw.contains("\"provider\": \"pi\""), "{raw}");
+
+        state.active_stage = None;
+        save_state(dir.path(), &state).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("state.json")).unwrap();
+        assert!(!raw.contains("active_stage"), "{raw}");
+        // A file written before this field existed loads as "no stage".
+        assert_eq!(parse_state(&raw).unwrap().active_stage, None);
     }
 }

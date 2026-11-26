@@ -10,8 +10,8 @@ use crate::loops::process::{
 use crate::loops::report::render_report_with_secrets;
 use crate::loops::sandbox::{wrap_for_provider, Sandbox};
 use crate::loops::state::{
-    redact_loop_text, sanitize_single_line, save_state, CallerInfo, Execution, RunState, RunStatus,
-    StopDiagnostic, StopLimit, StopProcess, ToolSignal, ToolSilence, Usage,
+    redact_loop_text, sanitize_single_line, save_state, ActiveStage, CallerInfo, Execution,
+    RunState, RunStatus, StopDiagnostic, StopLimit, StopProcess, ToolSignal, ToolSilence, Usage,
     LOOP_STATE_SCHEMA_VERSION,
 };
 use crate::loops::verdict::{parse_verdict, summary_line, MAX_SUMMARY_CHARS};
@@ -638,6 +638,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             executions: Vec::new(),
             files: Vec::new(),
             summary: String::new(),
+            active_stage: None,
         };
 
         let shared = Mutex::new(SharedState {
@@ -718,6 +719,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
             let end_run = |status: RunStatus, reason: Option<String>, summary: Option<String>| {
                 let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                 guard.state.status = status;
+                guard.state.active_stage = None;
                 if let Some(r) = reason {
                     guard.state.reason = Some(sanitize_reason(&r, extra_secrets));
                 }
@@ -897,6 +899,12 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 {
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
                     guard.state.current_cycle = current_cycle;
+                    guard.state.active_stage = Some(ActiveStage {
+                        stage_id: stage.id.clone(),
+                        role: stage.role.clone(),
+                        provider: stage.provider,
+                        started_at_ms: self.clock.now_ms(),
+                    });
                 }
                 if let Err(err) = persist_now() {
                     end_run(RunStatus::Error, Some(err), None);
@@ -962,6 +970,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
 
                 if let Some(err) = write_error() {
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.state.active_stage = None;
                     guard.state.executions.push(Execution {
                         cycle: current_cycle,
                         stage_id: stage.id.clone(),
@@ -991,6 +1000,7 @@ impl<W: Workspace, R: StageRunner, C: Clock> Engine<W, R, C> {
                 let push_exec = |outcome: &str, verdict: Option<_>, err: Option<String>| {
                     let clean_err = err.map(|e| sanitize_reason(&e, extra_secrets));
                     let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.state.active_stage = None;
                     guard.state.executions.push(Execution {
                         cycle: current_cycle,
                         stage_id: stage.id.clone(),
@@ -2424,6 +2434,69 @@ on_retry = "implement"
 
         let state = Engine::new(cfg, ws, runner, clock).run();
         assert_eq!(state.status, RunStatus::Pass);
+    }
+
+    #[test]
+    fn active_stage_is_on_disk_only_while_its_stage_runs() {
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let cfg = make_config(&tmp, wrc_workflow(3));
+        let run_dir = cfg.run_dir.clone();
+
+        let expect_stage = |run_dir: &Path, stage_id: &str, role: &str, cycle: u32| {
+            let on_disk = load_state(run_dir).unwrap();
+            assert_eq!(on_disk.current_cycle, cycle);
+            let stage = on_disk
+                .active_stage
+                .unwrap_or_else(|| panic!("no active_stage during {stage_id}"));
+            assert_eq!(stage.stage_id, stage_id);
+            assert_eq!(stage.role, role);
+            assert_eq!(stage.provider, Provider::Claude);
+        };
+
+        let mut runner = ScriptedRunner::new();
+        let d1 = run_dir.clone();
+        runner.push(move |req| {
+            expect_stage(&d1, "implement", "worker", 1);
+            fs::write(req.workspace.join("a.rs"), "pub fn a() {}\n").unwrap();
+            StageResult::default()
+        });
+        let d2 = run_dir.clone();
+        runner.push(move |req| {
+            expect_stage(&d2, "review", "reviewer", 1);
+            write_out(req.workspace, "review.md", "Sem bugs.\n");
+            StageResult::default()
+        });
+        let d3 = run_dir.clone();
+        runner.push(move |req| {
+            expect_stage(&d3, "audit", "critic", 1);
+            write_out(req.workspace, "critic.md", "ok\nVERDICT: PASS\n");
+            StageResult::default()
+        });
+
+        let state = Engine::new(cfg, ws, runner, FakeClock::new()).run();
+        assert_eq!(state.status, RunStatus::Pass);
+        assert_eq!(state.active_stage, None);
+        assert_eq!(load_state(&run_dir).unwrap().active_stage, None);
+    }
+
+    #[test]
+    fn active_stage_is_cleared_when_a_stage_fails() {
+        let tmp = TempDir::new().unwrap();
+        let ws = FakeWorkspace::new(tmp.path().join("ws"));
+        let cfg = make_config(&tmp, wrc_workflow(3));
+        let run_dir = cfg.run_dir.clone();
+
+        let mut runner = ScriptedRunner::new();
+        runner.push(|_req| StageResult {
+            outcome: StageOutcome::NonZeroExit(2),
+            ..Default::default()
+        });
+
+        let state = Engine::new(cfg, ws, runner, FakeClock::new()).run();
+        assert_eq!(state.status, RunStatus::Error);
+        assert_eq!(state.active_stage, None);
+        assert_eq!(load_state(&run_dir).unwrap().active_stage, None);
     }
 
     #[test]

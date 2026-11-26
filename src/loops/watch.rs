@@ -232,6 +232,7 @@ mod tests {
             executions: vec![],
             files: vec![],
             summary: String::new(),
+            active_stage: None,
         };
         save_state(dir, &state).unwrap();
         state

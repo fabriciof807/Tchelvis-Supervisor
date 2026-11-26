@@ -764,6 +764,7 @@ mod tests {
             }],
             files: vec![],
             summary: "ok".to_string(),
+            active_stage: None,
         };
 
         let md = render_report(&state, tmp.path());
@@ -832,6 +833,7 @@ mod tests {
             executions: vec![],
             files: vec![],
             summary: format!("summary saw {secret}"),
+            active_stage: None,
         };
         let md = render_report_with_secrets(&state, tmp.path(), &[secret]);
         assert!(!md.contains(secret), "secret leaked in report:\n{md}");
@@ -941,6 +943,7 @@ mod tests {
             ],
             files: vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
             summary: "Tudo corrigido com token glpat-abcdefghijklmn".to_string(),
+            active_stage: None,
         }
     }
 
