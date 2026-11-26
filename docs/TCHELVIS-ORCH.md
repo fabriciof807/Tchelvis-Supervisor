@@ -159,6 +159,12 @@ tchelvis orch check --run loop_<RUN_ID>
 tchelvis loop result <RUN_ID>
 ```
 
+The end notice waits 30 s before the daemon sends its pointer. Running
+`loop status`, `loop result` or `loop report` on a finished run from the
+caller terminal acknowledges it, so a coordinator that already read the result
+gets no pointer for it. Other terminals reading the result do not acknowledge
+anything.
+
 | Command | Purpose |
 | :--- | :--- |
 | `loop check <workflow>` | Validate workflow, config, sandbox and model plan. Spends no tokens. `--live` also probes models. |
@@ -229,7 +235,10 @@ Known limits:
   any message it shows; delivery is postponed while your terminal is busy or
   blocked. Run `tchelvis doctor`
   to confirm `tchelvis daemon` is running. Check `tchelvis orch status` for
-  unread counts. A pointer can be sent again if it was not read. If the
+  unread counts (a loop's end notice is counted only after its 30 s wait). A
+  pointer can be sent again if it was not read; a late one ends with
+  `(oldest message N min old)`. No pointer comes for a loop whose result you
+  already read with `loop status|result|report` from the caller terminal. If the
   terminal no longer exists, `tchelvis loop list --runs` shows the run as not
   delivered.
 - **A worker stopped without reporting.** Run `tchelvis orch status --run <run_id>`,
@@ -238,7 +247,11 @@ Known limits:
 - **The loop terminal is not shown as a tab.** Loop terminals are background
   `hc` terminals named `loop-<RUN_ID>`. They have no pane. They appear as
   working in `tchelvis status` and in the Fleet queue, where clicking one
-  attaches it. Use `tchelvis loop status <run_id>` to see the state.
+  attaches it. The Fleet card shows the active stage and cycle
+  (`worker: pi · 1/3`, `loop · 2/3` between stages, then the final status);
+  when the run's state cannot be read (for example after `loop clean`), the
+  card shows the run id instead. Use
+  `tchelvis loop status <run_id>` to see the state.
 - **`loop auth login agy` needs a browser.** If the browser does not open,
   attach to the terminal with `hc attach <addr>` and copy the URL.
 
